@@ -2,8 +2,8 @@
 
 **Status:** Stable / frozen wire contract (`0xAF01`, version byte = 1).
 **Spec version:** 1.0 (2026-06-27).
-**Scope:** the *audio* half of a radio-streaming toolkit. I/Q streaming is explicitly out of scope (see §1.2).
-**Provenance:** this document is the normative, field-by-field definition of the `0xAF01` audio wire. Every normative value here is implemented and pinned by the language-neutral golden-vector conformance suite (see §12), so the wire is byte-deterministic and independently checkable. Where the toolkit *plan* describes capabilities that are **not** in the v1 wire, they are isolated in §13 (Proposed extensions) and are explicitly **non-normative**.
+**Scope:** The *audio* half of a radio-streaming toolkit.
+**Provenance:** This document is the normative, field-by-field definition of the `0xAF01` audio wire. Every normative value here is implemented and pinned by the language-neutral golden-vector conformance suite (see §12), so the wire is byte-deterministic and independently checkable. Where the toolkit *plan* describes capabilities that are **not** in the v1 wire, they are isolated in §13 (Proposed extensions) and are explicitly **non-normative**.
 
 ---
 

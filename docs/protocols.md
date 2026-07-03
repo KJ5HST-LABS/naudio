@@ -5,28 +5,28 @@ job is to move radio **audio** over a network — a versioned, CRC-checked frame
 reliability stack (jitter / FEC / reorder / ARQ) that naudio **owns** and freezes at spec v1.
 
 ```
-                         naudio — net-audio audio-streaming protocol
-                         ============================================
+                  naudio — net-audio audio-streaming protocol
+                  ===========================================
 
- ┌────────────────────────────────────────────────────────────────────────────┐
- │ net-audio audio-streaming protocol                       MAGIC = 0xAF01      │
- │ naudio OWNS this · frozen at spec v1 · job: move radio AUDIO over a network  │
- │                                                                              │
- │     radio / capture                                                          │
- │          │ PCM                                                               │
- │          ▼                                                                   │
- │   ┌──────────────────┐   0xAF01 frames        ┌──────────────────┐          │
- │   │ AudioStreamServer │──(19-byte hdr+CRC32)──▶│ AudioStreamClient │          │
- │   │   (naudio_net)    │      TCP / UDP         │   (naudio_net)    │          │
- │   └──────────────────┘                        └─────────┬────────┘          │
- │       codec = naudio_core                                │                   │
- │       (AudioPacket 0xAF01 +                              ▼                   │
- │        jitter/FEC/reorder/ARQ)                   na_client_*  (C ABI,        │
- │                                                  libnaudio) ──▶ your app     │
- │                                                                              │
- │   VERIFIED BY:  conformance golden vectors  (language-neutral)               │
- │                 + live interop (first_frame_hex=68c569c6…)                   │
- └────────────────────────────────────────────────────────────────────────────┘
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ net-audio audio-streaming protocol                       MAGIC = 0xAF01     │
+ │ naudio OWNS this · frozen at spec v1 · job: move radio AUDIO over a network │
+ │                                                                             │
+ │     radio / capture                                                         │
+ │          │ PCM                                                              │
+ │          ▼                                                                  │
+ │   ┌───────────────────┐   0xAF01 frames        ┌───────────────────┐        │
+ │   │ AudioStreamServer │──(19-byte hdr+CRC32)──▶│ AudioStreamClient │        │
+ │   │   (naudio_net)    │      TCP / UDP         │   (naudio_net)    │        │
+ │   └───────────────────┘                        └─────────┬─────────┘        │
+ │       codec = naudio_core                                │                  │
+ │       (AudioPacket 0xAF01 +                              ▼                  │
+ │        jitter/FEC/reorder/ARQ)                   na_client_*  (C ABI,       │
+ │                                                  libnaudio) ──▶ your app    │
+ │                                                                             │
+ │   VERIFIED BY:  conformance golden vectors  (language-neutral)              │
+ │                 + live interop (first_frame_hex=68c569c6…)                  │
+ └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Same graph in Mermaid (renders on GitHub / VS Code / Obsidian)
@@ -116,9 +116,3 @@ are unchanged — only the silence-gap count is bounded.
   bounded output is **byte-identical** to the unbounded definition. The cap only changes the
   pathological out-of-range span, where the unbounded loop would hang rather than produce a meaningful
   stream.
-
----
-
-See also: the `0xAF01` wire contract in [spec/audio-streaming-protocol-v1.md](spec/audio-streaming-protocol-v1.md),
-the conformance gate in [../conformance/README.md](../conformance/README.md), and the example
-clients in [../examples/README.md](../examples/README.md) and the root README.

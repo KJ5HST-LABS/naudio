@@ -25,12 +25,3 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
     driving only the public C ABI, plus a demo streaming source.
   - **Tooling** — `na_audio_daemon`, a hardware-smoke driver that exercises the real PortAudio
     capture / playback path the hardware-free test suite cannot reach.
-
-### Notes
-- The hardware-free test suite runs **286 ctests** green (including the conformance golden vectors
-  and a README-snippet compile gate). Cross-platform CI covers Linux, macOS, and Windows.
-- **Not in v1** (see the spec's §13 and the README "Known limitations"): per-subscription format
-  negotiation and sample-format breadth beyond 16-bit PCM, application-level gap markers, stream-fact
-  metadata (RF center / precise time anchor), IP multicast, remote device selection over the wire, and
-  arbitrary sample-rate conversion.
-- **License:** LGPL-2.1-or-later.

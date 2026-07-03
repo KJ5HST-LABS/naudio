@@ -1,7 +1,7 @@
 # net-audio Protocol Conformance Suite
 
 Language-neutral **golden-vector** conformance fixtures for the [audio streaming
-protocol v1](../docs/spec/audio-streaming-protocol-v1.md). A conformance test
+protocol v1](../docs/audio-streaming-protocol-v1.md). A conformance test
 loads the vectors and validates encode + decode against them. Passing the
 language-neutral vectors against an independently computed known-answer set is
 the proof that an implementation matches the spec — the gate every reference
@@ -97,7 +97,7 @@ A `ControlMessage` payload (the bytes inside a `CONTROL` frame).
 - `minMs`, `maxMs`, `multiplier`, `packets` (count), `expectedTargetMs`,
   `expectedPacketCount`.
 
-## Scope notes (honest limits)
+## Notes
 
 - **Timestamps are pinned to 0** in frame vectors. The frame timestamp is sampled
   at packet creation (§3.5 of the spec) and its clock origin is

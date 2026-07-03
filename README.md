@@ -2,10 +2,10 @@
 
 **naudio** is an open, cross-platform toolkit for moving radio **audio** over the network: a versioned wire **spec**, a reference **server** and **clients**, a reliability stack (jitter / FEC / reorder / ARQ), virtual-audio device plumbing, and a stable **C ABI** so C / Hamlib / Python consumers can link a single versioned artifact. It is the C/C++ home of the **net-audio** audio-streaming protocol (magic `0xAF01`), built so the ham ecosystem — fldigi, Quisk, digital-mode apps, and Hamlib apps — can reuse one audio transport instead of each re-inventing it.
 
-> **On the names:** *net-audio* is the wire **protocol** — the frozen `0xAF01` frame contract defined in [the spec](docs/spec/audio-streaming-protocol-v1.md). *naudio* is this C/C++ **toolkit** that implements it. There is no separate "net-audio" package to find or install; the protocol name and this repository are the whole story.
+> **On the names:** *net-audio* is the wire **protocol** — the frozen `0xAF01` frame contract defined in [the spec](docs/audio-streaming-protocol-v1.md). *naudio* is this C/C++ **toolkit** that implements it. There is no separate "net-audio" package to find or install; the protocol name and this repository are the whole story.
 
 - **License:** LGPL-2.1-or-later — see **[LICENSE](LICENSE)**. (Matches Hamlib; links cleanly from proprietary apps and from GPL apps alike.)
-- **Wire spec:** **[docs/spec/audio-streaming-protocol-v1.md](docs/spec/audio-streaming-protocol-v1.md)** — the frozen `0xAF01` v1 contract.
+- **Wire spec:** **[docs/audio-streaming-protocol-v1.md](docs/audio-streaming-protocol-v1.md)** — the frozen `0xAF01` v1 contract.
 - **Protocols overview:** **[docs/protocols.md](docs/protocols.md)** — the `0xAF01` network audio wire format at a glance.
 - **Conformance:** **[conformance/README.md](conformance/README.md)** — language-neutral golden vectors that pin every normative value in the wire spec.
 
@@ -180,12 +180,12 @@ consumer. The byte-identity tell for a correctly received stream is
 - **Host-API duplication (carried forward).** PortAudio enumerates the same physical device once per
   host API (WASAPI/MME/DirectSound on Windows) under different names. The DUPLEX merge keys on
   `name + hostApi`, so it does **not** yet de-duplicate the same device across host APIs; deferred
-  until it can be tested on real Windows.
+  until it can be tested more thoroughly by others.
 - **`verifyConfiguration` "detected" values are PortAudio's defaults.** PortAudio has no format list,
   so the detected rate/channels come from the device's reported default rate + max channel counts —
   faithful, but device-default numbers rather than an enumerated best match.
 - **Virtual-device paths not runtime-verified.** With no BlackHole/VB-CABLE installed in CI,
-  `bestVirtual` selection and the virtual-mismatch report are unit-tested only; enumeration + the
+  `bestVirtual` selection and the virtual-mismatch report are unit-tested only, with limited local hardware testing; enumeration + the
   probe primitive **are** runtime-exercised on real Core Audio via `na_audio_daemon --list-devices`.
 - **No IP multicast; IPv4 only.** RX fan-out to multiple clients is **unicast replication** (O(N)
   egress), not IP multicast, and the transport is IPv4 (`AF_INET`) only. Fan-out should not be read as

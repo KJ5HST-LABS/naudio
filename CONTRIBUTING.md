@@ -35,7 +35,7 @@ naudio is **LGPL-2.1-or-later**. Contributions are accepted under that license.
 
 ## Changing the wire protocol
 
-The `0xAF01` wire is **frozen at v1** (`docs/spec/audio-streaming-protocol-v1.md`). A wire change
+The `0xAF01` wire is **frozen at v1** (`docs/audio-streaming-protocol-v1.md`). A wire change
 requires: (1) a spec revision, (2) regenerating `conformance/vectors/vectors.ini` via
 `conformance/tools/gen_vectors.py`, and (3) re-checking the codec and every example client against
 the regenerated golden vectors. The byte-identity tell for a correctly received stream is

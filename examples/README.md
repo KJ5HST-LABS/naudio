@@ -77,7 +77,7 @@ it at build time and so does not.
   C++ runtime it carries) — never the internal static libraries the `tools/` daemon
   uses. That is the "the C ABI is self-sufficient" guarantee.
 - **The wire is the `0xAF01` protocol, v1** — the frozen contract in
-  [`../docs/spec/audio-streaming-protocol-v1.md`](../docs/spec/audio-streaming-protocol-v1.md).
+  [`../docs/audio-streaming-protocol-v1.md`](../docs/audio-streaming-protocol-v1.md).
   Clients speak it *through* the library codec; none of them re-implement the wire.
 - **Real-device capture and audible playback need audio hardware**, so they are not part
   of the automated test suite; the `--test-tone` source plus the `null` backend are the
