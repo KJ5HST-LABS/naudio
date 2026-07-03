@@ -1,0 +1,125 @@
+name: CI
+
+# Build + test the naudio toolkit on every push and pull request.
+# The ctest suite is fully hardware-free (FakeBackend doubles + loopback sockets +
+# golden-vector conformance + the README snippet compile-gate), so it runs headless
+# on CI runners. The real-hardware smokes (na_audio_daemon / on-air audio) are
+# gated out here — they need a real sound device.
+#
+# Three job families (tri-platform + FetchContent coverage):
+#   * build-and-test  — Ubuntu + macOS with a SYSTEM PortAudio (the supported path);
+#                       full ctest + install smoke + the external-consumer find_package
+#                       / pkg-config gate.
+#   * windows         — Windows lib-only (tools/ daemon excluded on WIN32 — not built in CI);
+#                       PortAudio via FetchContent (no system dep on Windows). Exercises
+#                       the Winsock transport path (Socket.cpp ws2_32) that POSIX CI never
+#                       compiles.
+#   * fetchcontent    — Ubuntu with NO system PortAudio: proves the FetchContent fallback
+#                       (build PortAudio v19.7.0 from source) compiles + passes.
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build+test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PortAudio (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y portaudio19-dev pkg-config
+          # portaudio19-dev provides portaudio-2.0.pc + pulls libasound2-dev, so
+          # find_package(PkgConfig) resolves the tested pkg-config path (not the
+          # FetchContent fallback). GoogleTest still fetches via FetchContent.
+
+      - name: Install PortAudio (macOS)
+        if: runner.os == 'macOS'
+        run: brew install portaudio
+        # pkg-config deliberately NOT brewed: the runner images preinstall pkgconf
+        # (and homebrew's pkg-config is now just an alias of it) — installing it
+        # again is at best a no-op and has been a hard conflict on older images.
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test (conformance vectors + README snippet gate)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install smoke (shared lib + headers + pkg-config + CMake package)
+        run: cmake --install build --prefix "${{ runner.temp }}/naudio-prefix"
+
+      - name: External-consumer gate (find_package + pkg-config, C ABI + C++ API)
+        run: bash tests/external-consumer/run.sh
+        # run.sh installs naudio to its OWN temp prefix (configured with the prefix,
+        # so naudio.pc bakes the right paths) and builds+runs a throwaway external
+        # project against it via find_package(naudio) AND pkg-config — the real proof
+        # that the installed package is consumable.
+
+  windows:
+    name: build+test (windows-latest, lib-only, FetchContent PortAudio)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (no system PortAudio -> FetchContent; tools/ excluded on WIN32)
+        run: cmake -S . -B build -DNAUDIO_BUILD_APPS=OFF
+        # No portaudio-2.0.pc on Windows, so the build fetches + builds PortAudio
+        # v19.7.0 from source (MME/WASAPI/DirectSound backends, Windows SDK only).
+        # tools/ (the na_audio_daemon hardware smoke) is guarded out by `if(NOT WIN32)` in CMakeLists;
+        # NAUDIO_BUILD_APPS=OFF additionally drops the demo exes (na_c_play_to_speakers) — this
+        # is a libraries + C ABI + tests build (the C-ABI smokes prove C linkage). The
+        # README snippet gate is POSIX-only (bash) and is not registered on WIN32.
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo -j
+
+      - name: Test (conformance vectors + Winsock loopback smokes)
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+
+  fetchcontent:
+    name: build+test (ubuntu, no system PortAudio -> FetchContent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps (ALSA + pkg-config, NO portaudio19-dev)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+          # Deliberately NOT installing portaudio19-dev: with no portaudio-2.0.pc on
+          # the system, pkg_check_modules() misses and the build takes the
+          # FetchContent path (PortAudio v19.7.0 from source). libasound2-dev is the
+          # ALSA backend PortAudio's Linux build links. This is the no-system-deps
+          # FetchContent path that CI must exercise.
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNAUDIO_BUILD_APPS=OFF
+        # NAUDIO_BUILD_APPS=OFF: the no-system-deps mandate is that the LIBRARIES +
+        # C ABI + the full hardware-free ctest build against a FetchContent PortAudio.
+        # The demo app (na_audio_daemon) links PortAudio into an executable and is a
+        # hardware smoke CI never runs, so it's dropped here; the C-ABI / conformance /
+        # snippet ctests still build + run.
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test (conformance vectors + README snippet gate)
+        run: ctest --test-dir build --output-on-failure

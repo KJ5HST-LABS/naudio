@@ -1,0 +1,29 @@
+@PACKAGE_INIT@
+
+# naudio package config. Recreates the imported dependencies the
+# exported C++ targets reference, then pulls in the relocatable target definitions.
+#
+#   find_package(naudio CONFIG REQUIRED)
+#     naudio::naudio        -- shared C ABI (na_client_* + na_server_*); C / Hamlib
+#     naudio::naudio_core   -- codec + reliability + pure logic (static C++)
+#     naudio::naudio_net    -- transport/server/client (static C++)
+#     naudio::naudio_pa     -- PortAudio device backend (static C++)
+#
+# naudio::naudio_core / naudio_net use std::thread/std::mutex (Threads); the
+# device backend naudio::naudio_pa links PortAudio. Both are imported targets the
+# exported naudioTargets.cmake references by name, so they must exist before it is
+# included. PortAudio is also a runtime dependency of the naudio dylib (its bundled
+# backend loads libportaudio), so requiring it here is not an extra burden.
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Threads)
+
+if(NOT TARGET PkgConfig::PORTAUDIO)
+    find_dependency(PkgConfig)
+    pkg_check_modules(PORTAUDIO REQUIRED IMPORTED_TARGET portaudio-2.0)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/naudioTargets.cmake")
+
+check_required_components(naudio)

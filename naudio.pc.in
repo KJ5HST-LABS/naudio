@@ -1,0 +1,19 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: naudio
+Description: @PROJECT_DESCRIPTION@
+Version: @PROJECT_VERSION@
+# License: LGPL-2.1-or-later
+# The public shared C ABI (na_client_* + na_server_*). Cflags exposes both
+# naudio.h (the C ABI) and the naudio/ C++ API headers under ${includedir}.
+Libs: -L${libdir} -lnaudio
+Cflags: -I${includedir}
+# Static-link closure (only consulted by `pkg-config --static`): the bundled
+# device backend pulls PortAudio; the codec/net layers park the caller on a
+# std::condition_variable, so the platform thread library is added below (empty
+# where pthread is folded into libc, e.g. macOS).
+Requires.private: portaudio-2.0
+Libs.private: @NAUDIO_PC_PRIVATE_LIBS@

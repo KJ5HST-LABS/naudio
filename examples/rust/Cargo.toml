@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "na-rust-play-to-speakers"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "LGPL-2.1-or-later"
+description = "Play a network-audio stream to local speakers over the naudio C ABI (Rust example)."
+
+[[bin]]
+name = "play_to_speakers"
+path = "src/main.rs"
+
+# No dependencies on purpose: this example binds the C ABI with hand-written
+# `extern "C"` declarations (no `bindgen`) and uses only the standard library.
+[dependencies]

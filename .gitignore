@@ -1,0 +1,25 @@
+# Build output
+/build/
+build/
+/install/
+
+# Compiled objects / archives
+*.o
+*.a
+*.so
+*.dylib
+
+# CMake user files
+CMakeUserPresets.json
+
+# Generated pkg-config (from naudio.pc.in at configure/install time)
+*.pc
+
+# Editor / language-server caches
+.cache/
+
+# macOS
+.DS_Store
+
+# Local scratch / staging area (never committed)
+/archive/
