@@ -1,6 +1,6 @@
 # naudio — the C/C++ network-audio streaming toolkit
 
-**naudio** is an open, cross-platform toolkit for moving radio **audio** over the network: a versioned wire **spec**, a reference **server** and **clients**, a reliability stack (jitter / FEC / reorder / ARQ), virtual-audio device plumbing, and a stable **C ABI** so C / Hamlib / Python consumers can link a single versioned artifact. It is the C/C++ home of the **net-audio** audio-streaming protocol (magic `0xAF01`), built so the ham ecosystem — fldigi, Quisk, digital-mode apps, and Hamlib apps — can reuse one audio transport instead of each re-inventing it.
+**naudio** is an open, cross-platform toolkit for moving radio **audio** over the network: a versioned wire **spec**, a reference **server** and **clients**, a reliability stack (jitter / FEC / reorder / ARQ), virtual-audio device plumbing, and a stable **C ABI** so C / Hamlib / Python consumers can link a single versioned artifact. It is the C/C++ home of the **net-audio** audio-streaming protocol (magic `0xAF01`), built so the ham ecosystem — fldigi, Quisk, digital-mode apps, and Hamlib based apps — can reuse one audio transport (as clients) instead of each re-inventing it.
 
 > **On the names:** *net-audio* is the wire **protocol** — the frozen `0xAF01` frame contract defined in [the spec](docs/audio-streaming-protocol-v1.md). *naudio* is this C/C++ **toolkit** that implements it. There is no separate "net-audio" package to find or install; the protocol name and this repository are the whole story.
 
