@@ -134,6 +134,28 @@ Both are **configure-time** settings. Adding them to a `build/` tree that was al
 without them requires re-running the `cmake -S . -B build …` line above; `cmake --build` alone will
 not pick them up.
 
+### Changing the prefix later needs the cache invalidated
+
+Once a build tree has resolved libhamlib, `pkg_check_modules` **caches the answer** — including the
+absolute paths. Re-running the configure line with a different `PKG_CONFIG_PATH` does *not* re-detect:
+it silently replays the cached prefix and still prints `na_hamlib_bridge enabled`, so it looks like it
+worked. Drop the cached hamlib variables to force a real re-detect:
+
+```bash
+PKG_CONFIG_PATH="$HOME/.local/hamlib-streaming/lib/pkgconfig" \
+  cmake -U 'HAMLIB*' -U 'pkgcfg_lib_HAMLIB*' -S . -B build -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON
+cmake --build build -j
+```
+
+The tell that detection really re-ran is `-- Checking for module 'hamlib'` in the output; without the
+`-U` flags that line is absent. `cmake --fresh` or deleting `build/` also work, at the cost of
+re-resolving every other dependency too. Verify the result against the binary rather than the log:
+
+```bash
+otool -L build/tools/na_hamlib_bridge | grep hamlib     # macOS
+ldd    build/tools/na_hamlib_bridge | grep hamlib       # Linux
+```
+
 ---
 
 ## Confirm you actually got the bridge
@@ -180,8 +202,11 @@ So do not install into `/tmp`, a scratch directory, or anything a reboot clears.
 spent its first few bridge sessions with its only streaming libhamlib sitting in a scratch directory,
 one reboot away from being unable to rebuild or re-verify the bridge at all — which is why the script
 defaults to `$HOME/.local/hamlib-streaming`.
-If the prefix does go missing, rebuild it and re-run the configure step from
-[§2](#2-build-naudio-against-it); the cache repairs itself from the new `PKG_CONFIG_PATH`.
+If the prefix does go missing — or you simply want to point an existing build tree at a different
+one — rebuild it and then follow
+[§ Changing the prefix later](#changing-the-prefix-later-needs-the-cache-invalidated). Re-running the
+plain configure line is **not** enough: the old absolute paths are cached, and the reconfigure will
+quietly keep using them.
 
 ---
 
@@ -193,8 +218,9 @@ If the prefix does go missing, rebuild it and re-run the configure step from
 | `libhamlib <ver> lacks rig_stream_*` | `PKG_CONFIG_PATH` is resolving your system 4.x libhamlib | Point it at `<prefix>/lib/pkgconfig` **before** re-running the configure step |
 | `libhamlib not found via pkg-config` | `PKG_CONFIG_PATH` unset, wrong, or lost between shells | It is not inherited by a later `cmake --build`; it must be set on the `cmake -S . -B build` line |
 | Setting the flag changed nothing | Both settings are configure-time | Re-run the full `cmake -S . -B build …` line, not `cmake --build` |
+| Changed `PKG_CONFIG_PATH`, reconfigured, still the old prefix | `pkg_check_modules` cached the paths; the reconfigure no-ops and still reports success | [Invalidate the cached hamlib vars](#changing-the-prefix-later-needs-the-cache-invalidated) with `-U 'HAMLIB*' -U 'pkgcfg_lib_HAMLIB*'` |
 | `./bootstrap` fails on `libtoolize` | Apple's `/usr/bin/libtool` is not GNU libtool | `brew install libtool` (provides `glibtoolize`) |
-| Link/include errors on a rebuild that used to work | The prefix was moved or cleared | Rebuild the prefix, re-run the configure step |
+| Link/include errors on a rebuild that used to work | The prefix was moved or cleared | Rebuild the prefix, then invalidate the cache as above |
 
 ---
 
