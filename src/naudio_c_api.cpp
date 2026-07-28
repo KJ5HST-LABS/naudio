@@ -957,6 +957,60 @@ extern "C" na_error_t na_server_set_max_clients(na_audio_server* server, int max
     });
 }
 
+extern "C" na_error_t na_server_set_audio_format(na_audio_server* server, int sample_rate,
+                                                 int bits_per_sample, int channels) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        // v1 wire carries signed 16-bit PCM only; 1 or 2 channels; positive rate. naudio does not
+        // resample/convert — injected bytes must match this layout exactly.
+        if (sample_rate <= 0 || bits_per_sample != 16 || (channels != 1 && channels != 2)) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        server->pendingConfig.sampleRate    = sample_rate;
+        server->pendingConfig.bitsPerSample = bits_per_sample;
+        server->pendingConfig.channels      = channels;
+        return NA_OK;
+    });
+}
+
+extern "C" na_error_t na_server_set_reliability_profile(na_audio_server* server,
+                                                        na_reliability_profile profile) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        naudio::AudioStreamConfig preset;
+        switch (profile) {
+            case NA_RELIABILITY_DEFAULT: preset = naudio::AudioStreamConfig{};         break;
+            case NA_RELIABILITY_UDP_LAN: preset = naudio::AudioStreamConfig::udpLan(); break;
+            case NA_RELIABILITY_UDP_WAN: preset = naudio::AudioStreamConfig::udpWan(); break;
+            case NA_RELIABILITY_UDP_FT8: preset = naudio::AudioStreamConfig::udpFt8(); break;
+            default:
+                setError(NA_ERR_INVALID);
+                return NA_ERR_INVALID;
+        }
+        // Copy transport + framing + reliability; PRESERVE audio format (rate/bits/channels) and
+        // maxClients so this composes order-independently with na_server_set_audio_format /
+        // na_server_set_max_clients.
+        naudio::AudioStreamConfig& pc = server->pendingConfig;
+        pc.transportType                = preset.transportType;
+        pc.frameDurationMs              = preset.frameDurationMs;
+        pc.bufferTargetMs               = preset.bufferTargetMs;
+        pc.bufferMinMs                  = preset.bufferMinMs;
+        pc.bufferMaxMs                  = preset.bufferMaxMs;
+        pc.reorderBufferSize            = preset.reorderBufferSize;
+        pc.reorderMaxHoldMs             = preset.reorderMaxHoldMs;
+        pc.fecEnabled                   = preset.fecEnabled;
+        pc.fecBlockSize                 = preset.fecBlockSize;
+        pc.adaptiveJitterEnabled        = preset.adaptiveJitterEnabled;
+        pc.jitterMultiplier             = preset.jitterMultiplier;
+        pc.controlReliabilityEnabled    = preset.controlReliabilityEnabled;
+        pc.controlRetransmitMaxAttempts = preset.controlRetransmitMaxAttempts;
+        return NA_OK;
+    });
+}
+
 extern "C" na_error_t na_server_set_capture_device(na_audio_server* server, int backend_id) {
     NA_GUARD(NA_ERR_BACKEND, {
         if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }

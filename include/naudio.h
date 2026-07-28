@@ -373,6 +373,17 @@ typedef enum na_server_backend {
                                       na_server_tx_audio_cb. No PortAudio, no devices.             */
 } na_server_backend;
 
+/* UDP reliability profile applied by na_server_set_reliability_profile: transport + framing + the
+ * FEC / reorder / adaptive-jitter / control-ARQ knobs, as one named bundle. Mirrors the C++
+ * AudioStreamConfig UDP presets. Audio format (rate/bits/channels) and max-clients are NOT touched. */
+typedef enum na_reliability_profile {
+    NA_RELIABILITY_DEFAULT = 0,  /* Plain TCP defaults: no FEC / reorder / jitter / control-ARQ.    */
+    NA_RELIABILITY_UDP_LAN = 1,  /* UDP, low-latency LAN buffers, reorder + control-ARQ.            */
+    NA_RELIABILITY_UDP_WAN = 2,  /* UDP, Internet buffers: XOR FEC + adaptive jitter + reorder +    */
+                                 /*   control-ARQ. The resilient remote-operating profile.          */
+    NA_RELIABILITY_UDP_FT8 = 3   /* UDP, FT8/digital: tight buffers, reorder + control-ARQ.         */
+} na_reliability_profile;
+
 /* Opaque streaming-server handle. Create with na_server_create, free with na_server_destroy. */
 typedef struct na_audio_server na_audio_server;
 
@@ -412,6 +423,18 @@ NA_EXPORT void na_server_destroy(na_audio_server* server);
 NA_EXPORT na_error_t na_server_set_transport(na_audio_server* server, na_transport transport);
 /* Maximum simultaneous clients (must be > 0). Default 4. */
 NA_EXPORT na_error_t na_server_set_max_clients(na_audio_server* server, int max_clients);
+/* Audio wire format the server advertises and broadcasts. `bits_per_sample` must be 16 (the v1 wire
+ * carries signed 16-bit PCM), `channels` 1 or 2, `sample_rate` > 0. Bytes fed to na_server_inject_audio
+ * (and delivered to na_server_tx_audio_cb) MUST match this layout — naudio does not resample or convert.
+ * Default is 48000 / 16 / 2. NA_ERR_INVALID on a bad value / NULL server / after start. */
+NA_EXPORT na_error_t na_server_set_audio_format(na_audio_server* server, int sample_rate,
+                                                int bits_per_sample, int channels);
+/* Apply a UDP reliability profile (transport + framing + FEC/reorder/jitter/control-ARQ) in one call;
+ * see na_reliability_profile. Leaves audio format and max-clients untouched, so it composes freely with
+ * na_server_set_audio_format / na_server_set_max_clients. Selecting a UDP profile makes a separate
+ * na_server_set_transport call unnecessary. NA_ERR_INVALID on a NULL server / bad profile / after start. */
+NA_EXPORT na_error_t na_server_set_reliability_profile(na_audio_server* server,
+                                                       na_reliability_profile profile);
 /* RX capture device id (SYSTEM backend only; NA_ERR_UNSUPPORTED on the NULL backend). If no capture
  * device is set the server runs inject-only (RX comes from na_server_inject_audio). */
 NA_EXPORT na_error_t na_server_set_capture_device(na_audio_server* server, int backend_id);

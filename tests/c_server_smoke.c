@@ -147,6 +147,37 @@ int main(void) {
         return 1;
     }
 
+    /* New config setters (na_server_set_audio_format / _set_reliability_profile): NULL-server contract
+     * plus a throwaway server exercising the exact config the na_hamlib_bridge uses — the UDP WAN
+     * reliability profile (FEC on) + mono 48k S16 — and the invalid-value rejections. */
+    if (na_server_set_audio_format(NULL, 48000, 16, 2) != NA_ERR_INVALID ||
+        na_server_set_reliability_profile(NULL, NA_RELIABILITY_UDP_WAN) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: NULL-server format/reliability setters not NA_ERR_INVALID\n");
+        return 1;
+    }
+    {
+        na_audio_server* cfg = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+        if (cfg == NULL) {
+            fprintf(stderr, "FAIL: na_server_create (cfg probe) (%s)\n", na_strerror(na_last_error()));
+            return 1;
+        }
+        if (na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+            na_server_set_audio_format(cfg, 48000, 16, 1) != NA_OK) {
+            fprintf(stderr, "FAIL: UDP_WAN + mono-S16 config setters rejected\n");
+            na_server_destroy(cfg);
+            return 1;
+        }
+        if (na_server_set_audio_format(cfg, 48000, 24, 1) != NA_ERR_INVALID ||   /* bits != 16 */
+            na_server_set_audio_format(cfg, 48000, 16, 3) != NA_ERR_INVALID ||   /* channels 3 */
+            na_server_set_audio_format(cfg, 0, 16, 2)     != NA_ERR_INVALID ||   /* rate 0     */
+            na_server_set_reliability_profile(cfg, (na_reliability_profile)99) != NA_ERR_INVALID) {
+            fprintf(stderr, "FAIL: invalid format/profile values not rejected\n");
+            na_server_destroy(cfg);
+            return 1;
+        }
+        na_server_destroy(cfg);  /* never started — clean create/destroy */
+    }
+
     /* ---- (2) create + configure + start a NULL-backend server on an ephemeral port ---- */
 
     na_audio_server* server = na_server_create(NA_SERVER_BACKEND_NULL, 0);
@@ -206,7 +237,9 @@ int main(void) {
     /* Config is frozen after start. */
     if (na_server_set_max_clients(server, 8) != NA_ERR_INVALID ||
         na_server_set_callbacks(server, &scbs, NULL) != NA_ERR_INVALID ||
-        na_server_set_tx_audio_cb(server, srv_on_tx_audio, NULL) != NA_ERR_INVALID) {
+        na_server_set_tx_audio_cb(server, srv_on_tx_audio, NULL) != NA_ERR_INVALID ||
+        na_server_set_audio_format(server, 48000, 16, 2) != NA_ERR_INVALID ||
+        na_server_set_reliability_profile(server, NA_RELIABILITY_UDP_WAN) != NA_ERR_INVALID) {
         fprintf(stderr, "FAIL: config setters not frozen after start\n");
         na_server_destroy(server);
         return 1;
