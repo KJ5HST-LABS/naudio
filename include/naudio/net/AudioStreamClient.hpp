@@ -89,6 +89,12 @@ public:
     void setPlaybackDevice(int backendId) { playbackDeviceId_ = backendId; }
     // The capture device is OPTIONAL (only needed for TX).
     void setCaptureDevice(int backendId) { captureDeviceId_ = backendId; }
+    // TX audio can INSTEAD be injected (see injectTxAudio) — the headless path, symmetric to
+    // AudioStreamServer::injectAudio on the RX side. Must be set BEFORE connect(): it decides
+    // whether the send worker is started, and connect() starts the workers once. Independent of
+    // the capture device; with both set, captured and injected audio interleave in one TX ring.
+    void setTxInjectEnabled(bool v) { txInjectEnabled_.store(v); }
+    bool isTxInjectEnabled() const { return txInjectEnabled_.load(); }
 
     // --- Identification (sent to the server so other clients see who shares the radio) ---
     void setCallsign(std::string callsign) { callsign_ = std::move(callsign); }
@@ -136,6 +142,21 @@ public:
         captureMuted_.store(!pttActive);
         playbackMuted_.store(pttActive);
     }
+
+    // --- TX inject (no capture device) ---
+    // Queue TX audio for the send worker directly, for a client that cannot capture (the NULL
+    // backend) or should not. Requires setTxInjectEnabled(true) BEFORE connect(), otherwise the
+    // send worker never runs and this always returns 0.
+    //
+    // `pcm` MUST already match config()'s layout (sampleRate / bitsPerSample / channels) — nothing
+    // here resamples or converts. Non-blocking: the TX ring overwrites its oldest bytes on overrun,
+    // exactly as it does for captured audio.
+    //
+    // Gated on the SAME captureMuted_ flag the capture loop uses, so setPTT() governs injected and
+    // captured audio identically — a client that has not asserted PTT transmits nothing either way.
+    // Returns bytes accepted: 0 when not connected, when the send worker is not running, or when
+    // PTT is inactive.
+    std::size_t injectTxAudio(const std::uint8_t* pcm, std::size_t nBytes);
 
     // --- Latency ---
     void measureLatency();
@@ -247,6 +268,9 @@ private:
     // so the event is exactly-once; that discipline breaks if a future refactor makes
     // the client reconnectable-after-disconnect by clearing this flag.
     std::atomic<bool> closed_{false};
+    // Read by startWorkerThreads() to decide whether to spawn the send worker without a capture
+    // device; atomic because the setter and connect() may be on different threads.
+    std::atomic<bool> txInjectEnabled_{false};
     std::atomic<bool> captureMuted_{true};    // start muted (RX mode)
     std::atomic<bool> playbackMuted_{false};  // start unmuted (hear RX)
     std::atomic<std::int64_t> measuredLatencyMs_{0};

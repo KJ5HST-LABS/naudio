@@ -6,6 +6,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **Client-side TX audio injection on the C ABI** — `na_client_inject_tx_audio()` feeds a client's
+  TX path directly, and `na_client_set_tx_inject()` enables it before connect. Together they make
+  the `na_client_*` surface symmetric with `na_server_inject_audio()` on the RX side, so a headless
+  client with no capture device (the `NA_CLIENT_BACKEND_NULL` backend, which cannot capture) can
+  originate TX audio. Injected audio obeys the same PTT gate as captured audio.
 - **Initial release of the naudio C/C++ audio-streaming toolkit.**
   - **net-audio wire protocol, spec v1** — the frozen `0xAF01` frame contract: versioned framing
     with per-frame CRC32, a 32-bit sequence + reorder buffer, adaptive (RFC-3550-style) jitter

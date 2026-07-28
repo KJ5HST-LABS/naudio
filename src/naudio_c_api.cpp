@@ -586,6 +586,18 @@ extern "C" na_error_t na_client_set_capture_device(na_stream_client* client, int
     });
 }
 
+extern "C" na_error_t na_client_set_tx_inject(na_stream_client* client, int enabled) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        // Frozen on connect ATTEMPT, like the callback setters: startWorkerThreads() reads the flag
+        // once to decide whether to spawn the send worker, so flipping it later would silently do
+        // nothing rather than take effect.
+        if (client->connectStarted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        client->client->setTxInjectEnabled(enabled != 0);
+        return NA_OK;
+    });
+}
+
 extern "C" na_error_t na_client_set_transport(na_stream_client* client, na_transport transport) {
     NA_GUARD(NA_ERR_BACKEND, {
         if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
@@ -673,6 +685,20 @@ extern "C" na_error_t na_client_set_capture_muted(na_stream_client* client, int 
         if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
         client->client->setCaptureMuted(muted != 0);
         return NA_OK;
+    });
+}
+
+extern "C" int na_client_inject_tx_audio(na_stream_client* client, const unsigned char* pcm,
+                                         int n_bytes) {
+    NA_GUARD_VAL(NA_ERR_BACKEND, NA_ERR_BACKEND, {
+        if (client == nullptr || pcm == nullptr || n_bytes <= 0) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        // Len-return: bytes accepted. 0 is a legitimate outcome (not connected / inject not enabled
+        // / PTT inactive), so it is NOT mapped to an error — see the header contract.
+        return static_cast<int>(client->client->injectTxAudio(
+            reinterpret_cast<const std::uint8_t*>(pcm), static_cast<std::size_t>(n_bytes)));
     });
 }
 

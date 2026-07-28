@@ -197,9 +197,11 @@ static int open_stream(RIG *rig, rig_stream_type_t type, int channels, rig_strea
 static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s [-m model] [-r host:port] [-p naudio_port] [-c channels]\n"
-        "          [-R lan|wan|ft8] [-k] [-x]\n"
+        "          [-R lan|wan|ft8] [-S stream_mode] [-k] [-x]\n"
         "  -m  Hamlib model (default 1=DUMMY hardware-free; 2=NETRIGCTL)\n"
         "  -r  netrigctl target host:port (model 2), e.g. localhost:5555\n"
+        "  -S  backend stream_mode conf (dummy: tone|silence|loopback|counter).\n"
+        "      'loopback' feeds TX back out of RX — a hardware-free TX round-trip.\n"
         "  -p  naudio server port (default 4533)\n"
         "  -c  channels 1 or 2 (default 1)\n"
         "  -R  reliability profile: wan (default, FEC), lan, ft8\n"
@@ -213,6 +215,7 @@ static void usage(const char *argv0) {
 int main(int argc, char **argv) {
     int model = 1;                     /* RIG_MODEL_DUMMY */
     const char *rig_file = NULL;
+    const char *stream_mode = NULL;    /* unset => leave the backend's own default alone */
     int na_port = 4533;
     int channels = 1;
     na_reliability_profile profile = NA_RELIABILITY_UDP_WAN;
@@ -222,10 +225,11 @@ int main(int argc, char **argv) {
     rig_set_debug(RIG_DEBUG_WARN);   /* a bridge daemon, not a trace tool */
 
     int opt;
-    while ((opt = getopt(argc, argv, "m:r:p:c:R:kxh")) != -1) {
+    while ((opt = getopt(argc, argv, "m:r:p:c:R:S:kxh")) != -1) {
         switch (opt) {
             case 'm': model = atoi(optarg); break;
             case 'r': rig_file = optarg; break;
+            case 'S': stream_mode = optarg; break;
             case 'p': na_port = atoi(optarg); break;
             case 'c': channels = atoi(optarg); break;
             case 'R': profile = parse_profile(optarg); break;
@@ -261,6 +265,15 @@ int main(int argc, char **argv) {
         if (rc != RIG_OK)
             fprintf(stderr, "na_hamlib_bridge: warning: set rig_pathname(%s): %s\n",
                     rig_file, rigerror(rc));
+    }
+    if (stream_mode) {
+        /* Backend-specific conf, read when the stream opens — so it must be set before
+         * rig_stream_open. The dummy backend's "loopback" mode feeds written TX audio back out of
+         * the RX stream, which is what makes a hardware-free TX round-trip observable. */
+        int rc = rig_set_conf(b.rig, rig_token_lookup(b.rig, "stream_mode"), stream_mode);
+        if (rc != RIG_OK)
+            fprintf(stderr, "na_hamlib_bridge: warning: set stream_mode(%s): %s\n",
+                    stream_mode, rigerror(rc));
     }
     int r = rig_open(b.rig);
     if (r != RIG_OK) {

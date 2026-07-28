@@ -312,14 +312,19 @@ void AudioStreamClient::startWorkerThreads() {
         threadFinished();
     }).detach();
 
-    // Capture + send (only if a capture device is configured — TX is optional).
+    // Capture (device -> TX ring). Only with a capture device; TX is optional.
     if (cap) {
         threadStarted();
         std::thread([this, tx, cap, mono, cfg]() {
             captureLoop(tx, cap, mono, cfg);
             threadFinished();
         }).detach();
+    }
 
+    // Send (TX ring -> server). Runs for a capture device OR for injectTxAudio, which is the only
+    // TX source available to a backend that cannot capture (the C ABI's NULL client backend throws
+    // on openCaptureStream). Without either, there is no TX producer and the worker would idle.
+    if (cap || txInjectEnabled_.load()) {
         threadStarted();
         std::thread([this, conn, tx, generation, cfg]() {
             sendLoop(conn, tx, generation, cfg);
@@ -476,6 +481,29 @@ void AudioStreamClient::sendLoop(std::shared_ptr<ClientConnection> connection,
             }
         }
     }
+}
+
+// The third TX producer path, alongside captureLoop: feed the same ring from the caller's thread
+// instead of from a capture device. Mirrors AudioStreamServer::injectAudio (grab the per-generation
+// shared_ptr under runMutex_, then work outside the lock) so a concurrent reconnect swapping the
+// ring cannot leave us writing into freed memory.
+std::size_t AudioStreamClient::injectTxAudio(const std::uint8_t* pcm, std::size_t nBytes) {
+    if (pcm == nullptr || nBytes == 0) return 0;
+    if (!connected_.load() || closed_.load()) return 0;
+    // The TX ring is allocated for every connection, capture device or not, so writing without the
+    // send worker would succeed and then be silently discarded. Refuse instead: the return value is
+    // the caller's only signal, and it must not report bytes that can never leave the process.
+    if (!txInjectEnabled_.load()) return 0;
+    // Same gate as captureLoop, so setPTT() governs both TX sources identically.
+    if (captureMuted_.load()) return 0;
+
+    std::shared_ptr<AudioRingBuffer> tx;
+    {
+        std::lock_guard<std::mutex> lock(runMutex_);
+        tx = txBuffer_;
+    }
+    if (!tx) return 0;  // not connected yet, or resources already closed
+    return tx->write(pcm, 0, nBytes);
 }
 
 void AudioStreamClient::heartbeatLoop(std::shared_ptr<ClientConnection> connection,

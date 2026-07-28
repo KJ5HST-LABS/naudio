@@ -284,6 +284,11 @@ NA_EXPORT void na_client_destroy(na_stream_client* client);
 NA_EXPORT na_error_t na_client_set_playback_device(na_stream_client* client, int backend_id);
 /* The local capture device id (OPTIONAL — only needed for TX). Unsupported on the NULL backend. */
 NA_EXPORT na_error_t na_client_set_capture_device(na_stream_client* client, int backend_id);
+/* Enable TX audio from na_client_inject_tx_audio instead of (or alongside) a capture device — the
+ * headless TX path, and the ONLY way for a NULL-backend client to transmit, since that backend
+ * cannot capture. MUST be set before connect: it decides whether the send worker starts, and
+ * connect starts the workers once. NA_ERR_INVALID on a NULL client or after connect. */
+NA_EXPORT na_error_t na_client_set_tx_inject(na_stream_client* client, int enabled);
 /* Select the transport. No effect once connected (returns NA_ERR_INVALID). */
 NA_EXPORT na_error_t na_client_set_transport(na_stream_client* client, na_transport transport);
 /* Identify to the server's roster. Any argument may be NULL to leave that field unset. */
@@ -307,6 +312,22 @@ NA_EXPORT na_error_t na_client_set_reconnect_policy(na_stream_client* client, in
 NA_EXPORT na_error_t na_client_set_ptt(na_stream_client* client, int tx_active);
 NA_EXPORT na_error_t na_client_set_capture_muted(na_stream_client* client, int muted);
 NA_EXPORT na_error_t na_client_set_playback_muted(na_stream_client* client, int muted);
+
+/* --- TX audio inject (the client-side mirror of na_server_inject_audio) --- */
+/* Queue `n_bytes` of TX PCM for the server without a capture device. Requires
+ * na_client_set_tx_inject(client, 1) BEFORE connect, and a connected client.
+ *
+ * `pcm` MUST already match the negotiated format (48000 / 16-bit / the server's channel count) —
+ * nothing here resamples or converts, exactly as with na_server_inject_audio. Non-blocking: the TX
+ * ring overwrites its oldest bytes on overrun, the same as captured audio.
+ *
+ * Gated on PTT: a client that has not called na_client_set_ptt(client, 1) transmits nothing, so
+ * injected and captured audio obey identical keying rules.
+ *
+ * LEN-RETURN CONVENTION: returns the bytes accepted (>= 0), or a negative na_error_t. A 0 return is
+ * not an error — it means not connected, TX inject not enabled, or PTT inactive. */
+NA_EXPORT int na_client_inject_tx_audio(na_stream_client* client, const unsigned char* pcm,
+                                        int n_bytes);
 
 /* --- Lifecycle --- */
 /* Connect, handshake, open audio lines, start streaming. Returns NA_OK on success; on failure
