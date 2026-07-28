@@ -38,7 +38,23 @@
 /* ------------------------------------------------------------------ config + globals */
 
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_failed = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+/* A worker that stops for any reason other than an operator-requested shutdown must take the
+ * process down with it. The bridge runs unattended at the radio site, so its expected failure —
+ * the rig dropping off — has to surface as a non-zero exit rather than as a live process with a
+ * healthy-looking console, an open port, and no audio moving. Called only from the workers; the
+ * g_stop check keeps a stream teardown that races a SIGINT from being reported as a failure. */
+static void worker_failed(const char *who, const char *why) {
+    if (g_stop) return;                                     /* already stopping by request */
+    size_t n = strlen(why);
+    while (n > 0 && (why[n - 1] == '\n' || why[n - 1] == '\r')) n--;   /* rigerror2() appends \n */
+    fprintf(stderr, "na_hamlib_bridge: %s worker stopped: %.*s — shutting down\n",
+            who, (int)n, why);
+    g_failed = 1;
+    g_stop = 1;
+}
 
 static void sleep_ms(int ms) {
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
@@ -123,9 +139,10 @@ static void *rx_thread(void *arg) {
         } else if (r == -RIG_ETIMEOUT || (r == RIG_OK && got == 0)) {
             continue;                                         /* no data this tick */
         } else if (r == -RIG_ENAVAIL) {
-            break;                                            /* stream closing */
+            worker_failed("rx", "rig_stream_read: stream closed");
+            break;
         } else {
-            fprintf(stderr, "na_hamlib_bridge: rig_stream_read: %s\n", rigerror(r));
+            worker_failed("rx", rigerror2(r));
             break;
         }
     }
@@ -150,8 +167,12 @@ static void *tx_thread(void *arg) {
         if (n > 0 && has_owner) {
             size_t written = 0;
             int r = rig_stream_write(b->rig, b->tx, tmp, n, &written, 200, NULL);
-            if (r != RIG_OK && r != -RIG_ETIMEOUT) {
-                fprintf(stderr, "na_hamlib_bridge: rig_stream_write: %s\n", rigerror(r));
+            if (r == -RIG_ENAVAIL) {
+                worker_failed("tx", "rig_stream_write: stream closed");
+                break;
+            } else if (r != RIG_OK && r != -RIG_ETIMEOUT) {
+                worker_failed("tx", rigerror2(r));
+                break;
             }
         } else if (n == 0) {
             sleep_ms(5);   /* idle: nothing queued — poll gently */
@@ -353,5 +374,5 @@ teardown_rig:
     rig_close(b.rig);
     rig_cleanup(b.rig);
     ring_free(&b.txring);
-    return 0;
+    return g_failed ? 1 : 0;
 }
