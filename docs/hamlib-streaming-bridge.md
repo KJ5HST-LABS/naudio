@@ -274,8 +274,66 @@ the right rate, with perfect parity and `gaps=0` — it is indistinguishable fro
 every counter the bridge prints. Any check of this path has to look at the samples themselves;
 peak amplitude over a window is enough.
 
-Not verified, and not claimed: real hardware, Linux, a link with a non-1500 MTU, and FEC recovery
-under induced packet loss.
+Not verified, and not claimed: real hardware, Linux, and a link with a non-1500 MTU. FEC recovery
+under induced loss is covered below, on the `-m 1` path.
+
+---
+
+## FEC recovery under packet loss (`-R wan`)
+
+`-R wan` selects `udpWan`: XOR forward error correction over blocks of 5 audio packets, plus a
+reorder buffer and an adaptive jitter estimator. One parity packet per block recovers **at most one**
+lost packet in that block. `-R lan` runs the same transport with FEC off.
+
+This was measured by putting a UDP proxy between the bridge and a client and dropping a chosen
+fraction of the server→client `AudioRx` datagrams — never control, heartbeat or parity. Drop
+selection is by **audio-packet ordinal, not by sequence arithmetic**: a FEC block is 5 *audio
+packets in send order*, while the sequence counter is shared with control and heartbeat packets and
+the parity itself consumes one, so `sequence % 5` does not select one packet per block. Each parity
+packet names its own block (`startSeq`, `blockSize` in its payload), so what was actually dropped
+per block is reconciled against the real boundaries rather than assumed.
+
+Bridge at `-m 1` (Hamlib dummy, `stream_mode=tone`), mono, 960-byte frames — about 100 audio
+packets and 20 parity packets per second. Each arm is compared against **its own** no-loss control,
+because absolute rate reflects the producer, not correctness (a loopback dummy paces off `nanosleep`
+and sits near 80% of nominal while being entirely correct).
+
+| Arm | Loss induced | Delivered vs its own control | Recovered by FEC |
+|---|---|---|---|
+| `-R wan` | 1 per block of 5 | **99.1%** (924480 / 933120 B) | **193 of 194** |
+| `-R wan`, 30 s | 1 per block of 5 | **100.2%** (2427 / 2423 pkts) | **485 of 486** |
+| `-R lan` | same pattern, 193 drops | **79.9%** (743040 / 930240 B) | 0 — FEC is off |
+| `-R wan` | 2 per block of 5 | 49.7% | **0** — beyond what one parity can repair |
+
+Peak \|sample\| stayed 16383 on every arm, so the recovered packets carry in-range tone audio rather
+than XOR garbage that merely restores the byte count.
+
+**The single unrecovered drop in each `-R wan` arm is the last one**, whose block never closed before
+the run ended; 193 blocks carried exactly one drop and produced exactly 193 recoveries. A further
+4 packets per run are still inside the reorder/FEC pipeline at cutoff — that residual measured
+**4 on both a 12-second and a 30-second run** while recoveries scaled 193 → 485, so it is fixed
+in-flight depth, not a per-packet leak.
+
+The injector was validated in both directions before any of the above: with dropping disabled it
+delivered a byte-identical result to running with no proxy at all (935040 B, 974 packets both ways),
+and with every `AudioRx` dropped the client received nothing and the probe's silence check fired.
+
+### A client built on the C ABI gets none of this
+
+`na_client_set_transport(c, NA_TRANSPORT_UDP)` sets the transport and **nothing else**, and there is
+no client-side counterpart to `na_server_set_reliability_profile`. So a client built on `naudio.h`
+runs with FEC, reordering, adaptive jitter and control-ARQ all off, and discards every parity packet
+the bridge sends. Under the same 1-in-5 loss above it delivered **80.0%** — byte-for-byte the
+outcome of running the bridge at `-R lan`. Until the C ABI grows a client-side reliability setter,
+`-R wan` buys a C-ABI client nothing.
+
+The numbers above were therefore taken with a client built on `naudio::net::UdpClientConnection`
+configured from `AudioStreamConfig::udpWan()` — the same object a C++ client runs, reached directly
+because the counters (`packetsRecoveredByFec`, `packetsReordered`) are private to `AudioStreamClient`
+as well.
+
+Not verified, and not claimed: loss on the `-m 2` netrigctl path, real hardware, and loss patterns
+other than the deterministic 1-in-N used here (no bursts, no reordering, no duplication).
 
 ---
 
