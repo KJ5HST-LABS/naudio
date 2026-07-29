@@ -201,10 +201,21 @@ static void *rx_thread(void *arg) {
 static void *tx_thread(void *arg) {
     bridge *b = (bridge *)arg;
     unsigned char tmp[16384];
+    /* Size each write to the STREAM's negotiated budget, not to this local buffer. Over netrigctl
+     * that budget is one UDP datagram's worth of samples (1420 B at the default 1500 MTU), and an
+     * over-budget write is rejected OUTRIGHT with -RIG_EIO rather than partially accepted — which,
+     * since a dead worker now stops the bridge, means the operator's first keyup over -m 2 shuts the
+     * whole thing down. The value is frame-aligned by construction and fixed for the life of the
+     * stream, so read it once. A non-positive answer means the backend publishes no budget: fall
+     * back to the buffer, which is the pre-existing behaviour. */
+    int budget = rig_stream_get_max_payload(b->tx);
+    size_t chunk = (budget > 0 && (size_t)budget < sizeof tmp) ? (size_t)budget : sizeof tmp;
+    printf("na_hamlib_bridge: tx write budget %zu bytes/call\n", chunk);
+    fflush(stdout);
     int ptt_on = 0;
     for (;;) {
         if (g_stop) break;
-        size_t n = ring_pop(&b->txring, tmp, sizeof tmp);
+        size_t n = ring_pop(&b->txring, tmp, chunk);
         /* Is a client actually transmitting? (len-return convention: 0 == no owner). */
         int has_owner = na_server_tx_owner(b->srv, NULL, 0) > 0;
         if (b->use_ptt) {
@@ -231,10 +242,12 @@ static void *tx_thread(void *arg) {
                  * looping here. */
                 ring_requeue(&b->txring, tmp + written, n - written);
                 /* Back off ONLY when the radio took nothing. Partial progress usually means a small
-                 * per-call payload limit (netrigctl caps a write at its 1420-byte MTU budget), not a
-                 * radio that needs time — rig_stream_write already blocks up to timeout_ms when that
-                 * is the real problem, so a sleep here would just double-pace it. Retrying at once
-                 * costs nothing lasting either: the loop spins only while a backlog exists, and
+                 * per-call payload budget rather than a radio that needs time — note that netrigctl
+                 * is NOT an example: it accepts a write whole or rejects it whole, which is why the
+                 * pop above is sized to its budget instead of being left to short-write here.
+                 * rig_stream_write already blocks up to timeout_ms when a slow radio really is the
+                 * problem, so a sleep here would just double-pace it. Retrying at once costs
+                 * nothing lasting either: the loop spins only while a backlog exists, and
                  * draining the backlog is what ends the spin. Measured, not assumed — pacing every
                  * short write instead of only the stalled ones cost 206 KB of TX audio on a
                  * 16-bytes-per-call backend that the unpaced loop carried without a single drop. */
