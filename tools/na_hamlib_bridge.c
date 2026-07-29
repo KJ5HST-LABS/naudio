@@ -63,12 +63,24 @@ static void sleep_ms(int ms) {
 
 /* A mutex-only byte FIFO for TX frames: the na_server_tx_audio_cb (mixer thread, MUST NOT
  * block) pushes; the TX drain thread pops. Non-blocking both ways — push drops the oldest
- * bytes on overflow so a stalled radio write can never wedge the naudio mixer. */
+ * bytes on overflow so a stalled radio write can never wedge the naudio mixer.
+ *
+ * Every way this bridge can lose TX audio passes through a ring operation, so the loss
+ * counters live here under the ring's own mutex rather than in free-standing globals that
+ * two threads would race on. ring_stats() reads them as one consistent snapshot. */
 typedef struct {
     unsigned char *buf;
     size_t cap, head, count;
+    unsigned long long lost_queue;    /* bytes overwritten on push: radio not draining fast enough */
+    unsigned long long lost_requeue;  /* bytes of a short write's tail that no longer fit back */
+    unsigned long long short_writes;  /* rig_stream_write calls that accepted less than offered */
     pthread_mutex_t m;
 } byte_ring;
+
+/* Snapshot of the above, for the periodic health line. */
+typedef struct {
+    unsigned long long lost_queue, lost_requeue, short_writes;
+} tx_loss;
 
 static int ring_init(byte_ring *r, size_t cap) {
     r->buf = (unsigned char *)malloc(cap);
@@ -82,9 +94,14 @@ static void ring_free(byte_ring *r) {
 }
 static void ring_push(byte_ring *r, const unsigned char *src, size_t n) {
     pthread_mutex_lock(&r->m);
-    if (n > r->cap) { src += n - r->cap; n = r->cap; }  /* keep only the newest cap bytes */
+    if (n > r->cap) {                                   /* keep only the newest cap bytes */
+        r->lost_queue += n - r->cap;
+        src += n - r->cap;
+        n = r->cap;
+    }
     if (r->count + n > r->cap) {                        /* drop oldest to make room */
         size_t drop = r->count + n - r->cap;
+        r->lost_queue += drop;
         r->head = (r->head + drop) % r->cap;
         r->count -= drop;
     }
@@ -93,6 +110,36 @@ static void ring_push(byte_ring *r, const unsigned char *src, size_t n) {
     memcpy(r->buf + tail, src, first);
     memcpy(r->buf, src + first, n - first);
     r->count += n;
+    pthread_mutex_unlock(&r->m);
+}
+/* Put the unconsumed tail of a short write back at the FRONT of the ring, so the next drain pass
+ * retries it in order instead of dropping it. Those bytes are already off the ring, so whatever
+ * this does not hand back is transmitted audio that disappears — hence the accounting.
+ *
+ * When the mixer has filled the ring behind us, the leading (oldest) bytes of the tail go. That is
+ * the same "keep the newest" policy ring_push applies on overflow, and it is what keeps the bytes
+ * that survive contiguous with the newer frames already queued behind them. */
+static void ring_requeue(byte_ring *r, const unsigned char *src, size_t n) {
+    pthread_mutex_lock(&r->m);
+    r->short_writes++;
+    size_t space = r->cap - r->count;
+    if (n > space) {
+        r->lost_requeue += n - space;
+        src += n - space;
+        n = space;
+    }
+    r->head = (r->head + r->cap - n) % r->cap;          /* walk head back over the returned tail */
+    size_t first = n < (r->cap - r->head) ? n : (r->cap - r->head);
+    memcpy(r->buf + r->head, src, first);
+    memcpy(r->buf, src + first, n - first);
+    r->count += n;
+    pthread_mutex_unlock(&r->m);
+}
+static void ring_stats(byte_ring *r, tx_loss *out) {
+    pthread_mutex_lock(&r->m);
+    out->lost_queue   = r->lost_queue;
+    out->lost_requeue = r->lost_requeue;
+    out->short_writes = r->short_writes;
     pthread_mutex_unlock(&r->m);
 }
 static size_t ring_pop(byte_ring *r, unsigned char *dst, size_t max) {
@@ -165,6 +212,8 @@ static void *tx_thread(void *arg) {
             else if (!has_owner && ptt_on) { rig_set_ptt(b->rig, RIG_VFO_CURR, RIG_PTT_OFF); ptt_on = 0; }
         }
         if (n > 0 && has_owner) {
+            /* Init matters: the early-return error paths in rig_stream_write leave *bytes_written
+             * untouched, so 0 is what "the radio took nothing" has to read as. */
             size_t written = 0;
             int r = rig_stream_write(b->rig, b->tx, tmp, n, &written, 200, NULL);
             if (r == -RIG_ENAVAIL) {
@@ -173,6 +222,23 @@ static void *tx_thread(void *arg) {
             } else if (r != RIG_OK && r != -RIG_ETIMEOUT) {
                 worker_failed("tx", rigerror2(r));
                 break;
+            }
+            if (written > n) written = n;   /* never trust a count past what we offered */
+            if (written < n) {
+                /* Short write — including the -RIG_ETIMEOUT case, where the popped bytes are just
+                 * as gone as on the success path. Hand the tail back and retry it next pass, which
+                 * re-checks PTT and TX ownership first; that is why this requeues rather than
+                 * looping here. */
+                ring_requeue(&b->txring, tmp + written, n - written);
+                /* Back off ONLY when the radio took nothing. Partial progress usually means a small
+                 * per-call payload limit (netrigctl caps a write at its 1420-byte MTU budget), not a
+                 * radio that needs time — rig_stream_write already blocks up to timeout_ms when that
+                 * is the real problem, so a sleep here would just double-pace it. Retrying at once
+                 * costs nothing lasting either: the loop spins only while a backlog exists, and
+                 * draining the backlog is what ends the spin. Measured, not assumed — pacing every
+                 * short write instead of only the stalled ones cost 206 KB of TX audio on a
+                 * 16-bytes-per-call backend that the unpaced loop carried without a single drop. */
+                if (written == 0) sleep_ms(2);
             }
         } else if (n == 0) {
             sleep_ms(5);   /* idle: nothing queued — poll gently */
@@ -350,14 +416,32 @@ int main(int argc, char **argv) {
     int tick = 0;
     while (!g_stop) {
         sleep_ms(200);
-        if (++tick % 25 == 0) {   /* ~every 5s: RX health + roster */
+        if (++tick % 25 == 0) {   /* ~every 5s: RX health + roster, then TX loss */
             struct rig_stream_stats st;
             if (rig_stream_get_stats(b.rig, b.rx, &st) == RIG_OK) {
                 printf("  rx: clients=%d gaps=%u link_loss=%u overruns=%u underruns=%u\n",
                        na_server_client_count(b.srv), st.gaps, st.link_loss,
                        st.overruns, st.underruns);
-                fflush(stdout);
             }
+            if (b.tx) {
+                /* Three separate ways TX audio goes missing, kept apart because they have
+                 * different causes: our FIFO overwritten (the operator is producing faster than
+                 * the radio drains), a short write's tail that no longer fit back, and the rig
+                 * stream's OWN ring overwriting unread audio — that last one is counted inside
+                 * libhamlib and was invisible from here until now. */
+                tx_loss L;
+                struct rig_stream_stats ts;
+                ring_stats(&b.txring, &L);
+                if (rig_stream_get_stats(b.rig, b.tx, &ts) == RIG_OK)
+                    printf("  tx: short=%llu lost_queue=%lluB lost_requeue=%lluB"
+                           " rig_overruns=%u rig_underruns=%u\n",
+                           L.short_writes, L.lost_queue, L.lost_requeue,
+                           ts.overruns, ts.underruns);
+                else
+                    printf("  tx: short=%llu lost_queue=%lluB lost_requeue=%lluB\n",
+                           L.short_writes, L.lost_queue, L.lost_requeue);
+            }
+            fflush(stdout);
         }
     }
 
