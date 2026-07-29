@@ -321,6 +321,17 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
     set_target_properties(naudio_c_server_smoke PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME naudio_c_server_smoke COMMAND naudio_c_server_smoke)
 
+    # Sustained-TX regression: the same two ends as c_server_smoke, but over UDP and asserting
+    # TX audio is still flowing in the SECOND HALF of a multi-second run. c_net_smoke's TX
+    # round-trip asserts arrival at all, which passed while TX died about a second in. Drives
+    # the server's RX fan-out with 16384-byte frames (na_hamlib_bridge's rx_thread size, and
+    # == AudioPacket::MAX_PAYLOAD) because the trigger was an unsendable RX datagram killing
+    # the session, not anything on the TX path. Public C ABI only; hardware-free.
+    add_executable(naudio_c_tx_sustained tests/c_tx_sustained.c)
+    target_link_libraries(naudio_c_tx_sustained PRIVATE naudio)
+    set_target_properties(naudio_c_tx_sustained PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME naudio_c_tx_sustained COMMAND naudio_c_tx_sustained)
+
     # C-ABI fault-injection: a C++ TU (a global operator new override can't be done from C)
     # that arms allocation failure around single na_client_* calls and asserts the extern "C"
     # boundary stays exception-tight: a forced bad_alloc surfaces as NA_ERR_NOMEM (not a thrown

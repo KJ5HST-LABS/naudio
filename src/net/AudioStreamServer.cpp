@@ -299,11 +299,26 @@ void AudioStreamServer::ClientSession::writerLoop() {
             item = std::move(outQueue_.front());
             outQueue_.pop_front();
         }
-        const bool ok = item.control.has_value()
+        const bool isControl = item.control.has_value();
+        const std::size_t audioBytes = isControl ? 0 : item.audio.size();
+        const bool ok = isControl
                             ? connection_->sendControl(*item.control)
-                            : connection_->sendRxAudio(item.audio.data(), 0, item.audio.size());
+                            : connection_->sendRxAudio(item.audio.data(), 0, audioBytes);
         if (!ok) {
-            close();  // dead client — auto-remove
+            // Auto-remove the dead client — but never silently. This close() drops the session,
+            // which unregisters it from the mixer and so releases any TX channel it held: an
+            // operator mid-transmission goes off the air here. Reporting only the disconnect
+            // (below, via notifyClientDisconnected) leaves no trace of WHY, and the cause is
+            // often a send the kernel refused rather than a client that went away — e.g. an
+            // RX frame larger than the socket's send buffer (EMSGSIZE). Name the direction and
+            // the size so an oversized-frame kill is distinguishable from a real disconnect.
+            if (isControl) {
+                server_->notifyError(clientId_, "Send error: control message");
+            } else {
+                server_->notifyError(clientId_, "Send error: RX audio frame (" +
+                                                    std::to_string(audioBytes) + " bytes)");
+            }
+            close();
             return;
         }
     }
