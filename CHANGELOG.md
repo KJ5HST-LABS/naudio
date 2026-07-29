@@ -6,6 +6,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **Client-side reliability profiles on the C ABI** — `na_client_set_reliability_profile()` applies a
+  `na_reliability_profile` (transport + framing + FEC / reorder / adaptive jitter / control-ARQ) in
+  one call, before connect. This is the only way to enable a client's loss-recovery layer:
+  `na_client_set_transport()` selects the transport and nothing else, so a client configured with it
+  alone ran UDP with the whole reliability layer off and discarded every FEC parity packet the server
+  sent. Selecting a UDP profile makes a separate `na_client_set_transport()` call unnecessary; both
+  setters write the transport and the last one wins.
 - **Client-side TX audio injection on the C ABI** — `na_client_inject_tx_audio()` feeds a client's
   TX path directly, and `na_client_set_tx_inject()` enables it before connect. Together they make
   the `na_client_*` surface symmetric with `na_server_inject_audio()` on the RX side, so a headless

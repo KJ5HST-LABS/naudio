@@ -318,19 +318,41 @@ The injector was validated in both directions before any of the above: with drop
 delivered a byte-identical result to running with no proxy at all (935040 B, 974 packets both ways),
 and with every `AudioRx` dropped the client received nothing and the probe's silence check fired.
 
-### A client built on the C ABI gets none of this
+### A client built on the C ABI must select the profile too
 
-`na_client_set_transport(c, NA_TRANSPORT_UDP)` sets the transport and **nothing else**, and there is
-no client-side counterpart to `na_server_set_reliability_profile`. So a client built on `naudio.h`
-runs with FEC, reordering, adaptive jitter and control-ARQ all off, and discards every parity packet
-the bridge sends. Under the same 1-in-5 loss above it delivered **80.0%** — byte-for-byte the
-outcome of running the bridge at `-R lan`. Until the C ABI grows a client-side reliability setter,
-`-R wan` buys a C-ABI client nothing.
+`na_client_set_transport(c, NA_TRANSPORT_UDP)` sets the transport and **nothing else** — it leaves
+FEC, reordering, adaptive jitter and control-ARQ off, so a client configured that way receives every
+parity packet the bridge sends and discards it. Use **`na_client_set_reliability_profile`** instead;
+it selects the transport as part of the profile, so no separate `na_client_set_transport` call is
+needed:
 
-The numbers above were therefore taken with a client built on `naudio::net::UdpClientConnection`
-configured from `AudioStreamConfig::udpWan()` — the same object a C++ client runs, reached directly
-because the counters (`packetsRecoveredByFec`, `packetsReordered`) are private to `AudioStreamClient`
-as well.
+```c
+na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN);   /* match the bridge's -R wan */
+```
+
+Measured on the same bridge, the same injector and the same probe binary, 12 s per arm, each arm
+against **its own** no-loss control:
+
+| Client configuration | Delivered under 1-in-5 loss | Recovered |
+|---|---|---|
+| `na_client_set_transport(UDP)` alone | 648960 / 812160 B = **79.9%** | 0 — no decoder |
+| `na_client_set_reliability_profile(UDP_WAN)` | 808320 / 808320 B = **100.0%** | **165 of 169** |
+
+The four unrecovered packets are the fixed in-flight depth of the reorder/FEC pipeline at cutoff, not
+a leak — the same residual of 4 that holds across both 12- and 30-second runs while recoveries scale
+with duration.
+
+The earlier arm table was taken with a client built directly on `naudio::net::UdpClientConnection`,
+because at the time the C ABI could not enable the reliability layer at all. That is now only needed
+for the **counters**: `packetsRecoveredByFec` and `packetsReordered` remain private to
+`AudioStreamClient` and are unreachable from `naudio.h` ([#24](https://github.com/KJ5HST-LABS/naudio/issues/24)).
+
+**One caveat on recovered audio.** With FEC recovery active, the C-ABI RX callback delivers exactly
+one sample per 12-second run whose magnitude exceeds anything the source emits (~1 in 420,000
+samples). Reading the same recovered stream directly off `UdpClientConnection` does not reproduce it,
+and no-loss arms are clean, so it sits between the connection and the audio callback rather than in
+the FEC decoder. Filed as [#23](https://github.com/KJ5HST-LABS/naudio/issues/23); byte totals and
+packet counts are unaffected.
 
 Not verified, and not claimed: loss on the `-m 2` netrigctl path, real hardware, and loss patterns
 other than the deterministic 1-in-N used here (no bursts, no reordering, no duplication).
