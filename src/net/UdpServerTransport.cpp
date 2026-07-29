@@ -42,6 +42,11 @@ bool UdpServerTransport::bind(std::uint16_t port, std::string* err) {
     }
     socket_ = Socket::bindUdp(bindHost_, port, /*reuseAddr=*/true, err);
     if (!socket_.valid()) return false;
+    // A maximum-payload audio packet must be sendable, or the writer loop tears the whole
+    // session down on the first oversized RX frame (see Socket::setSendBufferAtLeast). The
+    // shared socket carries every client's RX fan-out, so give it room for a burst of them.
+    socket_.setSendBufferAtLeast(static_cast<int>(UdpClientConnection::MAX_DATAGRAM_SIZE) * 8);
+    socket_.setRecvBufferAtLeast(static_cast<int>(UdpClientConnection::MAX_DATAGRAM_SIZE) * 8);
     bound_.store(true);
     running_.store(true);
     demuxThread_ = std::thread([this] { demuxLoop(); });

@@ -121,6 +121,17 @@ public:
     // Sets the receive timeout (SO_RCVTIMEO). ms == 0 means block indefinitely.
     bool setRecvTimeout(int ms);
 
+    // Raises SO_SNDBUF / SO_RCVBUF to at least `bytes` (never lowers an already-larger
+    // buffer). Returns false if the resulting buffer is still smaller than `bytes`.
+    //
+    // Load-bearing for UDP, not a tuning knob: macOS refuses a sendto() larger than
+    // SO_SNDBUF with EMSGSIZE, and its default UDP send buffer is only 9216 bytes
+    // (net.inet.udp.maxdgram) — smaller than a maximum-payload 0xAF01 audio packet
+    // (19 + 16384 + 4 = 16407). Without this, sending a legal packet fails, and the
+    // caller cannot tell "the wire is broken" from "this kernel won't take it".
+    bool setSendBufferAtLeast(int bytes);
+    bool setRecvBufferAtLeast(int bytes);
+
     // The bound local port, or 0 if unbound/unknown.
     std::uint16_t localPort() const;
 
