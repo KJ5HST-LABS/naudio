@@ -618,6 +618,33 @@ extern "C" na_error_t na_client_set_transport(na_stream_client* client, na_trans
     });
 }
 
+extern "C" na_error_t na_client_set_reliability_profile(na_stream_client* client,
+                                                        na_reliability_profile profile) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        naudio::AudioStreamConfig preset;
+        switch (profile) {
+            case NA_RELIABILITY_DEFAULT: preset = naudio::AudioStreamConfig{};         break;
+            case NA_RELIABILITY_UDP_LAN: preset = naudio::AudioStreamConfig::udpLan(); break;
+            case NA_RELIABILITY_UDP_WAN: preset = naudio::AudioStreamConfig::udpWan(); break;
+            case NA_RELIABILITY_UDP_FT8: preset = naudio::AudioStreamConfig::udpFt8(); break;
+            default:
+                setError(NA_ERR_INVALID);
+                return NA_ERR_INVALID;
+        }
+        // The preset wins WHOLESALE rather than field by field, so a knob added to a preset later is
+        // carried through this ABI by default instead of being silently dropped. There is no
+        // exception list to preserve as there is on the server side: nothing else in the na_client_*
+        // surface writes AudioStreamConfig except na_client_set_transport, and the audio format the
+        // client actually streams at is the one the server pushes in its AUDIO_CONFIG at handshake.
+        if (!client->client->setConfig(preset)) {  // false == already connected (InvalidState)
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        return NA_OK;
+    });
+}
+
 extern "C" na_error_t na_client_set_identity(na_stream_client* client, const char* callsign,
                                              const char* operator_name, const char* location) {
     NA_GUARD(NA_ERR_BACKEND, {

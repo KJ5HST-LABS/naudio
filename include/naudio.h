@@ -239,6 +239,23 @@ typedef enum na_transport {
     NA_TRANSPORT_DUAL = 2   /* treated as TCP on the client side */
 } na_transport;
 
+/* UDP reliability profile applied by na_client_set_reliability_profile and
+ * na_server_set_reliability_profile: transport + framing + the FEC / reorder / adaptive-jitter /
+ * control-ARQ knobs, as one named bundle. Mirrors the C++ AudioStreamConfig UDP presets. Each
+ * setter documents below exactly which of its own settings the profile replaces — the two are
+ * deliberately not identical, because the client and the server own different settings.
+ *
+ * BOTH ENDS MUST AGREE on the transport, and it is the profile that carries FEC: a server on
+ * NA_RELIABILITY_UDP_WAN sends parity packets that a client left on any other profile receives and
+ * discards, silently getting no loss recovery at all. */
+typedef enum na_reliability_profile {
+    NA_RELIABILITY_DEFAULT = 0,  /* Plain TCP defaults: no FEC / reorder / jitter / control-ARQ.    */
+    NA_RELIABILITY_UDP_LAN = 1,  /* UDP, low-latency LAN buffers, reorder + control-ARQ.            */
+    NA_RELIABILITY_UDP_WAN = 2,  /* UDP, Internet buffers: XOR FEC + adaptive jitter + reorder +    */
+                                 /*   control-ARQ. The resilient remote-operating profile.          */
+    NA_RELIABILITY_UDP_FT8 = 3   /* UDP, FT8/digital: tight buffers, reorder + control-ARQ.         */
+} na_reliability_profile;
+
 /* Opaque streaming-client handle. Create with na_client_create, free with na_client_destroy. */
 typedef struct na_stream_client na_stream_client;
 
@@ -291,6 +308,24 @@ NA_EXPORT na_error_t na_client_set_capture_device(na_stream_client* client, int 
 NA_EXPORT na_error_t na_client_set_tx_inject(na_stream_client* client, int enabled);
 /* Select the transport. No effect once connected (returns NA_ERR_INVALID). */
 NA_EXPORT na_error_t na_client_set_transport(na_stream_client* client, na_transport transport);
+/* Apply a reliability profile (transport + framing + FEC / reorder / adaptive-jitter / control-ARQ)
+ * in one call; see na_reliability_profile. This is the ONLY way to enable the client's loss-recovery
+ * layer — na_client_set_transport selects the transport and nothing else, so a client configured with
+ * it alone runs UDP with FEC, reordering, adaptive jitter and control-ARQ all OFF and discards every
+ * parity packet the server sends.
+ *
+ * Selecting a UDP profile makes a separate na_client_set_transport call unnecessary. The two setters
+ * both write the transport and the LAST ONE WINS, so calling na_client_set_transport afterwards
+ * changes the transport while leaving the rest of the profile in force.
+ *
+ * Unlike the server's setter this replaces the client's WHOLE transport/framing/reliability set,
+ * including buffer targets: the na_client_* surface has no audio-format or max-clients setting of its
+ * own to preserve, and the server pushes the negotiated format to the client during the handshake.
+ *
+ * MUST be called before na_client_connect — the reliability pipeline is built at connect, from the
+ * config as it stands then. NA_ERR_INVALID on a NULL client, an unknown profile, or once connected. */
+NA_EXPORT na_error_t na_client_set_reliability_profile(na_stream_client* client,
+                                                       na_reliability_profile profile);
 /* Identify to the server's roster. Any argument may be NULL to leave that field unset. */
 NA_EXPORT na_error_t na_client_set_identity(na_stream_client* client, const char* callsign,
                                             const char* operator_name, const char* location);
@@ -394,16 +429,8 @@ typedef enum na_server_backend {
                                       na_server_tx_audio_cb. No PortAudio, no devices.             */
 } na_server_backend;
 
-/* UDP reliability profile applied by na_server_set_reliability_profile: transport + framing + the
- * FEC / reorder / adaptive-jitter / control-ARQ knobs, as one named bundle. Mirrors the C++
- * AudioStreamConfig UDP presets. Audio format (rate/bits/channels) and max-clients are NOT touched. */
-typedef enum na_reliability_profile {
-    NA_RELIABILITY_DEFAULT = 0,  /* Plain TCP defaults: no FEC / reorder / jitter / control-ARQ.    */
-    NA_RELIABILITY_UDP_LAN = 1,  /* UDP, low-latency LAN buffers, reorder + control-ARQ.            */
-    NA_RELIABILITY_UDP_WAN = 2,  /* UDP, Internet buffers: XOR FEC + adaptive jitter + reorder +    */
-                                 /*   control-ARQ. The resilient remote-operating profile.          */
-    NA_RELIABILITY_UDP_FT8 = 3   /* UDP, FT8/digital: tight buffers, reorder + control-ARQ.         */
-} na_reliability_profile;
+/* na_reliability_profile is declared with the client surface above — both ends select a profile,
+ * and both must select a matching one. */
 
 /* Opaque streaming-server handle. Create with na_server_create, free with na_server_destroy. */
 typedef struct na_audio_server na_audio_server;

@@ -332,6 +332,18 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
     set_target_properties(naudio_c_tx_sustained PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME naudio_c_tx_sustained COMMAND naudio_c_tx_sustained)
 
+    # Client reliability profile: na_client_set_reliability_profile is the only way a C-ABI client
+    # can turn on FEC / reorder / adaptive jitter / control-ARQ (na_client_set_transport writes the
+    # transport and nothing else). Asserts the argument contract, that the PROFILE ALONE selects the
+    # transport — the client never calls na_client_set_transport and still reaches a UDP-only server —
+    # that audio flows with the whole reliability pipeline in place, and that last-writer-wins holds
+    # against both a later set_transport and a later NA_RELIABILITY_DEFAULT. Loopback is loss-free, so
+    # this CANNOT distinguish FEC-on from FEC-off; that needs induced loss. Public C ABI only.
+    add_executable(naudio_c_client_profile tests/c_client_profile.c)
+    target_link_libraries(naudio_c_client_profile PRIVATE naudio)
+    set_target_properties(naudio_c_client_profile PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME naudio_c_client_profile COMMAND naudio_c_client_profile)
+
     # C-ABI fault-injection: a C++ TU (a global operator new override can't be done from C)
     # that arms allocation failure around single na_client_* calls and asserts the extern "C"
     # boundary stays exception-tight: a forced bad_alloc surfaces as NA_ERR_NOMEM (not a thrown
