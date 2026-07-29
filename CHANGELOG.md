@@ -5,6 +5,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **FEC no longer presents a mis-reconciled block as recovered audio** — the XOR parity header
+  carries a *count* of audio packets, which the decoder read as the contiguous sequence range
+  `[startSeq, startSeq + blockSize)`. That is the encoder's block only while the block's audio
+  packets are consecutive, and the connection's sequence counter is shared with control and
+  heartbeat traffic: one control message sent between two audio packets of a block displaced the
+  block's last packet out of the range. A single loss in such a block then emitted the lost frame
+  XORed with the displaced one — a whole frame of wrong samples delivered as recovered audio, and a
+  quiet one, since without loss the block still looked complete and XOR of two same-signal S16
+  payloads almost always stays inside the source's amplitude range. Such a block is now **declined**
+  (counted by `FecDecoder::fecBlocksUnreconciled`) and its lost packet stays lost, exactly as with
+  FEC disabled. Affects UDP profiles with FEC enabled; documented as limitation **R5** in
+  `docs/protocols.md`.
+
 ### Added
 - **Client-side reliability profiles on the C ABI** — `na_client_set_reliability_profile()` applies a
   `na_reliability_profile` (transport + framing + FEC / reorder / adaptive jitter / control-ARQ) in
