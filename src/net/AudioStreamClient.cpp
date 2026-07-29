@@ -848,6 +848,42 @@ void AudioStreamClient::measureLatency() {
 }
 
 // ---------------------------------------------------------------------------
+// Reliability / transport counters
+// ---------------------------------------------------------------------------
+
+ClientStats AudioStreamClient::stats() const {
+    ClientStats s;
+    // A shared_ptr copy, so the connection cannot be torn down under us mid-read
+    // even if a reconnect swaps connection_ while we are collecting.
+    const std::shared_ptr<ClientConnection> conn = currentConnection();
+    if (!conn) return s;  // no live connection: defaults, connected == false
+
+    s.connected = true;
+    s.packetsSent = conn->packetsSent();
+    s.packetsReceived = conn->packetsReceived();
+    s.bytesSent = conn->bytesSent();
+    s.bytesReceived = conn->bytesReceived();
+    s.crcErrors = conn->crcErrors();
+    s.packetsReordered = conn->packetsReordered();
+    s.packetsRecoveredByFec = conn->packetsRecoveredByFec();
+    s.fecBlocksUnreconciled = conn->fecBlocksUnreconciled();
+    s.controlRetransmits = conn->controlRetransmits();
+    s.queueDrops = conn->orderedQueueDrops();
+    s.jitterMs = conn->jitterMs();
+    s.bufferTargetMs = conn->adaptiveBufferTargetMs();
+
+    // Left at -1 (unmeasured) unless the connection actually runs the gap tracker.
+    // Reporting the untouched 0 here would read as "no loss", which is the one thing
+    // these counters must never be allowed to say (ClientStats).
+    if (conn->measuresSequenceGaps()) {
+        s.packetsLost = conn->packetsLost();
+        s.packetsOutOfOrder = conn->packetsOutOfOrder();
+        s.packetLossRate = conn->packetLossRate();
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
 // Server client info
 // ---------------------------------------------------------------------------
 

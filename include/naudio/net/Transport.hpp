@@ -88,6 +88,29 @@ public:
     virtual int adaptiveBufferTargetMs() const { return -1; }
     virtual std::int64_t controlRetransmits() const { return 0; }
 
+    // FEC blocks whose parity could not be reconciled against a contiguous run of
+    // audio packets — a control or heartbeat packet took a sequence inside the
+    // parity's range, so the range is not the encoder's block and recovery was
+    // DECLINED rather than run over the wrong member set. A lost opportunity to
+    // recover, never a correctness failure (FecDecoder.hpp).
+    virtual std::int64_t fecBlocksUnreconciled() const { return 0; }
+
+    // Packets discarded from the ordered queue because it was at capacity (a
+    // stalled or too-slow consumer). Non-zero means audio was dropped locally,
+    // after the network delivered it.
+    virtual std::int64_t orderedQueueDrops() const { return 0; }
+
+    // Whether packetsLost() / packetsOutOfOrder() / packetLossRate() are actually
+    // MEASURED on this connection. When false they are unavailable, and a consumer
+    // must not read their 0 as "nothing was lost".
+    //
+    // False is the common case: the sequence-gap tracker runs only when no reorder
+    // buffer is engaged (the reorder buffer owns ordering, and no post-reorder loss
+    // accounting exists), and TCP never tracks gaps at all. EVERY built-in UDP
+    // profile configures a reorder buffer, so on every one of them these three are
+    // unmeasured while packetsReordered / packetsRecoveredByFec are live.
+    virtual bool measuresSequenceGaps() const { return false; }
+
     // The remote address as a string ("ip:port"), or "" if unavailable.
     virtual std::string remoteAddress() const = 0;
 

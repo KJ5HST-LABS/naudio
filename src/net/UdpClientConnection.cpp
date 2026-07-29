@@ -427,6 +427,19 @@ std::int64_t UdpClientConnection::controlRetransmits() const {
     return controlReliability_ ? controlReliability_->controlRetransmits() : 0;
 }
 
+std::int64_t UdpClientConnection::fecBlocksUnreconciled() const {
+    std::lock_guard<std::mutex> lock(pipe_);
+    return fecDecoder_ ? fecDecoder_->fecBlocksUnreconciled() : 0;
+}
+
+bool UdpClientConnection::measuresSequenceGaps() const {
+    // trackSequence() is reached only in the two branches of the receive path that
+    // have no reorder buffer (enqueueReceived / receiveFromSocket). With one
+    // engaged the gap counters are never written, so they are unmeasured — not zero.
+    std::lock_guard<std::mutex> lock(pipe_);
+    return !reorderBuffer_.has_value();
+}
+
 void UdpClientConnection::close() {
     if (closed_.exchange(true)) return;
     orderedQueue_.shutdown();          // wake any blocked receivePacket

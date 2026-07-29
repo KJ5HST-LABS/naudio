@@ -227,11 +227,18 @@ public:
     double jitterMs() const override;
     int adaptiveBufferTargetMs() const override;
     std::int64_t controlRetransmits() const override;
+    std::int64_t fecBlocksUnreconciled() const override;
 
-    // --- Diagnostics (concrete; not on the virtual ClientConnection interface) ---
+    // True only when trackSequence() actually runs — i.e. when NO reorder buffer is
+    // engaged. With one engaged (every built-in UDP profile) the receive path never
+    // reaches the gap tracker, so packetsLost/packetsOutOfOrder/packetLossRate stay
+    // at 0 forever and must be reported as unmeasured rather than as zero loss.
+    bool measuresSequenceGaps() const override;
+
+    // --- Diagnostics ---
     // Packets dropped from the ordered queue under backpressure and the
     // current queue depth — exposed so a flood test can assert the bound holds.
-    std::int64_t orderedQueueDrops() const { return orderedQueue_.droppedCount(); }
+    std::int64_t orderedQueueDrops() const override { return orderedQueue_.droppedCount(); }
     std::size_t orderedQueueSize() const { return orderedQueue_.size(); }
 
     // UDP datagrams handed to the socket whose serialized size exceeded

@@ -54,6 +54,43 @@ public:
     virtual void onTxReleased() {}
 };
 
+// A point-in-time snapshot of the live connection's transport and reliability
+// counters — the diagnostic view AudioClientListener deliberately omits (see the
+// note on that class). Read with AudioStreamClient::stats(). Every field is a
+// cumulative total for the CURRENT connection, not a rate: a reconnect installs a
+// fresh connection and the counters restart from zero.
+//
+// UNAVAILABLE vs ZERO. packetsLost / packetsOutOfOrder / packetLossRate are -1 when
+// the connection does not measure sequence gaps, which is the case on every built-in
+// UDP profile (they all engage a reorder buffer) and on TCP. -1 means "not measured";
+// it never means "nothing was lost". See ClientConnection::measuresSequenceGaps.
+struct ClientStats {
+    // True only when a live connection supplied these numbers. False leaves every
+    // field at its default below — a default, not a reading.
+    bool connected = false;
+
+    std::int64_t packetsSent = 0;
+    std::int64_t packetsReceived = 0;
+    std::int64_t bytesSent = 0;
+    std::int64_t bytesReceived = 0;
+    int crcErrors = 0;
+
+    // Live on any UDP profile that configures the corresponding subsystem; 0 when
+    // that subsystem is off (and on TCP, which has none of them).
+    std::int64_t packetsReordered = 0;
+    std::int64_t packetsRecoveredByFec = 0;
+    std::int64_t fecBlocksUnreconciled = 0;
+    std::int64_t controlRetransmits = 0;
+    std::int64_t queueDrops = 0;
+    double jitterMs = 0.0;
+    int bufferTargetMs = -1;  // -1 when adaptive jitter is off
+
+    // -1 == unmeasured on this connection (the common case — see above).
+    std::int64_t packetsLost = -1;
+    std::int64_t packetsOutOfOrder = -1;
+    double packetLossRate = -1.0;
+};
+
 // Client for connecting to an AudioStreamServer.
 //
 // Receives RX audio from the server into a local (virtual) playback device, and captures TX
@@ -161,6 +198,13 @@ public:
     // --- Latency ---
     void measureLatency();
     std::int64_t measuredLatencyMs() const { return measuredLatencyMs_.load(); }
+
+    // --- Reliability / transport counters ---
+    // A snapshot of the current connection's counters (see ClientStats). Safe to call
+    // at any time from any thread; returns ClientStats{} with connected == false when
+    // there is no live connection (before connect, between reconnect attempts, after
+    // disconnect). The counters belong to the connection, so a reconnect restarts them.
+    ClientStats stats() const;
 
     // --- Listeners ---
     void addStreamListener(AudioClientListener* listener);
