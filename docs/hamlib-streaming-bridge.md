@@ -238,3 +238,48 @@ a radio:
 round-trip run without it shows RX bytes flowing from the tone generator and proves nothing about
 your TX path. `-h` lists the rest (`-m 2` for netrigctl, `-p` port, `-c` channels, `-R` reliability
 profile, `-k` PTT keying, `-x` RX-only).
+
+---
+
+## Known limit: `-c 2` does not work over netrigctl (`-m 2`)
+
+**Use `-c 1` when the source is a remote `rigctld`.** Stereo is silently wrong on that path, and the
+cause is upstream in Hamlib's streaming layer, not in naudio — there is nothing the bridge can do
+to obtain stereo over netrigctl today.
+
+The `\stream_open` command carries only *type*, *format* and *sample rate*. There is **no channels
+field on the wire**, so (all paths below are in **libhamlib**, not naudio):
+
+| Step | What happens |
+|---|---|
+| Client asks | `netrigctl_stream_open` sends `\stream_open AUDIO_RX PCM_S16 48000` — the channel count is dropped (`rigs/dummy/netrigctl.c`) |
+| Server opens | `rigctld_stream_config_from_args` hardcodes `channels = 1`, so the rig is always opened **mono** (`tests/rigctld_stream.c`) |
+| Caps still say stereo | `\stream_caps` advertises `channels 1..2`, so the open succeeds and looks honoured |
+| Truth is on the wire | The server stamps the real `channels` into every packet header … |
+| … and is discarded | The client's receive path (`src/stream_net.c`) never compares that field against the stream it opened |
+
+So a `-c 2` bridge over `-m 2` receives **mono** bytes, hands them to a naudio server configured
+for stereo, and naudio re-frames them as stereo — because the C ABI does not resample or convert
+(`include/naudio.h`, `na_server_set_audio_format`). The result is mis-framed audio at every client,
+not merely quieter or thinner audio.
+
+The visible symptom is a gap counter climbing at roughly one gap per received read while
+`link_loss` stays `0`:
+
+```
+  rx: clients=0 gaps=718 link_loss=0 overruns=0 underruns=0
+  rx: audio 66473 B/s of 192000 expected (35%)
+```
+
+That is not packet loss. The two ends disagree about how many bytes make a frame: the sender
+advances the wire timestamp by its own frame size, the receiver expects `payload_len` divided by
+*ours*, so every packet looks like a forward jump. The bridge detects exactly that combination and
+prints a one-time explanation pointing back here.
+
+**Do not read the byte-rate line as the alarm.** It is reported because it is useful, but it
+reflects how fast the producer runs as much as whether the framing is right — a dummy in
+`stream_mode=loopback` with no TX peer paces itself off `nanosleep` and sits near 70% of nominal
+while being completely correct at `-c 1`. The gap-per-read signature is the discriminator.
+
+`-c 2` against a **local** backend (`-m 1`) is unaffected: no `\stream_open` round trip is involved,
+and the channel count reaches the backend directly.

@@ -154,6 +154,59 @@ static size_t ring_pop(byte_ring *r, unsigned char *dst, size_t max) {
     return n;
 }
 
+/* How much RX audio actually reached naudio, over how long, and in how many reads. A stream that
+ * opens successfully is not a stream that delivers what it agreed to: the peer may accept a
+ * channel count and then send a different one, and nothing in rig_stream_* reports that back — the
+ * negotiated count is write-only from the caller's side. Same policy as the TX loss counters: a
+ * shared counter lives under a mutex, not in a free-standing global two threads race on.
+ *
+ * The read COUNT is what makes the check work. Delivered bytes/second is not a usable alarm on its
+ * own, because it says as much about the producer as about the framing — a dummy in `loopback`
+ * with no TX peer paces itself off nanosleep and lands near 70% of nominal at a perfectly correct
+ * channels=1. Rate is reported because it is useful to see; the alarm is the gap signature. */
+typedef struct {
+    pthread_mutex_t m;
+    unsigned long long bytes;
+    unsigned long long reads;
+    struct timespec t0;
+} rx_meter;
+
+static int rx_meter_init(rx_meter *r) {
+    r->bytes = 0;
+    r->reads = 0;
+    clock_gettime(CLOCK_MONOTONIC, &r->t0);
+    return pthread_mutex_init(&r->m, NULL);
+}
+/* Restart the clock once the stream is actually open. rig_init + stream open + na_server_start
+ * take real time and deliver no audio, so timing from rx_meter_init would understate the rate and
+ * report a shortfall that is only startup cost. */
+static void rx_meter_start(rx_meter *r) {
+    pthread_mutex_lock(&r->m);
+    r->bytes = 0;
+    r->reads = 0;
+    clock_gettime(CLOCK_MONOTONIC, &r->t0);
+    pthread_mutex_unlock(&r->m);
+}
+static void rx_meter_add(rx_meter *r, size_t n) {
+    pthread_mutex_lock(&r->m);
+    r->bytes += n;
+    r->reads++;
+    pthread_mutex_unlock(&r->m);
+}
+/* Snapshot bytes, reads and elapsed seconds together, so the rate they form is self-consistent. */
+static void rx_meter_read(rx_meter *r, unsigned long long *bytes, unsigned long long *reads,
+                          double *secs) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    pthread_mutex_lock(&r->m);
+    *bytes = r->bytes;
+    *reads = r->reads;
+    *secs = (double)(now.tv_sec - r->t0.tv_sec)
+            + (double)(now.tv_nsec - r->t0.tv_nsec) / 1e9;
+    pthread_mutex_unlock(&r->m);
+}
+static void rx_meter_free(rx_meter *r) { pthread_mutex_destroy(&r->m); }
+
 /* Shared context for the worker threads + the TX callback. */
 typedef struct {
     RIG *rig;
@@ -161,6 +214,7 @@ typedef struct {
     rig_stream_t *tx;               /* NULL if TX not available */
     na_audio_server *srv;
     byte_ring txring;
+    rx_meter rxm;
     int use_ptt;
 } bridge;
 
@@ -182,6 +236,7 @@ static void *rx_thread(void *arg) {
         size_t got = 0;
         int r = rig_stream_read(b->rig, b->rx, buf, sizeof buf, &got, 200, &info);
         if (r == RIG_OK && got > 0) {
+            rx_meter_add(&b->rxm, got);
             na_server_inject_audio(b->srv, buf, (int)got);   /* copy-and-return; fans out + FEC */
         } else if (r == -RIG_ETIMEOUT || (r == RIG_OK && got == 0)) {
             continue;                                         /* no data this tick */
@@ -350,12 +405,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "na_hamlib_bridge: ring_init failed\n");
         return 1;
     }
+    if (rx_meter_init(&b.rxm) != 0) {
+        fprintf(stderr, "na_hamlib_bridge: rx_meter_init failed\n");
+        ring_free(&b.txring);
+        return 1;
+    }
 
     /* ---- Hamlib source ---- */
     b.rig = rig_init((rig_model_t)model);
     if (!b.rig) {
         fprintf(stderr, "na_hamlib_bridge: rig_init(%d) failed\n", model);
         ring_free(&b.txring);
+        rx_meter_free(&b.rxm);
         return 1;
     }
     if (rig_file) {
@@ -380,10 +441,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "na_hamlib_bridge: rig_open: %s\n", rigerror(r));
         rig_cleanup(b.rig);
         ring_free(&b.txring);
+        rx_meter_free(&b.rxm);
         return 1;
     }
     if (open_stream(b.rig, RIG_STREAM_TYPE_AUDIO_RX, channels, &b.rx) != RIG_OK) {
-        rig_close(b.rig); rig_cleanup(b.rig); ring_free(&b.txring);
+        rig_close(b.rig); rig_cleanup(b.rig); ring_free(&b.txring); rx_meter_free(&b.rxm);
         return 1;
     }
     if (want_tx) {
@@ -420,21 +482,63 @@ int main(int argc, char **argv) {
            profile == NA_RELIABILITY_UDP_WAN ? "wan" :
            profile == NA_RELIABILITY_UDP_LAN ? "lan" : "ft8",
            channels, b.tx ? (use_ptt ? "on+ptt" : "on") : "off");
+    fflush(stdout);   /* redirected to a file this sits in the buffer until the first health tick,
+                       * landing AFTER any stderr diagnostic it is supposed to precede */
 
     /* ---- run ---- */
     pthread_t rxt, txt;
+    rx_meter_start(&b.rxm);
     pthread_create(&rxt, NULL, rx_thread, &b);
     if (b.tx) pthread_create(&txt, NULL, tx_thread, &b);
 
     int tick = 0;
+    int rx_short_reported = 0;
+    /* Bytes per second the format handed to na_server_set_audio_format implies. Every byte the
+     * bridge injects is charged against this, because naudio re-frames what it is given using
+     * exactly this layout — it does not resample or convert (naudio.h, na_server_set_audio_format). */
+    const double rx_nominal_bps = 48000.0 * 2.0 * (double)channels;
     while (!g_stop) {
         sleep_ms(200);
         if (++tick % 25 == 0) {   /* ~every 5s: RX health + roster, then TX loss */
+            unsigned long long rx_got = 0, rx_reads = 0;
+            double rx_secs = 0.0;
+            rx_meter_read(&b.rxm, &rx_got, &rx_reads, &rx_secs);
+
             struct rig_stream_stats st;
-            if (rig_stream_get_stats(b.rig, b.rx, &st) == RIG_OK) {
+            int have_st = (rig_stream_get_stats(b.rig, b.rx, &st) == RIG_OK);
+            if (have_st) {
                 printf("  rx: clients=%d gaps=%u link_loss=%u overruns=%u underruns=%u\n",
                        na_server_client_count(b.srv), st.gaps, st.link_loss,
                        st.overruns, st.underruns);
+            }
+            /* Delivered rate, reported but never used as the alarm: it reflects how fast the
+             * producer runs as much as whether the framing is right (a `loopback` dummy with no TX
+             * peer sits near 70% of nominal while being perfectly correct). */
+            if (rx_secs >= 1.0) {
+                double bps = (double)rx_got / rx_secs;
+                printf("  rx: audio %.0f B/s of %.0f expected (%.0f%%)\n",
+                       bps, rx_nominal_bps, 100.0 * bps / rx_nominal_bps);
+            }
+            /* A gap on nearly every read, with no link loss, is not packet loss — it is the two
+             * ends disagreeing about how many bytes make a frame. The sender advances the wire
+             * timestamp by its own frame size; the receiver expects payload_len / OUR frame size.
+             * When the peer honours a different channel count than it accepted, every packet's
+             * timestamp appears to jump and the audio is mis-framed rather than merely thinned.
+             * Genuine loss looks nothing like this: it lands far below one gap per read and
+             * normally moves link_loss too. */
+            if (!rx_short_reported && have_st && rx_reads >= 50
+                    && st.link_loss == 0 && (unsigned long long)st.gaps * 2 > rx_reads) {
+                rx_short_reported = 1;
+                fprintf(stderr,
+                    "na_hamlib_bridge: %u gaps over %llu RX reads with link_loss=0 — the peer is\n"
+                    "  framing this stream differently than the channels=%d we opened, so naudio is\n"
+                    "  re-framing its bytes wrongly and clients get mis-framed audio, not just less.\n"
+                    "  Over netrigctl (-m 2) this is expected at -c 2: \\stream_open carries no\n"
+                    "  channels field, so rigctld always opens the rig MONO even though its caps\n"
+                    "  advertise stereo, and the true count is stamped in every packet header but\n"
+                    "  never checked. Use -c 1 on that path. See docs/hamlib-streaming-bridge.md.\n",
+                    st.gaps, rx_reads, channels);
+                fflush(stderr);
             }
             if (b.tx) {
                 /* Three separate ways TX audio goes missing, kept apart because they have
@@ -471,5 +575,6 @@ teardown_rig:
     rig_close(b.rig);
     rig_cleanup(b.rig);
     ring_free(&b.txring);
+    rx_meter_free(&b.rxm);
     return g_failed ? 1 : 0;
 }
