@@ -239,6 +239,44 @@ round-trip run without it shows RX bytes flowing from the tone generator and pro
 your TX path. `-h` lists the rest (`-m 2` for netrigctl, `-p` port, `-c` channels, `-R` reliability
 profile, `-k` PTT keying, `-x` RX-only).
 
+### Over a remote `rigctld` (`-m 2`)
+
+Two commands, and both halves matter:
+
+```bash
+rigctld -m 1 -t 5599 -C stream_mode=tone           # streaming rigctld, dummy backend
+./build/tools/na_hamlib_bridge -m 2 -r localhost:5599 -p 4533
+```
+
+Set the backend's `stream_mode` on **`rigctld`** with `-C`. The bridge's `-S` sets the conf on its
+*local* netrigctl rig object, which is not where the dummy backend lives, so `-S` on an `-m 2` run
+does not reach the thing generating audio. `rig_stream_net_parse_caps_line: missing required 'type'
+field` on bridge startup is normal noise on this path, not a failure.
+
+### What has been verified on this path
+
+Measured with a headless naudio UDP client (`NA_CLIENT_BACKEND_NULL` + `na_client_set_audio_cb`,
+transport forced to UDP) attached to the bridge's server, against a streaming `rigctld` on
+localhost:
+
+| Check | Result |
+|---|---|
+| RX reaches a real client | ~932 KB per 12 s window, `gaps=0`, `link_loss=0` |
+| Delivery is lossless end to end | Client byte rate within **0.3%** of the bridge's own delivered-byte meter, across every arm |
+| Cadence | Largest gap between audio callbacks **12.8 ms**; per-second delivery 81 ± 1 callbacks of 960 B |
+| It is audio, not silence | Peak \|sample\| 16383, 99.9% of samples non-zero |
+| TX direction | Opens and runs alongside RX; write budget negotiated at 1420 B/call |
+| `SIGINT` shutdown | Exit status **0** in 0.56–1.44 s, both worker threads joined, UDP port released — including when a client is still attached |
+| Leaks | `leaks(1)` reports 0 both on the live process under load and at teardown |
+
+**A byte count is not proof of audio.** A source in `stream_mode=silence` delivers zeros at exactly
+the right rate, with perfect parity and `gaps=0` — it is indistinguishable from a healthy run on
+every counter the bridge prints. Any check of this path has to look at the samples themselves;
+peak amplitude over a window is enough.
+
+Not verified, and not claimed: real hardware, Linux, a link with a non-1500 MTU, and FEC recovery
+under induced packet loss.
+
 ---
 
 ## Known limit: `-c 2` does not work over netrigctl (`-m 2`)
@@ -275,6 +313,11 @@ That is not packet loss. The two ends disagree about how many bytes make a frame
 advances the wire timestamp by its own frame size, the receiver expects `payload_len` divided by
 *ours*, so every packet looks like a forward jump. The bridge detects exactly that combination and
 prints a one-time explanation pointing back here.
+
+**A client sees nothing wrong.** Measured at `-c 2` over `-m 2`, a naudio UDP client receives the
+bridge's bytes at 100% parity, with a steady cadence and a full-scale non-silent signal — the
+delivery path is faultless and it is the *shape* of the audio that is wrong. So no client-side
+byte, rate, or loss check can detect this; the bridge's gap signature is the only local symptom.
 
 **Do not read the byte-rate line as the alarm.** It is reported because it is useful, but it
 reflects how fast the producer runs as much as whether the framing is right — a dummy in
