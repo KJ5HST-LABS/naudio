@@ -344,6 +344,21 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
     set_target_properties(naudio_c_client_profile PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME naudio_c_client_profile COMMAND naudio_c_client_profile)
 
+    # Client reliability counters: na_client_get_stats is the observability half of
+    # na_client_set_reliability_profile — the profile turns FEC / reorder / jitter ON and this is how
+    # a C consumer sees them work. Asserts the argument contract, that an unconnected client reports
+    # connected == 0 with the unmeasured gap counters at -1 (never 0, which would read as "no loss"),
+    # that TCP leaves every reliability counter off, and — the headline — that
+    # packets_recovered_by_fec MOVES under real induced loss and stays 0 on the same relay with
+    # nothing dropped. client_stats_proxy.cpp is a C++ fixture (extern "C") that relays UDP between
+    # client and server and discards one audio packet per FEC block; the C side has no portable
+    # socket layer of its own, and naudio::net::Socket already is one. Links naudio (the public C
+    # ABI) + naudio_net (the fixture's Socket) + Threads.
+    add_executable(naudio_c_client_stats tests/c_client_stats.c tests/client_stats_proxy.cpp)
+    target_link_libraries(naudio_c_client_stats PRIVATE naudio naudio_net Threads::Threads)
+    set_target_properties(naudio_c_client_stats PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME naudio_c_client_stats COMMAND naudio_c_client_stats)
+
     # C-ABI fault-injection: a C++ TU (a global operator new override can't be done from C)
     # that arms allocation failure around single na_client_* calls and asserts the extern "C"
     # boundary stays exception-tight: a forced bad_alloc surfaces as NA_ERR_NOMEM (not a thrown

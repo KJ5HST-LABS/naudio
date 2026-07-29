@@ -813,6 +813,39 @@ extern "C" int na_client_server_tx_owner(na_stream_client* client, char* buf, in
     });
 }
 
+// ---- Reliability counters --------------------------------------------------------------
+// A field-by-field copy out of ClientStats rather than a memcpy or a layout assertion: the C
+// struct is a FROZEN ABI surface and the C++ one is free to gain fields, so the two must be
+// allowed to diverge. Every na_client_stats field is written on every non-error path (the
+// unmeasured -1s included), so a caller never has to pre-zero the struct.
+
+extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr || out == nullptr) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        const naudio::net::ClientStats s = client->client->stats();
+        out->connected = s.connected ? 1 : 0;
+        out->packets_sent = static_cast<long long>(s.packetsSent);
+        out->packets_received = static_cast<long long>(s.packetsReceived);
+        out->bytes_sent = static_cast<long long>(s.bytesSent);
+        out->bytes_received = static_cast<long long>(s.bytesReceived);
+        out->crc_errors = s.crcErrors;
+        out->packets_reordered = static_cast<long long>(s.packetsReordered);
+        out->packets_recovered_by_fec = static_cast<long long>(s.packetsRecoveredByFec);
+        out->fec_blocks_unreconciled = static_cast<long long>(s.fecBlocksUnreconciled);
+        out->control_retransmits = static_cast<long long>(s.controlRetransmits);
+        out->queue_drops = static_cast<long long>(s.queueDrops);
+        out->jitter_ms = s.jitterMs;
+        out->buffer_target_ms = s.bufferTargetMs;
+        out->packets_lost = static_cast<long long>(s.packetsLost);
+        out->packets_out_of_order = static_cast<long long>(s.packetsOutOfOrder);
+        out->packet_loss_rate = s.packetLossRate;
+        return NA_OK;
+    });
+}
+
 // ========================================================================================
 // Networking audio-streaming server (na_server_*)
 //

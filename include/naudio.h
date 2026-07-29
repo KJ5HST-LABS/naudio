@@ -383,6 +383,76 @@ NA_EXPORT int na_client_server_max_clients(na_stream_client* client);
  * convention (len==0 / buf==NULL just returns the needed length). "" (length 0) if no owner. */
 NA_EXPORT int na_client_server_tx_owner(na_stream_client* client, char* buf, int len);
 
+/* --- Reliability / transport counters --------------------------------------------------
+ *
+ * The observability half of na_client_set_reliability_profile: that setter turns FEC,
+ * reordering, adaptive jitter and control-ARQ ON, and these counters are how a consumer sees
+ * them work. Without them, showing that FEC repaired anything means inferring it from
+ * delivered-byte parity against a separate no-loss control run — which can show that delivery
+ * survived loss, but not how many packets were repaired.
+ *
+ * Every field is a CUMULATIVE TOTAL for the CURRENT connection, not a rate. An auto-reconnect
+ * installs a fresh connection, so the counters restart from zero; sample them and difference
+ * the samples yourself if you want a rate, and treat a decrease as "this is a new connection".
+ *
+ * WHICH COUNTERS MOVE depends on the profile, because each is owned by a subsystem the profile
+ * either configures or leaves off. A counter reading 0 because its subsystem is off is NOT
+ * distinguishable here from one reading 0 because nothing happened:
+ *
+ *   NA_RELIABILITY_DEFAULT (TCP)  packets_/bytes_ + crc_errors only; every reliability
+ *                                 counter below stays 0 (TCP has none of the subsystems).
+ *   NA_RELIABILITY_UDP_LAN/_FT8   + packets_reordered, control_retransmits. FEC is off in
+ *                                 these profiles, so both FEC counters stay 0.
+ *   NA_RELIABILITY_UDP_WAN        + packets_recovered_by_fec, fec_blocks_unreconciled,
+ *                                 jitter_ms, buffer_target_ms. The whole set is live.
+ */
+typedef struct na_client_stats {
+    /* 1 if a live connection supplied these numbers. 0 means there is none (before connect,
+     * between reconnect attempts, after disconnect) and EVERY field below is its default
+     * rather than a reading — check this before believing a zero. */
+    int connected;
+
+    long long packets_sent;
+    long long packets_received;
+    long long bytes_sent;
+    long long bytes_received;
+    int       crc_errors;         /* undeserializable datagrams (bad CRC / truncated header) */
+
+    long long packets_reordered;         /* delivered in order by the reorder buffer          */
+    long long packets_recovered_by_fec;  /* rebuilt from an XOR parity packet — loss repaired */
+    /* FEC blocks whose parity could not be reconciled against a contiguous run of audio
+     * packets, so recovery was declined rather than run over the wrong member set. This is a
+     * lost opportunity to recover, never corrupted audio: the packet stays lost exactly as it
+     * would with FEC off. It is what separates "no parity ever arrived" from "the parity
+     * arrived and was declined", and it moves whenever control traffic interleaves with an
+     * audio block — so a non-zero value here alongside a low packets_recovered_by_fec is the
+     * expected shape on a busy roster, not a defect. */
+    long long fec_blocks_unreconciled;
+    long long control_retransmits;       /* control-ARQ resends (reliability layer, not audio) */
+    /* Packets discarded from the ordered queue because it was full — a consumer too slow to
+     * drain it. Audio lost LOCALLY, after the network delivered it successfully. */
+    long long queue_drops;
+    double    jitter_ms;                 /* current inter-arrival jitter estimate; 0 if off    */
+    int       buffer_target_ms;          /* adaptive buffer target; -1 when adaptive jitter is off */
+
+    /* UNAVAILABLE IS NOT ZERO. These three are -1 when the library is not measuring them,
+     * which is the case on EVERY profile selectable here: the sequence-gap tracker runs only
+     * when no reorder buffer is engaged, and every UDP profile configures one (TCP never
+     * tracks gaps at all). -1 means "not measured" and never means "nothing was lost" — to
+     * see loss recovery, read packets_recovered_by_fec. They are present, and specified as
+     * -1 rather than 0, so that they can begin carrying real values without this struct
+     * changing shape if post-reorder loss accounting is ever added. */
+    long long packets_lost;
+    long long packets_out_of_order;
+    double    packet_loss_rate;
+} na_client_stats;
+
+/* Fill *out with a snapshot of the client's counters. Safe to call from any thread at any
+ * time, including while streaming and before connect (which yields connected == 0 and
+ * defaults). NA_ERR_INVALID on a NULL client or a NULL out; NA_OK otherwise — a
+ * not-connected client is NOT an error, it is `connected == 0`. */
+NA_EXPORT na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out);
+
 /* ---- Networking audio-streaming server (na_server_*) -----------------------------------
  *
  * The server side of the SAME frozen 0xAF01 v1 protocol the na_client_* surface speaks. A C
