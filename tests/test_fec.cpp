@@ -244,6 +244,82 @@ TEST(FecDecoder, ResetClearsState) {
     EXPECT_EQ(0, d.fecBlocksFailed());
 }
 
+// --- Issue #23: a non-audio packet inside the block's sequence range ---------
+//
+// The parity header carries a COUNT of audio packets, but the connection's
+// sequence counter is shared with control and heartbeat traffic. A control
+// message sent between two audio packets of the same block therefore takes a
+// sequence number inside [startSeq, startSeq + blockSize) and pushes the block's
+// last audio packet just past the end of that range. The decoder cannot read the
+// range as the block any more: one slot looks missing, and XORing across the
+// range would emit `lost ^ displaced` — a full frame of wrong samples presented
+// as recovered audio.
+
+TEST(FecDecoder, ControlInsideBlockRangeDeclinesRecoveryInsteadOfCorrupting) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    // Server: audio 0,1,2,3 -> control 4 -> audio 5 -> parity 6 (startSeq 0, 5 audio).
+    std::vector<std::uint8_t> a0{0x10, 0x20}, a1{0x30, 0x40}, a2{0x50, 0x60}, a3{0x70, 0x01},
+        a5{0x02, 0x03};
+    AudioPacket parity = buildParity(0, {a0, a1, a2, a3, a5});
+    parity.setSequence(6);  // the parity follows the LAST audio packet, at seq 5
+
+    d.processPacket(rx(0, a0));
+    d.processPacket(rx(1, a1));
+    d.process(std::nullopt, 2);  // a2 lost on the wire
+    d.processPacket(rx(3, a3));
+    d.processPacket(AudioPacket(PacketType::Control, 4, {'C', 'U'}));  // takes slot 4
+    d.processPacket(rx(5, a5));
+    d.processPacket(parity);
+
+    // Declined, not recovered: nothing is emitted for the lost sequence.
+    EXPECT_EQ(1, d.fecBlocksUnreconciled());
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
+    EXPECT_EQ(0, d.fecBlocksComplete());
+    EXPECT_EQ(nullptr, s.find(2));
+
+    // And nothing bogus was emitted in its place: every audio packet the sink saw
+    // is byte-identical to what the sender sent. Before the fix this failed with a
+    // packet at seq 2 carrying a2 ^ a5.
+    for (const AudioPacket& p : s.packets) {
+        if (p.packetType() != PacketType::AudioRx) continue;
+        switch (p.sequence()) {
+            case 0: EXPECT_EQ(a0, p.payload()); break;
+            case 1: EXPECT_EQ(a1, p.payload()); break;
+            case 3: EXPECT_EQ(a3, p.payload()); break;
+            case 5: EXPECT_EQ(a5, p.payload()); break;
+            default: ADD_FAILURE() << "unexpected audio at seq " << p.sequence();
+        }
+    }
+}
+
+// The healthy neighbour: the same control message, one slot earlier, so the block
+// keeps a contiguous audio range. Recovery must still happen — the guard has to
+// fire on the broken layout and stay silent on the correct one.
+TEST(FecDecoder, ControlOutsideBlockRangeStillRecovers) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    // Server: control 0 -> audio 1,2,3,4,5 -> parity 6 (startSeq 1, 5 audio).
+    std::vector<std::uint8_t> a1{0x10, 0x20}, a2{0x30, 0x40}, a3{0x50, 0x60}, a4{0x70, 0x01},
+        a5{0x02, 0x03};
+    AudioPacket parity = buildParity(1, {a1, a2, a3, a4, a5});
+    parity.setSequence(6);
+
+    d.processPacket(AudioPacket(PacketType::Control, 0, {'C', 'U'}));  // before the block
+    d.processPacket(rx(1, a1));
+    d.processPacket(rx(2, a2));
+    d.process(std::nullopt, 3);  // a3 lost
+    d.processPacket(rx(4, a4));
+    d.processPacket(rx(5, a5));
+    d.processPacket(parity);
+
+    EXPECT_EQ(0, d.fecBlocksUnreconciled());
+    EXPECT_EQ(1, d.packetsRecoveredByFec());
+    const AudioPacket* rec = s.find(3);
+    ASSERT_NE(nullptr, rec);
+    EXPECT_EQ(a3, rec->payload());  // byte-exact, not a XOR of two frames
+}
+
 TEST(FecDecoder, MissingParityTimesOut) {
     DecSink s;
     FecDecoder d(s.emitter(), 10);  // 10 ms timeout; pending uses 2x = 20 ms
