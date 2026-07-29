@@ -14,7 +14,7 @@
 
 ## Status
 
-The audio streaming stack is **implemented and tested** (the device layer, the `0xAF01` codec, the reliability primitives, the multi-tenant TCP/UDP server + client, and the full networking C ABI — both the `na_client_*` and `na_server_*` surfaces). It installs as a package: `find_package(naudio)` or pkg-config resolves the C ABI **and** the C++ API. The build runs **286 hardware-free ctests** green, including the language-neutral conformance golden vectors and the README snippet compile-gate. What is hardware-gated (real PortAudio capture/playback, on-air decode) is exercised by opt-in smokes and the `na_audio_daemon` driver, not by CI; see **Known limitations** below.
+The audio streaming stack is **implemented and tested** (the device layer, the `0xAF01` codec, the reliability primitives, the multi-tenant TCP/UDP server + client, and the full networking C ABI — both the `na_client_*` and `na_server_*` surfaces). It installs as a package: `find_package(naudio)` or pkg-config resolves the C ABI **and** the C++ API. The build runs **291 hardware-free ctests** green, including the language-neutral conformance golden vectors and the README snippet compile-gate. What is hardware-gated (real PortAudio capture/playback, on-air decode) is exercised by opt-in smokes and the `na_audio_daemon` driver, not by CI; see **Known limitations** below.
 
 ---
 
@@ -36,7 +36,7 @@ The audio streaming stack is **implemented and tested** (the device layer, the `
 ```bash
 cmake -S . -B build
 cmake --build build
-ctest --test-dir build --output-on-failure      # 286 logic + codec + C-ABI tests, no hardware
+ctest --test-dir build --output-on-failure      # 291 logic + codec + C-ABI tests, no hardware
 ```
 
 Dependencies resolve from a system / Homebrew install when present (PortAudio via `pkg-config`,
@@ -106,6 +106,8 @@ if (na_client_connect(c, errbuf, sizeof errbuf) != NA_OK) {
     /* connect failed — errbuf holds the reason (also via na_last_error()) */
 }
 /* ... receive PCM through on_pcm until done ... */
+na_client_stats st;                                      // reliability counters for THIS connection
+na_client_get_stats(c, &st);                             // packets_recovered_by_fec, reordered, jitter...
 na_client_disconnect(c);
 na_client_destroy(c);
 ```

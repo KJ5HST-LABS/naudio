@@ -343,16 +343,33 @@ a leak — the same residual of 4 that holds across both 12- and 30-second runs 
 with duration.
 
 The earlier arm table was taken with a client built directly on `naudio::net::UdpClientConnection`,
-because at the time the C ABI could not enable the reliability layer at all. That is now only needed
-for the **counters**: `packetsRecoveredByFec` and `packetsReordered` remain private to
-`AudioStreamClient` and are unreachable from `naudio.h` ([#24](https://github.com/KJ5HST-LABS/naudio/issues/24)).
+because at the time the C ABI could not enable the reliability layer at all. Nothing needs that
+detour any more: **`na_client_get_stats`** reports the counters, so a single run can assert how many
+packets FEC repaired instead of inferring it from delivered-byte parity against a separate control:
 
-**One caveat on recovered audio.** With FEC recovery active, the C-ABI RX callback delivers exactly
-one sample per 12-second run whose magnitude exceeds anything the source emits (~1 in 420,000
-samples). Reading the same recovered stream directly off `UdpClientConnection` does not reproduce it,
-and no-loss arms are clean, so it sits between the connection and the audio callback rather than in
-the FEC decoder. Filed as [#23](https://github.com/KJ5HST-LABS/naudio/issues/23); byte totals and
-packet counts are unaffected.
+```c
+na_client_stats st;
+na_client_get_stats(c, &st);
+printf("recovered %lld, declined %lld, reordered %lld\n",
+       st.packets_recovered_by_fec, st.fec_blocks_unreconciled, st.packets_reordered);
+```
+
+Note that `packets_lost` / `packets_out_of_order` / `packet_loss_rate` report **-1, meaning "not
+measured"**, on every profile: the sequence-gap tracker runs only when no reorder buffer is engaged,
+and every UDP profile configures one. Read `packets_recovered_by_fec` to see loss being repaired; a
+-1 there never means "nothing was lost".
+
+**The recovered-audio caveat that used to sit here is fixed.** It reported one out-of-range sample per
+12-second run and guessed the cause lay between the connection and the audio callback rather than in
+the FEC decoder. Both halves were wrong. It was a **whole corrupted frame** — 480 of 480 samples,
+of which only 3 happened to exceed the source's range, because XOR of two same-signal S16 payloads
+usually lands back inside it — and it was in `FecDecoder::handleParity`, which read the parity
+header's count as a contiguous sequence range. That range is the encoder's block only while the
+block's audio packets are consecutive, and the sender's sequence counter is shared with control and
+heartbeat traffic. The decoder now declines such a block and counts it as `fec_blocks_unreconciled`,
+leaving the packet lost exactly as it would be with FEC off, rather than emitting
+`lost ^ displaced` as recovered audio. See [#23](https://github.com/KJ5HST-LABS/naudio/issues/23) and
+`docs/protocols.md` R5.
 
 Not verified, and not claimed: loss on the `-m 2` netrigctl path, real hardware, and loss patterns
 other than the deterministic 1-in-N used here (no bursts, no reordering, no duplication).

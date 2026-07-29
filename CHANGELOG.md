@@ -20,6 +20,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `docs/protocols.md`.
 
 ### Added
+- **Client-side reliability counters on the C ABI** — `na_client_get_stats()` fills one
+  `na_client_stats` with the current connection's transport and reliability totals, including
+  `packets_recovered_by_fec`, `fec_blocks_unreconciled`, `packets_reordered`, `queue_drops` and the
+  jitter estimate. These were private to `AudioStreamClient`, reachable through neither an accessor
+  nor a listener, so a consumer could *enable* loss recovery but not observe it: showing that FEC
+  repaired anything meant inferring it from delivered-byte parity against a separate no-loss control
+  run, which cannot distinguish "FEC recovered 29 packets" from "nothing was dropped this time".
+  `AudioStreamClient::stats()` exposes the same snapshot to C++ consumers.
+  `packets_lost` / `packets_out_of_order` / `packet_loss_rate` report **-1 for "not measured"**
+  rather than 0: the sequence-gap tracker runs only when no reorder buffer is engaged and every UDP
+  profile configures one, so a 0 there would read as "nothing was lost".
 - **Client-side reliability profiles on the C ABI** — `na_client_set_reliability_profile()` applies a
   `na_reliability_profile` (transport + framing + FEC / reorder / adaptive jitter / control-ARQ) in
   one call, before connect. This is the only way to enable a client's loss-recovery layer:
