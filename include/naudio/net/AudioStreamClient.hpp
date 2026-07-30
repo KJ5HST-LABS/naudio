@@ -80,6 +80,13 @@ struct ClientStats {
     std::int64_t packetsReordered = 0;
     std::int64_t packetsRecoveredByFec = 0;
     std::int64_t fecBlocksUnreconciled = 0;
+    // These two are ALWAYS 0 here, on every profile. Both are written by live paths that only a
+    // server-side connection reaches: a client's only critical control message is DISCONNECT, sent
+    // after the thread that pumps the retransmit sweep has exited; and a client fills and drains its
+    // ordered queue from one thread, so the queue cannot back up to its 2048-packet cap (a slow
+    // consumer loses audio in the kernel socket buffer instead, which nothing here counts). They are
+    // 0 rather than -1 because -1 is reserved for "not measured" — these are measured, and the
+    // client simply never produces the event. See the na_client_stats contract in naudio.h.
     std::int64_t controlRetransmits = 0;
     std::int64_t queueDrops = 0;
     double jitterMs = 0.0;

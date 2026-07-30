@@ -6,6 +6,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **`na_client_stats` no longer claims two counters can move on a client when they cannot** — the
+  struct's contract listed `control_retransmits` as live on `NA_RELIABILITY_UDP_LAN` / `_FT8`, and
+  described `queue_drops` as reporting a consumer too slow to drain the queue. Neither is reachable
+  through `na_client_*` on any profile. Only a *critical* control type is tracked for retransmission
+  and the sole critical message a client sends is `DISCONNECT`, dispatched after the thread that
+  pumps the retransmit sweep has exited; and a client fills and drains its ordered queue from one
+  thread — the receive path empties the queue before reading the socket — so the queue cannot reach
+  its 2048-packet cap, and a slow consumer instead loses audio in the kernel's socket buffer, which
+  no counter reports. Both fields still exist, still read 0, and are now documented as carrying no
+  information on a client (they remain live on the server side of the same class). No ABI change:
+  the struct layout, field order and sizes are unchanged. `crc_errors`, by contrast, is genuinely
+  live on a client and is now covered by a test that corrupts datagrams in flight rather than
+  dropping them — a dropped datagram never arrives, so no amount of loss testing could move it.
 - **FEC no longer presents a mis-reconciled block as recovered audio** — the XOR parity header
   carries a *count* of audio packets, which the decoder read as the contiguous sequence range
   `[startSeq, startSeq + blockSize)`. That is the encoder's block only while the block's audio
@@ -22,7 +35,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 - **Client-side reliability counters on the C ABI** — `na_client_get_stats()` fills one
   `na_client_stats` with the current connection's transport and reliability totals, including
-  `packets_recovered_by_fec`, `fec_blocks_unreconciled`, `packets_reordered`, `queue_drops` and the
+  `packets_recovered_by_fec`, `fec_blocks_unreconciled`, `packets_reordered`, `crc_errors` and the
   jitter estimate. These were private to `AudioStreamClient`, reachable through neither an accessor
   nor a listener, so a consumer could *enable* loss recovery but not observe it: showing that FEC
   repaired anything meant inferring it from delivered-byte parity against a separate no-loss control

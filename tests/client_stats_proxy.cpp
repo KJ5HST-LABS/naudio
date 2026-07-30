@@ -20,6 +20,14 @@
 // others. Only AUDIO_RX is ever dropped: dropping the parity would remove the repair rather than
 // the damage, and dropping control or heartbeat traffic would break the handshake or time the
 // connection out.
+//
+// It ALSO corrupts on demand, which is a different fault from dropping: a dropped datagram never
+// reaches the client, while a corrupted one arrives and fails its CRC. Only the second moves
+// crc_errors, so the counter cannot be provoked by the drop path at any rate. Corruption flips one
+// PAYLOAD byte and leaves the header intact, so the datagram still passes the client's
+// expected-sender and truncation gates (UdpClientConnection.cpp:257, which return early WITHOUT
+// counting) and lands on the CRC check that does count. Corruption is applied by the same
+// per-block ordinal selection as dropping, and to AUDIO_RX only, for the same reasons.
 
 #include <atomic>
 #include <cstdint>
@@ -38,7 +46,8 @@ struct Proxy {
     naudio::net::Socket sock;
     std::uint16_t serverPort = 0;
     int blockSize = 5;
-    int dropOrdinal = 2;  // which audio packet within each block to drop (0-based)
+    int dropOrdinal = 2;     // which audio packet within each block to drop (0-based)
+    int corruptOrdinal = -1;  // which to corrupt instead; < 0 corrupts nothing
 
     std::thread worker;
     std::atomic<bool> stop{false};
@@ -46,6 +55,7 @@ struct Proxy {
     // Counters (single writer: the relay thread).
     std::atomic<long long> audioSeen{0};
     std::atomic<long long> audioDropped{0};
+    std::atomic<long long> audioCorrupted{0};
     std::atomic<long long> parityForwarded{0};
     std::atomic<long long> clientToServer{0};
 };
@@ -79,6 +89,13 @@ void relayLoop(Proxy* p) {
                     p->audioDropped.fetch_add(1);
                     continue;  // the induced loss
                 }
+                if (ordinalInBlock == p->corruptOrdinal &&
+                    rr.bytes > naudio::AudioPacket::HEADER_SIZE) {
+                    // Flip the first payload byte. CRC32 is computed over header + payload, so a
+                    // single-byte change always fails it — the packet arrives and is rejected.
+                    buf[naudio::AudioPacket::HEADER_SIZE] ^= 0xFF;
+                    p->audioCorrupted.fetch_add(1);
+                }
             } else if (pkt && pkt->packetType() == naudio::PacketType::FecParity) {
                 p->parityForwarded.fetch_add(1);
             }
@@ -97,11 +114,12 @@ void relayLoop(Proxy* p) {
 
 extern "C" {
 
-// Start a relay to 127.0.0.1:server_port on an ephemeral loopback port, dropping audio packet
-// `drop_ordinal` of every `block_size` audio packets. Writes the bound port to *out_port. Pass
-// drop_ordinal < 0 for a LOSSLESS relay (the control arm: same extra hop, nothing dropped).
-// Returns an opaque handle, or nullptr on failure.
-void* naproxy_start(int server_port, int block_size, int drop_ordinal, int* out_port) {
+// Start a relay to 127.0.0.1:server_port on an ephemeral loopback port. Of every `block_size` audio
+// packets it DROPS ordinal `drop_ordinal` and CORRUPTS ordinal `corrupt_ordinal`; pass either < 0 to
+// disable that fault (both < 0 is the lossless, uncorrupted control arm — same extra hop, nothing
+// touched). Writes the bound port to *out_port. Returns an opaque handle, or nullptr on failure.
+void* naproxy_start(int server_port, int block_size, int drop_ordinal, int corrupt_ordinal,
+                    int* out_port) {
     if (server_port <= 0 || server_port > 65535 || block_size <= 0) return nullptr;
     auto* p = new Proxy();
     p->sock = naudio::net::Socket::bindUdp("127.0.0.1", 0, false, nullptr);
@@ -119,7 +137,8 @@ void* naproxy_start(int server_port, int block_size, int drop_ordinal, int* out_
 
     p->serverPort = static_cast<std::uint16_t>(server_port);
     p->blockSize = block_size;
-    p->dropOrdinal = drop_ordinal;  // < 0 never matches an ordinal -> lossless
+    p->dropOrdinal = drop_ordinal;        // < 0 never matches an ordinal -> lossless
+    p->corruptOrdinal = corrupt_ordinal;  // < 0 never matches an ordinal -> uncorrupted
     if (out_port != nullptr) *out_port = p->sock.localPort();
     p->worker = std::thread(relayLoop, p);
     return p;
@@ -135,6 +154,14 @@ long long naproxy_audio_seen(void* handle) {
 long long naproxy_audio_dropped(void* handle) {
     if (handle == nullptr) return -1;
     return static_cast<Proxy*>(handle)->audioDropped.load();
+}
+
+// Audio packets the relay deliberately corrupted and then forwarded. This is the independently-known
+// quantity that bounds the client's crc_errors from ABOVE — the relay is the only source of
+// undeserializable datagrams on this path, so the client can never legitimately count more.
+long long naproxy_audio_corrupted(void* handle) {
+    if (handle == nullptr) return -1;
+    return static_cast<Proxy*>(handle)->audioCorrupted.load();
 }
 
 // FEC parity packets the relay forwarded (never dropped). Zero means the server was not sending

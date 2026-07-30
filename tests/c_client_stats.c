@@ -10,14 +10,30 @@
  * outside the library meant inferring it from delivered-byte parity against a separate no-loss
  * control run — which shows that delivery survived loss, not how many packets were repaired.
  *
- * THE HEADLINE ARM IS LOSSY ON PURPOSE. A counter that has never been observed to increment is an
- * unverified claim, not a feature, and loopback drops nothing: with no loss, the recovering and the
- * non-recovering configuration deliver byte-identical output and packets_recovered_by_fec can only
- * ever read 0. So arm (3) relays the audio through a fixture that discards ONE AUDIO PACKET PER FEC
- * BLOCK (client_stats_proxy.cpp) — exactly the damage single-parity XOR FEC is specified to repair —
- * and asserts the counter moves. Arm (4) is the control: the SAME relay with nothing dropped, where
- * the counter must stay at 0. A detector is not finished when it fires on the fault; it is finished
- * when it also stays quiet on the healthy neighbour.
+ * THE HEADLINE ARMS INJECT FAULTS ON PURPOSE. A counter that has never been observed to increment is
+ * an unverified claim, not a feature, and loopback is both loss-free and corruption-free: with no
+ * fault, the recovering and the non-recovering configuration deliver byte-identical output and the
+ * counters can only ever read 0. So the arms relay audio through client_stats_proxy.cpp, which
+ * injects one fault per FEC block, and each fault arm is paired with the SAME relay injecting
+ * nothing. A detector is not finished when it fires on the fault; it is finished when it also stays
+ * quiet on the healthy neighbour.
+ *
+ *   (1) argument contract      (2) TCP: transport counters live, reliability counters off
+ *   (3) UDP_WAN, one audio packet DROPPED per block  -> packets_recovered_by_fec moves
+ *   (4) UDP_WAN, the same relay dropping nothing     -> it stays 0
+ *   (5) UDP_WAN, one audio packet CORRUPTED per block -> crc_errors moves
+ *   (6) UDP_WAN, a deliberately stalled audio callback -> queue_drops does NOT move
+ *
+ * DROPPING AND CORRUPTING ARE DIFFERENT FAULTS, and the distinction is the whole reason crc_errors
+ * sat at 0 through fourteen sessions of loss testing: a dropped datagram never arrives, so nothing
+ * fails a checksum. Arm (5) is the first arm on this project to make a datagram ARRIVE broken.
+ *
+ * ARM (6) ASSERTS A NEGATIVE, and does so deliberately. queue_drops and control_retransmits are
+ * live code with real increments that no client-side path can reach — see the na_client_stats
+ * contract in include/naudio.h, which documents why. Arm (6) runs the provocation that looks like it
+ * should work and shows that it does not, so the claim in the header is executable rather than
+ * merely asserted. If either counter ever does move here, this test fails and that header contract
+ * is what needs updating.
  *
  * Hardware-free: NULL backends on both ends, loopback UDP, no PortAudio, no radio.
  */
@@ -36,9 +52,11 @@
 
 /* The lossy relay fixture (client_stats_proxy.cpp — a C++ TU behind extern "C", because the C side
  * has no portable socket layer of its own and naudio::net::Socket already is one). */
-void* naproxy_start(int server_port, int block_size, int drop_ordinal, int* out_port);
+void* naproxy_start(int server_port, int block_size, int drop_ordinal, int corrupt_ordinal,
+                    int* out_port);
 long long naproxy_audio_seen(void* handle);
 long long naproxy_audio_dropped(void* handle);
+long long naproxy_audio_corrupted(void* handle);
 long long naproxy_parity_forwarded(void* handle);
 void naproxy_stop(void* handle);
 
@@ -49,16 +67,30 @@ void naproxy_stop(void* handle);
 #define WAN_FEC_BLOCK 5
 #define DROP_ORDINAL  2   /* the 3rd audio packet of each block */
 #define NO_DROP       (-1)
-#define ARM_MS        3000  /* both UDP arms run this long, so their counts are comparable */
+#define CORRUPT_ORDINAL 2 /* the 3rd audio packet of each block, in the corrupting arm */
+#define NO_CORRUPT    (-1)
+#define ARM_MS        3000  /* every UDP arm runs this long, so their counts are comparable */
+/* One corrupted packet per 5 leaves 4 good ones between faults, and each good packet resets
+ * UdpClientConnection's consecutive-error run — so the 20-error teardown threshold
+ * (MAX_CONSECUTIVE_CRC_ERRORS) is never approached and the arm measures counting, not teardown. */
+#define STALL_ARM_MS  1500  /* the queue_drops arm: shorter, because it asserts a negative */
+#define STALL_CB_MS   100   /* how long the audio callback blocks in that arm */
 
 #define SIG_PERIOD 4
 static const unsigned char SIG_UNIT[SIG_PERIOD] = {0x5A, 0xA5, 0x3C, 0xC3};
 static unsigned char RXBUF[4096];
 
 static volatile int g_rx_ok = 0;
+/* Non-zero makes the audio callback block for that many ms — the stalled-consumer arm. */
+static volatile int g_stall_cb_ms = 0;
+static volatile long g_cb_calls = 0;
+
+static void sleep_ms(int ms);
 
 static void on_rx_audio(const unsigned char *pcm, size_t n_bytes, void *user) {
     (void)user;
+    g_cb_calls++;
+    if (g_stall_cb_ms > 0) sleep_ms(g_stall_cb_ms);
     if (pcm == NULL || n_bytes < SIG_PERIOD * 2) return;
     for (size_t i = 0; i + (SIG_PERIOD * 2) <= n_bytes; i++) {
         if (memcmp(pcm + i, SIG_UNIT, SIG_PERIOD) == 0 &&
@@ -97,12 +129,13 @@ static int gap_counters_are_unmeasured(const na_client_stats *st) {
  * (the control). Both arms run the same wall clock so their counts are directly comparable — an arm
  * that stopped at the first recovery would report a count that sizes the break condition rather than
  * the effect. Fills *out with the client's final counters. Returns 1 on success. */
-static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal,
+static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal, int corrupt_ordinal,
                        const char *what, int duration_ms, na_client_stats *out,
-                       long long *out_dropped, long long *out_parity) {
+                       long long *out_dropped, long long *out_parity, long long *out_corrupted) {
     char err[256];
     int proxy_port = 0;
-    void *proxy = naproxy_start(server_port, WAN_FEC_BLOCK, drop_ordinal, &proxy_port);
+    void *proxy =
+        naproxy_start(server_port, WAN_FEC_BLOCK, drop_ordinal, corrupt_ordinal, &proxy_port);
     if (proxy == NULL || proxy_port <= 0) {
         fprintf(stderr, "FAIL: naproxy_start (%s)\n", what);
         return 0;
@@ -123,6 +156,7 @@ static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal,
     na_client_set_auto_reconnect(c, 0);   /* a reconnect would reset the counters mid-arm */
 
     g_rx_ok = 0;
+    g_cb_calls = 0;
     if (na_client_connect(c, err, (int)sizeof err) != NA_OK) {
         fprintf(stderr, "FAIL: connect through the relay (%s): %s\n", what, err);
         na_client_destroy(c);
@@ -149,13 +183,19 @@ static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal,
     *out = st;
     *out_dropped = naproxy_audio_dropped(proxy);
     *out_parity = naproxy_parity_forwarded(proxy);
+    *out_corrupted = naproxy_audio_corrupted(proxy);
 
-    printf("c_client_stats: %s — relay saw %lld audio, dropped %lld, forwarded %lld parity; "
-           "client recovered %lld, unreconciled %lld, reordered %lld, received %lld pkts / "
-           "%lld B, rx_signature=%d (%d ms)\n",
-           what, naproxy_audio_seen(proxy), *out_dropped, *out_parity,
-           st.packets_recovered_by_fec, st.fec_blocks_unreconciled, st.packets_reordered,
-           st.packets_received, st.bytes_received, g_rx_ok, waited);
+    /* Echo the fault parameters this arm actually ran with, next to the results. An arm that prints
+     * only its results cannot be told apart from a differently-parameterised one that silently fell
+     * back to a default. */
+    printf("c_client_stats: %s — drop_ordinal=%d corrupt_ordinal=%d stall_cb_ms=%d; relay saw %lld "
+           "audio, dropped %lld, corrupted %lld, forwarded %lld parity; client recovered %lld, "
+           "unreconciled %lld, reordered %lld, crc_errors %d, control_retransmits %lld, "
+           "queue_drops %lld, received %lld pkts / %lld B, cb_calls %ld, rx_signature=%d (%d ms)\n",
+           what, drop_ordinal, corrupt_ordinal, g_stall_cb_ms, naproxy_audio_seen(proxy),
+           *out_dropped, *out_corrupted, *out_parity, st.packets_recovered_by_fec,
+           st.fec_blocks_unreconciled, st.packets_reordered, st.crc_errors, st.control_retransmits,
+           st.queue_drops, st.packets_received, st.bytes_received, g_cb_calls, g_rx_ok, waited);
 
     na_client_disconnect(c);
     na_client_destroy(c);
@@ -275,10 +315,11 @@ int main(void) {
     const int port = na_server_port(srv);
 
     na_client_stats lossy;
-    long long lossy_dropped = 0, lossy_parity = 0;
+    long long lossy_dropped = 0, lossy_parity = 0, lossy_corrupted = 0;
     memset(&lossy, 0, sizeof lossy);
-    if (!run_wan_arm(srv, port, DROP_ORDINAL, "lossy (1 audio packet dropped per FEC block)",
-                     ARM_MS, &lossy, &lossy_dropped, &lossy_parity)) {
+    if (!run_wan_arm(srv, port, DROP_ORDINAL, NO_CORRUPT,
+                     "lossy (1 audio packet dropped per FEC block)", ARM_MS, &lossy, &lossy_dropped,
+                     &lossy_parity, &lossy_corrupted)) {
         return fail("the lossy UDP_WAN arm did not complete", NULL, srv, NULL);
     }
 
@@ -320,11 +361,20 @@ int main(void) {
                     NULL, srv, NULL);
     }
 
+    /* A dropped packet must NOT be counted as a CRC error: it never arrived, so there was nothing to
+     * fail a checksum. This separates the two faults the relay can inject — without it, an arm that
+     * corrupts could be satisfied by a counter that actually tracks loss. */
+    if (lossy.crc_errors != 0) {
+        fprintf(stderr, "  (crc_errors %d on an arm that only DROPPED %lld packets)\n",
+                lossy.crc_errors, lossy_dropped);
+        return fail("crc_errors counted dropped packets, which never arrived", NULL, srv, NULL);
+    }
+
     na_client_stats clean;
-    long long clean_dropped = 0, clean_parity = 0;
+    long long clean_dropped = 0, clean_parity = 0, clean_corrupted = 0;
     memset(&clean, 0, sizeof clean);
-    if (!run_wan_arm(srv, port, NO_DROP, "control (same relay, nothing dropped)",
-                     ARM_MS, &clean, &clean_dropped, &clean_parity)) {
+    if (!run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, "control (same relay, nothing dropped)",
+                     ARM_MS, &clean, &clean_dropped, &clean_parity, &clean_corrupted)) {
         return fail("the lossless control arm did not complete", NULL, srv, NULL);
     }
     if (clean_dropped != 0) {
@@ -338,10 +388,112 @@ int main(void) {
     if (clean.packets_received <= 0) {
         return fail("the control arm carried no audio at all", NULL, srv, NULL);
     }
+    /* crc_errors silent on the healthy neighbour, so arm (5)'s non-zero cannot just mean "UDP". */
+    if (clean.crc_errors != 0) {
+        return fail("crc_errors moved with nothing corrupted", NULL, srv, NULL);
+    }
+
+    /* ---- (5) crc_errors: the SAME relay corrupting instead of dropping ----
+     *
+     * A corrupted datagram ARRIVES and fails its CRC; a dropped one never arrives. Only the first can
+     * move crc_errors, at any loss rate — which is why fourteen sessions of loss testing left this
+     * counter at 0. The relay flips one payload byte and leaves the header intact, so the datagram
+     * clears the expected-sender and truncation gates that return early WITHOUT counting
+     * (UdpClientConnection.cpp:257) and reaches the CRC check that does. */
+
+    na_client_stats corrupt;
+    long long corrupt_dropped = 0, corrupt_parity = 0, corrupt_corrupted = 0;
+    memset(&corrupt, 0, sizeof corrupt);
+    if (!run_wan_arm(srv, port, NO_DROP, CORRUPT_ORDINAL,
+                     "corrupting (1 audio packet per FEC block arrives with a bad CRC)", ARM_MS,
+                     &corrupt, &corrupt_dropped, &corrupt_parity, &corrupt_corrupted)) {
+        return fail("the corrupting UDP_WAN arm did not complete", NULL, srv, NULL);
+    }
+    if (corrupt_corrupted <= 0) {
+        return fail("the relay corrupted nothing — the arm was not a CRC arm", NULL, srv, NULL);
+    }
+    if (corrupt_dropped != 0) {
+        return fail("the corrupting relay also dropped something", NULL, srv, NULL);
+    }
+    /* THE HEADLINE: crc_errors moving under real induced corruption, through the real client, by an
+     * amount that TRACKS the corruption rather than merely being non-zero. The shortfall the 3/4
+     * floor allows for is the last datagram or two still in flight when the arm ends. */
+    if (corrupt.crc_errors < (int)((corrupt_corrupted * 3) / 4)) {
+        fprintf(stderr, "  (crc_errors %d of %lld corrupted — below the 3/4 floor)\n",
+                corrupt.crc_errors, corrupt_corrupted);
+        return fail("crc_errors does not track the induced corruption", NULL, srv, NULL);
+    }
+    /* Upper bound anchored to a quantity known INDEPENDENTLY of the library: the relay is the only
+     * source of undeserializable datagrams on this path, so the client cannot legitimately count
+     * more than it corrupted. This is what catches a field wired to a sibling — packets_received and
+     * packets_reordered both run far above corrupt_corrupted on this same arm and would sail past a
+     * bare "> 0" while blowing this bound. */
+    if ((long long)corrupt.crc_errors > corrupt_corrupted) {
+        fprintf(stderr, "  (crc_errors %d exceeds the %lld datagrams the relay corrupted)\n",
+                corrupt.crc_errors, corrupt_corrupted);
+        return fail("crc_errors exceeds the datagrams actually corrupted", NULL, srv, NULL);
+    }
+    if (!g_rx_ok) {
+        return fail("no RX signature survived the corrupting arm", NULL, srv, NULL);
+    }
+
+    /* ---- (6) queue_drops: #25's proposed provocation, RUN, and it does not move ----
+     *
+     * #25 proposed "a listener whose na_audio_cb sleeps longer than the reorder window" for
+     * queue_drops. That cannot work, and this arm is the executable refutation rather than an
+     * argument. The queue's cap is BlockingPacketQueue::kDefaultMaxSize = 2048 packets (~20 s of
+     * audio), not the 30 ms reorder window; and on a client-owned connection — the only kind a
+     * na_client_* consumer ever gets (UdpClientTransport.hpp:50) — receiveFromSocket DRAINS the
+     * queue before it reads the socket, so the producer and the consumer are the same thread. A
+     * blocking callback stalls the producer with the consumer and the depth never exceeds one
+     * reorder burst (~8).
+     *
+     * So this asserts a NEGATIVE, deliberately: queue_drops stays 0 while the consumer is stalled
+     * hard enough to overflow the socket buffer. If a future change makes it move, this arm fails —
+     * and that failure is the signal to update the na_client_stats contract in include/naudio.h,
+     * which documents the field as unreachable on a client connection. */
+
+    na_client_stats stalled;
+    long long stalled_dropped = 0, stalled_parity = 0, stalled_corrupted = 0;
+    memset(&stalled, 0, sizeof stalled);
+    g_stall_cb_ms = STALL_CB_MS;
+    const int stall_ok =
+        run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, "stalled consumer (audio cb blocks 100 ms)",
+                    STALL_ARM_MS, &stalled, &stalled_dropped, &stalled_parity, &stalled_corrupted);
+    g_stall_cb_ms = 0;
+    if (!stall_ok) {
+        return fail("the stalled-consumer arm did not complete", NULL, srv, NULL);
+    }
+    /* The stall has to have actually happened, or the negative below proves nothing. */
+    if (g_cb_calls <= 0) {
+        return fail("the audio callback never ran, so the consumer was never stalled", NULL, srv,
+                    NULL);
+    }
+    if (stalled.queue_drops != 0) {
+        fprintf(stderr, "  (queue_drops %lld — reachable after all; update the na_client_stats "
+                        "contract in include/naudio.h)\n", stalled.queue_drops);
+        return fail("queue_drops moved on a client-owned connection", NULL, srv, NULL);
+    }
+    /* Same shape for control_retransmits, and for the same reason it is documented as unreachable:
+     * ControlReliability::isCriticalType does not list ConnectRequest, HeartbeatAck or LatencyProbe,
+     * so the only tracked control message a client ever sends is Disconnect — and by the time it is
+     * sent, closed_ is set and the heartbeat loop that pumps the retransmit sweep is already down,
+     * which AudioStreamClient.cpp:742-744 states in its own comment. Nothing is ever pending when a
+     * sweep runs. */
+    if (stalled.control_retransmits != 0 || corrupt.control_retransmits != 0 ||
+        lossy.control_retransmits != 0) {
+        fprintf(stderr, "  (control_retransmits %lld/%lld/%lld — reachable after all; update the "
+                        "na_client_stats contract in include/naudio.h)\n",
+                lossy.control_retransmits, corrupt.control_retransmits,
+                stalled.control_retransmits);
+        return fail("control_retransmits moved on a client connection", NULL, srv, NULL);
+    }
 
     na_server_stop(srv);
     na_server_destroy(srv);
-    printf("c_client_stats: PASS — %lld recovered under induced loss, 0 with none\n",
-           lossy.packets_recovered_by_fec);
+    printf("c_client_stats: PASS — %lld recovered under induced loss (0 with none), %d crc_errors "
+           "under induced corruption of %lld datagrams (0 with none); queue_drops and "
+           "control_retransmits confirmed unreachable on a client connection\n",
+           lossy.packets_recovered_by_fec, corrupt.crc_errors, corrupt_corrupted);
     return 0;
 }

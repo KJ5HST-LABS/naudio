@@ -401,10 +401,17 @@ NA_EXPORT int na_client_server_tx_owner(na_stream_client* client, char* buf, int
  *
  *   NA_RELIABILITY_DEFAULT (TCP)  packets_/bytes_ + crc_errors only; every reliability
  *                                 counter below stays 0 (TCP has none of the subsystems).
- *   NA_RELIABILITY_UDP_LAN/_FT8   + packets_reordered, control_retransmits. FEC is off in
- *                                 these profiles, so both FEC counters stay 0.
+ *   NA_RELIABILITY_UDP_LAN/_FT8   + packets_reordered. FEC is off in these profiles, so both
+ *                                 FEC counters stay 0.
  *   NA_RELIABILITY_UDP_WAN        + packets_recovered_by_fec, fec_blocks_unreconciled,
- *                                 jitter_ms, buffer_target_ms. The whole set is live.
+ *                                 jitter_ms, buffer_target_ms.
+ *
+ * TWO COUNTERS CANNOT MOVE ON A CLIENT AT ALL — control_retransmits and queue_drops. They are not
+ * dead code and they are not off: both are written by live paths that only a SERVER-side connection
+ * reaches, and this struct reports a client's. Each field says why below. They read 0 rather than the
+ * -1 the three unavailable counters use, because -1 is this struct's frozen encoding for "the library
+ * is not measuring this", and these two ARE measured — the client simply never produces the event.
+ * Treat a 0 in either as carrying no information about the connection.
  */
 typedef struct na_client_stats {
     /* 1 if a live connection supplied these numbers. 0 means there is none (before connect,
@@ -428,9 +435,20 @@ typedef struct na_client_stats {
      * audio block — so a non-zero value here alongside a low packets_recovered_by_fec is the
      * expected shape on a busy roster, not a defect. */
     long long fec_blocks_unreconciled;
-    long long control_retransmits;       /* control-ARQ resends (reliability layer, not audio) */
-    /* Packets discarded from the ordered queue because it was full — a consumer too slow to
-     * drain it. Audio lost LOCALLY, after the network delivered it successfully. */
+    /* Control-ARQ resends (reliability layer, not audio). ALWAYS 0 ON A CLIENT: only a critical
+     * control type is tracked for retransmission, and of the four control messages a client sends
+     * (CONNECT_REQUEST, HEARTBEAT_ACK, LATENCY_PROBE, DISCONNECT) only DISCONNECT is critical — and
+     * it is sent during close, after the heartbeat thread that pumps the retransmit sweep has already
+     * exited, so nothing is ever pending when a sweep runs. The counter moves on the SERVER side,
+     * which sends CONNECT_ACCEPT / AUDIO_CONFIG / TX_GRANTED / CLIENTS_UPDATE and retransmits them. */
+    long long control_retransmits;
+    /* Packets discarded from the ordered queue because it was full — audio lost LOCALLY, after the
+     * network delivered it successfully. ALWAYS 0 ON A CLIENT: the cap is 2048 packets (~20 s of
+     * audio), and on a client the same thread both fills the queue and drains it — the receive path
+     * empties the queue before it reads the socket, so a slow consumer stalls the producer with it
+     * and the depth never exceeds one reorder burst. A consumer too slow to keep up loses audio in
+     * the kernel's socket buffer instead, which no counter here reports. The counter moves on the
+     * SERVER side, where a demux thread fills the queue and the application thread drains it. */
     long long queue_drops;
     double    jitter_ms;                 /* current inter-arrival jitter estimate; 0 if off    */
     int       buffer_target_ms;          /* adaptive buffer target; -1 when adaptive jitter is off */
