@@ -24,6 +24,15 @@
  *   (5) UDP_WAN, one audio packet CORRUPTED per block -> crc_errors moves
  *   (6) UDP_WAN, a deliberately stalled audio callback -> queue_drops does NOT move
  *
+ * SINCE 0.2.0, arm (1) also covers the struct_size guard in BOTH directions — a caller declaring
+ * MORE than the library writes (the tail is zero-filled, nothing past it touched) and a caller
+ * declaring the V1 size against this longer library (sequence_gaps is not written at all). The
+ * second is the case appending a field created, and only a shorter-than-ours declaration reaches
+ * the guard, so neither block substitutes for the other. Arms (2)-(6) carry sequence_gaps through
+ * the same fault matrix: -1 on TCP, 0 on the lossless control, bounded on both sides by the
+ * relay's own drop count under loss, and — deliberately — 0 on the stalled consumer, because a
+ * tail-dropping socket buffer leaves no hole for a gap counter to find.
+ *
  * DROPPING AND CORRUPTING ARE DIFFERENT FAULTS, and the distinction is the whole reason crc_errors
  * sat at 0 through fourteen sessions of loss testing: a dropped datagram never arrives, so nothing
  * fails a checksum. Arm (5) is the first arm on this project to make a datagram ARRIVE broken.
@@ -191,11 +200,13 @@ static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal, 
     printf("c_client_stats: %s — drop_ordinal=%d corrupt_ordinal=%d stall_cb_ms=%d; relay saw %lld "
            "audio, dropped %lld, corrupted %lld, forwarded %lld parity; client recovered %lld, "
            "unreconciled %lld, reordered %lld, crc_errors %d, control_retransmits %lld, "
-           "queue_drops %lld, received %lld pkts / %lld B, cb_calls %ld, rx_signature=%d (%d ms)\n",
+           "queue_drops %lld, sequence_gaps %lld, received %lld pkts / %lld B, cb_calls %ld, "
+           "rx_signature=%d (%d ms)\n",
            what, drop_ordinal, corrupt_ordinal, g_stall_cb_ms, naproxy_audio_seen(proxy),
            *out_dropped, *out_corrupted, *out_parity, st.packets_recovered_by_fec,
            st.fec_blocks_unreconciled, st.packets_reordered, st.crc_errors, st.control_retransmits,
-           st.queue_drops, st.packets_received, st.bytes_received, g_cb_calls, g_rx_ok, waited);
+           st.queue_drops, st.sequence_gaps, st.packets_received, st.bytes_received, g_cb_calls,
+           g_rx_ok, waited);
 
     na_client_disconnect(c);
     na_client_destroy(c);
@@ -276,6 +287,35 @@ int main(void) {
                 }
             }
         }
+        /* ---- the mirror, and the case 0.2.0 actually created ----
+         * A caller compiled against v1 calling this 0.2.0 library. It is entitled to: the floor
+         * check accepts NA_CLIENT_STATS_SIZE_V1 and always will, because a v1 consumer is exactly
+         * who the struct_size scheme exists to keep working. sequence_gaps lives BEYOND that floor,
+         * so writing it unconditionally — the obvious way to add a field — scribbles past the end
+         * of that consumer's struct. That is the #26 hazard reintroduced by the first field to use
+         * the #26 mechanism, and it is observed here directly rather than reasoned about: every
+         * byte from the v1 floor onward must come back untouched.
+         *
+         * The over-sized block above cannot catch this. It declares MORE than we write, so it
+         * exercises the zero-fill; this one declares LESS, which is the only way to reach the
+         * guard. Two directions, two blocks — a single block would leave one of them untested. */
+        {
+            struct { na_client_stats base; unsigned char tail[32]; } v1c;
+            unsigned char *raw = (unsigned char *)&v1c;
+            size_t i;
+            memset(&v1c, 0xA5, sizeof v1c);
+            if (na_client_get_stats(probe, &v1c.base, NA_CLIENT_STATS_SIZE_V1) != NA_OK) {
+                return fail("a v1-sized struct_size was rejected — v1 consumers must keep working",
+                            probe, NULL, NULL);
+            }
+            for (i = NA_CLIENT_STATS_SIZE_V1; i < sizeof v1c; i++) {
+                if (raw[i] != 0xA5) {
+                    return fail("na_client_get_stats wrote past a V1 caller's struct — the post-v1 "
+                                "field is not guarded on the caller's declared size",
+                                probe, NULL, NULL);
+                }
+            }
+        }
         na_client_destroy(probe);
     }
 
@@ -327,6 +367,15 @@ int main(void) {
         }
         if (!gap_counters_are_unmeasured(&st)) {
             return fail("the gap counters do not read -1 on TCP", tc, tsrv, NULL);
+        }
+        /* The one place BOTH sides of the complement are unmeasured, and the reason sequence_gaps
+         * defaults to -1 rather than to 0 like its Transport neighbours: TCP builds no reorder
+         * buffer, so there is nothing counting, and a 0 would read as "nothing was lost" from a
+         * field that measured nothing at all. */
+        if (st.sequence_gaps != -1) {
+            fprintf(stderr, "  (sequence_gaps %lld on TCP, which builds no reorder buffer)\n",
+                    st.sequence_gaps);
+            return fail("sequence_gaps does not read -1 on TCP", tc, tsrv, NULL);
         }
         if (!g_rx_ok) return fail("no RX signature reached the callback (tcp)", tc, tsrv, NULL);
 
@@ -395,6 +444,32 @@ int main(void) {
     if (!gap_counters_are_unmeasured(&lossy)) {
         return fail("the gap counters do not read -1 on UDP_WAN", NULL, srv, NULL);
     }
+    /* sequence_gaps (@since 0.2.0) is the COMPLEMENT of those three: measured precisely where they
+     * are not. -1 here would mean no reorder buffer, which UDP_WAN always has. */
+    if (lossy.sequence_gaps < 0) {
+        return fail("sequence_gaps reads unmeasured on UDP_WAN, which always engages a reorder "
+                    "buffer — it and the three gap counters must never both be -1",
+                    NULL, srv, NULL);
+    }
+    /* Two-sided, both bounds anchored to a quantity known INDEPENDENTLY of the field (Learning 31):
+     *   lower — every FEC recovery implies the slot was gapped first, since the pipeline is
+     *           reorder -> FEC and the decoder only ever sees what the buffer already gave up on;
+     *   upper — the relay's own drop count, which the library never sees.
+     * Measured 29 gaps against 30 dropped and 29 recovered, so the window is tight. A field
+     * cross-wired to a sibling blows one of these: packets_reordered reads 116 and
+     * packets_received 153 on this same arm. */
+    if (lossy.sequence_gaps < lossy.packets_recovered_by_fec) {
+        fprintf(stderr, "  (sequence_gaps %lld < recovered %lld — a slot was repaired that was "
+                        "never gapped)\n", lossy.sequence_gaps, lossy.packets_recovered_by_fec);
+        return fail("sequence_gaps is below the packets FEC recovered from those same gaps",
+                    NULL, srv, NULL);
+    }
+    if (lossy.sequence_gaps > lossy_dropped) {
+        fprintf(stderr, "  (sequence_gaps %lld > %lld actually dropped)\n",
+                lossy.sequence_gaps, lossy_dropped);
+        return fail("sequence_gaps exceeds the packets the relay actually dropped", NULL, srv,
+                    NULL);
+    }
     if (lossy.buffer_target_ms <= 0) {
         return fail("buffer_target_ms is not live on UDP_WAN, which enables adaptive jitter",
                     NULL, srv, NULL);
@@ -430,6 +505,13 @@ int main(void) {
     /* crc_errors silent on the healthy neighbour, so arm (5)'s non-zero cannot just mean "UDP". */
     if (clean.crc_errors != 0) {
         return fail("crc_errors moved with nothing corrupted", NULL, srv, NULL);
+    }
+    /* Silent here too — and note this is 0, not -1: the reorder buffer IS engaged and IS counting,
+     * it simply had nothing to count. That distinction is the entire point of the two conventions,
+     * and this is the arm where the difference between them is observable. */
+    if (clean.sequence_gaps != 0) {
+        fprintf(stderr, "  (sequence_gaps %lld with nothing dropped)\n", clean.sequence_gaps);
+        return fail("sequence_gaps moved on a lossless relay", NULL, srv, NULL);
     }
 
     /* ---- (5) crc_errors: the SAME relay corrupting instead of dropping ----
@@ -512,6 +594,30 @@ int main(void) {
         fprintf(stderr, "  (queue_drops %lld — reachable after all; update the na_client_stats "
                         "contract in include/naudio.h)\n", stalled.queue_drops);
         return fail("queue_drops moved on a client-owned connection", NULL, srv, NULL);
+    }
+    /* sequence_gaps ALSO stays 0 here, and this is the second negative this arm asserts — added
+     * with the field in 0.2.0 because the obvious expectation is the opposite one.
+     *
+     * A gap counter looks like it should report slow-consumer loss: the consumer falls behind, the
+     * socket buffer overflows, datagrams die, and surely a hole appears. It does not. The buffer
+     * TAIL-drops — it discards the newest arrivals, not the oldest — so a stalled consumer reads an
+     * unbroken PREFIX of the stream and simply stops early. Nothing it read has a hole in it, so
+     * there is nothing for any gap-based counter to count.
+     *
+     * Measured while writing this arm, by running it out to 8 s: the relay forwarded 400 audio
+     * packets, the client read 127, and sequence_gaps and packets_reordered were both 0. The loss
+     * was real and total silence from every counter was the correct reading.
+     *
+     * This is why the field's header contract says local loss remains unreported by this struct,
+     * rather than claiming sequence_gaps closes that gap — issue #29's premise was that a
+     * post-reorder gap counter would report it, and this arm is the executable refutation. If it
+     * ever DOES move here, the tail-drop assumption has changed and that contract needs revisiting. */
+    if (stalled.sequence_gaps != 0) {
+        fprintf(stderr, "  (sequence_gaps %lld on a stalled consumer — the socket buffer is no "
+                        "longer tail-dropping; revisit the contract in include/naudio.h)\n",
+                stalled.sequence_gaps);
+        return fail("sequence_gaps moved on a stalled consumer, which tail-drop makes invisible",
+                    NULL, srv, NULL);
     }
     /* Same shape for control_retransmits, and for the same reason it is documented as unreachable:
      * ControlReliability::isCriticalType does not list ConnectRequest, HeartbeatAck or LatencyProbe,

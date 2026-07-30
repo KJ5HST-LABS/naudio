@@ -591,8 +591,9 @@ typedef struct na_client_stats {
      * audio), and on a client the same thread both fills the queue and drains it — the receive path
      * empties the queue before it reads the socket, so a slow consumer stalls the producer with it
      * and the depth never exceeds one reorder burst. A consumer too slow to keep up loses audio in
-     * the kernel's socket buffer instead — read `sequence_gaps` for that, which is where such loss
-     * became visible in 0.2.0. The counter moves on the
+     * the kernel's socket buffer instead, which NO field here reports — not this one, and not
+     * sequence_gaps either, because that buffer tail-drops and leaves no hole to detect. The
+     * counter moves on the
      * SERVER side, where a demux thread fills the queue and the application thread drains it. */
     long long queue_drops;
     double    jitter_ms;                 /* current inter-arrival jitter estimate; 0 if off    */
@@ -623,9 +624,14 @@ typedef struct na_client_stats {
      *   - NOT final loss. It is counted BEFORE the FEC decoder sees the stream (the pipeline is
      *     reorder -> FEC -> queue), so a slot counted here may still be refilled by parity. The
      *     unrecovered remainder is sequence_gaps - packets_recovered_by_fec.
-     *   - NOT a cause. This is where a too-slow consumer's kernel-dropped datagrams finally
-     *     become visible — the loss mode that had no counter at all before 0.2.0 — but a gap
-     *     cannot distinguish one from a datagram lost on the wire, and this field does not try.
+     *   - NOT a cause, and in particular NOT local loss. A gap cannot distinguish a datagram
+     *     the kernel discarded from one lost on the wire, and this field does not try. More
+     *     importantly it does not SEE the slow-consumer case at all: an overflowing socket
+     *     buffer tail-drops, so a consumer that cannot keep up reads a contiguous prefix of the
+     *     stream and simply stops early. There is no hole in what it read, so there is nothing
+     *     for a gap counter to count. Measured: a client stalled to a quarter of the offered
+     *     rate read 127 of 400 packets with sequence_gaps == 0. Local loss remains unreported
+     *     by any field in this struct (see queue_drops, which cannot move on a client either).
      *
      * It counts every packet type sharing the sequence space (audio, parity, control), not
      * audio packets alone, so it moves a little on a busy roster even with no loss. */
