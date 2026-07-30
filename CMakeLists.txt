@@ -375,14 +375,25 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
         add_test(NAME naudio_c_abi_fault COMMAND naudio_c_abi_fault)
     endif()
 
-    # README honesty gate: extract every ```c / ```cpp
+    # Documentation honesty gate: extract every ```c / ```cpp
     # fenced block from README.md and compile each (-fsyntax-only) against the
     # in-tree headers, so a documented example that stops matching the real C ABI /
     # C++ API fails CI. POSIX-only (a bash + cc/c++ harness); the headers it checks
     # are platform-neutral, so running it on the Linux + macOS matrix covers them.
+    #
+    # docs/hamlib-streaming-bridge.md is checked too: its C blocks call the client
+    # ABI (na_client_set_reliability_profile, na_client_get_stats), so an ABI change
+    # can make them stale exactly as it can a README block. Its snippets are
+    # fragments of a client the prose already built, so their free identifiers come
+    # from tests/readme-snippets/preamble.hamlib-streaming-bridge.md.c — a per-FILE
+    # preamble, kept out of the shared one so README's blocks stay as tightly
+    # checked as they were. Any further doc added here needs the same treatment;
+    # check.sh documents the sidecar naming.
     if(NOT WIN32)
         add_test(NAME naudio_readme_snippets
-                 COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/readme-snippets/check.sh")
+                 COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/readme-snippets/check.sh"
+                              "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+                              "${CMAKE_CURRENT_SOURCE_DIR}/docs/hamlib-streaming-bridge.md")
     endif()
 endif()
 

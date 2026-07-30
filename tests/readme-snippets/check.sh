@@ -18,6 +18,13 @@
 # snippets reference but don't define (on_pcm/events/user for the networking
 # example).
 #
+# PER-FILE preamble: a markdown file may supply free identifiers of its own via a
+# sidecar next to this script, named `preamble.<markdown basename>.<c|cpp>`. It is
+# appended to the shared preamble for THAT file's blocks only. Deliberately not
+# merged into the shared one: an identifier added there would also satisfy every
+# README snippet, so a README block that referenced it without declaring it would
+# start compiling — the gate would silently annex blocks it no longer checks.
+#
 # A block can opt OUT of the gate with an HTML comment on the line immediately
 # above its opening fence:
 #     <!-- snippet-check: skip -->
@@ -26,6 +33,7 @@
 #     ```
 #
 # Usage:  tests/readme-snippets/check.sh [extra.md ...]
+#         (no arguments checks README.md alone)
 # Env:    CC (default cc), CXX (default c++).
 #
 set -euo pipefail
@@ -93,9 +101,16 @@ extract() {
   ' "$1"
 }
 
+# md_base[<file index>] remembers each source file's basename, so the compile loop
+# can find that file's sidecar preamble from a block name (block_<file index>_<n>).
+# An indexed array, not an associative one: macOS ships bash 3.2, which has no
+# `declare -A`, and the macOS CI job runs this script.
+md_base=()
+
 i=0
 for md in "${files[@]}"; do
   i=$((i+1))
+  md_base[$i]="$(basename "$md")"
   extract "$md" "$i"
 done
 
@@ -112,8 +127,12 @@ for block in "${blocks[@]}"; do
   ext="${block##*.}"
   name="$(basename "$block")"
   tu="$work/tu_${name}.${ext}"
+  # block_<file index>_<n>.<ext> -> the file index, to find that file's sidecar preamble.
+  idx="${name#block_}"; idx="${idx%%_*}"
+  sidecar="$here/preamble.${md_base[$idx]}.$ext"
   {
     if [ "$ext" = "c" ]; then printf '%s\n' "$c_preamble"; else printf '%s\n' "$cpp_preamble"; fi
+    if [ -f "$sidecar" ]; then cat "$sidecar"; fi
     grep -E '^[[:space:]]*#' "$block" || true
     printf 'static int na_snippet_%s(void){\n' "$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' _)"
     grep -vE '^[[:space:]]*#' "$block"
