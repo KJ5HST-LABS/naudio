@@ -880,6 +880,10 @@ ClientStats AudioStreamClient::stats() const {
         s.packetsOutOfOrder = conn->packetsOutOfOrder();
         s.packetLossRate = conn->packetLossRate();
     }
+    // Unconditional: the connection itself returns -1 when it is not measuring, so
+    // there is no predicate to gate on here. It is the complement of the block above
+    // — live exactly when those three are -1 — and the two are never both readings.
+    s.sequenceGaps = conn->sequenceGaps();
     return s;
 }
 

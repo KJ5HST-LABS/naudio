@@ -96,6 +96,14 @@ struct ClientStats {
     std::int64_t packetsLost = -1;
     std::int64_t packetsOutOfOrder = -1;
     double packetLossRate = -1.0;
+
+    // Sequence slots the reorder buffer gave up on — the post-reorder loss measure,
+    // and the exact COMPLEMENT of the three above: a reorder buffer is engaged on
+    // every built-in UDP profile, so this is live precisely where they are -1, and
+    // -1 here precisely where they are live. Counted before the FEC decoder gets its
+    // chance to refill the slot, so the unrecovered remainder is this minus
+    // packetsRecoveredByFec. See Transport::sequenceGaps for the full contract.
+    std::int64_t sequenceGaps = -1;
 };
 
 // Client for connecting to an AudioStreamServer.

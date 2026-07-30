@@ -235,6 +235,10 @@ public:
     // at 0 forever and must be reported as unmeasured rather than as zero loss.
     bool measuresSequenceGaps() const override;
 
+    // The complement of the above: -1 unless a reorder buffer IS engaged, in which
+    // case it reports the slots that buffer gave up on. See Transport::sequenceGaps.
+    std::int64_t sequenceGaps() const override;
+
     // --- Diagnostics ---
     // Packets dropped from the ordered queue under backpressure and the
     // current queue depth — exposed so a flood test can assert the bound holds.

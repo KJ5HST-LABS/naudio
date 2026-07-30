@@ -100,6 +100,23 @@ public:
     // after the network delivered it.
     virtual std::int64_t orderedQueueDrops() const { return 0; }
 
+    // Sequence slots the reorder buffer gave up on and emitted as a gap — the
+    // pipeline could not deliver them in order. This is the POST-REORDER loss
+    // measure, and it is the complement of packetsLost(): exactly one of the two
+    // is measured on any given connection, because the gap tracker runs only when
+    // NO reorder buffer is engaged and this counter exists only when one IS.
+    //
+    // Counted BEFORE the FEC decoder sees the stream (the pipeline is
+    // reorder -> FEC -> ordered queue), so a slot counted here may still be
+    // refilled; the unrecovered remainder is this minus packetsRecoveredByFec().
+    // Counts every packet type sharing the sequence space — audio, parity and
+    // control alike — not audio packets alone.
+    //
+    // Defaults to -1, NOT to 0 like its neighbours above: 0 here would read as
+    // "nothing was lost", which is the one thing a loss counter must never say
+    // when it is not measuring. TCP and any passthrough profile keep the -1.
+    virtual std::int64_t sequenceGaps() const { return -1; }
+
     // Whether packetsLost() / packetsOutOfOrder() / packetLossRate() are actually
     // MEASURED on this connection. When false they are unavailable, and a consumer
     // must not read their 0 as "nothing was lost".
