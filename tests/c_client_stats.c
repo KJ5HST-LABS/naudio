@@ -174,7 +174,7 @@ static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal, 
         waited += 20;
     }
 
-    if (na_client_get_stats(c, &st) != NA_OK) {
+    if (na_client_get_stats(c, &st, sizeof st) != NA_OK) {
         fprintf(stderr, "FAIL: na_client_get_stats final (%s)\n", what);
         na_client_destroy(c);
         naproxy_stop(proxy);
@@ -211,19 +211,19 @@ int main(void) {
 
     /* ---- (1) argument contract, no server needed ---- */
 
-    if (na_client_get_stats(NULL, &st) != NA_ERR_INVALID || na_last_error() != NA_ERR_INVALID) {
-        return fail("na_client_get_stats(NULL, &st) not NA_ERR_INVALID", NULL, NULL, NULL);
+    if (na_client_get_stats(NULL, &st, sizeof st) != NA_ERR_INVALID || na_last_error() != NA_ERR_INVALID) {
+        return fail("na_client_get_stats(NULL, &st, sizeof st) not NA_ERR_INVALID", NULL, NULL, NULL);
     }
     {
         na_stream_client *probe =
             na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", 4533, "stats-probe");
         if (probe == NULL) return fail("na_client_create (probe)", NULL, NULL, NULL);
-        if (na_client_get_stats(probe, NULL) != NA_ERR_INVALID) {
+        if (na_client_get_stats(probe, NULL, sizeof st) != NA_ERR_INVALID) {
             return fail("na_client_get_stats(client, NULL) not NA_ERR_INVALID", probe, NULL, NULL);
         }
         /* Never connected: NOT an error — connected == 0 with defaults, and the unmeasured
          * counters already reading -1 rather than 0. */
-        if (na_client_get_stats(probe, &st) != NA_OK) {
+        if (na_client_get_stats(probe, &st, sizeof st) != NA_OK) {
             return fail("na_client_get_stats on an unconnected client is not NA_OK", probe, NULL,
                         NULL);
         }
@@ -236,6 +236,45 @@ int main(void) {
         }
         if (!gap_counters_are_unmeasured(&st)) {
             return fail("the gap counters do not read -1 before connect", probe, NULL, NULL);
+        }
+
+        /* ---- struct_size is the write bound, not a formality ----
+         * Below the v1 floor is refused outright — including the 0 a caller who forgot the
+         * argument would pass through an implicit conversion. */
+        if (na_client_get_stats(probe, &st, 0) != NA_ERR_INVALID ||
+            na_last_error() != NA_ERR_INVALID) {
+            return fail("struct_size 0 not NA_ERR_INVALID", probe, NULL, NULL);
+        }
+        if (na_client_get_stats(probe, &st, NA_CLIENT_STATS_SIZE_V1 - 1) != NA_ERR_INVALID) {
+            return fail("struct_size below the v1 floor not NA_ERR_INVALID", probe, NULL, NULL);
+        }
+        /* A caller compiled against a LONGER future header. Two things must hold, and they are
+         * the whole point of the parameter: the bytes it DECLARED beyond our struct are zeroed
+         * (defined, not indeterminate), and not one byte past what it declared is touched.
+         * The second is the out-of-bounds write this migration exists to prevent, observed
+         * directly rather than inferred. */
+        {
+            struct { na_client_stats base; unsigned char tail[64]; } future;
+            unsigned char *raw = (unsigned char *)&future;
+            const size_t declared = sizeof(na_client_stats) + 32;  /* < sizeof future: 32 spare */
+            size_t i;
+            memset(&future, 0xA5, sizeof future);
+            if (na_client_get_stats(probe, &future.base, declared) != NA_OK) {
+                return fail("an over-sized (future-header) struct_size was rejected", probe, NULL,
+                            NULL);
+            }
+            for (i = sizeof(na_client_stats); i < declared; i++) {
+                if (raw[i] != 0x00) {
+                    return fail("the declared tail beyond our struct was not zero-filled", probe,
+                                NULL, NULL);
+                }
+            }
+            for (i = declared; i < sizeof future; i++) {
+                if (raw[i] != 0xA5) {
+                    return fail("na_client_get_stats wrote PAST the caller's declared struct_size",
+                                probe, NULL, NULL);
+                }
+            }
         }
         na_client_destroy(probe);
     }
@@ -266,7 +305,7 @@ int main(void) {
             sleep_ms(20);
             waited += 20;
         }
-        if (na_client_get_stats(tc, &st) != NA_OK) {
+        if (na_client_get_stats(tc, &st, sizeof st) != NA_OK) {
             return fail("na_client_get_stats (tcp)", tc, tsrv, NULL);
         }
         if (st.connected != 1) return fail("connected != 1 while connected (tcp)", tc, tsrv, NULL);

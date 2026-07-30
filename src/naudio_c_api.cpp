@@ -844,14 +844,30 @@ extern "C" int na_client_server_tx_owner(na_stream_client* client, char* buf, in
 // ---- Reliability counters --------------------------------------------------------------
 // A field-by-field copy out of ClientStats rather than a memcpy or a layout assertion: the C
 // struct is a FROZEN ABI surface and the C++ one is free to gain fields, so the two must be
-// allowed to diverge. Every na_client_stats field is written on every non-error path (the
-// unmeasured -1s included), so a caller never has to pre-zero the struct.
+// allowed to diverge. Every na_client_stats field the caller's `struct_size` covers is written
+// on every non-error path (the unmeasured -1s included), so a caller never has to pre-zero the
+// struct — which is exactly why the size travels as a PARAMETER here and not as an in-band
+// first member the way the two callback tables carry it. An out-parameter that the caller had
+// to initialize before the call would invert this contract, and every call site in the tree
+// (README.md's compiled snippet included) declares the struct uninitialized.
+//
+// Field-wise, not byte-wise, for the mirror of the reason copyCallerStruct above is byte-wise:
+// this side has no second na_client_stats to copy from, only a differently-shaped C++ struct.
+// When a field is appended, guard it with `if (struct_size >= NA_CLIENT_STATS_SIZE_V2)`.
 
-extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out) {
+extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out,
+                                          std::size_t struct_size) {
     NA_GUARD(NA_ERR_BACKEND, {
-        if (client == nullptr || out == nullptr) {
+        if (client == nullptr || out == nullptr || struct_size < NA_CLIENT_STATS_SIZE_V1) {
             setError(NA_ERR_INVALID);
             return NA_ERR_INVALID;
+        }
+        // A caller compiled against a LONGER version of this header gets its tail zeroed rather
+        // than left indeterminate. (A caller compiled against a shorter one cannot reach here:
+        // every field below is v1, and the floor check above guarantees v1 fits.)
+        if (struct_size > sizeof(na_client_stats)) {
+            std::memset(reinterpret_cast<char*>(out) + sizeof(na_client_stats), 0,
+                        struct_size - sizeof(na_client_stats));
         }
         const naudio::net::ClientStats s = client->client->stats();
         out->connected = s.connected ? 1 : 0;

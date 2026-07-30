@@ -434,6 +434,12 @@ NA_EXPORT int na_client_server_tx_owner(na_stream_client* client, char* buf, int
  * -1 the three unavailable counters use, because -1 is this struct's frozen encoding for "the library
  * is not measuring this", and these two ARE measured — the client simply never produces the event.
  * Treat a 0 in either as carrying no information about the connection.
+ *
+ * BINARY COMPATIBILITY. This struct is caller-allocated but the library WRITES it, so — unlike the
+ * two callback tables — it does NOT carry an in-band struct_size. An out-parameter the caller had to
+ * pre-initialize would invert this struct's contract (see na_client_get_stats: nothing here has ever
+ * needed pre-zeroing). The size travels as an explicit PARAMETER instead. New fields are only ever
+ * APPENDED, and na_client_get_stats writes only what the caller's declared size covers.
  */
 typedef struct na_client_stats {
     /* 1 if a live connection supplied these numbers. 0 means there is none (before connect,
@@ -487,11 +493,31 @@ typedef struct na_client_stats {
     double    packet_loss_rate;
 } na_client_stats;
 
+/* The size of na_client_stats in the FIRST published ABI, and the floor na_client_get_stats
+ * enforces. FROZEN: `packet_loss_rate` is v1's last field forever, so appending does not move it. */
+#define NA_CLIENT_STATS_SIZE_V1 \
+    (offsetof(na_client_stats, packet_loss_rate) + sizeof(double))
+
 /* Fill *out with a snapshot of the client's counters. Safe to call from any thread at any
  * time, including while streaming and before connect (which yields connected == 0 and
- * defaults). NA_ERR_INVALID on a NULL client or a NULL out; NA_OK otherwise — a
- * not-connected client is NOT an error, it is `connected == 0`. */
-NA_EXPORT na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out);
+ * defaults). NA_ERR_INVALID on a NULL client, a NULL out, or a `struct_size` below
+ * NA_CLIENT_STATS_SIZE_V1; NA_OK otherwise — a not-connected client is NOT an error, it is
+ * `connected == 0`.
+ *
+ * `struct_size` is sizeof(na_client_stats) AS THE CALLER COMPILED IT, and it is what makes this
+ * call safe across library versions:
+ *
+ *     na_client_stats st;                    // no pre-zeroing needed, as ever
+ *     na_client_get_stats(c, &st, sizeof st);
+ *
+ * A library NEWER than the caller writes only the prefix the caller allocated, so an appended
+ * field can never scribble past the end of an already-compiled consumer's struct — the hazard
+ * this parameter exists for. A library OLDER than the caller fills the fields it knows and
+ * ZERO-fills the remainder, so the tail is defined rather than indeterminate; note that such a
+ * zero is indistinguishable from a genuine zero, and naudio exposes no run-time library-version
+ * accessor to tell them apart. Build against the version you link. */
+NA_EXPORT na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out,
+                                         size_t struct_size);
 
 /* ---- Networking audio-streaming server (na_server_*) -----------------------------------
  *

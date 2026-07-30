@@ -5,6 +5,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING (C ABI): three of the four caller-allocated structs now carry their own size, so an
+  appended field stops being an out-of-bounds access against an already-compiled consumer.** None
+  of them recorded how large the caller believed them to be, so adding any field to a future
+  release would have made the library read or write past the end of a struct allocated by a
+  consumer compiled against the older header — silently, with no symbol rename and no link error.
+  The mechanism follows the struct's **direction**, because one size does not fit both:
+  - `na_client_callbacks` and `na_server_callbacks` are **read** by the library and gain an in-band
+    `size_t struct_size` as their first member, set by the caller (Win32's `cbSize` idiom). Callers
+    already `memset` these, so it is one line beside the existing one. `na_client_set_callbacks` /
+    `na_server_set_callbacks` return `NA_ERR_INVALID` below `NA_CLIENT_CALLBACKS_SIZE_V1` /
+    `NA_SERVER_CALLBACKS_SIZE_V1`, which includes the `0` an unset field carries.
+  - `na_client_stats` is **written** by the library, so its size travels as an explicit parameter:
+    `na_client_get_stats(client, out, sizeof *out)`, `NA_ERR_INVALID` below
+    `NA_CLIENT_STATS_SIZE_V1`. An in-band member would have required callers to initialize an
+    out-parameter, inverting this struct's long-standing "never needs pre-zeroing" contract.
+  In both directions the library honours the caller's declared size as a hard bound: a shorter
+  caller keeps its un-allocated tail untouched, and a longer one has its extra bytes zero-filled
+  (stats) or ignored (callbacks). `na_device` / `na_enumerate` are unchanged so far. Nothing has
+  been tagged and `SOVERSION` is still 0, so no released consumer exists to break.
+
 ### Fixed
 - **`na_client_stats` no longer claims two counters can move on a client when they cannot** — the
   struct's contract listed `control_retransmits` as live on `NA_RELIABILITY_UDP_LAN` / `_FT8`, and

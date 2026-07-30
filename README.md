@@ -108,7 +108,7 @@ if (na_client_connect(c, errbuf, sizeof errbuf) != NA_OK) {
 }
 /* ... receive PCM through on_pcm until done ... */
 na_client_stats st;                                      // reliability counters for THIS connection
-na_client_get_stats(c, &st);                             // packets_recovered_by_fec, reordered, jitter...
+na_client_get_stats(c, &st, sizeof st);                  // packets_recovered_by_fec, reordered, jitter...
 na_client_disconnect(c);
 na_client_destroy(c);
 ```

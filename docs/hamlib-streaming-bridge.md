@@ -349,7 +349,7 @@ packets FEC repaired instead of inferring it from delivered-byte parity against 
 
 ```c
 na_client_stats st;
-na_client_get_stats(c, &st);
+na_client_get_stats(c, &st, sizeof st);
 printf("recovered %lld, declined %lld, reordered %lld\n",
        st.packets_recovered_by_fec, st.fec_blocks_unreconciled, st.packets_reordered);
 ```
