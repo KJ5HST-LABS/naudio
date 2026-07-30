@@ -101,11 +101,46 @@ int main(void) {
         ++failures;
     }
 
+    /* ---- A5: na_client_callbacks::struct_size is validated (run BEFORE connect, so A3's
+     *      "already connected" guard cannot be what rejects these) ---- */
+    na_client_callbacks sized;
+    memset(&sized, 0, sizeof sized);
+    /* struct_size still 0 — exactly what a caller who forgot the line passes. */
+    if (na_client_set_callbacks(c, &sized, NULL) != NA_ERR_INVALID ||
+        na_last_error() != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: A5 struct_size=0 not rejected (last=%d)\n", na_last_error());
+        ++failures;
+    }
+    sized.struct_size = NA_CLIENT_CALLBACKS_SIZE_V1 - 1;
+    if (na_client_set_callbacks(c, &sized, NULL) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: A5 struct_size below the v1 floor not rejected\n");
+        ++failures;
+    }
+    sized.struct_size = sizeof sized;
+    if (na_client_set_callbacks(c, &sized, NULL) != NA_OK || na_last_error() != NA_OK) {
+        fprintf(stderr, "FAIL: A5 a correctly-sized struct was rejected (last=%d)\n",
+                na_last_error());
+        ++failures;
+    }
+    /* Forward compatibility: a caller compiled against a LONGER future header passes a bigger
+     * struct_size backed by real storage. We must accept it and read only the prefix we know. */
+    struct { na_client_callbacks base; char tail[64]; } future;
+    memset(&future, 0, sizeof future);
+    future.base.struct_size = sizeof future;
+    if (na_client_set_callbacks(c, &future.base, NULL) != NA_OK) {
+        fprintf(stderr, "FAIL: A5 an over-sized (future-header) struct was rejected\n");
+        ++failures;
+    }
+
     /* ---- A3: callbacks may not be set after connect() is attempted ---- */
     char errbuf[128];
     (void)na_client_connect(c, errbuf, (int)sizeof errbuf);  /* attempt (fails: no server) — locks cbs */
     na_client_callbacks cbs;
     memset(&cbs, 0, sizeof cbs);
+    /* Set struct_size so the ONLY thing that can reject this call is A3's post-connect guard.
+     * With it left at 0 the A5 size check would reject too, and two faults would collapse onto
+     * one observable — the assertion would pass whether or not A3 still worked. */
+    cbs.struct_size = sizeof cbs;
     if (na_client_set_callbacks(c, &cbs, NULL) != NA_ERR_INVALID ||
         na_last_error() != NA_ERR_INVALID) {
         fprintf(stderr, "FAIL: A3 set_callbacks after connect not rejected (last=%d)\n",

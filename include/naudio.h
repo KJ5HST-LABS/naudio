@@ -266,8 +266,22 @@ typedef void (*na_audio_cb)(const unsigned char* pcm, size_t n_bytes, void* user
 /* Lifecycle / roster / TX-arbitration events. EVERY field may be NULL (that event is ignored).
  * All fire on a single dedicated dispatch thread, one at a time and in order (the THREADING
  * CONTRACT above); `user` is the pointer passed to na_client_set_callbacks.
- * String arguments are valid only for the duration of the call. */
+ * String arguments are valid only for the duration of the call.
+ *
+ * BINARY COMPATIBILITY. This struct is CALLER-ALLOCATED and the library only ever READS it, so
+ * it carries its own size in-band: set `struct_size = sizeof(na_client_callbacks)` before the
+ * call. That lets the library tell a caller compiled against a shorter version from one compiled
+ * against a longer one, and read only the fields the caller actually allocated. New fields are
+ * only ever APPENDED. The idiomatic two lines are:
+ *
+ *     na_client_callbacks cbs;
+ *     memset(&cbs, 0, sizeof cbs);
+ *     cbs.struct_size = sizeof cbs;
+ *
+ * na_client_set_callbacks returns NA_ERR_INVALID if struct_size is below
+ * NA_CLIENT_CALLBACKS_SIZE_V1 -- which is what an unset (zero) struct_size gives you. */
 typedef struct na_client_callbacks {
+    size_t struct_size; /* = sizeof(na_client_callbacks); set by the CALLER before the call */
     void (*on_connected)(const char* client_id, const char* server_addr, void* user);
     void (*on_disconnected)(const char* client_id, void* user);
     void (*on_stream_started)(const char* client_id, void* user);
@@ -282,6 +296,12 @@ typedef struct na_client_callbacks {
     void (*on_tx_preempted)(const char* preempting_client_id, void* user);
     void (*on_tx_released)(void* user);
 } na_client_callbacks;
+
+/* The size of na_client_callbacks in the FIRST published ABI, and the floor na_client_set_callbacks
+ * enforces. FROZEN: `on_tx_released` is v1's last field forever, so appending fields does not move
+ * this value. Never rewrite it in terms of a newer field. */
+#define NA_CLIENT_CALLBACKS_SIZE_V1 \
+    (offsetof(na_client_callbacks, on_tx_released) + sizeof(void (*)(void*)))
 
 /* Create a streaming client for `host`:`port` (port 1..65535). `name` (may be NULL -> a default)
  * identifies the client in the server's roster. `backend` selects the local audio backend.
@@ -330,7 +350,9 @@ NA_EXPORT na_error_t na_client_set_reliability_profile(na_stream_client* client,
 NA_EXPORT na_error_t na_client_set_identity(na_stream_client* client, const char* callsign,
                                             const char* operator_name, const char* location);
 /* Register lifecycle/roster/TX callbacks (the struct is COPIED). `user` is passed back to each.
- * `cbs` may be NULL to clear all. Call before connect. */
+ * `cbs` may be NULL to clear all. Call before connect.
+ * `cbs->struct_size` MUST be set to sizeof(na_client_callbacks) -- NA_ERR_INVALID below
+ * NA_CLIENT_CALLBACKS_SIZE_V1, which includes the zero an unset field carries. */
 NA_EXPORT na_error_t na_client_set_callbacks(na_stream_client* client,
                                              const na_client_callbacks* cbs, void* user);
 /* Register the hot-path RX PCM callback (a single sink). `cb` may be NULL to clear. Call before
@@ -531,8 +553,14 @@ typedef void (*na_server_tx_audio_cb)(const unsigned char* pcm, size_t n_bytes, 
 
 /* Lifecycle / roster events (mirror AudioStreamListener). EVERY field may be NULL (that event is
  * ignored). All fire on the dispatch thread; `user` is the pointer passed to na_server_set_callbacks.
- * String arguments are valid only for the duration of the call. */
+ * String arguments are valid only for the duration of the call.
+ *
+ * BINARY COMPATIBILITY. Caller-allocated and library-READ, so it carries its own size in-band
+ * exactly as na_client_callbacks does: set `struct_size = sizeof(na_server_callbacks)` beside the
+ * memset, before the call. na_server_set_callbacks returns NA_ERR_INVALID below
+ * NA_SERVER_CALLBACKS_SIZE_V1. */
 typedef struct na_server_callbacks {
+    size_t struct_size; /* = sizeof(na_server_callbacks); set by the CALLER before the call */
     void (*on_started)(int port, void* user);
     void (*on_stopped)(void* user);
     void (*on_client_connected)(const char* client_id, const char* addr, void* user);
@@ -541,6 +569,11 @@ typedef struct na_server_callbacks {
     void (*on_stream_stopped)(const char* client_id, void* user);
     void (*on_error)(const char* client_id, const char* message, void* user);
 } na_server_callbacks;
+
+/* The size of na_server_callbacks in the FIRST published ABI, and the floor
+ * na_server_set_callbacks enforces. FROZEN: `on_error` is v1's last field forever. */
+#define NA_SERVER_CALLBACKS_SIZE_V1 \
+    (offsetof(na_server_callbacks, on_error) + sizeof(void (*)(const char*, const char*, void*)))
 
 /* Create a streaming server bound to `port` (0 => an OS-assigned ephemeral port, readable after
  * start via na_server_port; 1..65535 for a fixed port). `backend` selects the audio backend.
@@ -578,7 +611,9 @@ NA_EXPORT na_error_t na_server_set_capture_device(na_audio_server* server, int b
  * TX through na_server_tx_audio_cb instead). */
 NA_EXPORT na_error_t na_server_set_playback_device(na_audio_server* server, int backend_id);
 /* Register lifecycle/roster callbacks (the struct is COPIED). `user` is passed back to each. `cbs`
- * may be NULL to clear all. Call before start. */
+ * may be NULL to clear all. Call before start.
+ * `cbs->struct_size` MUST be set to sizeof(na_server_callbacks) -- NA_ERR_INVALID below
+ * NA_SERVER_CALLBACKS_SIZE_V1. */
 NA_EXPORT na_error_t na_server_set_callbacks(na_audio_server* server,
                                              const na_server_callbacks* cbs, void* user);
 /* Register the mixed-TX-audio callback (NULL backend only; a single sink). `cb` may be NULL to

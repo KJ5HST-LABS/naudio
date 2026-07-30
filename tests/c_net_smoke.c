@@ -155,6 +155,7 @@ int main(void) {
 
     na_client_callbacks cbs;
     memset(&cbs, 0, sizeof cbs);
+    cbs.struct_size = sizeof cbs;
     cbs.on_connected = on_connected;
     cbs.on_clients_update = on_clients_update;
     na_client_set_callbacks(client, &cbs, NULL);

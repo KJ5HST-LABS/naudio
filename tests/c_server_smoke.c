@@ -194,8 +194,25 @@ int main(void) {
         return 1;
     }
 
+    /* struct_size is validated on the server side too, and the server is not yet started, so
+     * the "set before start" guard cannot be what rejects these. */
+    na_server_callbacks sized;
+    memset(&sized, 0, sizeof sized);
+    if (na_server_set_callbacks(server, &sized, NULL) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: na_server_set_callbacks with struct_size=0 not rejected\n");
+        na_server_destroy(server);
+        return 1;
+    }
+    sized.struct_size = sizeof sized;
+    if (na_server_set_callbacks(server, &sized, NULL) != NA_OK) {
+        fprintf(stderr, "FAIL: na_server_set_callbacks with a correct struct_size rejected\n");
+        na_server_destroy(server);
+        return 1;
+    }
+
     na_server_callbacks scbs;
     memset(&scbs, 0, sizeof scbs);
+    scbs.struct_size = sizeof scbs;
     scbs.on_started = srv_on_started;
     scbs.on_stopped = srv_on_stopped;
     scbs.on_client_connected = srv_on_client_connected;
@@ -256,6 +273,7 @@ int main(void) {
     }
     na_client_callbacks ccbs;
     memset(&ccbs, 0, sizeof ccbs);
+    ccbs.struct_size = sizeof ccbs;
     ccbs.on_connected = cli_on_connected;
     na_client_set_callbacks(client, &ccbs, NULL);
     na_client_set_audio_cb(client, cli_on_rx_audio, NULL);

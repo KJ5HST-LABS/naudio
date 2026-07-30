@@ -100,6 +100,7 @@ na_stream_client* c =                                    // host, port, and rost
     na_client_create(NA_CLIENT_BACKEND_SYSTEM, "192.168.1.20", 4533, "my-client");
 na_client_set_transport(c, NA_TRANSPORT_TCP);            // NA_CLIENT_BACKEND_NULL = headless RX, no PortAudio
 na_client_set_audio_cb(c, on_pcm, user);                 // the hot-path RX PCM sink
+events.struct_size = sizeof events;                      // REQUIRED — see "Binary compatibility"
 na_client_set_callbacks(c, &events, user);               // connected / stream / roster / error events
 na_client_set_playback_device(c, playback_id);           // REQUIRED for RX (any id on the NULL backend)
 if (na_client_connect(c, errbuf, sizeof errbuf) != NA_OK) {

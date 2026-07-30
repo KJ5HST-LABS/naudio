@@ -656,6 +656,31 @@ extern "C" na_error_t na_client_set_identity(na_stream_client* client, const cha
     });
 }
 
+// ---- Caller-allocated struct versioning, library-READ direction ------------------------
+// na_client_callbacks and na_server_callbacks are allocated by the caller and only ever READ
+// here, so each carries its own size in its first member — Win32's cbSize idiom. That is what
+// lets a caller compiled against a different version of this header stay binary-compatible:
+//
+//   caller SHORTER than us  -> copy the bytes it actually allocated; the rest stay NULL, which
+//                              this ABI already defines as "that event is ignored"
+//   caller LONGER than us   -> copy what we understand and ignore the tail; this build has
+//                              nowhere to put fields it does not know about
+//
+// Byte-wise rather than field-wise on purpose. The struct is append-only, so "the fields that
+// fit" is exactly "the first min(theirs, ours) bytes", and a field-wise copy would have to be
+// re-derived by hand on every append — the staleness trap #9 describes. na_client_get_stats,
+// which the library WRITES, is field-wise for the opposite reason; see the note there.
+template <typename T>
+static na_error_t copyCallerStruct(T& dst, const T* src, std::size_t v1Size) {
+    dst = T{};
+    if (src == nullptr) { return NA_OK; }  // documented: NULL clears every callback
+    const std::size_t given = src->struct_size;
+    if (given < v1Size) { return NA_ERR_INVALID; }
+    std::memcpy(&dst, src, std::min(given, sizeof(T)));
+    dst.struct_size = sizeof(T);  // normalize: what we hold from here on is OUR layout
+    return NA_OK;
+}
+
 extern "C" na_error_t na_client_set_callbacks(na_stream_client* client,
                                               const na_client_callbacks* cbs, void* user) {
     NA_GUARD(NA_ERR_BACKEND, {
@@ -663,7 +688,10 @@ extern "C" na_error_t na_client_set_callbacks(na_stream_client* client,
         // A3: the dispatch worker reads cbs/cbUser with no lock once streaming starts. Enforce the
         // documented "set callbacks BEFORE connect" rule rather than racing a reader.
         if (client->connectStarted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
-        client->cbs = (cbs != nullptr) ? *cbs : na_client_callbacks{};
+        na_client_callbacks copy;
+        const na_error_t rc = copyCallerStruct(copy, cbs, NA_CLIENT_CALLBACKS_SIZE_V1);
+        if (rc != NA_OK) { setError(rc); return rc; }
+        client->cbs = copy;
         client->cbUser = user;
         return NA_OK;
     });
@@ -1131,7 +1159,10 @@ extern "C" na_error_t na_server_set_callbacks(na_audio_server* server,
         if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
         // The dispatch worker reads cbs/cbUser with no lock once running. Enforce "set before start".
         if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
-        server->cbs = (cbs != nullptr) ? *cbs : na_server_callbacks{};
+        na_server_callbacks copy;
+        const na_error_t rc = copyCallerStruct(copy, cbs, NA_SERVER_CALLBACKS_SIZE_V1);
+        if (rc != NA_OK) { setError(rc); return rc; }
+        server->cbs = copy;
         server->cbUser = user;
         return NA_OK;
     });

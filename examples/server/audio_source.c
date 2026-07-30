@@ -260,6 +260,7 @@ int main(int argc, char** argv) {
     // Configure BEFORE start — every setter is frozen once the server is running.
     na_server_callbacks cbs;
     memset(&cbs, 0, sizeof cbs);
+    cbs.struct_size = sizeof cbs;
     cbs.on_started             = on_started;
     cbs.on_client_connected    = on_client_connected;
     cbs.on_client_disconnected = on_client_disconnected;

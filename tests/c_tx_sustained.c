@@ -104,6 +104,7 @@ int main(void) {
 
     na_server_callbacks scbs;
     memset(&scbs, 0, sizeof scbs);
+    scbs.struct_size = sizeof scbs;
     scbs.on_error = on_error;
     na_server_set_callbacks(srv, &scbs, NULL);
 

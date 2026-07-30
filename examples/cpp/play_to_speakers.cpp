@@ -272,6 +272,7 @@ int main(int argc, char** argv) {
 
     na_client_callbacks cbs;
     memset(&cbs, 0, sizeof cbs);
+    cbs.struct_size = sizeof cbs;
     cbs.on_connected      = ev_connected;
     cbs.on_disconnected   = ev_disconnected;
     cbs.on_stream_started = ev_stream_started;

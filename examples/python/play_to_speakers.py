@@ -129,7 +129,11 @@ _CB_VOID = C.CFUNCTYPE(None, C.c_void_p)                                 # (user
 
 
 class NaClientCallbacks(C.Structure):
+    # struct_size is FIRST and must be set by the caller (see "Binary compatibility" in
+    # naudio.h) — the library reads it to learn which fields this caller actually allocated,
+    # and rejects the call with NA_ERR_INVALID if it is left at 0.
     _fields_ = [
+        ("struct_size", C.c_size_t),
         ("on_connected", _CB_ID2),       # (client_id, server_addr, user)
         ("on_disconnected", _CB_ID),
         ("on_stream_started", _CB_ID),
@@ -295,6 +299,7 @@ def main():
         log("[client] disconnected")
 
     cbs = NaClientCallbacks()
+    cbs.struct_size = C.sizeof(NaClientCallbacks)  # REQUIRED — NA_ERR_INVALID without it
     cbs.on_connected = _CB_ID2(on_connected)
     cbs.on_stream_started = _CB_ID(on_stream_started)
     cbs.on_error = _CB_ID2(on_error)
