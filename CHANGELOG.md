@@ -6,7 +6,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Changed
-- **BREAKING (C ABI): three of the four caller-allocated structs now carry their own size, so an
+- **BREAKING (C ABI): all four caller-allocated structs now carry their own size, so an
   appended field stops being an out-of-bounds access against an already-compiled consumer.** None
   of them recorded how large the caller believed them to be, so adding any field to a future
   release would have made the library read or write past the end of a struct allocated by a
@@ -21,10 +21,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
     `na_client_get_stats(client, out, sizeof *out)`, `NA_ERR_INVALID` below
     `NA_CLIENT_STATS_SIZE_V1`. An in-band member would have required callers to initialize an
     out-parameter, inverting this struct's long-standing "never needs pre-zeroing" contract.
-  In both directions the library honours the caller's declared size as a hard bound: a shorter
+  - `na_device` is **written by the library as an ARRAY**, so its size likewise travels as a
+    parameter: `na_enumerate(ctx, out, max, sizeof out[0])`, `NA_ERR_INVALID` below
+    `NA_DEVICE_SIZE_V1`. This is the case where the old signature was not merely awkward but
+    unsound — `max` is an element *count*, and the library strode the array by its **own**
+    `sizeof(na_device)`. Appending a field would therefore have written every element after the
+    first past its slot in a consumer's array and mis-parsed all of them. The library now strides
+    by the caller's element size, and `na_device`'s layout itself is unchanged.
+  In every direction the library honours the caller's declared size as a hard bound: a shorter
   caller keeps its un-allocated tail untouched, and a longer one has its extra bytes zero-filled
-  (stats) or ignored (callbacks). `na_device` / `na_enumerate` are unchanged so far. Nothing has
+  (stats, and each device element) or ignored (callbacks). Nothing has
   been tagged and `SOVERSION` is still 0, so no released consumer exists to break.
+  Consumers that bind the ABI by hand rather than through the header — the Python, Java and Rust
+  example clients — need the new argument at their `na_enumerate` call sites; their `na_device`
+  layouts are byte-for-byte unchanged.
 
 ### Fixed
 - **`na_client_stats` no longer claims two counters can move on a client when they cannot** — the
