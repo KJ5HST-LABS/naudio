@@ -6,6 +6,36 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **`na_client_stats.sequence_gaps` (`@since 0.2.0`) — the post-reorder loss measure, and the first
+  field appended under the struct-size promise.** Until now no counter in this struct could report
+  loss on a profile a consumer can actually select: `packets_lost` and its two siblings are `-1` on
+  every built-in UDP profile, because the sequence-gap tracker runs only where no reorder buffer is
+  engaged and all of them engage one, while `queue_drops` cannot move on a client at all. The new
+  field is the exact **complement** of those three — it carries a reading precisely where they read
+  `-1`, and reads `-1` itself precisely where they carry one — so between them a reading always
+  exists. The measurement is `PacketReorderBuffer`'s existing gap count, which the conformance
+  vectors already pinned but which reached no consumer.
+  Two things it deliberately does **not** claim, both stated on the field:
+  - **Not final loss.** It is counted before the FEC decoder sees the stream (the pipeline is
+    reorder → FEC → queue), so a slot counted here may still be refilled by parity; the unrecovered
+    remainder is `sequence_gaps - packets_recovered_by_fec`. It also counts every packet type
+    sharing the sequence space — audio, parity and control alike.
+  - **Not local loss.** Issue #29 proposed this counter as `socket_buffer_drops`, expecting it to
+    surface a too-slow consumer's kernel-dropped datagrams. It cannot, and measurement is what
+    settled it: an overflowing socket buffer **tail-drops**, so a stalled consumer reads an unbroken
+    prefix of the stream and stops early, leaving no hole for any gap-based counter to find. Driven
+    to 8 s, a client stalled to roughly a quarter of the offered rate read 127 of 400 forwarded
+    packets with `sequence_gaps` at 0. Local loss remains unreported by this struct; the test suite
+    asserts that 0 deliberately so the limitation stays executable.
+
+  This is also the first exercise of the size mechanism added below: the field is written **only**
+  when the caller's declared `struct_size` reaches it, so a consumer compiled against the v1 header
+  can call a 0.2.0 library and keep its shorter struct intact. `NA_CLIENT_STATS_SIZE_V2` is that
+  threshold; `NA_CLIENT_STATS_SIZE_V1` remains the floor and is unchanged. The library version moves
+  **0.1.0 → 0.2.0** accordingly (header macros and `project(VERSION)` together, as the configure-time
+  gate requires), which changes the SONAME to `libnaudio.0.2.0` — a relink, no source change: no v1
+  field moved and no existing call site needs an edit.
+
 - **`na_version_number()` and `na_version_string()` — the run-time half of the binary-compatibility
   promise, so a zero-filled struct tail can be read as fill rather than as a measurement.** The
   struct-size work above made an older library's tail *defined*; it could not make it *informative*,

@@ -191,11 +191,16 @@ if (na_version_number() < NAUDIO_VERSION_NUMBER)
     printf("naudio %s loaded, built against %s — newer fields read as zero-fill\n",
            na_version_string(), NAUDIO_VERSION_STRING);
 
-/* Per field: a counter appended in 0.2.0 carries a measurement only on 0.2.0 or later.
-   On anything older, na_client_get_stats zero-filled that tail and the 0 means nothing. */
-if (na_version_number() >= NA_VERSION_ENCODE(0, 2, 0)) {
-    /* safe to read the field that arrived in 0.2.0 */
-}
+/* Per field: sequence_gaps arrived in 0.2.0, so it carries a measurement only on 0.2.0 or
+   later. On anything older, na_client_get_stats zero-filled that tail and the 0 means
+   nothing. The -1 check is a second, separate question: this library IS new enough, but
+   this connection may still not be measuring (no reorder buffer engaged). */
+na_stream_client* c = na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", 4533, "demo");
+na_client_stats st;
+na_client_get_stats(c, &st, sizeof st);
+
+if (na_version_number() >= NA_VERSION_ENCODE(0, 2, 0) && st.sequence_gaps >= 0)
+    printf("%lld sequence gaps\n", st.sequence_gaps);
 ```
 
 Always compare **through** `NA_VERSION_ENCODE` rather than spelling the arithmetic — the packing is
