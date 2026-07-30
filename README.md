@@ -76,7 +76,7 @@ ABI has two surfaces.
 
 na_context* ctx = na_context_create();                   // one backend init per context
 na_device devs[32];
-int n = na_enumerate(ctx, devs, 32);                     // count, or a negative na_error_t
+int n = na_enumerate(ctx, devs, 32, sizeof devs[0]);     // count, or a negative na_error_t
 na_capture_stream* s =
     na_open_capture(ctx, devs[0].capture_backend_id, 48000, 16, 2, /*out_actual_channels=*/NULL);
 int16_t buf[480 * 2];

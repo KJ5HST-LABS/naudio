@@ -155,9 +155,15 @@ extern "C" void na_context_destroy(na_context* ctx) { delete ctx; }  // Pa_Termi
 
 // ---- Enumeration / probe ---------------------------------------------------------------
 
-extern "C" int na_enumerate(na_context* ctx, na_device* out, int max) {
+// The size travels as a PARAMETER, not as an in-band first member, for the same reason it does on
+// na_client_get_stats: the library writes this struct, and an out-parameter the caller had to
+// pre-initialize would invert that contract. Here there is a second, harder reason — this call
+// fills an ARRAY. `max` is an element COUNT, so the stride below MUST be the caller's element
+// size; striding by the library's own sizeof is what walks past the end of a shorter consumer's
+// array after the first element, and mis-parses every element after it.
+extern "C" int na_enumerate(na_context* ctx, na_device* out, int max, std::size_t struct_size) {
     setError(NA_OK);
-    if (ctx == nullptr || out == nullptr || max < 0) {
+    if (ctx == nullptr || out == nullptr || max < 0 || struct_size < NA_DEVICE_SIZE_V1) {
         setError(NA_ERR_INVALID);
         return NA_ERR_INVALID;
     }
@@ -168,7 +174,15 @@ extern "C" int na_enumerate(na_context* ctx, na_device* out, int max) {
         int written = 0;
         for (const auto& d : devices) {
             if (written >= max) break;
-            na_device& slot = out[written];
+            // Stride by the CALLER's element size, never by sizeof(na_device).
+            char* base = reinterpret_cast<char*>(out) + static_cast<std::size_t>(written) * struct_size;
+            // A caller compiled against a LONGER version of this header gets each element's tail
+            // zeroed rather than left indeterminate. (A caller compiled against a shorter one
+            // cannot reach here: every field below is v1, and the floor check guarantees v1 fits.)
+            if (struct_size > sizeof(na_device)) {
+                std::memset(base + sizeof(na_device), 0, struct_size - sizeof(na_device));
+            }
+            na_device& slot = *reinterpret_cast<na_device*>(base);
             slot.backend_id = d.backendId;
             slot.capture_backend_id = d.captureBackendId;
             slot.playback_backend_id = d.playbackBackendId;

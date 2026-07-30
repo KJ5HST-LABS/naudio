@@ -151,7 +151,7 @@ static int list_devices(void) {
         return 1;
     }
     na_device devs[MAX_DEVICES];
-    int n = na_enumerate(ctx, devs, MAX_DEVICES);
+    int n = na_enumerate(ctx, devs, MAX_DEVICES, sizeof devs[0]);
     if (n < 0) {
         fprintf(stderr, "error: na_enumerate: %s\n", na_strerror(na_last_error()));
         na_context_destroy(ctx);
@@ -178,7 +178,7 @@ static int default_capture_id(void) {
     na_context* ctx = na_context_create();
     if (ctx == NULL) return -1;
     na_device devs[MAX_DEVICES];
-    int n = na_enumerate(ctx, devs, MAX_DEVICES);
+    int n = na_enumerate(ctx, devs, MAX_DEVICES, sizeof devs[0]);
     int id = -1;
     for (int i = 0; i < n; i++) {
         if (devs[i].capability == NA_CAP_CAPTURE || devs[i].capability == NA_CAP_DUPLEX) {

@@ -76,11 +76,18 @@ int main(void) {
 
     /* NULL-context argument paths must return NA_ERR_INVALID and record it on the thread. */
     na_device devs[8];
-    if (na_enumerate(NULL, devs, 8) != NA_ERR_INVALID || na_last_error() != NA_ERR_INVALID) {
+    /* A VALID struct_size here on purpose: na_enumerate now rejects a short one too, so passing a
+     * bad size would let that guard satisfy this arm and the NULL check could rot undetected. The
+     * fault this arm names must be the only invalid thing present. */
+    if (na_enumerate(NULL, devs, 8, sizeof devs[0]) != NA_ERR_INVALID ||
+        na_last_error() != NA_ERR_INVALID) {
         fprintf(stderr, "FAIL: na_enumerate(NULL,...) ret=%d last=%d (want NA_ERR_INVALID)\n",
-                na_enumerate(NULL, devs, 8), na_last_error());
+                na_enumerate(NULL, devs, 8, sizeof devs[0]), na_last_error());
         return 1;
     }
+    /* The struct_size floor gets its own arm below, once a real ctx exists -- testing it here
+     * with ctx == NULL would let the NULL guard satisfy it, which is the trap this arm's own
+     * comment above describes, pointed the other way. */
     if (na_probe_format(NULL, 0, 48000, 16, 2, 1) != NA_ERR_INVALID) {
         fprintf(stderr, "FAIL: na_probe_format(NULL,...) did not return NA_ERR_INVALID\n");
         return 1;
@@ -109,8 +116,20 @@ int main(void) {
                na_strerror(na_last_error()), len);
         return 0;
     }
+    /* The struct_size floor, with ctx/out/max all VALID so only the size can reject. Zero is the
+     * case that matters: it is what a caller who forgets the parameter's meaning passes. */
+    if (na_enumerate(ctx, devs, 8, 0) != NA_ERR_INVALID || na_last_error() != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: na_enumerate(..., struct_size=0) did not return NA_ERR_INVALID\n");
+        na_context_destroy(ctx);
+        return 1;
+    }
+    if (na_enumerate(ctx, devs, 8, NA_DEVICE_SIZE_V1 - 1) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: na_enumerate(..., struct_size below V1) not NA_ERR_INVALID\n");
+        na_context_destroy(ctx);
+        return 1;
+    }
     /* Enumerate must succeed (>= 0; zero devices is fine) and leave last-error NA_OK. */
-    const int n = na_enumerate(ctx, devs, 8);
+    const int n = na_enumerate(ctx, devs, 8, sizeof devs[0]);
     if (n < 0) {
         fprintf(stderr, "FAIL: na_enumerate(ctx,...) returned %d (%s)\n", n,
                 na_strerror(na_last_error()));
@@ -122,6 +141,64 @@ int main(void) {
         na_context_destroy(ctx);
         return 1;
     }
+
+    /* ---- (3b) the caller's stride, which is the whole point of struct_size ----
+     * Stand in for a consumer compiled against a LATER header: elements are sizeof(na_device)+PAD
+     * apart. The library must place element k at k*(sizeof+PAD) -- its OWN sizeof is the wrong
+     * stride and would pack the elements, mis-parsing every one after the first. Backed by 0xA5
+     * so "written" and "untouched" are distinguishable, exactly as the na_client_stats arm does. */
+#define PAD 16
+    const size_t elem = sizeof(na_device) + PAD;
+    /* _Alignas so the library writes through a properly-aligned na_device*, as a real caller's
+     * array would be -- a bare unsigned char[] is only byte-aligned. */
+    _Alignas(na_device) unsigned char wide[8 * (sizeof(na_device) + PAD)];
+    memset(wide, 0xA5, sizeof wide);
+    const int m = na_enumerate(ctx, (na_device*)wide, 8, elem);
+    if (m < 0) {
+        fprintf(stderr, "FAIL: na_enumerate rejected a struct_size LARGER than its own (%d)\n", m);
+        na_context_destroy(ctx);
+        return 1;
+    }
+    /* PLACEMENT first, in its own pass, and the TAIL second in another. The two must not share a
+     * pass: a wrong stride also tramples the pads (element k+1 lands on element k's tail), so a
+     * combined loop reports the tail failure and the placement assertion below is never evaluated
+     * -- it would sit here dead, passing every mutation. Separated, each is provable on its own. */
+    for (int i = 0; i < m; i++) {
+        const na_device* slot = (const na_device*)(wide + (size_t)i * elem);
+        /* The element must be AT the caller's stride. A library striding by its own sizeof leaves
+         * this offset holding some other element's interior (or untouched 0xA5). */
+        if (slot->backend_id != devs[i].backend_id) {
+            fprintf(stderr, "FAIL: element %d not at the caller's stride (backend_id %d != %d)\n",
+                    i, slot->backend_id, devs[i].backend_id);
+            na_context_destroy(ctx);
+            return 1;
+        }
+    }
+    for (int i = 0; i < m; i++) {
+        const unsigned char* slot = wide + (size_t)i * elem;
+        /* The declared tail past the library's own struct must be ZERO-filled, not left 0xA5. */
+        for (size_t b = sizeof(na_device); b < elem; b++) {
+            if (slot[b] != 0x00) {
+                fprintf(stderr, "FAIL: element %d's declared tail not zero-filled at +%zu\n", i, b);
+                na_context_destroy(ctx);
+                return 1;
+            }
+        }
+    }
+    /* Nothing past the elements it reported writing. */
+    for (size_t b = (size_t)m * elem; b < sizeof wide; b++) {
+        if (wide[b] != 0xA5) {
+            fprintf(stderr, "FAIL: na_enumerate wrote past element %d at +%zu\n", m, b);
+            na_context_destroy(ctx);
+            return 1;
+        }
+    }
+    /* Say which half ran. With fewer than 2 devices every stride collapses onto element 0, so the
+     * placement check above is vacuous and only the tail/overrun checks carry weight. */
+    printf("c_abi_smoke: stride arm %s (%d device record(s), elem=%zu, sizeof=%zu)\n",
+           m >= 2 ? "EXERCISED" : "NOT exercised -- needs 2+ devices", m, elem, sizeof(na_device));
+#undef PAD
+
     na_context_destroy(ctx);  /* must not crash; Pa_Terminate balances the create's Pa_Initialize */
     na_context_destroy(NULL); /* safe on NULL */
 

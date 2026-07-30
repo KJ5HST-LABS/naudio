@@ -79,6 +79,14 @@ NA_EXPORT na_context* na_context_create(void);
  * must be closed BEFORE destroying it. Safe on NULL. */
 NA_EXPORT void na_context_destroy(na_context* ctx);
 
+/*
+ * BINARY COMPATIBILITY. Like na_client_stats, this struct is caller-allocated but the library
+ * WRITES it, so it does NOT carry an in-band struct_size — the size travels to na_enumerate as an
+ * explicit PARAMETER instead. Here that is not merely a contract preference: na_enumerate fills an
+ * ARRAY, its `max` is an element COUNT, and only the caller's own element size can say where
+ * element k begins. New fields are only ever APPENDED, and na_enumerate writes only what the
+ * caller's declared element size covers.
+ */
 typedef struct na_device {
     int  backend_id;           /* primary id (== capture id for a capture-capable device)        */
     /* Per-direction ids. For a normal device all three are equal; for a device the backend reports
@@ -93,12 +101,31 @@ typedef struct na_device {
     int  is_virtual;  /* 0 or 1     */
 } na_device;
 
+/* The size of na_device in the FIRST published ABI, and the floor na_enumerate enforces.
+ * FROZEN: `is_virtual` is v1's last field forever, so appending does not move it. */
+#define NA_DEVICE_SIZE_V1 \
+    (offsetof(na_device, is_virtual) + sizeof(int))
+
 /*
- * Enumerate audio devices using `ctx`'s backend. Writes up to `max` devices into
- * `out`; returns the number written (>= 0), or a negative na_error_t on failure
- * (NA_ERR_INVALID if ctx/out is NULL or max < 0).
+ * Enumerate audio devices using `ctx`'s backend. Writes up to `max` devices into the array at
+ * `out` — `max` is an element COUNT, not a byte size — and returns the number written (>= 0), or
+ * a negative na_error_t on failure (NA_ERR_INVALID if ctx/out is NULL, max < 0, or `struct_size`
+ * is below NA_DEVICE_SIZE_V1, which is what an accidentally-zero size gives you).
+ *
+ *     na_device devs[32];
+ *     int n = na_enumerate(ctx, devs, 32, sizeof devs[0]);
+ *
+ * `struct_size` is sizeof(na_device) AS THE CALLER COMPILED IT, and the library strides the array
+ * by it rather than by its own sizeof. That stride is the whole point: `max` bounds how many
+ * elements may be written, and only the caller's element size says where element k begins, so a
+ * library NEWER than the caller writes each element's v1 prefix in the caller's own slot instead
+ * of walking off the end of the array after the first one. A library OLDER than the caller fills
+ * the fields it knows and ZERO-fills the rest of each element, so the tail is defined rather than
+ * indeterminate; note that such a zero is indistinguishable from a genuine zero, and naudio
+ * exposes no run-time library-version accessor to tell them apart. Build against the version you
+ * link.
  */
-NA_EXPORT int na_enumerate(na_context* ctx, na_device* out, int max);
+NA_EXPORT int na_enumerate(na_context* ctx, na_device* out, int max, size_t struct_size);
 
 /*
  * Probe whether device `backend_id` (a na_device.backend_id) supports the given
