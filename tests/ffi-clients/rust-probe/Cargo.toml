@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Rust arm of the FFI example-client gate (tests/ffi-clients/run.sh). This crate
+# exists only to report examples/rust's OWN NaDevice declaration; see src/main.rs.
+#
+# No dependencies, matching the example it probes: the layout under test is bound
+# with hand-written `extern "C"` declarations and no bindgen, so a binding
+# generator here would be testing the wrong thing.
+[package]
+name = "na-ffi-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "LGPL-2.1-or-later"
+description = "Report examples/rust's hand-declared na_device layout for the FFI gate."
+
+[[bin]]
+name = "na_ffi_probe"
+path = "src/main.rs"
+
+[dependencies]

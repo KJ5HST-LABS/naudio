@@ -59,10 +59,11 @@ build_dir="${NAUDIO_BUILD_DIR:-$repo/build}"
 CC="${CC:-cc}"
 PYTHON="${PYTHON:-python3}"
 JAVA="${JAVA:-java}"
+CARGO="${CARGO:-cargo}"
 
 # Languages compared this run. Each needs a probe file here, plus an entry in
 # tool_for(), run_probe() and expected_for().
-LANGS="python java"
+LANGS="python java rust"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -139,6 +140,7 @@ tool_for() {
   case "$1" in
     python) echo "$PYTHON" ;;
     java)   echo "$JAVA" ;;
+    rust)   echo "$CARGO" ;;
     *)      echo "" ;;
   esac
 }
@@ -160,6 +162,13 @@ run_probe() {
       rm -rf "$jdir" && mkdir -p "$jdir"
       cp "$repo/examples/java/PlayToSpeakers.java" "$here/Probe.java" "$jdir/"
       ( cd "$jdir" && NAUDIO_LIB="$lib" "$JAVA" --enable-native-access=ALL-UNNAMED Probe.java ) > "$2"
+      ;;
+    rust)
+      # CARGO_TARGET_DIR keeps the build out of the source tree entirely, so the
+      # gate leaves nothing behind for `git status` to report.
+      ( cd "$here/rust-probe" \
+        && NAUDIO_LIB="$lib" CARGO_TARGET_DIR="$work/rust-target" \
+           "$CARGO" run --quiet --bin na_ffi_probe ) > "$2"
       ;;
     *)
       return 1
