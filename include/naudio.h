@@ -79,10 +79,15 @@ extern "C" {
 #define NAUDIO_VERSION_MINOR 1
 #define NAUDIO_VERSION_PATCH 0
 
+/* The largest value NA_VERSION_ENCODE accepts for minor and for patch. Above it a lower component
+ * would carry into a higher one and the ordering would stop being total; CMakeLists.txt refuses to
+ * configure a version that exceeds it, and c_abi_smoke.c pins both carry boundaries against it. */
+#define NA_VERSION_MAX_COMPONENT 999
+
 /* Pack a major/minor/patch triple into one monotonically comparable integer. Always compare
  * THROUGH this macro rather than spelling the arithmetic: the encoding is an implementation
- * detail, and only this macro and na_version_number() are promised to agree on it. Minor and
- * patch are each bounded by 999, which is what makes the ordering total (0.999.999 < 1.0.0). */
+ * detail, and only this macro and na_version_number() are promised to agree on it. The ordering is
+ * total for components within NA_VERSION_MAX_COMPONENT (so 0.999.999 < 1.0.0). */
 #define NA_VERSION_ENCODE(major, minor, patch) \
     ((major) * 1000000 + (minor) * 1000 + (patch))
 

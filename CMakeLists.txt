@@ -57,13 +57,26 @@ if(NOT NAUDIO_HEADER_VERSION VERSION_EQUAL PROJECT_VERSION)
         "header macros are what a consumer compares against na_version_number(), while "
         "PROJECT_VERSION sets the SONAME and naudio.pc's Version:.")
 endif()
-# NA_VERSION_ENCODE bounds minor and patch at 999 to keep the ordering total (0.999.999 < 1.0.0).
-if(_na_MINOR GREATER 999 OR _na_PATCH GREATER 999)
+# NA_VERSION_ENCODE keeps the ordering total only for components within NA_VERSION_MAX_COMPONENT.
+# That bound is READ FROM THE HEADER rather than spelled here, so this check cannot disagree with
+# the macro it is enforcing -- the same drift this whole gate exists to prevent, one level down.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/naudio.h" _na_max_line
+     REGEX "^#define[ \t]+NA_VERSION_MAX_COMPONENT[ \t]+[0-9]+[ \t]*$")
+if(NOT _na_max_line)
     message(FATAL_ERROR
-        "naudio version gate: ${NAUDIO_HEADER_VERSION} overflows NA_VERSION_ENCODE, which packs "
-        "minor and patch into 3 decimal digits each. Widen the encoding before releasing this.")
+        "naudio version gate: include/naudio.h defines no NA_VERSION_MAX_COMPONENT, which bounds "
+        "NA_VERSION_ENCODE's components and is what this check enforces.")
+endif()
+string(REGEX REPLACE "^#define[ \t]+NA_VERSION_MAX_COMPONENT[ \t]+([0-9]+).*$" "\\1"
+       _na_max "${_na_max_line}")
+if(_na_MINOR GREATER _na_max OR _na_PATCH GREATER _na_max)
+    message(FATAL_ERROR
+        "naudio version gate: ${NAUDIO_HEADER_VERSION} exceeds NA_VERSION_MAX_COMPONENT "
+        "(${_na_max}), so NA_VERSION_ENCODE would let a lower component carry into a higher one "
+        "and every consumer comparison would be wrong at that boundary. Widen the encoding first.")
 endif()
 unset(_na_line)
+unset(_na_max_line)
 
 # Hidden default visibility everywhere: only symbols tagged NA_EXPORT (the na_* C
 # ABI) end up in the shared library's dynamic symbol table. The internal C++

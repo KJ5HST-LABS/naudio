@@ -27,10 +27,16 @@
 
 /* NA_VERSION_ENCODE must be MONOTONIC, or every `>=` a consumer writes against it is wrong at a
  * carry boundary — and that is the one comparison the whole accessor exists to support. Both are
- * compile-time facts about the macro, so they are asserted at compile time rather than run time. */
-_Static_assert(NA_VERSION_ENCODE(0, 1, 99) < NA_VERSION_ENCODE(0, 2, 0),
+ * compile-time facts about the macro, so they are asserted at compile time rather than run time.
+ *
+ * The witnesses are NA_VERSION_MAX_COMPONENT rather than a spelled number ON PURPOSE. A witness
+ * chosen by hand tests the number you picked, not the bound the macro documents: `patch = 99` here
+ * survived scaling minor by 100 (199 < 200) and reported the encoding monotonic when it was not.
+ * Derived from the bound, the same mutation fails — 1*100 + 999 > 2*100. */
+_Static_assert(NA_VERSION_ENCODE(0, 1, NA_VERSION_MAX_COMPONENT) < NA_VERSION_ENCODE(0, 2, 0),
                "NA_VERSION_ENCODE: patch must not carry into minor");
-_Static_assert(NA_VERSION_ENCODE(0, 999, 999) < NA_VERSION_ENCODE(1, 0, 0),
+_Static_assert(NA_VERSION_ENCODE(0, NA_VERSION_MAX_COMPONENT, NA_VERSION_MAX_COMPONENT)
+                   < NA_VERSION_ENCODE(1, 0, 0),
                "NA_VERSION_ENCODE: minor.patch must not carry into major");
 
 int main(void) {
