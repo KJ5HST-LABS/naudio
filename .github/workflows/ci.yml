@@ -6,7 +6,7 @@ name: CI
 # on CI runners. The real-hardware smokes (na_audio_daemon / on-air audio) are
 # gated out here — they need a real sound device.
 #
-# Three job families (tri-platform + FetchContent coverage):
+# Four job families (tri-platform + FetchContent + FFI coverage):
 #   * build-and-test  — Ubuntu + macOS with a SYSTEM PortAudio (the supported path);
 #                       full ctest + install smoke + the external-consumer find_package
 #                       / pkg-config gate.
@@ -16,6 +16,11 @@ name: CI
 #                       compiles.
 #   * fetchcontent    — Ubuntu with NO system PortAudio: proves the FetchContent fallback
 #                       (build PortAudio v19.7.0 from source) compiles + passes.
+#   * ffi-clients     — Ubuntu: the Python / Java / Rust example clients, which ctest
+#                       never touches. Each hand-declares na_device, so each is diffed
+#                       against a C reference compiled from naudio.h. Asserts on matched
+#                       output lines, never on exit status — every drift this catches is
+#                       one where the client exits 0.
 
 on:
   push:
@@ -123,3 +128,73 @@ jobs:
 
       - name: Test (conformance vectors + README snippet gate)
         run: ctest --test-dir build --output-on-failure
+
+  ffi-clients:
+    name: ffi example clients (python + java + rust vs the C ABI)
+    runs-on: ubuntu-latest
+    # The Python, Java and Rust example clients each mirror na_device
+    # (include/naudio.h) byte-for-byte in a hand-written declaration, and until this
+    # job existed nothing built or ran them. Measured on this repo: shifting
+    # na_device by 8 bytes left all three printing WRONG device records and exiting
+    # 0, while ctest stayed green at 291/291 and the install + external-consumer
+    # gates passed. See tests/ffi-clients/run.sh.
+    #
+    # One platform is enough: na_device is all fixed-width ints and char arrays, so
+    # its layout is identical everywhere. What varies by platform is the toolchains,
+    # and those are what this job pins.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PortAudio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y portaudio19-dev pkg-config
+
+      - name: Install JDK 22
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '22'
+        # Exactly 22, not the newest available: the Foreign Function & Memory API is
+        # final as of 22 and examples/java/README.md documents that as the floor.
+        # Building on a newer JDK would stop testing the floor we publish.
+        # python3 and cargo are preinstalled on the runner image.
+
+      - name: Configure + build the shared library
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build -j
+
+      - name: FFI gate — each client's own declaration vs the C ABI
+        run: |
+          # Assert on MATCHED OUTPUT, never on the step's exit code. Every failure
+          # mode this gate exists to catch is one where the client exits 0: a padded
+          # ctypes struct, a stale MemoryLayout, a #[repr(C)] that drifted. A missing
+          # toolchain is the same shape, so the per-language lines below are what
+          # make it impossible for an absent JDK or cargo to report green.
+          set +e
+          bash tests/ffi-clients/run.sh > ffi-clients.log 2>&1
+          rc=$?
+          set -e
+          cat ffi-clients.log
+          echo "--- run.sh exited ${rc} (informational; the assertions are on output) ---"
+
+          for lang in python java rust; do
+            grep -q "^  ok    ffi-clients: ${lang} layout MATCHES the C truth$" ffi-clients.log \
+              || { echo "::error::ffi-clients: no MATCH line for ${lang} — it did not run, or it differs from the C ABI"; exit 1; }
+          done
+
+          grep -q "^ffi-clients: 3 probe(s) compared, 0 failure(s)$" ffi-clients.log \
+            || { echo "::error::ffi-clients: expected exactly 3 probes and 0 failures"; exit 1; }
+
+          # Not a gate: the device half needs the runner to expose an audio device.
+          # Surfaced so a run where it was skipped cannot be mistaken for one where
+          # records were actually compared.
+          grep "^ffi-clients: device arm" ffi-clients.log
+
+      - name: Upload the manifest comparison log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffi-clients-log
+          path: ffi-clients.log
