@@ -12,6 +12,28 @@
  * to enumerate/probe/open, then destroy it. Errors are reported as negative
  * na_error_t codes (or NULL for handle-returning calls, with na_last_error()
  * giving the cause on the calling thread).
+ *
+ * BINARY COMPATIBILITY (the full policy is README.md's "Binary compatibility" section).
+ * Every caller-allocated struct here tells the library how large the CALLER believes it to be, so
+ * that appending a field in a later release is not an out-of-bounds access against an
+ * already-compiled consumer. How the size travels depends on which side WRITES the struct:
+ *
+ *   library READS it   -> in-band first member, set by the caller:
+ *                         na_client_callbacks, na_server_callbacks (`cbs.struct_size = sizeof cbs`)
+ *   library WRITES it  -> an explicit PARAMETER, since an out-parameter the caller had to
+ *                         pre-initialize would invert these structs' "never needs pre-zeroing"
+ *                         contract: na_client_stats (na_client_get_stats(c, &st, sizeof st)) and
+ *                         na_device, which is an ARRAY whose `max` is an element COUNT, so only the
+ *                         caller's element size can say where element k begins
+ *                         (na_enumerate(ctx, devs, max, sizeof devs[0])).
+ *
+ * The library honours that size as a hard bound in both directions: a NEWER library touches only the
+ * prefix the caller allocated, and an OLDER one zero-fills the remainder so the tail is defined —
+ * though such a zero is indistinguishable from a genuine zero, and naudio exposes no run-time
+ * library-version accessor to tell them apart. Build against the version you link. Fields are only
+ * ever APPENDED, and each floor below (NA_*_SIZE_V1) is frozen as offsetof(<v1's last field>) +
+ * sizeof(<its type>), never a byte literal, so appending does not move it. A struct_size below its
+ * floor is rejected with NA_ERR_INVALID -- which is what an accidentally-zero size gives you.
  */
 #ifndef NAUDIO_H
 #define NAUDIO_H

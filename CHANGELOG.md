@@ -35,6 +35,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   Consumers that bind the ABI by hand rather than through the header — the Python, Java and Rust
   example clients — need the new argument at their `na_enumerate` call sites; their `na_device`
   layouts are byte-for-byte unchanged.
+  The resulting promise is now written down for packagers as **"Binary compatibility"** in
+  `README.md`, condensed at the top of `include/naudio.h`: what the declared size guarantees in each
+  version direction, the append-only growth rule the `NA_*_SIZE_V1` floors encode, and the one thing
+  it does not buy — an older library's zero-filled tail is defined but indistinguishable from a
+  genuine zero, since there is no run-time version accessor.
 
 ### Fixed
 - **`na_client_stats` no longer claims two counters can move on a client when they cannot** — the

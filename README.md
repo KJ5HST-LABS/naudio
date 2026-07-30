@@ -119,6 +119,74 @@ The networking client wraps the C++ `AudioStreamClient`; the matching server is 
 **[examples/README.md](examples/README.md)** for the example clients (play to speakers, in five
 languages) and the demo source.
 
+### Binary compatibility
+
+Read this if you package naudio, or link it as a shared library you did not build yourself.
+
+**Source compatibility is promised; binary compatibility begins at the first tag.** Nothing has been
+tagged, `SOVERSION` is `0`, and no released consumer exists — so the C ABI is still free to change
+shape. The rules below are what it commits to *from* the first tagged release, and the mechanism
+they rest on is already in place.
+
+**Every caller-allocated struct tells the library how large the caller believes it to be.** Without
+that, appending a single field to a future release would make the library read or write past the end
+of a struct allocated by a consumer compiled against the older header — silently, with no symbol
+rename and no link error. How the size travels depends on which side *writes* the struct:
+
+| Struct | Direction | How its size travels | Floor the library enforces |
+|---|---|---|---|
+| `na_client_callbacks` | library **reads** | in-band: `cbs.struct_size = sizeof cbs` | `NA_CLIENT_CALLBACKS_SIZE_V1` |
+| `na_server_callbacks` | library **reads** | in-band: `cbs.struct_size = sizeof cbs` | `NA_SERVER_CALLBACKS_SIZE_V1` |
+| `na_client_stats` | library **writes** | parameter: `na_client_get_stats(c, &st, sizeof st)` | `NA_CLIENT_STATS_SIZE_V1` |
+| `na_device` | library **writes** (array) | parameter: `na_enumerate(ctx, devs, max, sizeof devs[0])` | `NA_DEVICE_SIZE_V1` |
+
+The split is not stylistic. A table the library only reads can carry its own size as a first member —
+Win32's `cbSize` idiom — and callers already `memset` these, so it is one line beside the existing
+one. An *out*-parameter cannot: requiring a caller to pre-initialize a struct the library fills would
+invert the contract these have always had, which is that nothing needs pre-zeroing. For `na_device`
+it is not even a preference — `na_enumerate` fills an **array** and its `max` is an element *count*,
+so only the caller's own element size can say where element *k* begins.
+
+```c
+#include <string.h>
+
+na_client_callbacks cbs;                 /* library READS it -> size travels in-band  */
+memset(&cbs, 0, sizeof cbs);
+cbs.struct_size = sizeof cbs;            /* NA_ERR_INVALID without this — 0 is below the floor */
+
+na_context* ctx = na_context_create();
+na_device devs[32];                      /* library WRITES it -> size is a parameter  */
+int n = na_enumerate(ctx, devs, 32, sizeof devs[0]);
+na_context_destroy(ctx);
+```
+
+**What the declared size buys, in both directions.** The library treats it as a hard bound:
+
+- A library **newer** than the consumer writes only the prefix the consumer allocated, and reads only
+  the fields it declared. An appended field cannot scribble past the end of an already-compiled
+  consumer's struct — the hazard this exists for. For `na_enumerate` it also means each element lands
+  in the consumer's own slot instead of the array walking off its end after the first one.
+- A library **older** than the consumer fills the fields it knows and **zero-fills** the remainder, so
+  the tail is defined rather than indeterminate. Note the honest limit: such a zero is
+  indistinguishable from a genuine zero, and naudio exposes no run-time library-version accessor to
+  tell them apart. The zero-fill makes the tail *defined*, not *informative*. Build against the
+  version you link.
+
+A size below the struct's `_SIZE_V1` floor is rejected with `NA_ERR_INVALID`, which is what an
+accidentally-zero size gives you — the common mistake fails loudly at the call rather than quietly in
+memory.
+
+**The growth rule these constants encode:** fields are only ever **appended**, and each `_SIZE_V1` is
+frozen as `offsetof(<v1's last field>) + sizeof(<its type>)` rather than a byte literal, so appending
+does not move it and the value stays correct on a 32-bit build where these mostly-pointer structs are
+smaller. Any change that is *not* an append — reordering, resizing, or removing a field — is an soname
+break, and `SOVERSION` tracks the major version for exactly that.
+
+**Outside this promise:** the `0xAF01` wire format is frozen separately by
+[the spec](docs/audio-streaming-protocol-v1.md) and is unaffected by any of the above; and the C++ API
+under `naudio/**` ships as **static archives** with no binary-stability promise — link the shared
+`naudio` C ABI if you need one.
+
 ---
 
 ## Using naudio as a C++ library
