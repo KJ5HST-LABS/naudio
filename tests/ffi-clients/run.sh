@@ -58,9 +58,11 @@ repo="$(cd "$here/../.." && pwd)"
 build_dir="${NAUDIO_BUILD_DIR:-$repo/build}"
 CC="${CC:-cc}"
 PYTHON="${PYTHON:-python3}"
+JAVA="${JAVA:-java}"
 
-# Languages compared this run. Each needs a probe below and an entry in probe_cmd().
-LANGS="python"
+# Languages compared this run. Each needs a probe file here, plus an entry in
+# tool_for(), run_probe() and expected_for().
+LANGS="python java"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -136,15 +138,32 @@ echo "ffi-clients: C truth: na_device is $(sed -n 's/^na_device\.sizeof=//p' "$w
 tool_for() {
   case "$1" in
     python) echo "$PYTHON" ;;
+    java)   echo "$JAVA" ;;
     *)      echo "" ;;
   esac
 }
 
 # run_probe <lang> <output file> -- emit that client's manifest on stdout.
+#
+# Java: JDK 22's multi-file source launcher (JEP 458) compiles other classes it
+# needs from the directory holding the file it was given, so Probe.java and the
+# shipped PlayToSpeakers.java are copied into one scratch directory and run from
+# there. That is what lets the probe read the example's own layout without adding
+# a non-example file to examples/java/.
 run_probe() {
   case "$1" in
-    python) NAUDIO_LIB="$lib" "$PYTHON" "$here/probe.py" > "$2" ;;
-    *)      return 1 ;;
+    python)
+      NAUDIO_LIB="$lib" "$PYTHON" "$here/probe.py" > "$2"
+      ;;
+    java)
+      local jdir="$work/java"
+      rm -rf "$jdir" && mkdir -p "$jdir"
+      cp "$repo/examples/java/PlayToSpeakers.java" "$here/Probe.java" "$jdir/"
+      ( cd "$jdir" && NAUDIO_LIB="$lib" "$JAVA" --enable-native-access=ALL-UNNAMED Probe.java ) > "$2"
+      ;;
+    *)
+      return 1
+      ;;
   esac
 }
 

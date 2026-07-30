@@ -54,9 +54,10 @@ int main(void) {
     OFF(na_device, type);
     OFF(na_device, capability);
     OFF(na_device, is_virtual);
-    /* The two char arrays are the only fields whose SIZE a mirror can get wrong
-     * without moving a later offset — a shorter `name` and a longer `host_api`
-     * cancel out. Emit both sizes so that cancellation cannot hide. */
+    /* The array extents. Redundant with the offsets for these two fields — either
+     * array changing size moves a later offset, so nothing here is undetectable
+     * without them — but they name the wrong field directly, which turns "every
+     * offset after 12 is off by one" into "name is 255 bytes, not 256". */
     printf("na_device.fieldsizeof.name=%zu\n", sizeof(((na_device*)0)->name));
     printf("na_device.fieldsizeof.host_api=%zu\n", sizeof(((na_device*)0)->host_api));
 
