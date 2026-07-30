@@ -119,6 +119,23 @@ naudio::AudioFormat makeFormat(int sample_rate, int bits_per_sample, int channel
     catch (const std::bad_alloc&) { setError(NA_ERR_NOMEM); return (sentinel); }      \
     catch (...) { setError(defaultErr); return (sentinel); }
 
+// ---- Library version -------------------------------------------------------------------
+//
+// These are compiled INTO the shared library, so they report the version of the binary a process
+// actually LOADED. That is the whole point: they read the same NAUDIO_VERSION_* macros a consumer's
+// header carries, but from the copy that was current when the LIBRARY was built — so a consumer
+// newer than the library sees the two disagree, which is how a zero-filled struct tail is told
+// apart from a genuinely-zero measurement (naudio.h, "Library version").
+//
+// Deliberately outside NA_GUARD/NA_GUARD_VAL and deliberately NOT calling setError(): neither can
+// fail, so neither clears the thread's last-error. The header documents that clear-on-entry as a
+// property of FALLIBLE calls, and c_abi_smoke.c asserts these two leave a non-OK last-error alone.
+// No allocation, no backend, no lock — safe on any thread and before any na_context exists.
+
+extern "C" int na_version_number(void) { return NAUDIO_VERSION_NUMBER; }
+
+extern "C" const char* na_version_string(void) { return NAUDIO_VERSION_STRING; }
+
 // ---- Error model -----------------------------------------------------------------------
 
 extern "C" const char* na_strerror(na_error_t err) {

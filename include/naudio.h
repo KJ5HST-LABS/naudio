@@ -29,11 +29,12 @@
  *
  * The library honours that size as a hard bound in both directions: a NEWER library touches only the
  * prefix the caller allocated, and an OLDER one zero-fills the remainder so the tail is defined —
- * though such a zero is indistinguishable from a genuine zero, and naudio exposes no run-time
- * library-version accessor to tell them apart. Build against the version you link. Fields are only
- * ever APPENDED, and each floor below (NA_*_SIZE_V1) is frozen as offsetof(<v1's last field>) +
- * sizeof(<its type>), never a byte literal, so appending does not move it. A struct_size below its
- * floor is rejected with NA_ERR_INVALID -- which is what an accidentally-zero size gives you.
+ * and such a zero is told apart from a genuine zero by comparing NAUDIO_VERSION_NUMBER (the version
+ * you COMPILED against) with na_version_number() (the one you LOADED); see "Library version" below.
+ * Fields are only ever APPENDED — each naming the version it arrived in — and each floor below
+ * (NA_*_SIZE_V1) is frozen as offsetof(<v1's last field>) + sizeof(<its type>), never a byte
+ * literal, so appending does not move it. A struct_size below its floor is rejected with
+ * NA_ERR_INVALID -- which is what an accidentally-zero size gives you.
  */
 #ifndef NAUDIO_H
 #define NAUDIO_H
@@ -45,6 +46,68 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ---- Library version ---------------------------------------------------------------
+ *
+ * TWO versions exist and they are not the same number: the one you COMPILED against (the macros
+ * below, baked into your object file at build time) and the one you LOADED (the na_version_*
+ * accessors, answered by the shared library itself at run time). They agree only when you build
+ * and link against the same release — which a packager, a distro upgrade, or an LD_LIBRARY_PATH
+ * cannot guarantee for you.
+ *
+ * This is what makes an older library's zero-filled struct tail INFORMATIVE rather than merely
+ * defined. Per BINARY COMPATIBILITY above, a library older than your header fills the fields it
+ * knows and zero-fills the rest — but a zero there is indistinguishable from a genuine zero, and
+ * na_client_stats deliberately encodes "the library is not measuring this" as -1, so the two
+ * conventions collide precisely in that tail. Comparing the versions is what separates them:
+ *
+ *     if (na_version_number() >= NA_VERSION_ENCODE(0, 2, 0))
+ *         use(st.field_added_in_0_2_0);   // the library really wrote it
+ *     else
+ *         ;                               // the zero is fill, not a measurement
+ *
+ * Every field appended after the first tagged release names the version it arrived in, so that
+ * comparison is always writable. NOTE the ordinary linker rule still applies underneath: calling
+ * na_version_number() at all requires a library that HAS it, so this answers "how much newer am I
+ * than the library" and never "does this symbol exist" — a missing symbol is a load-time failure,
+ * not something to test for. Both accessors are in the first published ABI for that reason.
+ *
+ * These macros are held equal to the build's project(VERSION) by a configure-time check in
+ * CMakeLists.txt, so they cannot drift from the SONAME or from naudio.pc's Version.
+ */
+#define NAUDIO_VERSION_MAJOR 0
+#define NAUDIO_VERSION_MINOR 1
+#define NAUDIO_VERSION_PATCH 0
+
+/* Pack a major/minor/patch triple into one monotonically comparable integer. Always compare
+ * THROUGH this macro rather than spelling the arithmetic: the encoding is an implementation
+ * detail, and only this macro and na_version_number() are promised to agree on it. Minor and
+ * patch are each bounded by 999, which is what makes the ordering total (0.999.999 < 1.0.0). */
+#define NA_VERSION_ENCODE(major, minor, patch) \
+    ((major) * 1000000 + (minor) * 1000 + (patch))
+
+/* The version of THIS HEADER, encoded. Compare against na_version_number() (the loaded library). */
+#define NAUDIO_VERSION_NUMBER \
+    NA_VERSION_ENCODE(NAUDIO_VERSION_MAJOR, NAUDIO_VERSION_MINOR, NAUDIO_VERSION_PATCH)
+
+/* The version of THIS HEADER as "major.minor.patch". DERIVED from the three macros above by
+ * stringification rather than spelled as a literal, so it cannot disagree with them. */
+#define NA_VERSION_STRINGIFY_(x) #x
+#define NA_VERSION_STRINGIFY(x)  NA_VERSION_STRINGIFY_(x)
+#define NAUDIO_VERSION_STRING          \
+    NA_VERSION_STRINGIFY(NAUDIO_VERSION_MAJOR) "." \
+    NA_VERSION_STRINGIFY(NAUDIO_VERSION_MINOR) "." \
+    NA_VERSION_STRINGIFY(NAUDIO_VERSION_PATCH)
+
+/* The version of the LIBRARY THIS PROCESS ACTUALLY LOADED, in NA_VERSION_ENCODE form.
+ * INFALLIBLE: no allocation, no backend, no failure mode — so it is callable before
+ * na_context_create, from any thread, and it does NOT touch na_last_error() (which is documented
+ * as being cleared by each FALLIBLE call; these two are not). */
+NA_EXPORT int na_version_number(void);
+
+/* The same loaded-library version as "major.minor.patch". Never NULL; static storage valid for the
+ * life of the process, never freed by the caller. Infallible on the same terms as above. */
+NA_EXPORT const char* na_version_string(void);
 
 /* Device type codes (mirror naudio::DeviceType). */
 #define NA_TYPE_HARDWARE 0
@@ -143,9 +206,8 @@ typedef struct na_device {
  * library NEWER than the caller writes each element's v1 prefix in the caller's own slot instead
  * of walking off the end of the array after the first one. A library OLDER than the caller fills
  * the fields it knows and ZERO-fills the rest of each element, so the tail is defined rather than
- * indeterminate; note that such a zero is indistinguishable from a genuine zero, and naudio
- * exposes no run-time library-version accessor to tell them apart. Build against the version you
- * link.
+ * indeterminate; such a zero reads the same as a genuine zero, so compare NAUDIO_VERSION_NUMBER
+ * against na_version_number() to tell fill from measurement (see "Library version" at the top).
  */
 NA_EXPORT int na_enumerate(na_context* ctx, na_device* out, int max, size_t struct_size);
 
@@ -562,9 +624,11 @@ typedef struct na_client_stats {
  * A library NEWER than the caller writes only the prefix the caller allocated, so an appended
  * field can never scribble past the end of an already-compiled consumer's struct — the hazard
  * this parameter exists for. A library OLDER than the caller fills the fields it knows and
- * ZERO-fills the remainder, so the tail is defined rather than indeterminate; note that such a
- * zero is indistinguishable from a genuine zero, and naudio exposes no run-time library-version
- * accessor to tell them apart. Build against the version you link. */
+ * ZERO-fills the remainder, so the tail is defined rather than indeterminate. Such a zero reads the
+ * same as a genuine zero — and this struct in particular encodes "not measured" as -1, so the two
+ * conventions collide there — but comparing NAUDIO_VERSION_NUMBER against na_version_number()
+ * separates them: a field appended in a later release names the version it arrived in, and a
+ * library older than that never wrote it (see "Library version" at the top of this header). */
 NA_EXPORT na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out,
                                          size_t struct_size);
 

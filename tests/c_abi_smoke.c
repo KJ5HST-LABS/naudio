@@ -7,6 +7,9 @@
  *
  * C-ABI contract smoke. Compiled as C and linked against the C++ naudio library:
  * it proves naudio.h is C-compilable and C-callable, and asserts:
+ *   (0) the library-version contract — the na_version_* accessors are exported and C-callable, the
+ *       loaded library agrees with the header it was built from, and both accessors are infallible
+ *       (they leave a NON-OK na_last_error() untouched, unlike every fallible call);
  *   (1) the text-function contract — buf == NULL returns the needed length WITHOUT writing (this
  *       previously segfaulted), and a short buffer is NUL-terminated while the full length is
  *       still returned;
@@ -22,10 +25,62 @@
 
 #include "naudio.h"
 
+/* NA_VERSION_ENCODE must be MONOTONIC, or every `>=` a consumer writes against it is wrong at a
+ * carry boundary — and that is the one comparison the whole accessor exists to support. Both are
+ * compile-time facts about the macro, so they are asserted at compile time rather than run time. */
+_Static_assert(NA_VERSION_ENCODE(0, 1, 99) < NA_VERSION_ENCODE(0, 2, 0),
+               "NA_VERSION_ENCODE: patch must not carry into minor");
+_Static_assert(NA_VERSION_ENCODE(0, 999, 999) < NA_VERSION_ENCODE(1, 0, 0),
+               "NA_VERSION_ENCODE: minor.patch must not carry into major");
+
 int main(void) {
+    /* ---- (0) library version ----
+     * These run FIRST, before any context exists, because that is part of the contract: both
+     * accessors are infallible and callable before na_context_create. */
+
+    const char* const vstr = na_version_string();
+    if (vstr == NULL || vstr[0] == '\0') {
+        fprintf(stderr, "FAIL: na_version_string() returned %s\n", vstr ? "an empty string" : "NULL");
+        return 1;
+    }
+    /* In-tree the header and the library are the same build, so these MUST agree. Cross-version
+     * skew is the case this cannot reach from one build (that is #32's separately-compiled
+     * consumer gate); what this proves is that the accessors report the header they were compiled
+     * from rather than a hand-maintained constant that drifted. */
+    if (na_version_number() != NAUDIO_VERSION_NUMBER) {
+        fprintf(stderr, "FAIL: na_version_number()=%d != NAUDIO_VERSION_NUMBER=%d\n",
+                na_version_number(), NAUDIO_VERSION_NUMBER);
+        return 1;
+    }
+    /* Its own arm, not folded into the one above: the string is derived from the three macros by
+     * stringification and the number by arithmetic, so they fail independently. */
+    if (strcmp(vstr, NAUDIO_VERSION_STRING) != 0) {
+        fprintf(stderr, "FAIL: na_version_string()=\"%s\" != NAUDIO_VERSION_STRING=\"%s\"\n",
+                vstr, NAUDIO_VERSION_STRING);
+        return 1;
+    }
+
+    /* Infallible means they do NOT touch the thread's last-error. Establish a NON-OK state first:
+     * asserted against NA_OK this would pass even if the accessors cleared it, which is the
+     * reading that makes such an assertion worthless. */
+    (void)na_probe_format(NULL, 0, 48000, 16, 2, 1); /* a known NA_ERR_INVALID path, no ctx needed */
+    if (na_last_error() != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: could not establish a non-OK last-error for the version arm\n");
+        return 1;
+    }
+    (void)na_version_number();
+    (void)na_version_string();
+    if (na_last_error() != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: na_version_* cleared na_last_error() (now %d) -- they are "
+                        "infallible and must leave it alone\n", na_last_error());
+        return 1;
+    }
+
     /* ---- (1) text-function NULL-buffer / truncation contract ---- */
 
-    /* buf == NULL must return the needed length without writing (the documented length probe). */
+    /* buf == NULL must return the needed length without writing (the documented length probe).
+     * NOTE this now runs with last-error at NA_ERR_INVALID from arm (0), which STRENGTHENS the
+     * NA_OK assertion below: it can no longer pass by inheriting an already-clear state. */
     const int len = na_install_instructions(NULL, 1000);
     if (len <= 0) {
         fprintf(stderr, "FAIL: NULL-buffer length probe returned %d\n", len);
