@@ -76,7 +76,7 @@ extern "C" {
  * CMakeLists.txt, so they cannot drift from the SONAME or from naudio.pc's Version.
  */
 #define NAUDIO_VERSION_MAJOR 0
-#define NAUDIO_VERSION_MINOR 1
+#define NAUDIO_VERSION_MINOR 2
 #define NAUDIO_VERSION_PATCH 0
 
 /* The largest value NA_VERSION_ENCODE accepts for minor and for patch. Above it a lower component
@@ -591,7 +591,8 @@ typedef struct na_client_stats {
      * audio), and on a client the same thread both fills the queue and drains it — the receive path
      * empties the queue before it reads the socket, so a slow consumer stalls the producer with it
      * and the depth never exceeds one reorder burst. A consumer too slow to keep up loses audio in
-     * the kernel's socket buffer instead, which no counter here reports. The counter moves on the
+     * the kernel's socket buffer instead — read `sequence_gaps` for that, which is where such loss
+     * became visible in 0.2.0. The counter moves on the
      * SERVER side, where a demux thread fills the queue and the application thread drains it. */
     long long queue_drops;
     double    jitter_ms;                 /* current inter-arrival jitter estimate; 0 if off    */
@@ -607,12 +608,42 @@ typedef struct na_client_stats {
     long long packets_lost;
     long long packets_out_of_order;
     double    packet_loss_rate;
+
+    /* @since 0.2.0 — read it only when na_version_number() >= NA_VERSION_ENCODE(0, 2, 0);
+     * an older library zero-fills this slot and that 0 is fill, not a measurement.
+     *
+     * Sequence slots the reorder buffer gave up on and emitted as a gap — audio the pipeline
+     * could not deliver in order. This is the post-reorder loss measure, and it is the exact
+     * COMPLEMENT of the three fields above: a reorder buffer is engaged on every built-in UDP
+     * profile, so this carries a reading precisely where those read -1, and reads -1 itself
+     * precisely where they carry one. Never both, never neither.
+     *
+     * Two things it does NOT say, both of which the name invites:
+     *
+     *   - NOT final loss. It is counted BEFORE the FEC decoder sees the stream (the pipeline is
+     *     reorder -> FEC -> queue), so a slot counted here may still be refilled by parity. The
+     *     unrecovered remainder is sequence_gaps - packets_recovered_by_fec.
+     *   - NOT a cause. This is where a too-slow consumer's kernel-dropped datagrams finally
+     *     become visible — the loss mode that had no counter at all before 0.2.0 — but a gap
+     *     cannot distinguish one from a datagram lost on the wire, and this field does not try.
+     *
+     * It counts every packet type sharing the sequence space (audio, parity, control), not
+     * audio packets alone, so it moves a little on a busy roster even with no loss. */
+    long long sequence_gaps;
 } na_client_stats;
 
 /* The size of na_client_stats in the FIRST published ABI, and the floor na_client_get_stats
  * enforces. FROZEN: `packet_loss_rate` is v1's last field forever, so appending does not move it. */
 #define NA_CLIENT_STATS_SIZE_V1 \
     (offsetof(na_client_stats, packet_loss_rate) + sizeof(double))
+
+/* The size through the last field added in 0.2.0. NOT a floor — na_client_get_stats still
+ * accepts anything >= NA_CLIENT_STATS_SIZE_V1, because a v1-compiled consumer is exactly who
+ * this scheme exists to keep working. It is the threshold the library tests the caller's
+ * declared size against before writing `sequence_gaps`, and the shape every future append
+ * repeats: one frozen constant per version, each the offset+size of that version's last field. */
+#define NA_CLIENT_STATS_SIZE_V2 \
+    (offsetof(na_client_stats, sequence_gaps) + sizeof(long long))
 
 /* Fill *out with a snapshot of the client's counters. Safe to call from any thread at any
  * time, including while streaming and before connect (which yields connected == 0 and

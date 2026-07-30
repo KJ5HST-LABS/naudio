@@ -195,7 +195,11 @@ extern "C" int na_enumerate(na_context* ctx, na_device* out, int max, std::size_
             char* base = reinterpret_cast<char*>(out) + static_cast<std::size_t>(written) * struct_size;
             // A caller compiled against a LONGER version of this header gets each element's tail
             // zeroed rather than left indeterminate. (A caller compiled against a shorter one
-            // cannot reach here: every field below is v1, and the floor check guarantees v1 fits.)
+            // cannot reach here: every field below is v1, and the floor check guarantees v1 fits.
+            // That holds because na_device HAS NO POST-V1 FIELD YET -- it is a fact about this
+            // struct's current contents, not a property of the scheme. na_client_get_stats now
+            // has one and guards it per-field; the first na_device append owes the same guard
+            // here, and this scoping stops being true the moment it lands.)
             if (struct_size > sizeof(na_device)) {
                 std::memset(base + sizeof(na_device), 0, struct_size - sizeof(na_device));
             }
@@ -884,7 +888,12 @@ extern "C" int na_client_server_tx_owner(na_stream_client* client, char* buf, in
 //
 // Field-wise, not byte-wise, for the mirror of the reason copyCallerStruct above is byte-wise:
 // this side has no second na_client_stats to copy from, only a differently-shaped C++ struct.
-// When a field is appended, guard it with `if (struct_size >= NA_CLIENT_STATS_SIZE_V2)`.
+//
+// 0.2.0 appended the first post-v1 field, so the guard this comment used to describe in the future
+// tense is now below and load-bearing: EVERY post-v1 field is written only if the CALLER's declared
+// size reaches it. The floor check rejects anything under v1 and nothing more, which is the whole
+// point -- a v1-compiled consumer is exactly who this scheme exists to keep working, and it is
+// still entitled to call a 0.2.0 library with `sizeof` its own shorter struct.
 
 extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out,
                                           std::size_t struct_size) {
@@ -894,8 +903,10 @@ extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_st
             return NA_ERR_INVALID;
         }
         // A caller compiled against a LONGER version of this header gets its tail zeroed rather
-        // than left indeterminate. (A caller compiled against a shorter one cannot reach here:
-        // every field below is v1, and the floor check above guarantees v1 fits.)
+        // than left indeterminate. (A caller compiled against a SHORTER one absolutely can reach
+        // here -- a v1 consumer calling a 0.2.0 library is the case this whole scheme is for --
+        // which is why every post-v1 field below is guarded on struct_size individually. The
+        // unguarded writes are exactly the v1 set, which the floor check guarantees fits.)
         if (struct_size > sizeof(na_client_stats)) {
             std::memset(reinterpret_cast<char*>(out) + sizeof(na_client_stats), 0,
                         struct_size - sizeof(na_client_stats));
@@ -917,6 +928,10 @@ extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_st
         out->packets_lost = static_cast<long long>(s.packetsLost);
         out->packets_out_of_order = static_cast<long long>(s.packetsOutOfOrder);
         out->packet_loss_rate = s.packetLossRate;
+        // ---- end of v1. Everything below is guarded on the CALLER's declared size. ----
+        if (struct_size >= NA_CLIENT_STATS_SIZE_V2) {
+            out->sequence_gaps = static_cast<long long>(s.sequenceGaps);
+        }
         return NA_OK;
     });
 }
