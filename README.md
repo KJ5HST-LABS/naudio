@@ -167,16 +167,46 @@ na_context_destroy(ctx);
   consumer's struct — the hazard this exists for. For `na_enumerate` it also means each element lands
   in the consumer's own slot instead of the array walking off its end after the first one.
 - A library **older** than the consumer fills the fields it knows and **zero-fills** the remainder, so
-  the tail is defined rather than indeterminate. Note the honest limit: such a zero is
-  indistinguishable from a genuine zero, and naudio exposes no run-time library-version accessor to
-  tell them apart. The zero-fill makes the tail *defined*, not *informative*. Build against the
-  version you link.
+  the tail is defined rather than indeterminate. On its own that makes the tail *defined*, not
+  *informative* — a zero there reads exactly like a measured zero. The version accessors below are
+  what separate them.
 
 A size below the struct's `_SIZE_V1` floor is rejected with `NA_ERR_INVALID`, which is what an
 accidentally-zero size gives you — the common mistake fails loudly at the call rather than quietly in
 memory.
 
-**The growth rule these constants encode:** fields are only ever **appended**, and each `_SIZE_V1` is
+**Telling a zero-fill from a zero.** Two versions exist and they are not the same number: the one you
+**compiled** against (`NAUDIO_VERSION_MAJOR` / `_MINOR` / `_PATCH`, and the derived
+`NAUDIO_VERSION_NUMBER` and `NAUDIO_VERSION_STRING`) and the one you **loaded**
+(`na_version_number()` and `na_version_string()`, answered by the shared library itself). A packager,
+a distro upgrade, or an `LD_LIBRARY_PATH` can make them differ. This matters most for
+`na_client_stats`, which deliberately encodes *"the library is not measuring this"* as `-1`, so the
+zero-fill and the sentinel conventions collide exactly in that tail.
+
+```c
+#include <stdio.h>
+
+/* At startup: is the library you LOADED as new as the header you COMPILED against? */
+if (na_version_number() < NAUDIO_VERSION_NUMBER)
+    printf("naudio %s loaded, built against %s — newer fields read as zero-fill\n",
+           na_version_string(), NAUDIO_VERSION_STRING);
+
+/* Per field: a counter appended in 0.2.0 carries a measurement only on 0.2.0 or later.
+   On anything older, na_client_get_stats zero-filled that tail and the 0 means nothing. */
+if (na_version_number() >= NA_VERSION_ENCODE(0, 2, 0)) {
+    /* safe to read the field that arrived in 0.2.0 */
+}
+```
+
+Always compare **through** `NA_VERSION_ENCODE` rather than spelling the arithmetic — the packing is
+an implementation detail, and only that macro and `na_version_number()` are promised to agree on it.
+The ordering is total for components within `NA_VERSION_MAX_COMPONENT` (so `0.999.999 < 1.0.0`).
+Both accessors are infallible: no allocation, no backend, callable before `na_context_create()` and
+from any thread, and they leave `na_last_error()` untouched. The header's macros cannot drift from
+the SONAME — CMake refuses to configure a build where they disagree with `project(VERSION)`.
+
+**The growth rule these constants encode:** fields are only ever **appended**, each one **naming the
+version it arrived in**, so the comparison above is always writable; and each `_SIZE_V1` is
 frozen as `offsetof(<v1's last field>) + sizeof(<its type>)` rather than a byte literal, so appending
 does not move it and the value stays correct on a 32-bit build where these mostly-pointer structs are
 smaller. Any change that is *not* an append — reordering, resizing, or removing a field — is an soname
