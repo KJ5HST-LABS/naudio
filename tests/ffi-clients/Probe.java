@@ -76,7 +76,9 @@ public final class Probe {
                 MemorySegment arr =
                     arena.allocate(devSize * max, PlayToSpeakers.NA_DEVICE.byteAlignment());
 
-                int n = (int) PlayToSpeakers.naEnumerate.invokeExact(ctx, arr, max);
+                // invokeExact is SIGNATURE-EXACT: devSize must be a long here, matching the
+                // JAVA_LONG the example's FunctionDescriptor declares for struct_size.
+                int n = (int) PlayToSpeakers.naEnumerate.invokeExact(ctx, arr, max, devSize);
                 if (n < 0) {
                     System.err.println("Probe: na_enumerate failed: " + n);
                     System.exit(1);

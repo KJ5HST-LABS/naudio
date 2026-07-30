@@ -106,7 +106,9 @@ public final class PlayToSpeakers {
         naLastError              = dh(lib, "na_last_error",                 FunctionDescriptor.of(JAVA_INT));
         naContextCreate          = dh(lib, "na_context_create",            FunctionDescriptor.of(ADDRESS));
         naContextDestroy         = dh(lib, "na_context_destroy",           FunctionDescriptor.ofVoid(ADDRESS));
-        naEnumerate              = dh(lib, "na_enumerate",                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
+        // Trailing JAVA_LONG is na_enumerate's `size_t struct_size` — the caller's element size,
+        // which the library strides the array by. Same 64-bit assumption as the RX callback.
+        naEnumerate              = dh(lib, "na_enumerate",                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_LONG));
         naClientCreate           = dh(lib, "na_client_create",            FunctionDescriptor.of(ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, ADDRESS));
         naClientDestroy          = dh(lib, "na_client_destroy",           FunctionDescriptor.ofVoid(ADDRESS));
         naClientSetTransport     = dh(lib, "na_client_set_transport",     FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
@@ -228,7 +230,7 @@ public final class PlayToSpeakers {
         }
         try {
             MemorySegment arr = arena.allocate(DEV_SIZE * MAX_DEVICES, NA_DEVICE.byteAlignment());
-            int n = (int) naEnumerate.invokeExact(ctx, arr, MAX_DEVICES);
+            int n = (int) naEnumerate.invokeExact(ctx, arr, MAX_DEVICES, DEV_SIZE);
             if (n < 0) {
                 log("error: na_enumerate: " + strerror(n));
                 return 1;
@@ -259,7 +261,7 @@ public final class PlayToSpeakers {
         if (ctx.address() == 0) return -1;
         try {
             MemorySegment arr = arena.allocate(DEV_SIZE * MAX_DEVICES, NA_DEVICE.byteAlignment());
-            int n = (int) naEnumerate.invokeExact(ctx, arr, MAX_DEVICES);
+            int n = (int) naEnumerate.invokeExact(ctx, arr, MAX_DEVICES, DEV_SIZE);
             for (int i = 0; i < n; i++) {
                 MemorySegment d = arr.asSlice((long) i * DEV_SIZE, DEV_SIZE);
                 int cap = d.get(JAVA_INT, DEV_CAPABILITY);

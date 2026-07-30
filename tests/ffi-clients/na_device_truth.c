@@ -89,7 +89,7 @@ int main(void) {
      * count is compared across all four, so the cap only has to exceed the host's
      * device count -- which it does by a wide margin on any real machine. */
     na_device devs[128];
-    int n = na_enumerate(ctx, devs, 128);
+    int n = na_enumerate(ctx, devs, 128, sizeof devs[0]);
     if (n < 0) {
         fprintf(stderr, "na_device_truth: na_enumerate failed: %s\n", na_strerror(n));
         na_context_destroy(ctx);

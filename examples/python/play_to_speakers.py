@@ -159,7 +159,9 @@ def bind(lib):
     lib.na_context_create.argtypes = []
     lib.na_context_create.restype = C.c_void_p
     lib.na_context_destroy.argtypes = [C.c_void_p]
-    lib.na_enumerate.argtypes = [C.c_void_p, C.POINTER(NaDevice), C.c_int]
+    # The 4th argument is the caller's sizeof(na_device): na_enumerate strides the array by it,
+    # so an appended field can never make the library walk off the end of OUR array.
+    lib.na_enumerate.argtypes = [C.c_void_p, C.POINTER(NaDevice), C.c_int, C.c_size_t]
     lib.na_enumerate.restype = C.c_int
 
     lib.na_client_create.argtypes = [C.c_int, C.c_char_p, C.c_int, C.c_char_p]
@@ -192,7 +194,7 @@ def enumerate_devices(lib):
         sys.exit("na_context_create failed: " + lib.na_strerror(lib.na_last_error()).decode())
     try:
         arr = (NaDevice * 64)()
-        n = lib.na_enumerate(ctx, arr, 64)
+        n = lib.na_enumerate(ctx, arr, 64, C.sizeof(NaDevice))
         if n < 0:
             sys.exit("na_enumerate failed: " + lib.na_strerror(n).decode())
         return [arr[i] for i in range(n)]

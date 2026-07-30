@@ -63,7 +63,8 @@ mod client {
                 std::process::exit(1);
             }
             let mut devs: Vec<NaDevice> = Vec::with_capacity(MAX_DEVICES);
-            let n = na_enumerate(ctx, devs.as_mut_ptr(), MAX_DEVICES as c_int);
+            let n = na_enumerate(ctx, devs.as_mut_ptr(), MAX_DEVICES as c_int,
+                                 std::mem::size_of::<NaDevice>());
             if n < 0 {
                 eprintln!("na_ffi_probe: na_enumerate failed: {n}");
                 na_context_destroy(ctx);
