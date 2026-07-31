@@ -6,6 +6,40 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **`na_server_get_stats` + `na_server_stats` (`@since 0.2.0`) — the server-side counters, where the
+  two fields that carry no information on a client actually move.** `na_client_stats` documents
+  `control_retransmits` and `queue_drops` as always 0 on a client: both are written by paths only a
+  server-side connection reaches. Until now there was nowhere in the C ABI to read them from —
+  `na_server_get_stats` did not exist — so two fields shipped in the public ABI with no surface that
+  could observe them. The new call reports the five aggregates the transports already computed
+  (`packets_`/`bytes_` + `crc_errors`) plus those two and a `clients_connected` roster size, and the
+  size travels as an explicit `struct_size` **parameter**, matching `na_client_get_stats`, because
+  this is a struct the library writes. `NA_SERVER_STATS_SIZE_V1` is the floor.
+
+  **It is a gauge over the live roster, not a lifetime total** — the one contract difference from
+  `na_client_stats`, and the one most likely to be got wrong. Every field is summed across the
+  clients connected *at the moment of the call*, so a client that disconnects takes its counters out
+  of the sum and these fields **can decrease**. Measured rather than reasoned about: two clients
+  being fanned 60 frames each read `packets_sent` 127, and 64 after one disconnected. A consumer
+  computing a delta across a roster change reads negative throughput; the header says so, and both
+  the C++ and the pure-C suites assert the decrease.
+
+  `control_retransmits` is now **observed non-zero on a real server session** for the first time —
+  6 resends from 3 distinct unacked critical control messages, bounded above by the retransmit
+  attempt limit and below by the client's own count of duplicate control datagrams, a quantity the
+  server never computes. Previous coverage drove the counter at the class level via a synthetic
+  NACK, which proved the mechanism and not that a server reaches it.
+
+  `queue_drops`, by contrast, is **reachable in principle and unreached in practice**, and issue
+  #29's stated reason for expecting it to move — that a demux thread fills the queue while the
+  application thread drains it — turns out not to be sufficient. 20,000 packets pushed as fast as
+  the socket would accept them arrived complete and left the counter at 0, because the server's
+  receive path has no blocking step in it by design. The counter is correctly wired: a consumer
+  artificially stalled 1 ms per packet produced 57,115 drops from 60,001 received. So it is a safety
+  net that fires if a blocking step is ever introduced on the receive path, not a meter on normal
+  operation — and the 0 is committed as an executable assertion so the limitation cannot quietly
+  become folklore.
+
 - **`na_client_stats.sequence_gaps` (`@since 0.2.0`) — the post-reorder loss measure, and the first
   field appended under the struct-size promise.** Until now no counter in this struct could report
   loss on a profile a consumer can actually select: `packets_lost` and its two siblings are `-1` on

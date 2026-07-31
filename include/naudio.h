@@ -830,6 +830,99 @@ NA_EXPORT int na_server_max_clients(na_audio_server* server);
  * convention (len==0 / buf==NULL just returns the needed length). "" (length 0) if no owner. */
 NA_EXPORT int na_server_tx_owner(na_audio_server* server, char* buf, int len);
 
+/* --- Statistics ---
+ *
+ * @since 0.2.0 — the whole of na_server_stats / na_server_get_stats. A caller that may load an
+ * older library must gate on na_version_number() >= NA_VERSION_ENCODE(0, 2, 0); resolving the
+ * symbol dynamically will simply fail there.
+ *
+ * The server-side mirror of na_client_stats, and it exists because two of that struct's fields
+ * carry no information on a client at all. control_retransmits and queue_drops are written by
+ * paths only a server-side connection reaches, so before this call there was nowhere in the C ABI
+ * they could be read from.
+ *
+ * A GAUGE OVER THE LIVE ROSTER, NOT A LIFETIME TOTAL — the one contract difference from
+ * na_client_stats, and the one that will bite a consumer building a rate on top of it. Every
+ * number here is summed across the clients connected AT THE MOMENT OF THE CALL. A client that
+ * disconnects takes its counters out of the sum, so these fields CAN DECREASE between two reads,
+ * and a roster that churns loses the departed clients' history entirely. Measured: two clients
+ * being fanned 60 frames each read packets_sent == 127; after one disconnected the next read was
+ * 64. Never compute a delta across a roster change and call it throughput.
+ *
+ * Fields are not snapshotted atomically with respect to each other: each aggregate is taken
+ * independently, so a client may join or leave between two of them. The skew is bounded by one
+ * roster change, which is the same quantity the fields are already documented as summing over.
+ */
+typedef struct na_server_stats {
+    /* 1 if a bound transport supplied these numbers. 0 means there is none (before
+     * na_server_start, after na_server_stop) and EVERY field below is its default rather than a
+     * reading — check this before believing a zero, exactly as with na_client_stats.connected. */
+    int running;
+
+    /* Roster size at the moment of the read — the divisor for any per-client average, and the
+     * context the rest of this struct needs: a 0 alongside clients_connected == 0 says nothing
+     * happened because nobody is connected, not that nothing happened. */
+    int clients_connected;
+
+    long long packets_sent;
+    long long packets_received;
+    long long bytes_sent;
+    long long bytes_received;
+    int       crc_errors;
+
+    /* Control-ARQ resends (reliability layer, not audio) — the counter that CANNOT move on a
+     * client, and does move here. The server sends CONNECT_ACCEPT / AUDIO_CONFIG / TX_GRANTED /
+     * CLIENTS_UPDATE, tracks each for acknowledgement, and resends any still unacked when the
+     * retransmit sweep runs. Non-zero only on a UDP or DUAL reliability profile, all of which
+     * enable control reliability; a structural 0 on NA_RELIABILITY_DEFAULT (TCP), which has no
+     * ARQ layer because the stream is already reliable.
+     *
+     * Observed, not inferred: a client that never acknowledges leaves 3 distinct critical control
+     * messages unacked, and this read 6 after two sweeps, against a ceiling of 3 messages x 3
+     * attempts. Bounded per message by the attempt limit, after which the pending entry is
+     * dropped rather than resent forever. */
+    long long control_retransmits;
+
+    /* Packets discarded from a connection's ordered queue because it was full — audio lost
+     * LOCALLY, after the network delivered it successfully. Reachable here and structurally
+     * impossible on a client (see na_client_stats.queue_drops).
+     *
+     * BUT EXPECT 0, AND DO NOT READ THAT 0 AS "THE SERVER IS HEALTHY". The server's receive path
+     * has no blocking step in it by design, so the drain keeps pace with the network and the
+     * 2048-packet queue does not back up under load: 20000 packets pushed as fast as the socket
+     * would accept them arrived complete and left this at 0. The counter is correctly wired — a
+     * consumer artificially stalled 1 ms per packet produced 57115 drops from 60001 received — so
+     * a non-zero value here is a real and serious signal. It is best understood as a safety net
+     * that fires if a blocking step is ever introduced on the receive path, not as a meter that
+     * reports on normal operation. Note this is a DIFFERENT reason from the client's: there the
+     * event cannot occur at all, here it can and simply does not. */
+    long long queue_drops;
+} na_server_stats;
+
+/* The size of na_server_stats in the FIRST published ABI, and the floor na_server_get_stats
+ * enforces. FROZEN: `queue_drops` is v1's last field forever, so appending does not move it.
+ * The same shape as NA_CLIENT_STATS_SIZE_V1 — offset of the last v1 field plus its size, never a
+ * byte literal — and every future version adds one more such constant beside it. */
+#define NA_SERVER_STATS_SIZE_V1 \
+    (offsetof(na_server_stats, queue_drops) + sizeof(long long))
+
+/* Fill *out with a snapshot of the server's aggregate counters. Safe to call from any thread at
+ * any time, including while running and before na_server_start (which yields running == 0 and
+ * defaults). NA_ERR_INVALID on a NULL server, a NULL out, or a `struct_size` below
+ * NA_SERVER_STATS_SIZE_V1; NA_OK otherwise — a stopped server is NOT an error, it is
+ * `running == 0`.
+ *
+ * `struct_size` is sizeof(na_server_stats) AS THE CALLER COMPILED IT, and it carries the same
+ * cross-version guarantee na_client_get_stats documents at length: a newer library writes only
+ * the prefix the caller allocated, an older one zero-fills the tail it does not know, and a field
+ * appended later names the version it arrived in so a zero-fill can be told from a reading.
+ *
+ *     na_server_stats st;                     // no pre-zeroing needed
+ *     na_server_get_stats(s, &st, sizeof st);
+ */
+NA_EXPORT na_error_t na_server_get_stats(na_audio_server* server, na_server_stats* out,
+                                         size_t struct_size);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

@@ -138,6 +138,17 @@ int main(void) {
         fprintf(stderr, "FAIL: NULL-server setters/start/inject not NA_ERR_INVALID\n");
         return 1;
     }
+    /* na_server_get_stats, NULL-server half. The NULL-out and below-the-floor halves need a
+     * REAL server handle to be meaningful, so they are asserted at the live-reading site below
+     * rather than with a fabricated pointer here. */
+    {
+        na_server_stats st;
+        if (na_server_get_stats(NULL, &st, sizeof st) != NA_ERR_INVALID) {
+            fprintf(stderr, "FAIL: na_server_get_stats(NULL) not NA_ERR_INVALID\n");
+            return 1;
+        }
+    }
+
     /* NULL-safe no-ops must not crash, and the NULL-server getters return their sentinels. */
     na_server_stop(NULL);
     na_server_destroy(NULL);
@@ -293,6 +304,7 @@ int main(void) {
      * flags land on the server/client dispatch threads slightly after the wire-level connect
      * — poll for them here rather than asserting them immediately after the loop, or a busy
      * scheduler loses that race. na_server_client_count is mutex-guarded (safe to poll). */
+    long long srv_packets_sent_with_client = 0;
     int waited = 0;
     while (waited < 3000 &&
            !(atomic_load(&g_cli_rx_ok) && atomic_load(&g_cli_connected) &&
@@ -320,6 +332,87 @@ int main(void) {
         na_client_destroy(client);
         na_server_destroy(server);
         return 1;
+    }
+
+    /* ---- na_server_get_stats: a LIVE reading, from pure C ----
+     * The two counters this call exists for are control_retransmits and queue_drops, neither of
+     * which can carry information on a client. Their VALUES are provoked and bounded in
+     * tests/net/test_server.cpp (a server observed at 6 retransmits, and queue_drops pinned at 0
+     * while the drain keeps up); what is asserted here is the C-ABI surface itself — that the
+     * struct is C-compilable, the call is C-callable, the size parameter behaves, and a live
+     * server reports a live roster. */
+    {
+        na_server_stats st;  /* deliberately NOT pre-zeroed: the library writes every field */
+
+        /* The remaining two thirds of the invalid contract, against a real handle: a NULL out,
+         * and a struct_size below the v1 floor. The floor is the guard that stops a caller
+         * compiled against a SHORTER header from having its struct overrun — asserted one byte
+         * under, which is the only interesting value, since anything smaller is caught by the
+         * same comparison. */
+        if (na_server_get_stats(server, NULL, sizeof st) != NA_ERR_INVALID ||
+            na_server_get_stats(server, &st, NA_SERVER_STATS_SIZE_V1 - 1) != NA_ERR_INVALID) {
+            fprintf(stderr, "FAIL: na_server_get_stats NULL-out / below-floor not NA_ERR_INVALID\n");
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+
+        if (na_server_get_stats(server, &st, sizeof st) != NA_OK) {
+            fprintf(stderr, "FAIL: na_server_get_stats on a running server\n");
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        if (st.running != 1 || st.clients_connected != 1) {
+            fprintf(stderr, "FAIL: server stats running=%d clients=%d (want 1/1)\n",
+                    st.running, st.clients_connected);
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        /* Non-vacuity: the connection really is carrying traffic, so the zeros below are
+         * measurements of a live server rather than of an idle one. */
+        if (st.packets_sent <= 0 || st.bytes_sent <= st.packets_sent) {
+            fprintf(stderr, "FAIL: server stats packets_sent=%lld bytes_sent=%lld\n",
+                    st.packets_sent, st.bytes_sent);
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        /* Documented expectations on a healthy loopback server: no corruption, and no local
+         * queue loss because the receive path never blocks (see the na_server_stats contract). */
+        if (st.crc_errors != 0 || st.queue_drops != 0) {
+            fprintf(stderr, "FAIL: healthy server reported crc_errors=%d queue_drops=%lld\n",
+                    st.crc_errors, st.queue_drops);
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        srv_packets_sent_with_client = st.packets_sent;  /* for the roster-gauge check below */
+    }
+
+    /* The OVER-SIZED caller: a consumer compiled against a FUTURE header that appended fields.
+     * The library must fill what it knows and ZERO the tail rather than leave it indeterminate,
+     * so an appended field reads as a defined 0 instead of stack garbage. Poisoned first, so
+     * "zeroed by the library" and "never written" are distinguishable. */
+    {
+        unsigned char big[sizeof(na_server_stats) + 32];
+        memset(big, 0xAB, sizeof big);
+        if (na_server_get_stats(server, (na_server_stats*)big, sizeof big) != NA_OK) {
+            fprintf(stderr, "FAIL: na_server_get_stats with an over-sized struct_size\n");
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        for (size_t i = sizeof(na_server_stats); i < sizeof big; i++) {
+            if (big[i] != 0) {
+                fprintf(stderr, "FAIL: over-sized tail not zero-filled at byte %zu (0x%02X)\n",
+                        i, big[i]);
+                na_client_destroy(client);
+                na_server_destroy(server);
+                return 1;
+            }
+        }
     }
 
     /* TX-extract WIRING: with a client connected, the mixer playback loop drains the (empty) TX
@@ -355,12 +448,56 @@ int main(void) {
         return 1;
     }
 
+    /* THE ROSTER-GAUGE CONTRACT, asserted from C because it is the one way na_server_stats
+     * differs from na_client_stats and the one a consumer will get wrong. These are sums over the
+     * clients connected RIGHT NOW, so the departed client's counters left with it and packets_sent
+     * must have DROPPED — a C consumer computing a delta across this boundary would read a
+     * negative throughput. If this ever stops holding, the header contract is stale. */
+    {
+        na_server_stats st;
+        if (na_server_get_stats(server, &st, sizeof st) != NA_OK) {
+            fprintf(stderr, "FAIL: na_server_get_stats after disconnect\n");
+            na_server_destroy(server);
+            return 1;
+        }
+        if (st.clients_connected != 0) {
+            fprintf(stderr, "FAIL: stats roster %d after disconnect (want 0)\n",
+                    st.clients_connected);
+            na_server_destroy(server);
+            return 1;
+        }
+        if (st.packets_sent >= srv_packets_sent_with_client) {
+            fprintf(stderr, "FAIL: packets_sent did not decrease when the client left "
+                    "(%lld -> %lld); na_server_stats promises it is a roster gauge\n",
+                    srv_packets_sent_with_client, st.packets_sent);
+            na_server_destroy(server);
+            return 1;
+        }
+        printf("  roster gauge: packets_sent %lld (1 client) -> %lld (0 clients)\n",
+               srv_packets_sent_with_client, st.packets_sent);
+    }
+
+    /* A STOPPED server is not an error — it is running == 0 with defaults, the same rule
+     * na_client_stats.connected states. Asserted after na_server_stop below. */
+
     na_server_stop(server);
     if (na_server_is_running(server)) {
         fprintf(stderr, "FAIL: server still running after na_server_stop\n");
         na_server_destroy(server);
         return 1;
     }
+    {
+        na_server_stats st;
+        if (na_server_get_stats(server, &st, sizeof st) != NA_OK || st.running != 0 ||
+            st.clients_connected != 0 || st.packets_sent != 0) {
+            fprintf(stderr, "FAIL: stopped server stats running=%d clients=%d packets_sent=%lld "
+                    "(want 0/0/0, and NOT an error)\n",
+                    st.running, st.clients_connected, st.packets_sent);
+            na_server_destroy(server);
+            return 1;
+        }
+    }
+
     for (int i = 0; i < 50 && !atomic_load(&g_srv_stopped); i++) sleep_ms(20);
     if (!atomic_load(&g_srv_stopped)) {
         fprintf(stderr, "FAIL: server on_stopped never fired\n");

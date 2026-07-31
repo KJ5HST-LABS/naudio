@@ -1365,3 +1365,46 @@ extern "C" int na_server_tx_owner(na_audio_server* server, char* buf, int len) {
         return static_cast<int>(owner.size());
     });
 }
+
+// The server-side mirror of na_client_get_stats, and it repeats that function's shape exactly:
+// a field-by-field copy out of ServerStats (the C struct is a FROZEN ABI surface while the C++ one
+// is free to gain fields, so the two must be allowed to diverge), every field written on every
+// non-error path so a caller never pre-zeroes, and the size travelling as an explicit PARAMETER
+// because this is a struct the library WRITES.
+//
+// na_server_stats has no post-v1 fields yet, so the floor check is currently the only size gate
+// and every write below is unconditional. The moment a field is APPENDED it must be guarded on
+// the caller's declared size individually — see na_client_get_stats, where `sequence_gaps` is the
+// worked example, and note that the zero-fill below covers only the opposite case (a caller
+// LONGER than us), never this one.
+extern "C" na_error_t na_server_get_stats(na_audio_server* server, na_server_stats* out,
+                                          std::size_t struct_size) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr || out == nullptr || struct_size < NA_SERVER_STATS_SIZE_V1) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        // A caller compiled against a LONGER version of this header gets its tail zeroed rather
+        // than left indeterminate.
+        if (struct_size > sizeof(na_server_stats)) {
+            std::memset(reinterpret_cast<char*>(out) + sizeof(na_server_stats), 0,
+                        struct_size - sizeof(na_server_stats));
+        }
+        // Before na_server_start there is no AudioStreamServer at all (it is built lazily with the
+        // final config), which is the same "no live source" case ServerStats reports as
+        // running == false — so a not-started server yields defaults, not an error.
+        const naudio::net::ServerStats s =
+            server->server ? server->server->stats() : naudio::net::ServerStats{};
+        out->running = s.running ? 1 : 0;
+        out->clients_connected = s.clientsConnected;
+        out->packets_sent = static_cast<long long>(s.packetsSent);
+        out->packets_received = static_cast<long long>(s.packetsReceived);
+        out->bytes_sent = static_cast<long long>(s.bytesSent);
+        out->bytes_received = static_cast<long long>(s.bytesReceived);
+        out->crc_errors = s.crcErrors;
+        out->control_retransmits = static_cast<long long>(s.controlRetransmits);
+        out->queue_drops = static_cast<long long>(s.queueDrops);
+        // ---- end of v1. A future append is guarded on struct_size here. ----
+        return NA_OK;
+    });
+}
