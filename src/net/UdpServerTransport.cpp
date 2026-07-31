@@ -234,6 +234,27 @@ int UdpServerTransport::crcErrors() const {
     return total;
 }
 
+// The two counters that are only reachable on this side. Both sum over byId_ — the ACCEPTED
+// roster — and not over pending_, so a spoofed sender that never completes the handshake
+// contributes nothing.
+//
+// controlRetransmits is non-zero only when the reliability profile enables control ARQ
+// (UdpReliabilityConfig::controlReliabilityEnabled); with it off, UdpClientConnection builds no
+// ControlReliability and the sum is a true 0.
+std::int64_t UdpServerTransport::controlRetransmits() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::int64_t total = 0;
+    for (const auto& [id, conn] : byId_) total += conn->controlRetransmits();
+    return total;
+}
+
+std::int64_t UdpServerTransport::orderedQueueDrops() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::int64_t total = 0;
+    for (const auto& [id, conn] : byId_) total += conn->orderedQueueDrops();
+    return total;
+}
+
 void UdpServerTransport::close() {
     bool wasRunning = running_.exchange(false);
     bound_.store(false);

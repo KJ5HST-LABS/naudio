@@ -172,11 +172,28 @@ public:
     virtual void disconnectClient(const std::shared_ptr<ClientConnection>& connection) = 0;
 
     // Aggregate statistics across all clients.
+    //
+    // THESE SUM OVER THE CURRENTLY REGISTERED CONNECTIONS ONLY. disconnectClient
+    // erases a connection from the routing map, and its counters leave the sum with
+    // it — so every aggregate here can DECREASE, and a roster that churns loses the
+    // departed clients' history entirely. They are a snapshot of the live roster, not
+    // a lifetime total, and no caller may treat them as monotonic.
     virtual std::int64_t packetsSent() const = 0;
     virtual std::int64_t packetsReceived() const = 0;
     virtual std::int64_t bytesSent() const = 0;
     virtual std::int64_t bytesReceived() const = 0;
     virtual int crcErrors() const = 0;
+
+    // Control-ARQ resends, summed over the live roster. Pure virtual rather than a
+    // defaulted 0 like ClientConnection's: all three implementations are in-tree, and
+    // a silent 0 from a forgotten override is indistinguishable from "no retransmits
+    // happened" — the one thing this counter must never say when it is not counting.
+    virtual std::int64_t controlRetransmits() const = 0;
+    // Packets discarded from a connection's ordered queue because it was at capacity —
+    // audio lost LOCALLY after the network delivered it. Unlike the client side, this is
+    // reachable here: a demux thread fills the queue while the session's application
+    // thread drains it, so a slow consumer does not stall its own producer.
+    virtual std::int64_t orderedQueueDrops() const = 0;
 
     virtual void close() = 0;
 };

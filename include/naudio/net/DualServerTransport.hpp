@@ -99,6 +99,15 @@ public:
         return tcp_.bytesReceived() + udp_.bytesReceived();
     }
     int crcErrors() const override { return tcp_.crcErrors() + udp_.crcErrors(); }
+    // The TCP half contributes a structural 0 to both (no control ARQ, no ordered queue), so on
+    // DUAL these report the UDP half's roster alone — which is the half that can produce the
+    // events at all.
+    std::int64_t controlRetransmits() const override {
+        return tcp_.controlRetransmits() + udp_.controlRetransmits();
+    }
+    std::int64_t orderedQueueDrops() const override {
+        return tcp_.orderedQueueDrops() + udp_.orderedQueueDrops();
+    }
 
     void close() override {
         tcp_.close();

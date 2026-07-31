@@ -44,6 +44,8 @@ public:
     std::int64_t bytesSent() const override;
     std::int64_t bytesReceived() const override;
     int crcErrors() const override;
+    std::int64_t controlRetransmits() const override;
+    std::int64_t orderedQueueDrops() const override;
 
     void close() override;
 
