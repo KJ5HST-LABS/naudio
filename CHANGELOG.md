@@ -175,6 +175,37 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   the `na_client_*` surface symmetric with `na_server_inject_audio()` on the RX side, so a headless
   client with no capture device (the `NA_CLIENT_BACKEND_NULL` backend, which cannot capture) can
   originate TX audio. Injected audio obeys the same PTT gate as captured audio.
+- **Server-side audio format and UDP reliability profiles on the C ABI** —
+  `na_server_set_audio_format()` and `na_server_set_reliability_profile()` let a C consumer configure
+  what the server puts on the wire, which until now was reachable only from C++.
+  `na_server_set_transport()` could already select UDP, but the FEC / reorder / adaptive-jitter /
+  control-ARQ settings that make UDP worth selecting lived solely in the C++ `AudioStreamConfig`
+  presets, and the `na_server_*` surface had no format setter at all, so the advertised format was
+  pinned to its 48000 / 16 / 2 default. A C or Hamlib consumer could therefore stand up a UDP server
+  with naudio's entire resilience stack switched off, and could not serve mono. Both are pre-start
+  configuration like the rest of the `na_server_set_*` family, returning `NA_ERR_INVALID` on a NULL
+  server or after `na_server_start()`.
+  - `na_server_set_audio_format(server, sample_rate, bits_per_sample, channels)` sets the format the
+    server advertises and broadcasts. **The v1 wire carries signed 16-bit PCM**, so `bits_per_sample`
+    must be 16 and `channels` 1 or 2, with `sample_rate` > 0; any other combination is rejected with
+    `NA_ERR_INVALID` rather than silently converted. naudio does not resample or change channel
+    count, so the bytes fed to `na_server_inject_audio()` — and those delivered to
+    `na_server_tx_audio_cb` — must already match this layout.
+  - `na_server_set_reliability_profile(server, profile)` applies one `na_reliability_profile` —
+    transport, framing and the whole reliability bundle — in a single call. **Selecting a UDP
+    profile makes a separate `na_server_set_transport()` call unnecessary**, because the profile
+    carries the transport with it. It leaves the audio format and max-clients untouched, so it and
+    `na_server_set_audio_format()` **compose order-independently** — neither undoes the other
+    whichever is called first, and the same holds for `na_server_set_max_clients()`.
+    `na_server_set_transport()` is the one exception: it and the profile setter both write the
+    transport, and the last one called wins.
+  The `na_reliability_profile` enum arrives with these setters and is shared with the client setter
+  above: `NA_RELIABILITY_DEFAULT` (the plain defaults — TCP, with FEC, reorder, jitter and
+  control-ARQ all off), `NA_RELIABILITY_UDP_LAN`, `NA_RELIABILITY_UDP_WAN` (the resilient
+  remote-operating profile: XOR FEC + adaptive jitter + reorder + control-ARQ) and
+  `NA_RELIABILITY_UDP_FT8`. Both ends must select the same one — a server on
+  `NA_RELIABILITY_UDP_WAN` sends parity packets that a client left on any other profile receives and
+  discards, with no loss recovery and no error.
 - **Initial release of the naudio C/C++ audio-streaming toolkit.**
   - **net-audio wire protocol, spec v1** — the frozen `0xAF01` frame contract: versioned framing
     with per-frame CRC32, a 32-bit sequence + reorder buffer, adaptive (RFC-3550-style) jitter
