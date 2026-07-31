@@ -438,3 +438,121 @@ TEST(Server, GateWriterBridgeSlowClientDoesNotStallOthers) {
 
     server.stop();
 }
+
+// ServerStats is a GAUGE OVER THE LIVE ROSTER, not a monotonic lifetime total. The aggregation
+// sums over the transport's routing map, and disconnectClient erases the departed connection
+// from it — so a client leaving takes its counters out of the sum and the totals go DOWN.
+//
+// This arm exists because that sentence is written into the ServerStats contract and into the
+// na_server_stats contract in the public C header, where a consumer will build a rate on top of
+// it. A counter that silently decreases is exactly the kind of claim that must be observed
+// rather than reasoned about, so this measures the decrease instead of asserting a shape.
+//
+// It is bounded in BOTH directions against a quantity the library does not compute: `sent`,
+// counted here from the frames this test itself injected and fanned out.
+TEST(Server, GateServerStatsIsARosterGaugeNotALifetimeTotal) {
+    AudioStreamConfig config{};
+    config.maxClients = 4;
+    AudioStreamServer server{0, config};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+    const auto port = static_cast<std::uint16_t>(server.port());
+
+    // Before any client: running, but an empty roster sums to nothing.
+    const ServerStats idle = server.stats();
+    EXPECT_TRUE(idle.running);
+    EXPECT_EQ(idle.clientsConnected, 0);
+    EXPECT_EQ(idle.packetsSent, 0);
+
+    TcpClientTransport ta, tb;
+    auto a = ta.connect("127.0.0.1", port, 2000, &err);
+    ASSERT_TRUE(a);
+    auto b = tb.connect("127.0.0.1", port, 2000, &err);
+    ASSERT_TRUE(b);
+    ASSERT_TRUE(clientHandshake(*a, "A"));
+    ASSERT_TRUE(clientHandshake(*b, "B"));
+    ASSERT_TRUE(waitForClientsUpdate(*b, 2, 3000));
+    ASSERT_TRUE(waitForClientCount(server, 2, 2000));
+
+    // Drive traffic to BOTH clients so each connection carries a non-trivial count.
+    std::vector<std::uint8_t> frame(static_cast<std::size_t>(config.bytesPerFrame()), 0x5A);
+    const int kFrames = 60;
+    for (int i = 0; i < kFrames; i++) server.injectAudio(frame);
+    // Drain both so the writer threads actually complete their sends before we read.
+    for (int i = 0; i < 30; i++) {
+        (void)recvUntil(*a, PacketType::AudioRx, std::nullopt, 500);
+        (void)recvUntil(*b, PacketType::AudioRx, std::nullopt, 500);
+    }
+
+    const ServerStats both = server.stats();
+    EXPECT_TRUE(both.running);
+    EXPECT_EQ(both.clientsConnected, 2);
+    // LOWER bound, against a quantity the library never sees: each of the two sessions was
+    // handed kFrames injected frames, and every session also sends handshake control traffic.
+    EXPECT_GE(both.packetsSent, 2 * kFrames);
+    EXPECT_GT(both.bytesSent, both.packetsSent);  // every packet carries a header + payload
+
+    // THE MEASUREMENT: one client leaves. Its counters leave the sum with it.
+    a->close();
+    ASSERT_TRUE(waitForClientCount(server, 1, 3000));
+    // The routing-map erase happens in the session's close path, just after the roster erase
+    // clientCount() observes, so give the transport a moment to catch up before reading.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    ServerStats one = server.stats();
+    while (one.packetsSent >= both.packetsSent &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        one = server.stats();
+    }
+
+    EXPECT_EQ(one.clientsConnected, 1);
+    // The whole point: STRICTLY LESS than the previous read. This is the assertion that would
+    // fail if the aggregation were ever changed to accumulate departed clients — at which point
+    // the contract in naudio.h must change with it.
+    EXPECT_LT(one.packetsSent, both.packetsSent)
+        << "ServerStats::packetsSent did not decrease when a client left: " << both.packetsSent
+        << " -> " << one.packetsSent << ". The roster-gauge contract in AudioStreamServer.hpp "
+        << "and na_server_stats in naudio.h both promise it does.";
+    // UPPER bound, again independent of the library's own arithmetic: what remains is one
+    // client's share, so it cannot still hold both clients' worth of fan-out.
+    EXPECT_LT(one.packetsSent, 2 * kFrames);
+
+    // After stop() there is no transport, so it reads as not-running defaults rather than a
+    // stale final total — the same "check this before believing a zero" rule as ClientStats.
+    server.stop();
+    const ServerStats stopped = server.stats();
+    EXPECT_FALSE(stopped.running);
+    EXPECT_EQ(stopped.packetsSent, 0);
+    EXPECT_EQ(stopped.clientsConnected, 0);
+}
+
+// TCP contributes a STRUCTURAL zero to both of the counters this struct exists for — it has no
+// control-ARQ layer and no ordered queue, so the events cannot occur rather than occurring
+// uncounted. Pinning it here means the UDP arms that provoke them are measuring something TCP
+// could never have supplied, and a future defaulted-to-0 override on the TCP side stays honest.
+TEST(Server, ServerStatsControlAndQueueCountersAreZeroOnTcp) {
+    AudioStreamServer server{0};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    TcpClientTransport client;
+    auto cc = client.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
+    ASSERT_TRUE(cc) << err;
+    ASSERT_TRUE(clientHandshake(*cc, "tester"));
+    ASSERT_TRUE(waitForClientCount(server, 1, 2000));
+
+    std::vector<std::uint8_t> payload = {0x10, 0x20, 0x30, 0x40};
+    for (int i = 0; i < 20; i++) server.injectAudio(payload);
+    for (int i = 0; i < 10; i++) (void)recvUntil(*cc, PacketType::AudioRx, std::nullopt, 500);
+
+    const ServerStats s = server.stats();
+    EXPECT_TRUE(s.running);
+    EXPECT_EQ(s.clientsConnected, 1);
+    EXPECT_GT(s.packetsSent, 0);  // the connection is live, so the zeros below are not vacuous
+    EXPECT_EQ(s.controlRetransmits, 0);
+    EXPECT_EQ(s.queueDrops, 0);
+
+    server.stop();
+}

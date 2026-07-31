@@ -46,6 +46,46 @@ public:
     virtual void onError(const std::string& /*clientId*/, const std::string& /*error*/) {}
 };
 
+// A snapshot of the server's aggregate counters, summed across the LIVE ROSTER.
+//
+// The mirror of ClientStats, and it differs from it in one way that matters more than the
+// field list: ClientStats is a cumulative total for one connection, whereas every number here
+// is a sum over the connections registered RIGHT NOW. A client that disconnects takes its
+// counters out of the sum, so these can DECREASE between two reads and a churning roster loses
+// the departed clients' history entirely (ServerTransport, where the aggregation lives).
+// Measured, not inferred: with two clients being fanned 60 frames each, packetsSent read 127;
+// after one of them disconnected it read 64. Treat this as a gauge, never as a monotonic meter.
+// (tests/net/test_server.cpp, GateServerStatsIsARosterGaugeNotALifetimeTotal.)
+//
+// The two counters that carry no information on a client (ControlReliability's retransmits and
+// the ordered queue's drops — see ClientStats) are the ones this struct exists for: both are
+// reachable here, because the server sends critical control messages that can go unacked and
+// because a demux thread fills each connection's ordered queue while the session's application
+// thread drains it.
+struct ServerStats {
+    // True only when a bound transport supplied these numbers. False leaves every field at its
+    // default below — a default, not a reading. False before start() and after stop().
+    bool running = false;
+
+    // Roster size at the moment of the read — the divisor for any per-client average, and the
+    // context every other field needs (a 0 with clientsConnected == 0 says nothing happened
+    // because nobody is here, not that nothing happened).
+    int clientsConnected = 0;
+
+    std::int64_t packetsSent = 0;
+    std::int64_t packetsReceived = 0;
+    std::int64_t bytesSent = 0;
+    std::int64_t bytesReceived = 0;
+    int crcErrors = 0;
+
+    // Control-ARQ resends. Non-zero only on a UDP/DUAL profile with control reliability
+    // enabled; a structural 0 on TCP, which has no ARQ layer.
+    std::int64_t controlRetransmits = 0;
+    // Packets discarded from a connection's ordered queue at capacity — audio lost locally,
+    // after the network delivered it. Reachable here and not on a client.
+    std::int64_t queueDrops = 0;
+};
+
 // Server for bidirectional audio streaming with multi-client support.
 //
 // It captures radio RX audio and broadcasts it to all connected clients (via
@@ -109,6 +149,12 @@ public:
     const AudioStreamConfig& config() const { return config_; }
     // The bound port (-1 if not bound).
     int port() const;
+
+    // A snapshot of the aggregate counters. Safe to call from any thread at any time,
+    // including before start() and after stop() (which yield running == false and defaults).
+    // Read the ServerStats contract above before comparing two snapshots: it is a gauge over
+    // the live roster, not a monotonic lifetime total.
+    ServerStats stats() const;
 
 private:
     class ClientSession;  // defined in the .cpp
