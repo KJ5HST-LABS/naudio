@@ -18,6 +18,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,6 +26,7 @@
 #include "naudio/AudioPacket.hpp"
 #include "naudio/AudioStreamConfig.hpp"
 #include "naudio/ControlMessage.hpp"
+#include "naudio/ControlReliability.hpp"
 #include "naudio/DeviceBackend.hpp"
 #include "naudio/FakeBackend.hpp"
 #include "naudio/Stream.hpp"
@@ -553,6 +555,153 @@ TEST(Server, ServerStatsControlAndQueueCountersAreZeroOnTcp) {
     EXPECT_GT(s.packetsSent, 0);  // the connection is live, so the zeros below are not vacuous
     EXPECT_EQ(s.controlRetransmits, 0);
     EXPECT_EQ(s.queueDrops, 0);
+
+    server.stop();
+}
+
+// controlRetransmits OBSERVED NON-ZERO ON A SERVER CONNECTION — the acceptance item #29 was
+// filed with, and the reason ServerStats exists at all.
+//
+// The counter has been live on this class since it was written and had never been seen to move
+// on a real AudioStreamServer session: the only existing coverage drives it at the CLASS level
+// by feeding a connection a NACK (tests/net/test_udp_connection.cpp), which proves the mechanism
+// and says nothing about whether a server reaches it. "The code path is live" is a property of
+// the class; "the role under test can reach it" is a property of the role.
+//
+// The provocation needs no lossy relay. UdpReliabilityConfig::controlReliabilityEnabled is what
+// builds the ControlReliability object, and it builds BOTH the sender-side pending ring and the
+// receiver-side ACK generator. So a client configured with it OFF never emits a CONTROL_ACK,
+// while the server — on udpLan(), which turns it ON — tracks every critical control it sends and
+// finds them all still unacked when the retransmit sweep runs. The sweep is pumped from
+// shouldSendHeartbeat() in the session run loop, which ticks once a second against a 500 ms RTO,
+// so the arm must outlast several ticks.
+//
+// Bounded in BOTH directions against a quantity the server never computes: the client's own
+// count of critical control datagrams, split into distinct sequences (D) and total arrivals (T).
+// Every retransmit is the same packet resent with the same sequence, so T - D is the number of
+// resends that reached the wire, measured entirely on the far side of the socket.
+TEST(Server, GateServerControlRetransmitsObservedNonZero) {
+    AudioStreamConfig config = AudioStreamConfig::udpLan();  // controlReliabilityEnabled = true
+    config.maxClients = 4;
+    ASSERT_TRUE(config.controlReliabilityEnabled) << "the provocation depends on the server ARQ";
+    AudioStreamServer server{0, config};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    // The client: passthrough (so duplicate sequences are not swallowed by a reorder buffer)
+    // and control reliability OFF, which is what makes it silent on ACKs.
+    UdpReliabilityConfig ccfg;
+    ccfg.reorderWindowSize = 0;
+    ccfg.controlReliabilityEnabled = false;
+    UdpClientTransport client{ccfg};
+    auto cc = client.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
+    ASSERT_TRUE(cc) << err;
+    ASSERT_TRUE(cc->sendControl(ControlMessage::connectRequest("noack", AudioPacket::VERSION)));
+    ASSERT_TRUE(waitForClientCount(server, 1, 3000));
+
+    // Collect every critical control the server sends for long enough to outlast the sweep.
+    std::set<std::int32_t> distinctCritical;
+    long long totalCritical = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(6000);
+    while (std::chrono::steady_clock::now() < deadline) {
+        ReceiveResult r = cc->receivePacket(200);
+        if (r.closed) break;
+        if (!r.hasPacket() || r.packet->packetType() != PacketType::Control) continue;
+        auto msg = ControlMessage::deserialize(r.packet->payload());
+        if (!msg || !ControlReliability::isCriticalType(msg->messageType())) continue;
+        ++totalCritical;
+        distinctCritical.insert(r.packet->sequence());
+    }
+
+    const ServerStats s = server.stats();
+    const long long D = static_cast<long long>(distinctCritical.size());
+    const long long T = totalCritical;
+    const long long observedResends = T - D;
+
+    ASSERT_GT(D, 0) << "the server sent no critical control at all — the arm proves nothing";
+    // The headline: it moves on a server, where it is structurally pinned to 0 on a client.
+    EXPECT_GT(s.controlRetransmits, 0)
+        << "control_retransmits stayed 0 on a SERVER connection. distinct=" << D
+        << " total=" << T;
+
+    // LOWER bound: every duplicate the client saw was a resend the server performed. The server
+    // increments as it queues the packet, so its count can only lead what reached the far side.
+    EXPECT_GE(s.controlRetransmits, observedResends)
+        << "server counted fewer resends than the client actually received: "
+        << s.controlRetransmits << " < " << observedResends;
+
+    // UPPER bound: ControlReliability erases a pending entry once attempts reach maxAttempts, so
+    // no single critical control can be resent more than that many times.
+    EXPECT_LE(s.controlRetransmits, D * config.controlRetransmitMaxAttempts)
+        << "server counted more resends than " << D << " criticals x "
+        << config.controlRetransmitMaxAttempts << " attempts allows";
+
+    server.stop();
+}
+
+// queue_drops on a SERVER: reachable in principle, unreached in practice — and the reason is
+// not the one #29 gives.
+//
+// The issue argues the counter moves on a server because "a demux thread fills the queue while
+// the application thread drains it", i.e. that the producer/consumer split is sufficient. It is
+// not. Measured here: 20k TX packets pushed as fast as the socket accepts them arrive complete
+// and leave queue_drops at 0, because the session's receive path is non-blocking END TO END by
+// design (the writer-bridge decision, §3.2) — handleTxAudio only writes into the mixer's ring
+// buffer, so the drain keeps pace with the demux thread and the 2048-packet queue never backs up.
+//
+// That the counter WORKS was established separately and in two places: its arithmetic at the
+// class level (test_udp_connection.cpp, OrderedQueueBoundedUnderFlood — 200 dropped past a
+// 2048 cap), and its wiring through ServerStats by stalling the consumer 1 ms per packet in a
+// throwaway mutation, which produced 57115 drops from 60001 received. So a 0 here is a real
+// measurement of a real server, not a broken counter.
+//
+// Committed as a NEGATIVE on purpose, the same way c_client_stats.c pins the client-side
+// impossibility: it keeps the limitation executable. If a future change puts a blocking step
+// back on the receive path, this arm is what notices.
+TEST(Server, ServerQueueDropsStayZeroWhileTheDrainKeepsUp) {
+    AudioStreamConfig config = AudioStreamConfig::udpLan();
+    config.maxClients = 4;
+    AudioStreamServer server{0, config};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    UdpReliabilityConfig ccfg;
+    ccfg.reorderWindowSize = 0;
+    UdpClientTransport client{ccfg};
+    auto cc = client.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
+    ASSERT_TRUE(cc) << err;
+    ASSERT_TRUE(cc->sendControl(ControlMessage::connectRequest("flood", AudioPacket::VERSION)));
+    ASSERT_TRUE(waitForClientCount(server, 1, 3000));
+
+    std::vector<std::uint8_t> pcm(960, 0x11);
+    const int kSend = 20000;
+    int sent = 0;
+    for (int i = 0; i < kSend; i++) {
+        if (cc->sendTxAudio(pcm.data(), pcm.size())) ++sent;
+    }
+    ASSERT_GT(sent, kSend / 2) << "the flood never left the client; the arm proves nothing";
+
+    // Let the backlog settle, then read once.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const ServerStats s = server.stats();
+
+    // The counter is bounded by what actually arrived, whatever the machine's speed — a
+    // relationship, not a threshold, so it holds on a loaded CI runner too.
+    EXPECT_LE(s.queueDrops, s.packetsReceived);
+
+    // The headline is conditional on the premise it depends on: drops are 0 BECAUSE the drain
+    // kept up. On a machine slow enough to fall behind, the premise fails and asserting 0 would
+    // be asserting something this arm never established.
+    if (s.packetsReceived >= sent) {
+        EXPECT_EQ(s.queueDrops, 0)
+            << "the server drained every one of " << sent << " flooded packets yet still "
+            << "reported queue drops — the receive path has acquired a blocking step";
+    } else {
+        GTEST_SKIP() << "drain fell behind (" << s.packetsReceived << " of " << sent
+                     << "); the zero-drop premise does not hold on this machine";
+    }
 
     server.stop();
 }
