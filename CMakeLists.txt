@@ -501,6 +501,38 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
                           "$<TARGET_FILE:na_hamlib_bridge>"
                           "$<TARGET_FILE:naudio_bridge_probe>")
     message(STATUS "naudio: naudio_bridge_arm enabled (na_hamlib_bridge present)")
+
+    # Fault-injection arm (issue #35) — the same gate, one target further. naudio_failshim is a
+    # PRELOAD library, never linked by anything: it is inserted into the bridge's process at launch
+    # and interposes libhamlib's two stream calls, which is the only way to reach the error paths
+    # issues #5 and #6 describe (the Hamlib dummy has no error-injection knob, and it routes reads
+    # through its own caps->stream_read hook).
+    #
+    # SHARED, and NOT MODULE, even though nothing links it. MODULE builds a -bundle on macOS, and
+    # DYLD_INSERT_LIBRARIES flatly refuses one: `cannot link against bundle`, at which point dyld
+    # aborts the process before main. Measured — the arms failed as harness faults, not as bridge
+    # bugs, which is the tri-state working. MODULE is the intuitively correct choice here and it is
+    # wrong on the one platform this arm currently runs on.
+    #
+    # The HAMLIB_* variables come from pkg_check_modules inside tools/, which caches them, so they
+    # are visible here; HAMLIB_LINK_LIBRARIES is NOT cached and deliberately not used.
+    add_library(naudio_failshim SHARED tests/bridge/failshim.c)
+    target_include_directories(naudio_failshim PRIVATE ${HAMLIB_INCLUDE_DIRS})
+    target_link_directories(naudio_failshim PRIVATE ${HAMLIB_LIBRARY_DIRS})
+    target_link_libraries(naudio_failshim PRIVATE ${HAMLIB_LIBRARIES})
+    # No "lib" prefix and a platform-native suffix: the driver passes this path straight to
+    # DYLD_INSERT_LIBRARIES / LD_PRELOAD, which want the file, not a linker name.
+    set_target_properties(naudio_failshim PROPERTIES PREFIX "")
+
+    add_test(NAME naudio_bridge_fault_arm
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/bridge/bridge_fault_arm.sh"
+                          "$<TARGET_FILE:na_hamlib_bridge>"
+                          "$<TARGET_FILE:naudio_bridge_probe>"
+                          "$<TARGET_FILE:naudio_failshim>")
+    # Two bridge arms both bind a fixed UDP port and both drive the same dummy backend, so they are
+    # serialised rather than left to race a port bind under `ctest -j`.
+    set_tests_properties(naudio_bridge_arm naudio_bridge_fault_arm PROPERTIES RESOURCE_LOCK bridge)
+    message(STATUS "naudio: naudio_bridge_fault_arm enabled (na_hamlib_bridge present)")
 endif()
 
 # ----------------------------------------------------------------------------

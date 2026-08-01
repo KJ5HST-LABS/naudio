@@ -226,11 +226,60 @@ it needs no libhamlib — so it can be pointed at anything speaking the naudio w
 Its exit status is a tri-state: `0` the expectation held, `1` it did not, `2` the probe itself could
 not run — so a broken harness is never read as a clean negative result. `--selftest` proves the
 detector separates content from silence using an in-process server, needs neither the bridge nor
-libhamlib, and runs on every platform as `naudio_bridge_probe_selftest`.
+libhamlib, and runs on every platform as `naudio_bridge_probe_selftest`. It also proves the probe's
+`--tx` path: injected audio must reach the server's TX sink at full amplitude with PTT on, and must
+be refused entirely with PTT off.
 
 Absolute rate is reported but never asserted: a correct run against a dummy backend sits near 83% of
 nominal because the backend paces itself off `nanosleep`, so any threshold tight enough to catch a
 fault also fires on a healthy run. `--min-rate` exists for that comparison and is off by default.
+
+---
+
+## Verifying it survives failure (`naudio_bridge_fault_arm`)
+
+`naudio_bridge_arm` covers the happy path and deliberately makes nothing go wrong. The second arm
+covers the two bugs whose *fixes* shipped but whose verification never did, because both were
+originally checked with a hand-built shim in a scratchpad that evaporated with it:
+
+| Arm | Fault injected | The bridge must |
+|---|---|---|
+| `rx-fail` | `rig_stream_read` fails after 10 calls | **exit non-zero** and name the dead worker |
+| `control` | *none* — shim loaded, no fault armed | stay up and report `short=0` |
+| `tx-short` | every `rig_stream_write` truncated to half | **count** the short writes (`short > 0`) |
+
+```bash
+ctest --test-dir build -R naudio_bridge_fault_arm --output-on-failure   # ~18 s, three arms
+```
+
+Neither fault is reachable from outside the process: the Hamlib dummy has no error-injection knob,
+and it routes reads through its own `caps->stream_read` hook, so libhamlib's error and `closing`
+paths cannot be provoked however the backend is configured. `tests/bridge/failshim.c` is therefore
+preloaded into the bridge (`DYLD_INSERT_LIBRARIES` on macOS, `LD_PRELOAD` on ELF) and interposes the
+two stream calls. It is armed entirely by environment variables — `NA_FAIL_RX_AFTER`,
+`NA_FAIL_TX_AFTER`, `NA_FAIL_CODE`, `NA_FAIL_TX_SHORT` — and with none of them set it is a pure
+pass-through, which is exactly what the `control` arm runs.
+
+**The `control` arm is what makes the other two mean anything.** A bridge that short-writes during
+ordinary operation would satisfy `tx-short` with no fault injected at all. Same shim, same probe,
+same TX load, fault switched off — so the fault is isolated as the cause.
+
+Every arm also asserts the shim *announced itself* (`na_failshim: armed …`, printed from its
+constructor). A preload that fails to load produces exactly the output of a healthy run — no error,
+no diagnostic — so "no short writes were reported" and "interposition never happened" are otherwise
+the same observation, and the second one passes the control arm silently.
+
+> **macOS SIP.** `DYLD_INSERT_LIBRARIES` is stripped the moment a SIP-protected binary is exec'd,
+> which includes `/usr/bin/timeout`, `/bin/zsh` and `/usr/bin/perl`. Both driver scripts launch the
+> bridge **directly** for this reason. Wrapping it in a timeout disables the interposition with no
+> error at all, and the arms then fail as if the bridge were broken.
+
+Reaching the TX path needs a transmitting client, because `tx_thread` calls `rig_stream_write` only
+while a TX owner exists. That is what `--tx` is for:
+
+```bash
+./build/naudio_bridge_probe --port 4533 --seconds 6 --tx
+```
 
 ---
 

@@ -123,16 +123,99 @@ static void sleep_ms(int ms) {
 #endif
 }
 
+/* ---- the transmit half -------------------------------------------------------------------------
+ *
+ * Issue #6's fault — a short rig_stream_write silently dropping TX audio — cannot be provoked
+ * unless a client is ACTUALLY transmitting: na_hamlib_bridge's tx_thread calls rig_stream_write
+ * only while na_server_tx_owner reports an owner (tools/na_hamlib_bridge.c:275-286). A pure RX
+ * probe leaves that whole path unreached, so --tx exists to key up and feed it.
+ *
+ * The route is public C ABI end to end: na_client_set_tx_inject BEFORE connect (it decides whether
+ * the send worker starts, and connect starts the workers once), na_client_set_ptt to key up
+ * (injected audio obeys exactly the same keying rules as captured audio), then
+ * na_client_inject_tx_audio. No capture device is involved — the NULL backend cannot capture, and
+ * this is the reason na_client_set_tx_inject exists. */
+#define TX_FRAME_SAMPLES 480    /* 10 ms at 48 kHz mono S16 — the format the bridge negotiates */
+#define TX_TONE_PEAK     16383  /* matches the Hamlib dummy's tone amplitude and SELFTEST_TONE_PEAK */
+
+/* A square wave, so |sample| is exactly `peak` on every sample and the expected value downstream is
+ * a derived constant rather than something to approximate. */
+static void fill_tone(unsigned char* frame, int samples, int peak) {
+    for (int i = 0; i < samples; i++) {
+        const int v = (i / 24) % 2 ? -peak : peak;
+        frame[2 * i]     = (unsigned char)((unsigned)v & 0xFFu);
+        frame[2 * i + 1] = (unsigned char)(((unsigned)v >> 8) & 0xFFu);
+    }
+}
+
+/* What the SERVER's TX sink actually received. Used only by --selftest: it is the far end of the
+ * client's transmit path, and it is what makes the TX half portable-testable without a bridge.
+ * Peak, not volume — the server delivers continuous SILENCE frames whenever nobody is transmitting
+ * (naudio.h, na_server_tx_audio_cb), so byte count cannot tell a keyed-up client from an idle
+ * one and every arm here would pass on a client that transmits nothing. */
+static atomic_int g_txsrv_calls = 0;
+static atomic_int g_txsrv_bytes = 0;
+static atomic_int g_txsrv_peak  = 0;
+
+static void on_server_tx_audio(const unsigned char* pcm, size_t n_bytes, void* user) {
+    (void)user;
+    const size_t n = n_bytes / 2u;
+    int peak = 0;
+    for (size_t i = 0; i < n; i++) {
+        const int lo = pcm[2u * i], hi = pcm[2u * i + 1u];
+        int v = (int)(short)((unsigned)lo | ((unsigned)hi << 8));
+        if (v < 0) v = -v;
+        if (v > peak) peak = v;
+    }
+    atomic_fetch_add(&g_txsrv_calls, 1);
+    atomic_fetch_add(&g_txsrv_bytes, (int)n_bytes);
+    /* Single dispatch thread (the mixer playback thread), so read-compare-store is safe — the same
+     * argument as on_rx_audio's peak. */
+    if (peak > atomic_load(&g_txsrv_peak)) atomic_store(&g_txsrv_peak, peak);
+}
+
+static void reset_tx_detector(void) {
+    atomic_store(&g_txsrv_calls, 0);
+    atomic_store(&g_txsrv_bytes, 0);
+    atomic_store(&g_txsrv_peak, 0);
+}
+
+/* Key up and stream `ms` milliseconds of tone, 10 ms per frame. Returns bytes accepted, or -1 if
+ * the client refused to key up. The LEN-RETURN convention means a 0 from inject is not an error —
+ * it means not connected, TX inject not enabled, or PTT inactive — so a caller that wants "audio
+ * was really sent" must look at the total, which is why it is returned rather than logged. */
+static long transmit_tone(na_stream_client* c, int ms, int peak) {
+    unsigned char frame[TX_FRAME_SAMPLES * 2];
+    fill_tone(frame, TX_FRAME_SAMPLES, peak);
+    if (na_client_set_ptt(c, 1) != NA_OK) return -1;
+    long total = 0;
+    for (int t = 0; t < ms / 10; t++) {
+        const int w = na_client_inject_tx_audio(c, frame, (int)sizeof frame);
+        if (w < 0) return -1;
+        total += w;
+        sleep_ms(10);
+    }
+    return total;
+}
+
 /* Build a configured, connected UDP client. The bridge always selects a UDP reliability profile,
  * so a client left on the ABI-default TCP transport is refused at connect with SO_ERROR=61 — that
  * is not a bridge fault, it is the documented default (CLAUDE.md Learning 7). */
-static na_stream_client* attach(const char* host, int port, const char* who) {
+static na_stream_client* attach(const char* host, int port, const char* who, int tx_inject) {
     char err[256];
     err[0] = '\0';
     na_stream_client* c = na_client_create(NA_CLIENT_BACKEND_NULL, host, port, who);
     if (c == NULL) {
         fprintf(stderr, "na_bridge_probe: na_client_create failed (%s)\n",
                 na_strerror(na_last_error()));
+        return NULL;
+    }
+    /* Before connect, without exception: this setter decides whether the send worker is started,
+     * and connect starts the workers exactly once (naudio.h, na_client_set_tx_inject). */
+    if (tx_inject && na_client_set_tx_inject(c, 1) != NA_OK) {
+        fprintf(stderr, "na_bridge_probe: na_client_set_tx_inject rejected (%s)\n",
+                na_strerror(na_last_error()));
+        na_client_destroy(c);
         return NULL;
     }
     /* The profile selects the transport too, so it is NOT paired with na_client_set_transport —
@@ -224,6 +307,73 @@ static int selftest_arm(na_audio_server* srv, na_stream_client* cli, int tone, c
     return EXIT_MET;
 }
 
+/* The TX half of the self-test, and the reason --tx is not a compiled-but-never-executed mode.
+ * --tx is exercised for real only by the bridge fault arm, which needs a hand-built streaming
+ * libhamlib and so runs on ONE developer machine; without this, every other platform in CI would
+ * compile the transmit path and never run a line of it — exactly the gap this file's --selftest was
+ * written to close for the RX half.
+ *
+ * Two arms that must DISAGREE, for the same reason the RX pair must (Learning 58): the server hands
+ * its TX sink continuous silence whenever nobody is transmitting, so an arm that only checked
+ * "frames arrived" would pass identically on a client that never keys up. PTT off must give peak 0
+ * and PTT on must give exactly TX_TONE_PEAK. */
+static int selftest_tx(na_audio_server* srv, na_stream_client* cli) {
+    /* Keyed DOWN first. na_client_inject_tx_audio is gated on PTT, so this must accept nothing and
+     * the server's sink must stay silent — the control that stops a constant-returning detector, or
+     * a server that simply echoes anything offered, from satisfying the arm below. */
+    reset_tx_detector();
+    unsigned char frame[TX_FRAME_SAMPLES * 2];
+    fill_tone(frame, TX_FRAME_SAMPLES, TX_TONE_PEAK);
+    na_client_set_ptt(cli, 0);
+    long unkeyed = 0;
+    for (int t = 0; t < 30; t++) {
+        const int w = na_client_inject_tx_audio(cli, frame, (int)sizeof frame);
+        if (w > 0) unkeyed += w;
+        sleep_ms(10);
+    }
+    sleep_ms(200);
+    printf("RESULT tx-unkeyed accepted=%ld srv_calls=%d srv_bytes=%d srv_peak=%d\n",
+           unkeyed, atomic_load(&g_txsrv_calls), atomic_load(&g_txsrv_bytes),
+           atomic_load(&g_txsrv_peak));
+    fflush(stdout);
+    if (atomic_load(&g_txsrv_peak) != 0) {
+        fprintf(stderr, "FAIL selftest/tx-unkeyed: the server's TX sink saw peak %d from a client "
+                        "with PTT OFF — injected audio is not obeying the keying gate\n",
+                atomic_load(&g_txsrv_peak));
+        return EXIT_UNMET;
+    }
+
+    /* Keyed UP: the same frames must now reach the server's TX sink at full amplitude. */
+    reset_tx_detector();
+    const long sent = transmit_tone(cli, 500, TX_TONE_PEAK);
+    if (sent < 0) {
+        fprintf(stderr, "na_bridge_probe: selftest could not key up or inject TX audio\n");
+        return EXIT_HARNESS;
+    }
+    sleep_ms(300);   /* let the last frames cross the wire and the mixer */
+    const int peak = atomic_load(&g_txsrv_peak), calls = atomic_load(&g_txsrv_calls);
+    printf("RESULT tx-keyed accepted=%ld srv_calls=%d srv_bytes=%d srv_peak=%d\n",
+           sent, calls, atomic_load(&g_txsrv_bytes), peak);
+    fflush(stdout);
+    if (sent == 0) {
+        fprintf(stderr, "FAIL selftest/tx-keyed: the client accepted 0 TX bytes with PTT on — "
+                        "na_client_set_tx_inject or the keying gate is not doing what it says\n");
+        return EXIT_UNMET;
+    }
+    if (calls == 0) {
+        fprintf(stderr, "na_bridge_probe: selftest TX sink never fired — the server delivered no "
+                        "TX frames at all, so nothing can be concluded about keying\n");
+        return EXIT_HARNESS;
+    }
+    if (peak != TX_TONE_PEAK) {
+        fprintf(stderr, "FAIL selftest/tx-keyed: the server's TX sink peaked at %d, expected "
+                        "exactly %d — TX audio is not arriving intact\n", peak, TX_TONE_PEAK);
+        return EXIT_UNMET;
+    }
+    na_client_set_ptt(cli, 0);
+    return EXIT_MET;
+}
+
 static int run_selftest(void) {
     char err[256];
     printf("na_bridge_probe --selftest: proving the detector tells content from silence\n");
@@ -241,6 +391,12 @@ static int run_selftest(void) {
         na_server_destroy(srv);
         return EXIT_HARNESS;
     }
+    /* The far end of the client's transmit path. NULL-backend only, and before start. */
+    if (na_server_set_tx_audio_cb(srv, on_server_tx_audio, NULL) != NA_OK) {
+        fprintf(stderr, "na_bridge_probe: selftest TX sink rejected\n");
+        na_server_destroy(srv);
+        return EXIT_HARNESS;
+    }
     if (na_server_start(srv, err, (int)sizeof err) != NA_OK) {
         fprintf(stderr, "na_bridge_probe: selftest server start failed (%s)\n", err);
         na_server_destroy(srv);
@@ -248,7 +404,7 @@ static int run_selftest(void) {
     }
 
     const int port = na_server_port(srv);
-    na_stream_client* cli = attach("127.0.0.1", port, "bridge-probe-selftest");
+    na_stream_client* cli = attach("127.0.0.1", port, "bridge-probe-selftest", 1);
     if (cli == NULL) {
         na_server_stop(srv);
         na_server_destroy(srv);
@@ -264,13 +420,15 @@ static int run_selftest(void) {
     } else {
         rc = selftest_arm(srv, cli, 1, "content");
         if (rc == EXIT_MET) rc = selftest_arm(srv, cli, 0, "silence");
+        if (rc == EXIT_MET) rc = selftest_tx(srv, cli);
     }
 
     na_client_disconnect(cli);
     na_client_destroy(cli);
     na_server_stop(srv);
     na_server_destroy(srv);
-    if (rc == EXIT_MET) printf("na_bridge_probe --selftest: OK (content and silence separated)\n");
+    if (rc == EXIT_MET)
+        printf("na_bridge_probe --selftest: OK (RX content/silence separated, TX keying honoured)\n");
     return rc;
 }
 
@@ -279,7 +437,7 @@ static int run_selftest(void) {
 static void usage(void) {
     fprintf(stderr,
         "usage: na_bridge_probe [--host H] [--port N] [--seconds S]\n"
-        "                       [--expect content|silence] [--min-rate BYTES_PER_SEC]\n"
+        "                       [--expect content|silence] [--min-rate BYTES_PER_SEC] [--tx]\n"
         "       na_bridge_probe --selftest\n"
         "\n"
         "  --expect content   require peak |sample| > 0   (a silent stream FAILS)\n"
@@ -287,6 +445,9 @@ static void usage(void) {
         "  --min-rate N       also require the delivered byte rate >= N. OFF by default:\n"
         "                     a correct run against a dummy backend sits near 83%% of nominal,\n"
         "                     so any threshold tight enough to be useful fires on healthy runs.\n"
+        "  --tx               ALSO key up and inject TX tone for the sampling window, making this\n"
+        "                     client the server's TX owner. Required to reach na_hamlib_bridge's\n"
+        "                     rig_stream_write path at all — it writes only while an owner exists.\n"
         "\n"
         "exit: 0 expectation met, 1 expectation NOT met, 2 the probe could not run\n");
 }
@@ -296,10 +457,12 @@ int main(int argc, char** argv) {
     int port = 4533, seconds = 8;
     const char* expect = NULL;
     long min_rate = 0;
+    int tx = 0;
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         if (strcmp(a, "--selftest") == 0) return run_selftest();
+        if (strcmp(a, "--tx") == 0) { tx = 1; continue; }
         if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(); return EXIT_MET; }
         if (i + 1 >= argc) { usage(); return EXIT_HARNESS; }
         if      (strcmp(a, "--host") == 0)     host = argv[++i];
@@ -316,11 +479,28 @@ int main(int argc, char** argv) {
     if (seconds <= 0 || port <= 0 || port > 65535) { usage(); return EXIT_HARNESS; }
 
     reset_detector();
-    na_stream_client* c = attach(host, port, "bridge-probe");
+    na_stream_client* c = attach(host, port, "bridge-probe", tx);
     if (c == NULL) return EXIT_HARNESS;
-    printf("na_bridge_probe: attached to %s:%d, sampling %d s\n", host, port, seconds);
+    printf("na_bridge_probe: attached to %s:%d, sampling %d s%s\n", host, port, seconds,
+           tx ? " (transmitting)" : "");
     fflush(stdout);
-    sleep_ms(seconds * 1000);
+    if (tx) {
+        /* Transmitting IS the sampling window here — transmit_tone paces itself at 10 ms a frame,
+         * so it occupies the same wall clock the RX detector is accumulating over. */
+        const long sent = transmit_tone(c, seconds * 1000, TX_TONE_PEAK);
+        if (sent <= 0) {
+            fprintf(stderr, "na_bridge_probe: --tx could not key up or the client accepted 0 bytes "
+                            "(%ld) — nothing was transmitted, so the TX path was never exercised\n",
+                    sent);
+            na_client_disconnect(c);
+            na_client_destroy(c);
+            return EXIT_HARNESS;
+        }
+        printf("RESULT tx-injected bytes=%ld\n", sent);
+        fflush(stdout);
+    } else {
+        sleep_ms(seconds * 1000);
+    }
 
     report(expect != NULL ? expect : "sample", (double)seconds);
     const int peak = atomic_load(&g_peak);
