@@ -29,7 +29,8 @@
  *       na_server_stop fires on_stopped and flips is_running to 0; destroy of both is clean;
  *   (5) the transport/profile ordering naudio.h promises — na_server_set_transport and
  *       na_server_set_reliability_profile both write the transport and the LAST ONE CALLED WINS —
- *       observed through which client kind can reach the resulting server;
+ *       observed through which client kind can reach the resulting server, plus the reset the
+ *       shared profile type promises: NA_RELIABILITY_DEFAULT really undoes a UDP profile;
  *   (6) the other half of that promise — na_server_set_reliability_profile leaves the fields the
  *       other config setters own alone, so they compose in either order. Only max-clients is
  *       observable through the public ABI; the arm's own comment records what is not, and why.
@@ -133,11 +134,20 @@ static void sleep_ms(int ms) {
  * so it is observed the only way a C consumer can: by which client kind can reach the server. A
  * UDP-only server refuses a client left on the ABI-default TCP transport at connect (SO_ERROR=61),
  * and a TCP-only server refuses a UDP-profile client at handshake. This mirrors
- * tests/c_client_profile.c's assert_cannot_reach_udp_server onto the server's own setter pair. */
+ * tests/c_client_profile.c's assert_cannot_reach_udp_server onto the server's own setter pair.
+ *
+ * ARM D PINS A SECOND SENTENCE, stated on the shared na_reliability_profile type rather than on
+ * either setter: NA_RELIABILITY_DEFAULT "mirrors a default-constructed AudioStreamConfig — plain
+ * TCP with the whole reliability layer off, so it is the reset rather than a UDP profile"
+ * (include/naudio.h:361-363). The CLIENT half of that claim has been pinned since
+ * c_client_profile.c:211-214; the server's profile setter was passed UDP_WAN only, so a DEFAULT
+ * case that had quietly become a no-op would have kept the whole suite green while contradicting
+ * the shipped contract. Same asymmetry arms A-C closed, one sentence over. */
 
 #define ORD_PROFILE_ONLY           0  /* control: profile(UDP_WAN) alone         -> UDP serves */
 #define ORD_PROFILE_THEN_TRANSPORT 1  /* profile(UDP_WAN) -> set_transport(TCP)  -> TCP serves */
 #define ORD_TRANSPORT_THEN_PROFILE 2  /* set_transport(TCP) -> profile(UDP_WAN)  -> UDP serves */
+#define ORD_PROFILE_THEN_DEFAULT   3  /* profile(UDP_WAN) -> profile(DEFAULT)    -> TCP serves */
 
 /* Start a NULL-backend server on an ephemeral port with the two setters called in `order`.
  * Returns NULL (having already destroyed the handle) on any failure. */
@@ -154,6 +164,8 @@ static na_audio_server* ordering_server(int order, int* out_port) {
     ok = ok && na_server_set_reliability_profile(s, NA_RELIABILITY_UDP_WAN) == NA_OK;
     if (order == ORD_PROFILE_THEN_TRANSPORT)
         ok = ok && na_server_set_transport(s, NA_TRANSPORT_TCP) == NA_OK;
+    if (order == ORD_PROFILE_THEN_DEFAULT)  /* the reset, applied THROUGH the profile setter */
+        ok = ok && na_server_set_reliability_profile(s, NA_RELIABILITY_DEFAULT) == NA_OK;
     if (!ok) {
         fprintf(stderr, "FAIL: an ordering-arm config setter was rejected\n");
         na_server_destroy(s);
@@ -202,10 +214,18 @@ static int reaches(int port, int udp_client, const char* what) {
  * The client expected to CONNECT is probed first because it is always the fast one: a client whose
  * transport the server does not serve is refused instantly over TCP (SO_ERROR=61) but pays the
  * full 10 s handshake timeout over UDP, since a datagram sent at a port with no UDP listener draws
- * no reply. Probing in this order keeps a regression's report in milliseconds. That single slow
- * probe — arm B's UDP one — is the whole cost of this section, and it is not redundant with arm B's
- * TCP probe: the TCP probe catches a set_transport that did nothing, while only the UDP probe
- * catches one that selected DUAL and left the server answering both.
+ * no reply. Probing in this order keeps a regression's report in milliseconds. The TWO slow probes
+ * — arm B's UDP one and arm D's — are the whole cost of this section, and neither is redundant with
+ * its arm's TCP probe: the TCP probe catches a setter that did nothing (the server stays UDP and
+ * refuses it instantly), while only the UDP probe catches one that selected DUAL and left the
+ * server answering both, which no TCP probe can see because a DUAL server accepts it happily.
+ *
+ * MEASURED, so that nobody has to re-derive it before deciding whether to keep them: on a healthy
+ * arm D the TCP probe returns in 1.2 ms and the UDP probe in 10000.3 ms — the whole 10 s is
+ * src/net/AudioStreamClient.cpp:24's kConnectTimeoutMs, and no public setter shortens it. The cost
+ * is therefore paid on GREEN runs only; under either regression the arm reports in milliseconds.
+ * Keeping it was a deliberate call, not an oversight — do not "optimise" a UDP probe away without
+ * replacing what it catches.
  *
  * IF YOU RE-AUDIT THESE BY MUTATION, note that the two checks below are not independent detectors:
  * a mutation that makes a setter a no-op violates BOTH of an arm's expectations, and the UDP check
@@ -730,13 +750,20 @@ int main(void) {
      * A regression that made either setter a no-op after the other would have kept the whole suite
      * green while contradicting the shipped contract. Arm A is the control the claim requires to
      * DIFFER from arm B; arm C is the same expectation reached in the opposite order, which is
-     * what pins the profile as the winner when IT is the later call. */
+     * what pins the profile as the winner when IT is the later call.
+     *
+     * Arm D is the profile setter answering for ITSELF rather than against set_transport: it is the
+     * only arm in which no na_server_set_transport call appears at all, so it is the one that can
+     * tell a real NA_RELIABILITY_DEFAULT reset from a no-op. Its expectation is arm B's, reached
+     * without the other setter. */
 
     if (!check_ordering_arm(ORD_PROFILE_ONLY, "A: profile(UDP_WAN) alone [control]", 1, 0) ||
         !check_ordering_arm(ORD_PROFILE_THEN_TRANSPORT,
                             "B: profile(UDP_WAN) -> set_transport(TCP)", 0, 1) ||
         !check_ordering_arm(ORD_TRANSPORT_THEN_PROFILE,
-                            "C: set_transport(TCP) -> profile(UDP_WAN)", 1, 0)) {
+                            "C: set_transport(TCP) -> profile(UDP_WAN)", 1, 0) ||
+        !check_ordering_arm(ORD_PROFILE_THEN_DEFAULT,
+                            "D: profile(UDP_WAN) -> profile(DEFAULT) [the reset]", 0, 1)) {
         return 1;
     }
 
