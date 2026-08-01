@@ -6,7 +6,7 @@ name: CI
 # on CI runners. The real-hardware smokes (na_audio_daemon / on-air audio) are
 # gated out here — they need a real sound device.
 #
-# Four job families (tri-platform + FetchContent + FFI coverage):
+# Five job families (tri-platform + FetchContent + FFI + the Hamlib bridge):
 #   * build-and-test  — Ubuntu + macOS with a SYSTEM PortAudio (the supported path);
 #                       full ctest + install smoke + the external-consumer find_package
 #                       / pkg-config gate.
@@ -21,6 +21,14 @@ name: CI
 #                       against a C reference compiled from naudio.h. Asserts on matched
 #                       output lines, never on exit status — every drift this catches is
 #                       one where the client exits 0.
+#   * hamlib-bridge   — Ubuntu: na_hamlib_bridge, which until this job had never been compiled
+#                       on any platform but one developer's macOS. It is opt-in behind
+#                       NAUDIO_BUILD_HAMLIB_BRIDGE and needs a libhamlib exposing rig_stream_*
+#                       (Hamlib 5.0+ / PR #2116) that no distro ships, so nothing had ever built
+#                       it against glibc or gcc. Builds that dependency from source with the
+#                       tracked tools/build-streaming-hamlib.sh, then asserts on the BINARY and
+#                       on named passing tests — never on an exit code, because both the skipped
+#                       build and the empty test selection exit 0.
 
 on:
   push:
@@ -198,3 +206,102 @@ jobs:
         with:
           name: ffi-clients-log
           path: ffi-clients.log
+
+  hamlib-bridge:
+    name: hamlib bridge (ubuntu-latest, libhamlib built from source)
+    runs-on: ubuntu-latest
+    # Issue #27. na_hamlib_bridge was the one component of naudio that had never been compiled on
+    # any platform but one developer's macOS machine — it is pure POSIX C with pthreads that had
+    # only ever met clang and macOS libc. The first Linux build found a real defect immediately
+    # (hidden visibility silently disabling the fault shim's LD_PRELOAD interposition — see the
+    # C_VISIBILITY_PRESET note on naudio_failshim in CMakeLists.txt), which is the class of bug
+    # this job exists to catch before a distro packager does.
+    #
+    # DELIBERATELY NOT CACHED. Caching the libhamlib prefix would make the common run skip
+    # build-streaming-hamlib.sh entirely — and running that script on Linux, where its Debian
+    # dependency list had never once been executed, is half of what this job is for. A cache hit
+    # would report green having exercised neither the script nor the list it advertises.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps (exactly the list the script and the docs advertise)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config build-essential portaudio19-dev
+          # The first five are precisely what tools/build-streaming-hamlib.sh prints when a tool is
+          # missing (:106) and what docs/hamlib-streaming-bridge.md tells a reader to install. That
+          # list shipped cross-platform from the start and had never been run on Linux, so this step
+          # is itself an assertion: if it is wrong or short, the next step fails.
+          # portaudio19-dev is naudio's own dependency, as in build-and-test.
+
+      - name: "Build a streaming-capable libhamlib (Hamlib PR #2116) from source"
+        # Quoted: an unquoted '#' after a space starts a YAML comment, which silently truncates
+        # this step's name in the Actions UI.
+        run: tools/build-streaming-hamlib.sh --prefix "${{ runner.temp }}/hamlib-streaming"
+        # Tracks the PR branch HEAD rather than pinning a commit: #2116 is open, and noticing when
+        # the streaming API moves out from under the bridge is exactly what this job is worth.
+        # docs/hamlib-streaming-bridge.md records that choice and how to pin instead (--ref).
+        # The cost of tracking a third-party branch is that an upstream force-push, a rename, or a
+        # deleted branch turns this job red for reasons outside naudio. Pin --ref if that bites.
+        #
+        # This step dominates the job's wall clock. Every figure here was measured by running these
+        # steps verbatim in an ubuntu:24.04 amd64 container held to 4 CPUs, the runner's shape:
+        # deps 4 s, THIS step 244 s, configure 8 s, build 53 s, bridge tests 31 s — about 5m40s
+        # end to end, of which this is three quarters. (Unconstrained at -j18 the same step is
+        # 179 s; Hamlib's ~200 backends parallelise well, so it tracks core count.)
+
+      - name: Configure with the bridge enabled
+        run: |
+          PKG_CONFIG_PATH="${{ runner.temp }}/hamlib-streaming/lib/pkgconfig" \
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Assert the bridge BINARY exists — never the build's exit code
+        run: |
+          # Every skip in tools/CMakeLists.txt is a message(WARNING), not a FATAL_ERROR. A
+          # NAUDIO_BUILD_HAMLIB_BRIDGE=ON build against a stock libhamlib configures clean, builds
+          # clean, exits 0 and produces NO binary, with the warning scrolling past in a few hundred
+          # lines of output. So the two steps above passing is not evidence the bridge was built.
+          # Only the file is. (This trap has already cost this project one false "bridge enabled".)
+          test -x build/tools/na_hamlib_bridge \
+            || { echo "::error::na_hamlib_bridge was not built — the target was silently skipped"; exit 1; }
+
+          # Linked against the streaming libhamlib, and able to actually load it: a binary that
+          # exists but cannot resolve libhamlib.so at run time would satisfy the check above.
+          ldd build/tools/na_hamlib_bridge | grep -i hamlib \
+            || { echo "::error::na_hamlib_bridge is not linked against libhamlib"; exit 1; }
+
+          # -h writes to STDERR, so the redirect is load-bearing; without it this greps an empty
+          # stream and fails on a perfectly good binary.
+          ./build/tools/na_hamlib_bridge -h 2>&1 | grep -q '^usage: .*na_hamlib_bridge' \
+            || { echo "::error::na_hamlib_bridge built but will not run"; exit 1; }
+
+      - name: Run the bridge on Linux (naudio_bridge_arm + naudio_bridge_fault_arm)
+        run: |
+          # Both arms are registered ONLY when na_hamlib_bridge exists as a target, which is what
+          # makes them worth running here: the fault arm LD_PRELOADs naudio_failshim to force
+          # rig_stream_read/write to fail, and its ELF half had never been compiled anywhere.
+          set +e
+          ctest --test-dir build -R naudio_bridge --output-on-failure > bridge-ctest.log 2>&1
+          rc=$?
+          set -e
+          cat bridge-ctest.log
+          echo "--- ctest exited ${rc} (informational; the assertions are on output) ---"
+
+          # Assert on NAMED PASSING TESTS, not on ctest's exit code. Measured: `ctest -R <pattern>`
+          # that matches nothing prints "No tests were found!!!" and exits 0. That is the identical
+          # failure this job's binary check exists to catch, one layer down — a silently skipped
+          # bridge registers no arms, so an exit-code check reports green having run nothing.
+          for t in naudio_bridge_probe_selftest naudio_bridge_arm naudio_bridge_fault_arm; do
+            grep -qE "Test +#[0-9]+: ${t} +\.+ +Passed" bridge-ctest.log \
+              || { echo "::error::${t} did not run, or did not pass"; exit 1; }
+          done
+
+      - name: Upload the bridge test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hamlib-bridge-ctest-log
+          path: bridge-ctest.log

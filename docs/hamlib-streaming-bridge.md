@@ -208,6 +208,11 @@ to mistake for coverage.
 ctest --test-dir build -R naudio_bridge_arm --output-on-failure   # ~10 s, two arms
 ```
 
+CI runs this arm and the fault arm below on `ubuntu-latest` (the `hamlib-bridge` job), building
+libhamlib from source with the script above. That job asserts on the **binary** and on named
+passing tests rather than on exit codes, because a skipped bridge and an empty test selection both
+exit 0. It is the only place the bridge is compiled against glibc and gcc.
+
 It runs two arms, and the second is the one that matters. `-S tone` must deliver **content** and
 `-S silence` must deliver **silence** — because those two runs are indistinguishable on every
 volume-shaped metric. Measured against the Hamlib dummy: 956160 vs 954240 bytes, 996 vs 994
@@ -377,8 +382,9 @@ the right rate, with perfect parity and `gaps=0` — it is indistinguishable fro
 every counter the bridge prints. Any check of this path has to look at the samples themselves;
 peak amplitude over a window is enough.
 
-Not verified, and not claimed: real hardware, Linux, and a link with a non-1500 MTU. FEC recovery
-under induced loss is covered below, on the `-m 1` path.
+Not verified, and not claimed: real hardware, this `-m 2` path on Linux — CI compiles and runs the
+bridge on Linux, but only against `-m 1` — and a link with a non-1500 MTU. FEC recovery under
+induced loss is covered below, on the `-m 1` path.
 
 ---
 
