@@ -252,9 +252,15 @@ originally checked with a hand-built shim in a scratchpad that evaporated with i
 | `rx-fail` | `rig_stream_read` fails after 10 calls | **exit non-zero** and name the dead worker |
 | `control` | *none* — shim loaded, no fault armed | stay up and report `short=0` |
 | `tx-short` | every `rig_stream_write` truncated to half | **count** the short writes (`short > 0`) |
+| `tx-fail` | `rig_stream_write` fails after 10 calls | **exit non-zero** and name the dead worker |
+
+`rx-fail` and `tx-fail` are the two halves of the same bug, and one arm does not cover both: the two
+workers reach `worker_failed()` from separate call sites, so deleting only `tx_thread`'s call leaves
+`rx-fail` entirely green. `tx-fail` costs **0.9 s** of the total — it needs no health-line
+interval, because process exit and the `tx worker stopped` line are both immediate.
 
 ```bash
-ctest --test-dir build -R naudio_bridge_fault_arm --output-on-failure   # ~18 s, three arms
+ctest --test-dir build -R naudio_bridge_fault_arm --output-on-failure   # ~18 s, four arms
 ```
 
 Neither fault is reachable from outside the process: the Hamlib dummy has no error-injection knob,
@@ -265,7 +271,7 @@ two stream calls. It is armed entirely by environment variables — `NA_FAIL_RX_
 `NA_FAIL_TX_AFTER`, `NA_FAIL_CODE`, `NA_FAIL_TX_SHORT` — and with none of them set it is a pure
 pass-through, which is exactly what the `control` arm runs.
 
-**The `control` arm is what makes the other two mean anything.** A bridge that short-writes during
+**The `control` arm is what makes the others mean anything.** A bridge that short-writes during
 ordinary operation would satisfy `tx-short` with no fault injected at all. Same shim, same probe,
 same TX load, fault switched off — so the fault is isolated as the cause.
 
@@ -273,6 +279,12 @@ Every arm also asserts the shim *announced itself* (`na_failshim: armed …`, pr
 constructor). A preload that fails to load produces exactly the output of a healthy run — no error,
 no diagnostic — so "no short writes were reported" and "interposition never happened" are otherwise
 the same observation, and the second one passes the control arm silently.
+
+`tx-fail` goes one step further, because the `armed` marker proves the shim *loaded* and says
+nothing about whether either interposer *bound*: it requires the shim's forced-write line — emitted
+from inside the interposed call — before it reports anything about the bridge at all. Measured by
+running the arm with the fault left unarmed: it reports a **harness fault (exit 2)**, not a bridge
+bug and not a pass, while the other three arms stay green.
 
 > **macOS SIP.** `DYLD_INSERT_LIBRARIES` is stripped the moment a SIP-protected binary is exec'd,
 > which includes `/usr/bin/timeout`, `/bin/zsh` and `/usr/bin/perl`. Both driver scripts launch the
@@ -291,7 +303,9 @@ the same observation, and the second one passes the control arm silently.
 > local definition directly and never consults the dynamic symbol table.
 
 Reaching the TX path needs a transmitting client, because `tx_thread` calls `rig_stream_write` only
-while a TX owner exists. That is what `--tx` is for:
+while a TX owner exists — measured, not assumed: armed to fail the *very first* write with no
+client connected, the bridge logged zero forced writes in 3 s and exited 0 on `SIGINT`. An idle
+client therefore reaches neither `tx-short` nor `tx-fail`. That is what `--tx` is for:
 
 ```bash
 ./build/naudio_bridge_probe --port 4533 --seconds 6 --tx

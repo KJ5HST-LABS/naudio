@@ -13,21 +13,26 @@
 #
 #   #5  a dead worker thread left the bridge running with no audio. Fixed by worker_failed()
 #       (tools/na_hamlib_bridge.c:49-57), which sets g_stop and g_failed so main tears down and
-#       returns 1. Guarded here by arm A.
+#       returns 1. #5's acceptance list has TWO checkboxes — an RX stream error and a TX one —
+#       because rx_thread and tx_thread have the same shape and the same fix. Arm A guards the RX
+#       half; arm D guards the TX half (issue #37). One arm did not cover both: the two workers
+#       reach worker_failed() from separate call sites, and a mutation that deletes only the TX
+#       one leaves arm A entirely green (measured — see the mutation table in issue #37).
 #   #6  a short rig_stream_write silently dropped the unwritten tail. Fixed by ring_requeue()
 #       (tools/na_hamlib_bridge.c:122-137), which hands the tail back and counts what no longer
 #       fits. Guarded here by arm C.
 #
-# THE ARMS MUST DISAGREE, and arm B is the one that makes the other two mean anything:
+# THE ARMS MUST DISAGREE, and arm B is the one that makes the others mean anything:
 #
 #   A  rx-fail   NA_FAIL_RX_AFTER   the bridge must EXIT NON-ZERO   (it used to idle forever)
 #   B  control   no fault armed     the bridge must STAY UP and report short=0
 #   C  tx-short  NA_FAIL_TX_SHORT   the bridge must COUNT the short writes  (short > 0)
+#   D  tx-fail   NA_FAIL_TX_AFTER   the bridge must EXIT NON-ZERO   (the TX half of #5)
 #
 # Without arm B, arm C proves nothing: a bridge that short-writes during ordinary operation would
-# satisfy "short > 0" with no fault injected at all, and arm A cannot tell "exited because of the
-# forced error" from "exited because the shim broke it". Arm B is the same shim, the same probe and
-# the same TX load with only the fault switched off, so it isolates the fault as the cause.
+# satisfy "short > 0" with no fault injected at all, and arms A and D cannot tell "exited because of
+# the forced error" from "exited because the shim broke it". Arm B is the same shim, the same probe
+# and the same TX load with only the fault switched off, so it isolates the fault as the cause.
 #
 # EVERY ARM ASSERTS THE SHIM ANNOUNCED ITSELF. A preload that fails to load produces exactly the
 # output of a healthy run — no error, no diagnostic, nothing — so "no short writes were
@@ -230,15 +235,110 @@ arm_tx () {
     return 0
 }
 
+# ---------------------------------------------------------------- arm D: a dead TX worker exits
+#
+# The TX half of issue #5 (issue #37). Same symptom as arm A and a different call site: tx_thread
+# returns on the error (tools/na_hamlib_bridge.c:285-291), main() never learns, and the process keeps
+# serving a client whose audio now goes nowhere.
+#
+# THE PROBE MUST TRANSMIT. tx_thread calls rig_stream_write only while na_server_tx_owner reports an
+# owner (tools/na_hamlib_bridge.c:275-286), so an idle client never reaches the fault. Measured, not
+# assumed: armed at NA_FAIL_TX_AFTER=0 — fail the very first write — with no client at all, the
+# bridge logged zero forced writes in 3 s and exited 0 on SIGINT. That is also why this arm cannot
+# reuse arm A's shape, and why it asserts the fault FIRED before it reports anything about the bridge.
+#
+# Unlike arms B and C this needs no health-line interval: process exit and the `tx worker stopped`
+# line are both immediate, so it costs ~1 s rather than the ~6 s those two pay for one health tick.
+arm_tx_fail () {
+    log="$workdir/tx_fail.log"
+    plog="$workdir/tx_fail.probe.log"
+
+    env "$PRELOAD_VAR=$SHIM" NA_FAIL_TX_AFTER=10 \
+        "$BRIDGE" -m 1 -S silence -p "$PORT" >"$log" 2>&1 &
+    bpid=$!
+
+    if ! wait_ready "$log" "$bpid"; then
+        echo "FAIL bridge_fault_arm/tx-fail: the bridge never reported itself listening" >&2
+        sed 's/^/    | /' "$log" >&2
+        kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        return 2
+    fi
+
+    # 10 writes are allowed through first, so the bridge is genuinely carrying TX audio before the
+    # fault. -S silence keeps the RX direction out of it; bridge_arm.sh owns the RX content claim.
+    "$PROBE" --port "$PORT" --seconds 6 --tx >"$plog" 2>&1 &
+    ppid=$!
+
+    exited=0
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$bpid" 2>/dev/null; then exited=1; break; fi
+        sleep 0.1
+    done
+
+    # SIGTERM, not SIGINT. A background job started by a non-interactive shell inherits SIG_IGN for
+    # SIGINT, and the probe installs no handler of its own — so `kill -INT` here would be a silent
+    # no-op and this arm would pay the probe's full --seconds on every run. The bridge is immune to
+    # that trap only because it installs a handler, which overrides the inherited disposition.
+    kill -TERM "$ppid" 2>/dev/null; wait "$ppid" 2>/dev/null
+
+    if [ "$exited" -eq 1 ]; then
+        wait "$bpid" 2>/dev/null
+        bexit=$?
+    else
+        kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        bexit=-1
+    fi
+
+    assert_shim_loaded "$log" tx-fail || return 2
+
+    # The shim announcing it LOADED is not evidence that it BOUND, and for this arm the difference
+    # is the whole verdict: an unbound interposer injects no fault, the bridge correctly stays up,
+    # and "the bridge ignored a failing write" is then indistinguishable from "no write ever failed"
+    # (Learning 68; issue #39 is the general form). The forced-write line is emitted from INSIDE the
+    # interposed call, so it is the marker that separates them. It gates both verdicts below rather
+    # than only the failing one, so a pass means the bridge died OF THE INJECTED FAULT.
+    if ! grep -q 'na_failshim: rig_stream_write .* (forced)' "$log" 2>/dev/null; then
+        echo "FAIL bridge_fault_arm/tx-fail: no rig_stream_write ever failed, so tx_thread never" >&2
+        echo "  reached the code under test and this arm asserted nothing about the bridge. The" >&2
+        echo "  shim loaded — the armed marker is above — so this is either a probe that never" >&2
+        echo "  keyed up, or an interposer that loaded without binding." >&2
+        sed 's/^/    | /' "$plog" >&2
+        return 2
+    fi
+
+    if [ "$exited" -eq 0 ]; then
+        echo "FAIL bridge_fault_arm/tx-fail: rig_stream_write has been failing for 10 s and the" >&2
+        echo "  bridge is still running. This is issue #5's TX half: tx_thread returns on the" >&2
+        echo "  error, main() never learns, and the process keeps serving with no TX audio." >&2
+        sed 's/^/    | /' "$log" >&2
+        return 1
+    fi
+    if [ "$bexit" -eq 0 ]; then
+        echo "FAIL bridge_fault_arm/tx-fail: the bridge exited 0 after a TX stream error." >&2
+        echo "  A supervisor reads that as a clean shutdown and will not restart it." >&2
+        return 1
+    fi
+    # Named separately from arm A's `rx worker stopped`: the two workers share worker_failed(), so
+    # only the label distinguishes which one died, and an operator gets a cause rather than a code.
+    if ! grep -q 'tx worker stopped' "$log" 2>/dev/null; then
+        echo "FAIL bridge_fault_arm/tx-fail: exited $bexit but never said which worker died" >&2
+        sed 's/^/    | /' "$log" >&2
+        return 1
+    fi
+    echo "  bridge_fault_arm/tx-fail: OK (exited $bexit and named the failed worker)"
+    return 0
+}
+
 echo "bridge_fault_arm: $BRIDGE on :$PORT under $(basename "$SHIM")"
 
 arm_rx_fail                                        || rc=$?
-# Arms B and C both run even if an earlier arm failed: "the control also failed" and "only the fault
-# arm failed" are different diagnoses, and running both is what tells them apart.
+# Every later arm runs even if an earlier one failed: "the control also failed" and "only the fault
+# arm failed" are different diagnoses, and running them all is what tells them apart.
 arm_tx control  zero                               || { a=$?; [ "$rc" -eq 0 ] && rc=$a; }
 arm_tx tx-short nonzero NA_FAIL_TX_SHORT=2         || { a=$?; [ "$rc" -eq 0 ] && rc=$a; }
+arm_tx_fail                                        || { a=$?; [ "$rc" -eq 0 ] && rc=$a; }
 
 if [ "$rc" -eq 0 ]; then
-    echo "bridge_fault_arm: OK — a dead RX worker stops the bridge, and short writes are counted"
+    echo "bridge_fault_arm: OK — a dead RX or TX worker stops the bridge, and short writes counted"
 fi
 exit "$rc"
