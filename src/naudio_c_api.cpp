@@ -1166,23 +1166,30 @@ extern "C" na_error_t na_server_set_reliability_profile(na_audio_server* server,
                 setError(NA_ERR_INVALID);
                 return NA_ERR_INVALID;
         }
-        // Copy transport + framing + reliability; PRESERVE audio format (rate/bits/channels) and
-        // maxClients so this composes order-independently with na_server_set_audio_format /
-        // na_server_set_max_clients.
+        // The preset wins WHOLESALE and the EXCEPTION LIST is explicit, rather than the reverse.
+        // Which way round this goes decides which mistake is silent, so it is worth being blunt
+        // about: a field-by-field copy makes a knob added to a preset later default to NOT being
+        // applied through this ABI, diverging the C and C++ paths with no compile error and no
+        // failing test. Assigning wholesale makes it carried by default, and the only thing a
+        // future field has to earn is a place on the four-line exception list below.
+        //
+        // ADDING A FIELD TO AudioStreamConfig? It is carried by the profile automatically. Add it
+        // below ONLY if some other na_server_* setter also writes it — that is what the list is:
+        // the fields this ABI lets a caller set independently, which must therefore survive a
+        // profile call made in either order (the promise in naudio.h on this function).
+        //
+        // Nothing else needs preserving today: txIdleTimeoutMs is the one remaining field, no
+        // na_server_* setter writes it and no preset changes it, so it is default on both sides.
         naudio::AudioStreamConfig& pc = server->pendingConfig;
-        pc.transportType                = preset.transportType;
-        pc.frameDurationMs              = preset.frameDurationMs;
-        pc.bufferTargetMs               = preset.bufferTargetMs;
-        pc.bufferMinMs                  = preset.bufferMinMs;
-        pc.bufferMaxMs                  = preset.bufferMaxMs;
-        pc.reorderBufferSize            = preset.reorderBufferSize;
-        pc.reorderMaxHoldMs             = preset.reorderMaxHoldMs;
-        pc.fecEnabled                   = preset.fecEnabled;
-        pc.fecBlockSize                 = preset.fecBlockSize;
-        pc.adaptiveJitterEnabled        = preset.adaptiveJitterEnabled;
-        pc.jitterMultiplier             = preset.jitterMultiplier;
-        pc.controlReliabilityEnabled    = preset.controlReliabilityEnabled;
-        pc.controlRetransmitMaxAttempts = preset.controlRetransmitMaxAttempts;
+        const std::int32_t rate = pc.sampleRate;       // na_server_set_audio_format
+        const std::int32_t bits = pc.bitsPerSample;    // na_server_set_audio_format
+        const std::int32_t chan = pc.channels;         // na_server_set_audio_format
+        const std::int32_t maxc = pc.maxClients;       // na_server_set_max_clients
+        pc = preset;
+        pc.sampleRate    = rate;
+        pc.bitsPerSample = bits;
+        pc.channels      = chan;
+        pc.maxClients    = maxc;
         return NA_OK;
     });
 }

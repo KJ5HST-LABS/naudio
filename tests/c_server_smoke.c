@@ -29,7 +29,11 @@
  *       na_server_stop fires on_stopped and flips is_running to 0; destroy of both is clean;
  *   (5) the transport/profile ordering naudio.h promises — na_server_set_transport and
  *       na_server_set_reliability_profile both write the transport and the LAST ONE CALLED WINS —
- *       observed through which client kind can reach the resulting server.
+ *       observed through which client kind can reach the resulting server;
+ *   (6) the other half of that promise — na_server_set_reliability_profile leaves the fields the
+ *       other config setters own alone, so they compose in either order. Only max-clients is
+ *       observable through the public ABI; the arm's own comment records what is not, and why.
+ *       Runs early (before section 2) because it needs no started server.
  * Returns non-zero (failing the ctest) on any contract violation.
  */
 #include <stdio.h>
@@ -239,6 +243,62 @@ static int check_ordering_arm(int order, const char* name, int want_udp, int wan
     return 1;
 }
 
+/* ---- profile / config-setter composition (section 6) -----------------------------------------
+ *
+ * na_server_set_reliability_profile applies a preset but must leave the four fields the OTHER
+ * na_server_* config setters own untouched — sample rate, bits, channels and max-clients — so the
+ * setters compose in either order. That is the promise at include/naudio.h:786-787.
+ *
+ * WHAT IS MEASURABLE HERE, AND WHAT IS NOT. Only max-clients is observable through the public C
+ * ABI: na_server_max_clients reports the configured value pre-start. The three audio-format fields
+ * have NO public accessor, and the obvious byte-volume route is a DEAD detector —
+ * na_server_inject_audio broadcasts the caller's buffer verbatim
+ * (src/net/AudioStreamServer.cpp:733-741), so a client receives the same byte count whatever format
+ * the server carries. Measured, not assumed: deleting `pc.sampleRate = rate;` from the setter
+ * leaves all 299 tests GREEN. That is why this section pins one field rather than four, and the
+ * unguarded three are tracked as an issue rather than left as folklore.
+ *
+ * THE THIRD ARM IS WHAT MAKES THE FIRST TWO MEAN ANYTHING. An order-independence claim predicts
+ * arm A == arm B, and an accessor stuck on any constant satisfies that perfectly. The profile-only
+ * arm must read the DEFAULT instead, so a blind accessor fails here and only here. It is NOT a
+ * second preservation check — every preset carries the default max-clients, so a clobbering profile
+ * leaves this arm looking correct. Arm A is the clobber detector.
+ *
+ * Placed before section (2) because it needs no started server — create/destroy only, no port, no
+ * measurable suite time — and because section (2) reads the same accessor at :359+13: evaluating
+ * the blind-instrument control first keeps a mutation of the accessor landing HERE instead of being
+ * masked downstream.
+ */
+#define COMPOSE_MAX_CLIENTS 7  /* != the documented default (4), so the two are distinguishable */
+
+/* max-clients on a throwaway pre-start server, with na_server_set_max_clients placed on either side
+ * of the profile call. Returns -1 on a setup fault, which no arm accepts as an answer. */
+static int compose_max_clients(int set_before, int set_after) {
+    int seen;
+    na_audio_server* s = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+    if (s == NULL) return -1;
+    if (set_before && na_server_set_max_clients(s, COMPOSE_MAX_CLIENTS) != NA_OK) goto fault;
+    if (na_server_set_reliability_profile(s, NA_RELIABILITY_UDP_WAN) != NA_OK) goto fault;
+    if (set_after && na_server_set_max_clients(s, COMPOSE_MAX_CLIENTS) != NA_OK) goto fault;
+    seen = na_server_max_clients(s);
+    na_server_destroy(s);
+    return seen;
+fault:
+    na_server_destroy(s);
+    return -1;
+}
+
+/* The default the accessor reports on an untouched server — derived from the library rather than
+ * spelled here, so this stays a preservation check and not a restatement of the default. */
+static int default_max_clients(void) {
+    int seen;
+    na_audio_server* s = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+    if (s == NULL) return -1;
+    seen = na_server_max_clients(s);
+    na_server_destroy(s);
+    return seen;
+}
+
 int main(void) {
     /* ---- (1) invalid-argument contract (no server / hardware) ---- */
 
@@ -307,6 +367,43 @@ int main(void) {
             return 1;
         }
         na_server_destroy(cfg);  /* never started — clean create/destroy */
+    }
+
+    /* ---- (6) the profile leaves what the other config setters own alone ----
+     * Three arms, three distinct jobs — see the comment block above compose_max_clients. Each
+     * assertion stands alone so a mutation lands on the one property it breaks. */
+    {
+        const int dflt  = default_max_clients();
+        const int arm_a = compose_max_clients(1, 0);  /* set_max_clients -> profile */
+        const int arm_b = compose_max_clients(0, 1);  /* profile -> set_max_clients */
+        const int arm_c = compose_max_clients(0, 0);  /* profile alone -> must read the default */
+
+        if (dflt < 0 || arm_a < 0 || arm_b < 0 || arm_c < 0) {
+            fprintf(stderr, "FAIL: a composition arm could not be configured\n");
+            return 1;
+        }
+        if (arm_a != COMPOSE_MAX_CLIENTS) {  /* the clobber detector */
+            fprintf(stderr, "FAIL: the profile clobbered max-clients set before it — got %d, "
+                            "want %d\n", arm_a, COMPOSE_MAX_CLIENTS);
+            return 1;
+        }
+        if (arm_b != COMPOSE_MAX_CLIENTS) {
+            fprintf(stderr, "FAIL: max-clients set after the profile did not stick — got %d, "
+                            "want %d\n", arm_b, COMPOSE_MAX_CLIENTS);
+            return 1;
+        }
+        if (arm_c == COMPOSE_MAX_CLIENTS) {  /* the blind-instrument control */
+            fprintf(stderr, "FAIL: the profile-only arm reads %d — na_server_max_clients cannot "
+                            "discriminate, so arms A and B prove nothing\n", arm_c);
+            return 1;
+        }
+        if (arm_c != dflt) {
+            fprintf(stderr, "FAIL: the profile moved max-clients off the default — got %d, want %d\n",
+                    arm_c, dflt);
+            return 1;
+        }
+        printf("  (6) profile composition: max-clients %d preserved in both orders; profile-only "
+               "reads the default %d\n", COMPOSE_MAX_CLIENTS, dflt);
     }
 
     /* ---- (2) create + configure + start a NULL-backend server on an ephemeral port ---- */
