@@ -531,6 +531,11 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
     # still printed its `armed` marker, so the fault arm failed as though the BRIDGE had regressed and
     # reported issues #5 and #6 as live bugs. macOS never showed it, because __DATA,__interpose binds
     # the local definition directly and does not consult the dynamic symbol table.
+    #
+    # Deleting this line no longer produces that misdiagnosis: the arms also require the shim's
+    # `interposed <fn>` marker, printed from inside the interposed call, so an unbound interposer is
+    # now reported as a harness fault instead (issue #39, tests/bridge/failshim.c). That is a better
+    # error message and not a reason to drop the property — the arms would still all fail.
     set_target_properties(naudio_failshim PROPERTIES PREFIX "" C_VISIBILITY_PRESET default)
 
     add_test(NAME naudio_bridge_fault_arm

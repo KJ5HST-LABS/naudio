@@ -34,11 +34,26 @@
 # the forced error" from "exited because the shim broke it". Arm B is the same shim, the same probe
 # and the same TX load with only the fault switched off, so it isolates the fault as the cause.
 #
-# EVERY ARM ASSERTS THE SHIM ANNOUNCED ITSELF. A preload that fails to load produces exactly the
-# output of a healthy run — no error, no diagnostic, nothing — so "no short writes were
-# reported" and "interposition never happened" are otherwise indistinguishable, and the second
-# one passes arm B silently. failshim.c's constructor prints `na_failshim: armed ...` for this
-# reason, and this script greps for it before believing any arm (CLAUDE.md Learning 63).
+# EVERY ARM ASSERTS THE SHIM LOADED, AND THAT THE CALLS IT DEPENDS ON WERE INTERPOSED. These are
+# two different checks because they are two different failures with one symptom (issue #39):
+#
+#   `na_failshim: armed ...`        from the constructor      — the library LOADED
+#   `na_failshim: interposed <fn>`  from inside the call      — that call BOUND
+#
+# A preload that fails to load produces exactly the output of a healthy run — no error, no
+# diagnostic, nothing — so "no short writes were reported" and "interposition never happened" are
+# otherwise indistinguishable, and the second one passes arm B silently (CLAUDE.md Learning 63).
+# The `armed` marker fixes that and is NOT sufficient: a shim can load, print it, and still have
+# both interposers as unreachable dead code, which is precisely what the ELF visibility trap did on
+# the first Linux build — every arm failed reporting issues #5 and #6 as live bridge bugs. The
+# `interposed` marker is emitted from inside the interposed call, on the pass-through path as well
+# as the failing one, so no shim that failed to bind can produce it. Which calls each arm asserts
+# is set by which calls it actually makes, measured rather than assumed:
+#
+#   A  rx-fail   read           — connects no client, so tx_thread never writes at all
+#   B  control   read + write   — short=0 is satisfied by a shim that never bound; this is the fix
+#   C  tx-short  read + write   — short=0 is reported as issue #6 regressing; same trap, inverted
+#   D  tx-fail   read           — plus its stronger forced-write gate, which subsumes the write one
 #
 # macOS SIP TRAP (CLAUDE.md Learning 6): the bridge is launched DIRECTLY, never through `timeout`,
 # `perl` or a nested shell. Exec'ing a SIP-protected binary strips DYLD_* from the environment with
@@ -105,6 +120,28 @@ assert_shim_loaded () {
     return 0
 }
 
+# ...and the marker that proves a given call was actually INTERPOSED (issue #39). Loading and
+# binding are different failures with the same symptom, and assert_shim_loaded above cannot tell
+# them apart: the ELF visibility trap left this shim loaded, its constructor printing `armed` on
+# every run, and both interposers unreachable dead code — so all four arms failed as though the
+# BRIDGE had regressed and reported issues #5 and #6 as live bugs (measured, see the note in
+# failshim.c). `interposed <fn>` is printed from INSIDE the interposed call, on the pass-through
+# path as well as the failing one, so a shim that never bound cannot produce it however healthy the
+# run looks. Emitted immediately after the bridge's own readiness line, which every arm already
+# waits for, so no arm is too short to see it; once per function per process, so it does not swamp
+# the log the arms grep (measured: 3 shim lines in a 6 s control run).
+assert_shim_bound () {
+    log="$1"; arm="$2"; fn="$3"
+    if ! grep -q "na_failshim: interposed $fn" "$log" 2>/dev/null; then
+        echo "FAIL bridge_fault_arm/$arm: the shim loaded but $fn was never interposed, so no" >&2
+        echo "  fault could reach the bridge and this arm asserted nothing about it. The armed" >&2
+        echo "  marker is present below — this is a HARNESS fault, not a bridge regression." >&2
+        sed 's/^/    | /' "$log" >&2
+        return 2
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- arm A: a dead RX worker exits
 #
 # Issue #5's actual symptom was NOT a crash — it was the opposite. rx_thread returned on the error
@@ -134,6 +171,10 @@ arm_rx_fail () {
     if [ "$exited" -eq 0 ]; then
         kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
         assert_shim_loaded "$log" rx-fail || return 2
+        # Before blaming the bridge. A read interposer that loaded without binding injects no fault,
+        # so the bridge correctly stays up and this branch is reached — which is issue #39's exact
+        # misdiagnosis, and it is this arm that produced it on the first Linux build.
+        assert_shim_bound "$log" rx-fail rig_stream_read || return 2
         echo "FAIL bridge_fault_arm/rx-fail: rig_stream_read has been failing for 10 s and the" >&2
         echo "  bridge is still running. This is issue #5 exactly: a dead worker leaves the" >&2
         echo "  process up, the port open and the health line printing, with no audio moving." >&2
@@ -143,6 +184,11 @@ arm_rx_fail () {
     bexit=$?
 
     assert_shim_loaded "$log" rx-fail || return 2
+    # Only rig_stream_read. This arm connects no client, so na_server_tx_owner never reports an
+    # owner and tx_thread never calls rig_stream_write at all — measured, not assumed: the write
+    # marker is absent from this arm's log on a healthy run, so requiring it here would fail a
+    # correct shim. Arms control/tx-short/tx-fail run a --tx probe and do assert both.
+    assert_shim_bound "$log" rx-fail rig_stream_read || return 2
 
     if [ "$bexit" -eq 0 ]; then
         echo "FAIL bridge_fault_arm/rx-fail: the bridge exited 0 after an RX stream error." >&2
@@ -197,11 +243,24 @@ arm_tx () {
 
     assert_shim_loaded "$log" "$arm" || return 2
 
+    # Before the interposition checks below, not after: a probe that never ran also produces no TX
+    # owner and so no writes at all, which would surface as "rig_stream_write was never interposed"
+    # — true, but the wrong proximate cause to put in front of whoever is reading. Both are harness
+    # faults, so the verdict is unchanged either way; only the diagnosis differs.
     if [ "$prc" -ne 0 ]; then
         echo "FAIL bridge_fault_arm/$arm: the TX probe could not run (exit $prc)" >&2
         sed 's/^/    | /' "$plog" >&2
         return 2
     fi
+
+    # Both calls, and for the CONTROL arm this is the whole point of issue #39. Its pass condition
+    # is short=0 — which a shim that never bound satisfies perfectly, because a write that was never
+    # interposed is never short. "The pass-through changed nothing" and "nothing ran" are otherwise
+    # the same observation, one level in from the `armed` marker that was added to fix exactly this
+    # shape (Learning 68). tx-short needs it for the converse reason: short=0 there is reported as a
+    # regression of issue #6, and an unbound write interposer would produce it with #6 intact.
+    assert_shim_bound "$log" "$arm" rig_stream_read  || return 2
+    assert_shim_bound "$log" "$arm" rig_stream_write || return 2
 
     # The last health line wins: counters are cumulative, so the final sample carries the whole run.
     short=$(grep -o 'short=[0-9]*' "$log" 2>/dev/null | tail -1 | cut -d= -f2)
@@ -290,6 +349,12 @@ arm_tx_fail () {
     fi
 
     assert_shim_loaded "$log" tx-fail || return 2
+    # The read interposer is not what this arm faults, but nothing else here asserts it bound and
+    # the bridge is reading throughout. `interposed rig_stream_write` is deliberately NOT asserted:
+    # the forced-write gate below is strictly stronger — it proves the write interposer bound AND
+    # that the fault fired — and two assertions on one observable let the weaker one rot unnoticed
+    # (Learning 43).
+    assert_shim_bound "$log" tx-fail rig_stream_read || return 2
 
     # The shim announcing it LOADED is not evidence that it BOUND, and for this arm the difference
     # is the whole verdict: an unbound interposer injects no fault, the bridge correctly stays up,

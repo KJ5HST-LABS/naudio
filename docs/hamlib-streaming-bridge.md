@@ -275,16 +275,45 @@ pass-through, which is exactly what the `control` arm runs.
 ordinary operation would satisfy `tx-short` with no fault injected at all. Same shim, same probe,
 same TX load, fault switched off — so the fault is isolated as the cause.
 
-Every arm also asserts the shim *announced itself* (`na_failshim: armed …`, printed from its
-constructor). A preload that fails to load produces exactly the output of a healthy run — no error,
-no diagnostic — so "no short writes were reported" and "interposition never happened" are otherwise
-the same observation, and the second one passes the control arm silently.
+**Every arm asserts the shim loaded, and that the calls it depends on were interposed.** Those are
+two checks because they are two different failures with one symptom:
 
-`tx-fail` goes one step further, because the `armed` marker proves the shim *loaded* and says
-nothing about whether either interposer *bound*: it requires the shim's forced-write line — emitted
-from inside the interposed call — before it reports anything about the bridge at all. Measured by
-running the arm with the fault left unarmed: it reports a **harness fault (exit 2)**, not a bridge
-bug and not a pass, while the other three arms stay green.
+| Marker | Printed from | Proves |
+|---|---|---|
+| `na_failshim: armed …` | the constructor | the library **loaded** |
+| `na_failshim: interposed <fn>` | inside `shim_read` / `shim_write` | that call **bound** |
+
+The first is needed because a preload that fails to load produces exactly the output of a healthy
+run — no error, no diagnostic — so "no short writes were reported" and "interposition never
+happened" are otherwise the same observation, and the second one passes the `control` arm silently.
+
+The first is also **not sufficient**, which is why the second exists. A shim can load, print `armed`
+on every run, and still have both interposers as unreachable dead code — exactly what the ELF
+visibility trap below did on the first Linux build of the bridge. `interposed <fn>` is emitted from
+inside the interposed call, on the pass-through path as well as the failing one, so a shim that
+never bound cannot print it however healthy the run looks. Which calls each arm requires is set by
+which calls it actually makes, measured rather than assumed:
+
+| Arm | Requires | Why |
+|---|---|---|
+| `rx-fail` | read | connects no client, so `tx_thread` never writes at all |
+| `control` | read + write | `short=0` is satisfied by a shim that never bound — the case it exists for |
+| `tx-short` | read + write | `short=0` is reported as issue #6 regressing; the same trap inverted |
+| `tx-fail` | read | plus its forced-write line, which is strictly stronger for the write side |
+
+Proved by removing both `DYLD_INTERPOSE` entries, so the shim loads and binds nothing: **all four
+arms report a harness fault (exit 2)**, none blames the bridge. Against the harness as it stood
+before this check, the same shim reported `rx-fail` and `tx-short` as **live bridge bugs** — issues
+#5 and #6 regressing — while `control` **passed clean**. Removing only the write marker leaves
+`rx-fail` and `tx-fail` green and fails `control` and `tx-short` alone, which is what shows the two
+requirements are independent rather than one check counted twice.
+
+Proved again on ELF, against the mutation that caused the original defect. In an `ubuntu:24.04`
+amd64 container, reverting `naudio_failshim`'s `C_VISIBILITY_PRESET` to `hidden` leaves `nm -D`
+reporting **no** exported interposers and `nm` two local `t` symbols — and all four arms report a
+**harness fault**, with the `armed` marker present in every one of them. The unmutated build in the
+same container passes all four, which is itself the evidence that the marker prints under
+`LD_PRELOAD`: every arm asserts it, so none of them could have passed otherwise.
 
 > **macOS SIP.** `DYLD_INSERT_LIBRARIES` is stripped the moment a SIP-protected binary is exec'd,
 > which includes `/usr/bin/timeout`, `/bin/zsh` and `/usr/bin/perl`. Both driver scripts launch the
@@ -295,12 +324,13 @@ bug and not a pass, while the other three arms stay green.
 > two definitions have to be exported. naudio compiles with hidden visibility globally
 > (`CMAKE_C_VISIBILITY_PRESET`), which leaves them local — `nm` shows `t` rather than `T`, and
 > `nm -D` shows nothing — and the preload then does nothing whatsoever. `naudio_failshim` sets
-> `C_VISIBILITY_PRESET default` to opt out. This trap is worse than the SIP one, because it defeats
-> the check in the paragraph above: the shim still loads and still prints its `armed` line, so the
-> marker is satisfied while both interposers are dead code, and the arms fail as though issues #5
-> and #6 had regressed rather than as a harness fault. Measured on Ubuntu 24.04 / gcc 13.3 on the
-> first Linux build of the bridge; macOS never showed it, because `__DATA,__interpose` binds the
-> local definition directly and never consults the dynamic symbol table.
+> `C_VISIBILITY_PRESET default` to opt out. This trap defeated the `armed` check: the shim still
+> loads and still prints that line, so the load marker is satisfied while both interposers are dead
+> code, and the arms failed as though issues #5 and #6 had regressed rather than as a harness fault.
+> Measured on Ubuntu 24.04 / gcc 13.3 on the first Linux build of the bridge; macOS never showed it,
+> because `__DATA,__interpose` binds the local definition directly and never consults the dynamic
+> symbol table. The `interposed <fn>` marker above is what now catches it — this is the trap it was
+> added for, and the arms report a harness fault instead of blaming the bridge.
 
 Reaching the TX path needs a transmitting client, because `tx_thread` calls `rig_stream_write` only
 while a TX owner exists — measured, not assumed: armed to fail the *very first* write with no

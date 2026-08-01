@@ -18,11 +18,24 @@
  * its stderr, and the TX loss counters it already prints. Nothing here is asserted on directly:
  * a probe that reports its own opinion of a fault is testing itself (Learning 43).
  *
- * THE LOAD MARKER IS LOAD-BEARING. The constructor prints `na_failshim: armed ...` before main()
- * runs. Every arm in bridge_fault_arm.sh greps for it, because a shim that fails to load produces
- * EXACTLY the output of a healthy run: no fault, no error, no diagnostic. "The bridge did not
- * report a short write" and "interposition never happened" are otherwise the same observation, and
- * the second one silently passes the control arm (CLAUDE.md Learning 63).
+ * TWO MARKERS, AND THEY PROVE DIFFERENT THINGS (issue #39).
+ *
+ *   `na_failshim: armed ...`        printed from the constructor — the library LOADED
+ *   `na_failshim: interposed <fn>`  printed from inside shim_read / shim_write — that call BOUND
+ *
+ * The first is load-bearing because a shim that fails to load produces EXACTLY the output of a
+ * healthy run: no fault, no error, no diagnostic. "The bridge did not report a short write" and
+ * "interposition never happened" are otherwise the same observation, and the second one silently
+ * passes the control arm (CLAUDE.md Learning 63).
+ *
+ * The first is also NOT ENOUGH, which is why the second exists. Loading and binding are different
+ * failures with the same symptom: the ELF visibility trap below left this file loaded, its
+ * constructor printing `armed` on every run, and both interposers unreachable dead code — so the
+ * arms failed as though the BRIDGE had regressed and reported issues #5 and #6 as live bugs. A
+ * marker emitted from inside the interposed call cannot be printed by a shim that never bound, so
+ * it separates the two and lets the driver report a harness fault instead of blaming the bridge.
+ * It is emitted on the PASS-THROUGH path as well as the failing one, because the control arm arms
+ * no fault at all and would otherwise have nothing from inside the call to grep.
  *
  * macOS SIP TRAP (CLAUDE.md Learning 6): DYLD_INSERT_LIBRARIES is stripped from the environment the
  * instant a SIP-protected binary is exec'd — /usr/bin/timeout, /bin/zsh and /usr/bin/perl included.
@@ -93,9 +106,22 @@ typedef int (*read_fn)(RIG *, rig_stream_t *, void *, size_t, size_t *, int,
 typedef int (*write_fn)(RIG *, rig_stream_t *, const void *, size_t, size_t *, int,
                         const struct rig_stream_write_info *);
 
+/* The BOUND marker (issue #39). Printed from inside the interposed call, so a shim that loaded
+ * without binding — the ELF visibility trap, a missing __DATA,__interpose entry — cannot produce it
+ * however healthy the run looks. Exactly once per function per process: atomic_fetch_add returns the
+ * previous value, so precisely one thread ever sees n == 1, and the log the arms grep gains two
+ * lines rather than one per call. Called before any fault branch, so the pass-through path announces
+ * itself too; the control arm arms nothing and would otherwise have nothing from inside the call to
+ * assert on. */
+static void announce_bound(const char *fn) {
+    fprintf(stderr, "na_failshim: interposed %s\n", fn);
+    fflush(stderr);
+}
+
 static int shim_read(read_fn real, RIG *rig, rig_stream_t *s, void *buf, size_t bufsize,
                      size_t *got, int timeout_ms, struct rig_stream_read_info *info) {
     const long n = atomic_fetch_add(&g_rx_calls, 1) + 1;
+    if (n == 1) announce_bound("rig_stream_read");
     if (g_rx_after >= 0 && n > g_rx_after) {
         /* Zero the out-parameter: the bridge reads `got` on every path, and leaving a stale count
          * here would inject audio the fault is supposed to have prevented. */
@@ -112,6 +138,7 @@ static int shim_read(read_fn real, RIG *rig, rig_stream_t *s, void *buf, size_t 
 static int shim_write(write_fn real, RIG *rig, rig_stream_t *s, const void *buf, size_t n_bytes,
                       size_t *written, int timeout_ms, const struct rig_stream_write_info *info) {
     const long n = atomic_fetch_add(&g_tx_calls, 1) + 1;
+    if (n == 1) announce_bound("rig_stream_write");
     if (g_tx_after >= 0 && n > g_tx_after) {
         if (written != NULL) *written = 0;
         if (n == g_tx_after + 1) {
