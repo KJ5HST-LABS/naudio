@@ -191,6 +191,49 @@ runs it for you at the end of a build.
 
 ---
 
+## Verifying it delivers audio (`naudio_bridge_arm`)
+
+Once the bridge builds, `ctest` gains a `naudio_bridge_arm` test that drives it for real: it starts
+the bridge on the hardware-free dummy backend, attaches a client, and checks what actually arrives.
+Configure-time success looks like
+
+```
+-- naudio: naudio_bridge_arm enabled (na_hamlib_bridge present)
+```
+
+and where the bridge was not built the test is simply **not registered** — there is no skipped test
+to mistake for coverage.
+
+```bash
+ctest --test-dir build -R naudio_bridge_arm --output-on-failure   # ~10 s, two arms
+```
+
+It runs two arms, and the second is the one that matters. `-S tone` must deliver **content** and
+`-S silence` must deliver **silence** — because those two runs are indistinguishable on every
+volume-shaped metric. Measured against the Hamlib dummy: 956160 vs 954240 bytes, 996 vs 994
+callbacks, and the bridge's own meter reporting 83% of nominal for *both*. Peak |sample| is the only
+thing that separates them, 16383 against 0, so a harness that gates on byte counts or rate passes a
+completely silent bridge.
+
+The probe behind it is `naudio_bridge_probe`, built unconditionally against the public C ABI alone —
+it needs no libhamlib — so it can be pointed at anything speaking the naudio wire:
+
+```bash
+./build/naudio_bridge_probe --help
+./build/naudio_bridge_probe --port 4533 --seconds 8 --expect content
+```
+
+Its exit status is a tri-state: `0` the expectation held, `1` it did not, `2` the probe itself could
+not run — so a broken harness is never read as a clean negative result. `--selftest` proves the
+detector separates content from silence using an in-process server, needs neither the bridge nor
+libhamlib, and runs on every platform as `naudio_bridge_probe_selftest`.
+
+Absolute rate is reported but never asserted: a correct run against a dummy backend sits near 83% of
+nominal because the backend paces itself off `nanosleep`, so any threshold tight enough to catch a
+fault also fires on a healthy run. `--min-rate` exists for that comparison and is off by default.
+
+---
+
 ## The prefix must be durable
 
 `build/CMakeCache.txt` records an **absolute path** into the hamlib prefix

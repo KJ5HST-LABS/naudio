@@ -435,6 +435,23 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
         add_test(NAME naudio_c_abi_fault COMMAND naudio_c_abi_fault)
     endif()
 
+    # Bridge RX probe: a content-aware naudio client, split deliberately from the thing it probes.
+    # Six sessions hand-built a na_hamlib_bridge harness in a scratchpad and all six evaporated
+    # (issue #15); nearly all of every one of them was this probe, and none of it needed libhamlib.
+    # So the probe is built HERE, unconditionally, against the public C ABI alone — it compiles and
+    # runs on the whole CI matrix — while the arm that drives the real bridge is registered after
+    # add_subdirectory(tools) and exists only when that opt-in target does.
+    #
+    # --selftest is what stops "built in CI" from meaning "compiled but never executed": it stands
+    # up an in-process NULL-backend server, injects known content and then silence, and asserts the
+    # probe's detector separates them. That negative control is the whole reason the probe measures
+    # peak |sample| instead of byte counts — measured against the Hamlib dummy, a silent bridge and
+    # a healthy one differ by 0.2% in bytes and by 16383 in peak.
+    add_executable(naudio_bridge_probe tests/bridge/na_bridge_probe.c)
+    target_link_libraries(naudio_bridge_probe PRIVATE naudio)
+    set_target_properties(naudio_bridge_probe PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME naudio_bridge_probe_selftest COMMAND naudio_bridge_probe --selftest)
+
     # Documentation honesty gate: extract every ```c / ```cpp
     # fenced block from README.md and compile each (-fsyntax-only) against the
     # in-tree headers, so a documented example that stops matching the real C ABI /
@@ -468,6 +485,22 @@ endif()
 # ----------------------------------------------------------------------------
 if(NOT WIN32)
     add_subdirectory(tools)
+endif()
+
+# ----------------------------------------------------------------------------
+# Bridge arm (issue #15) — the half of the bridge harness that cannot be portable. Registered ONLY
+# when na_hamlib_bridge actually exists as a target, which needs both NAUDIO_BUILD_HAMLIB_BRIDGE=ON
+# and a streaming-capable libhamlib; on a stock build ctest has no such test at all, rather than a
+# skip that reads like coverage. Must come after add_subdirectory(tools), where that target is
+# defined. The detector this arm leans on is proved unconditionally and on every platform by
+# naudio_bridge_probe --selftest above, so the portable half never depends on this one running.
+# ----------------------------------------------------------------------------
+if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudio_bridge_probe)
+    add_test(NAME naudio_bridge_arm
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/bridge/bridge_arm.sh"
+                          "$<TARGET_FILE:na_hamlib_bridge>"
+                          "$<TARGET_FILE:naudio_bridge_probe>")
+    message(STATUS "naudio: naudio_bridge_arm enabled (na_hamlib_bridge present)")
 endif()
 
 # ----------------------------------------------------------------------------
