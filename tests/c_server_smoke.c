@@ -26,7 +26,10 @@
  *       once a client is connected — the extract WIRING, since a NULL-backend client cannot
  *       capture real TX);
  *   (4) clean disconnect leaves the server at zero clients and on_client_disconnected fires;
- *       na_server_stop fires on_stopped and flips is_running to 0; destroy of both is clean.
+ *       na_server_stop fires on_stopped and flips is_running to 0; destroy of both is clean;
+ *   (5) the transport/profile ordering naudio.h promises — na_server_set_transport and
+ *       na_server_set_reliability_profile both write the transport and the LAST ONE CALLED WINS —
+ *       observed through which client kind can reach the resulting server.
  * Returns non-zero (failing the ctest) on any contract violation.
  */
 #include <stdio.h>
@@ -117,6 +120,123 @@ static void sleep_ms(int ms) {
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
 #endif
+}
+
+/* ---- transport/profile ordering (section 5) --------------------------------------------------
+ *
+ * naudio.h promises that na_server_set_transport and na_server_set_reliability_profile BOTH write
+ * the transport and that the LAST ONE CALLED WINS. Nothing in the C ABI reads the transport back,
+ * so it is observed the only way a C consumer can: by which client kind can reach the server. A
+ * UDP-only server refuses a client left on the ABI-default TCP transport at connect (SO_ERROR=61),
+ * and a TCP-only server refuses a UDP-profile client at handshake. This mirrors
+ * tests/c_client_profile.c's assert_cannot_reach_udp_server onto the server's own setter pair. */
+
+#define ORD_PROFILE_ONLY           0  /* control: profile(UDP_WAN) alone         -> UDP serves */
+#define ORD_PROFILE_THEN_TRANSPORT 1  /* profile(UDP_WAN) -> set_transport(TCP)  -> TCP serves */
+#define ORD_TRANSPORT_THEN_PROFILE 2  /* set_transport(TCP) -> profile(UDP_WAN)  -> UDP serves */
+
+/* Start a NULL-backend server on an ephemeral port with the two setters called in `order`.
+ * Returns NULL (having already destroyed the handle) on any failure. */
+static na_audio_server* ordering_server(int order, int* out_port) {
+    char err[256];
+    na_audio_server* s = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+    if (s == NULL) {
+        fprintf(stderr, "FAIL: na_server_create (ordering arm)\n");
+        return NULL;
+    }
+    int ok = 1;
+    if (order == ORD_TRANSPORT_THEN_PROFILE)
+        ok = ok && na_server_set_transport(s, NA_TRANSPORT_TCP) == NA_OK;
+    ok = ok && na_server_set_reliability_profile(s, NA_RELIABILITY_UDP_WAN) == NA_OK;
+    if (order == ORD_PROFILE_THEN_TRANSPORT)
+        ok = ok && na_server_set_transport(s, NA_TRANSPORT_TCP) == NA_OK;
+    if (!ok) {
+        fprintf(stderr, "FAIL: an ordering-arm config setter was rejected\n");
+        na_server_destroy(s);
+        return NULL;
+    }
+    if (na_server_start(s, err, (int)sizeof err) != NA_OK) {
+        fprintf(stderr, "FAIL: na_server_start (ordering arm) (%s)\n", err);
+        na_server_destroy(s);
+        return NULL;
+    }
+    *out_port = na_server_port(s);
+    return s;
+}
+
+/* Probe `port` with one client kind: 1 if the connect succeeded, 0 if it was refused, -1 if the
+ * harness itself failed. `udp_client` applies the UDP_WAN profile (which selects UDP); otherwise
+ * the client is left on the ABI-default transport, exactly as c_client_profile.c's probes are. */
+static int reaches(int port, int udp_client, const char* what) {
+    char err[256];
+    err[0] = '\0';
+    na_stream_client* c = na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", port, what);
+    if (c == NULL) {
+        fprintf(stderr, "FAIL: na_client_create (%s)\n", what);
+        return -1;
+    }
+    na_client_set_playback_device(c, 0);  /* REQUIRED for RX even on the NULL backend */
+    na_client_set_auto_reconnect(c, 0);   /* a retry storm would only slow the refusal down */
+    if (udp_client && na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN) != NA_OK) {
+        fprintf(stderr, "FAIL: profile rejected on the %s probe\n", what);
+        na_client_destroy(c);
+        return -1;
+    }
+    const na_error_t rc = na_client_connect(c, err, (int)sizeof err);
+    if (rc == NA_OK) na_client_disconnect(c);
+    na_client_destroy(c);
+    if (rc != NA_OK) printf("    %s refused (%s)\n", what, err);
+    return rc == NA_OK ? 1 : 0;
+}
+
+/* One ordering arm end to end. BOTH client kinds are probed and BOTH results asserted against the
+ * arm's expected pair, which is what makes the control real: no constant-returning probe can
+ * satisfy arm A's (connected, refused) and arm B's (refused, connected) at once, so a detector
+ * blind to the transport fails whichever expectation it contradicts instead of reporting agreement
+ * and reading as corroboration (Learning 58).
+ *
+ * The client expected to CONNECT is probed first because it is always the fast one: a client whose
+ * transport the server does not serve is refused instantly over TCP (SO_ERROR=61) but pays the
+ * full 10 s handshake timeout over UDP, since a datagram sent at a port with no UDP listener draws
+ * no reply. Probing in this order keeps a regression's report in milliseconds. That single slow
+ * probe — arm B's UDP one — is the whole cost of this section, and it is not redundant with arm B's
+ * TCP probe: the TCP probe catches a set_transport that did nothing, while only the UDP probe
+ * catches one that selected DUAL and left the server answering both.
+ *
+ * IF YOU RE-AUDIT THESE BY MUTATION, note that the two checks below are not independent detectors:
+ * a mutation that makes a setter a no-op violates BOTH of an arm's expectations, and the UDP check
+ * is evaluated first, so it fires and MASKS the TCP one. Each was confirmed live by neutralising
+ * the check that masks it and re-running the same mutation — read WHICH assertion fired, never
+ * merely that something went red (Learning 54). Returns 1 on success. */
+static int check_ordering_arm(int order, const char* name, int want_udp, int want_tcp) {
+    int port = -1;
+    na_audio_server* s = ordering_server(order, &port);
+    if (s == NULL) return 0;
+    printf("  ordering arm %s (port %d)\n", name, port);
+
+    int got_udp, got_tcp;
+    if (want_udp) {
+        got_udp = reaches(port, 1, "udp-profile");
+        got_tcp = reaches(port, 0, "tcp-default");
+    } else {
+        got_tcp = reaches(port, 0, "tcp-default");
+        got_udp = reaches(port, 1, "udp-profile");
+    }
+    na_server_stop(s);
+    na_server_destroy(s);
+    if (got_udp < 0 || got_tcp < 0) return 0;
+
+    if (got_udp != want_udp) {
+        fprintf(stderr, "FAIL: ordering arm %s — the UDP-profile client %s, want %s\n", name,
+                got_udp ? "connected" : "was refused", want_udp ? "connected" : "refused");
+        return 0;
+    }
+    if (got_tcp != want_tcp) {
+        fprintf(stderr, "FAIL: ordering arm %s — the TCP-default client %s, want %s\n", name,
+                got_tcp ? "connected" : "was refused", want_tcp ? "connected" : "refused");
+        return 0;
+    }
+    return 1;
 }
 
 int main(void) {
@@ -506,6 +626,22 @@ int main(void) {
     }
 
     na_server_destroy(server);  /* idempotent stop + join + drain dispatcher + free */
+
+    /* ---- (5) transport/profile ordering — the last setter to write the transport wins ----
+     * The header states this on na_server_set_reliability_profile; before this section nothing
+     * asserted it, while the client's identical claim was pinned by c_client_profile.c:203-214.
+     * A regression that made either setter a no-op after the other would have kept the whole suite
+     * green while contradicting the shipped contract. Arm A is the control the claim requires to
+     * DIFFER from arm B; arm C is the same expectation reached in the opposite order, which is
+     * what pins the profile as the winner when IT is the later call. */
+
+    if (!check_ordering_arm(ORD_PROFILE_ONLY, "A: profile(UDP_WAN) alone [control]", 1, 0) ||
+        !check_ordering_arm(ORD_PROFILE_THEN_TRANSPORT,
+                            "B: profile(UDP_WAN) -> set_transport(TCP)", 0, 1) ||
+        !check_ordering_arm(ORD_TRANSPORT_THEN_PROFILE,
+                            "C: set_transport(TCP) -> profile(UDP_WAN)", 1, 0)) {
+        return 1;
+    }
 
     printf("c_server_smoke OK (port=%d, client RX byte-identical, roster=1, TX-extract frames=%d "
            "@ %d bytes, clean disconnect+stop)\n", port, atomic_load(&g_tx_frames),
