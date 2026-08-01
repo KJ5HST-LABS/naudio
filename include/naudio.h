@@ -602,13 +602,21 @@ typedef struct na_client_stats {
     double    jitter_ms;                 /* current inter-arrival jitter estimate; 0 if off    */
     int       buffer_target_ms;          /* adaptive buffer target; -1 when adaptive jitter is off */
 
-    /* UNAVAILABLE IS NOT ZERO. These three are -1 when the library is not measuring them,
-     * which is the case on EVERY profile selectable here: the sequence-gap tracker runs only
-     * when no reorder buffer is engaged, and every UDP profile configures one (TCP never
-     * tracks gaps at all). -1 means "not measured" and never means "nothing was lost" — to
-     * see loss recovery, read packets_recovered_by_fec. They are present, and specified as
-     * -1 rather than 0, so that they can begin carrying real values without this struct
-     * changing shape if post-reorder loss accounting is ever added. */
+    /* UNAVAILABLE IS NOT ZERO. These three are -1 when the library is not measuring them, which
+     * is the case on every PROFILE selectable here: the sequence-gap tracker runs only when no
+     * reorder buffer is engaged, and every UDP profile configures one (TCP never tracks gaps at
+     * all). -1 means "not measured" and never means "nothing was lost" — to see loss recovery,
+     * read packets_recovered_by_fec.
+     *
+     * A profile is not the only thing that writes the transport, though, and one composition
+     * DOES reach the tracker: NA_RELIABILITY_DEFAULT resets the reliability layer, so following
+     * it with na_client_set_transport(NA_TRANSPORT_UDP) — last writer wins — builds the one
+     * publicly reachable UDP connection carrying no reorder buffer. There these three hold real
+     * readings and sequence_gaps holds the -1. Measured, and pinned by section (6) of
+     * tests/c_client_profile.c. So read the sign rather than assuming it from the profile.
+     *
+     * They are present, and specified as -1 rather than 0, so that they can begin carrying real
+     * values without this struct changing shape if post-reorder loss accounting is ever added. */
     long long packets_lost;
     long long packets_out_of_order;
     double    packet_loss_rate;

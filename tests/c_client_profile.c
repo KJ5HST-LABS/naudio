@@ -8,7 +8,9 @@
  * WHAT THIS COVERS. na_client_set_transport writes the transport and NOTHING else, so a C-ABI
  * client configured with it alone runs UDP with FEC, reordering, adaptive jitter and control-ARQ
  * all off — it receives every parity packet the server sends and discards it. The profile setter
- * is the only way to turn that layer on, and this file asserts it does.
+ * is the only way to turn that layer on, and this file asserts it does. It also asserts the
+ * reverse, which is a separate claim: NA_RELIABILITY_DEFAULT turns that layer back OFF (6), not
+ * merely the transport back to TCP (5).
  *
  * WHAT IT DOES NOT COVER — read before adding a claim here. Every path below is loss-free
  * loopback, so it CANNOT distinguish FEC-on from FEC-off: with nothing dropped, the recovering and
@@ -17,6 +19,29 @@
  * prove, and does, is that the profile writes the transport (a client configured with the profile
  * ALONE reaches a UDP-only server, which a client left on the TCP default cannot) and that a client
  * running the whole reliability pipeline still delivers real audio end to end.
+ *
+ * SO SECTION (6) IS NOT A WHOLE-LAYER CLAIM, and must not be read as one. Of the four knobs
+ * NA_RELIABILITY_DEFAULT resets, exactly two have an observable on this side of the C ABI, and
+ * that is measured rather than assumed — the same two clients, one per configuration:
+ *
+ *   reorder buffer  — OBSERVED. sequence_gaps 0 with UDP_WAN against -1 after the reset, and the
+ *                     three pre-reorder loss counters flip the opposite way (unmeasured against
+ *                     0). Either side of that complement detects the knob.
+ *   adaptive jitter — OBSERVED. buffer_target_ms 60 with UDP_WAN against -1 after the reset; only
+ *                     an estimator that exists publishes a target.
+ *   FEC             — NO OBSERVABLE HERE. packets_recovered_by_fec and fec_blocks_unreconciled
+ *                     both read 0 in BOTH configurations, because on a loss-free path there is
+ *                     nothing to recover and no block to decline. A decoder that exists and a
+ *                     decoder that does not are indistinguishable, so asserting on them here
+ *                     would be decoration.
+ *   control-ARQ     — NO OBSERVABLE ON A CLIENT AT ALL, by design rather than by fixture:
+ *                     control_retransmits is documented ALWAYS 0 on a client (naudio.h), since
+ *                     DISCONNECT is its only critical control message and it is sent after the
+ *                     thread that pumps the retransmit sweep has exited. Measured 0 in both
+ *                     configurations here, exactly as that says.
+ *
+ * A preset wrongly left in the DEFAULT case is therefore caught by this file iff it differs in
+ * reordering or adaptive jitter. One differing only in FEC or control-ARQ is NOT caught.
  *
  * Hardware-free: NULL backends on both ends, loopback UDP, no PortAudio, no radio.
  */
@@ -188,6 +213,36 @@ int main(void) {
         return fail("server roster never reached 1", c, srv);
     }
 
+    /* The ON side of the pair that section (6) asserts the OFF side of, and it is not optional.
+     * A negative claim — "the reliability layer is off" — is worth exactly as much as the proof
+     * that its instrument can see the layer when it IS on. So the same three fields are read
+     * here, on a client running the whole pipeline, and must read the opposite way. Without this
+     * arm, a field that returned "off" unconditionally would satisfy (6) perfectly. */
+    {
+        na_client_stats on;
+        if (na_client_get_stats(c, &on, sizeof on) != NA_OK) {
+            return fail("na_client_get_stats on the profile-only client", c, srv);
+        }
+        /* A reorder buffer IS engaged here, so the post-reorder gap counter carries a reading and
+         * the three pre-reorder counters are unmeasured. naudio.h specifies the two as exact
+         * complements — never both, never neither — so this reads both sides of that. */
+        if (on.sequence_gaps < 0) {
+            return fail("sequence_gaps unmeasured on UDP_WAN, which engages a reorder buffer",
+                        c, srv);
+        }
+        if (on.packets_lost >= 0 || on.packets_out_of_order >= 0 || on.packet_loss_rate >= 0.0) {
+            return fail("a pre-reorder loss counter is measured alongside sequence_gaps", c, srv);
+        }
+        /* A second, independent knob: adaptive jitter builds its own estimator, and only an
+         * existing estimator publishes a target. */
+        if (on.buffer_target_ms < 0) {
+            return fail("buffer_target_ms unmeasured on UDP_WAN, which enables adaptive jitter",
+                        c, srv);
+        }
+        printf("c_client_profile: UDP_WAN pipeline live — sequence_gaps %lld, loss counters "
+               "unmeasured, buffer_target_ms %d\n", on.sequence_gaps, on.buffer_target_ms);
+    }
+
     /* ---- (4) frozen once connected, like every other config setter ---- */
 
     if (na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_LAN) != NA_ERR_INVALID ||
@@ -212,6 +267,93 @@ int main(void) {
                                         NA_TRANSPORT_TCP, 0, NA_RELIABILITY_DEFAULT)) {
         return fail("NA_RELIABILITY_DEFAULT did not reset the transport to TCP", NULL, srv);
     }
+
+    /* ---- (6) DEFAULT resets the RELIABILITY LAYER too, not merely the transport ---- */
+
+    /* NA_RELIABILITY_DEFAULT's contract (naudio.h, na_reliability_profile) is TWO assertions —
+     * "plain TCP" AND "with the whole reliability layer off". Everything above pins only the
+     * first, and the refusal probe (5) uses CANNOT be extended to the second: NA_TRANSPORT_DUAL
+     * is aliased to TCP on the client side, so a preset that leaves the transport wrong AND every
+     * reliability knob on is refused by this UDP-only server in exactly the way a correct reset
+     * is, and (5) still passes. Measured: replacing the DEFAULT case with dualDefault() left the
+     * whole suite green before this section existed.
+     *
+     * The technique that does work is to stop varying the transport at all. set_transport(UDP)
+     * runs AFTER the profile and overwrites whichever transport it chose — last-writer-wins,
+     * which (5) itself pins — so this client reaches the server whatever DEFAULT did to the
+     * transport, and the reliability half is then the only thing left varying. The counters read
+     * it directly.
+     *
+     * This is also the only public path that builds a UDP connection with NO reorder buffer: all
+     * three NA_RELIABILITY_UDP_* profiles configure one, so a C consumer reaches the
+     * reorder-free branch only by resetting with DEFAULT and re-selecting UDP. */
+
+    g_rx_ok = 0;  /* section (3) left it set; this arm needs a reading of its own */
+    na_stream_client *reset =
+        na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", port, "reset-cli");
+    if (reset == NULL) return fail("na_client_create (reset)", NULL, srv);
+    na_client_set_playback_device(reset, 0);
+    na_client_set_audio_cb(reset, on_rx_audio, NULL);
+    na_client_set_auto_reconnect(reset, 0);
+    if (na_client_set_reliability_profile(reset, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+        na_client_set_reliability_profile(reset, NA_RELIABILITY_DEFAULT) != NA_OK ||
+        na_client_set_transport(reset, NA_TRANSPORT_UDP) != NA_OK) {
+        return fail("UDP_WAN -> DEFAULT -> set_transport(UDP) rejected", reset, srv);
+    }
+    if (na_client_connect(reset, err, (int)sizeof err) != NA_OK) {
+        fprintf(stderr, "  (%s)\n", err);
+        return fail("the reset client could not reach the UDP server", reset, srv);
+    }
+
+    /* Gate on RX ALONE, never on the roster: the server has not yet reaped the client section (4)
+     * disconnected, so na_client_server_client_count reads 2 here and a `== 1` gate burns the
+     * entire budget waiting for a number that never arrives. Measured: 20 ms with this gate
+     * against the full 3000 ms with the roster one. */
+    int rwaited = 0;
+    while (rwaited < 3000 && !g_rx_ok) {
+        na_server_inject_audio(srv, RXBUF, (int)sizeof RXBUF);
+        sleep_ms(20);
+        rwaited += 20;
+    }
+    if (!g_rx_ok) return fail("no RX reached the reset client within budget", reset, srv);
+
+    {
+        na_client_stats off;
+        if (na_client_get_stats(reset, &off, sizeof off) != NA_OK) {
+            return fail("na_client_get_stats on the reset client", reset, srv);
+        }
+        /* The exact mirror of section (3): with no reorder buffer it is the post-reorder counter
+         * that reads -1 and the three pre-reorder ones that carry the reading. */
+        if (off.sequence_gaps != -1) {
+            fprintf(stderr, "  (sequence_gaps %lld — a reorder buffer survived the reset)\n",
+                    off.sequence_gaps);
+            return fail("DEFAULT left the reorder buffer engaged on a UDP client", reset, srv);
+        }
+        if (off.packets_lost < 0 || off.packets_out_of_order < 0 || off.packet_loss_rate < 0.0) {
+            return fail("the gap tracker is not running, so no reorder-free path was taken",
+                        reset, srv);
+        }
+        /* A separate knob builds a separate estimator, so this is a SECOND detector rather than a
+         * restatement of the first. It is MASKED by the reorder assertions above, which are
+         * evaluated first and which most wrong presets also trip — dualDefault() dies there and
+         * never reaches this line. Isolating it needs the reorder pair neutralised and a preset
+         * that enables adaptive jitter ALONE; done that way it fails here with
+         * buffer_target_ms 40, and the same neutralisation with no mutation stays green. Keep
+         * that in mind before trusting a red run to mean this assertion is live. */
+        if (off.buffer_target_ms != -1) {
+            fprintf(stderr, "  (buffer_target_ms %d — an adaptive-jitter estimator survived)\n",
+                    off.buffer_target_ms);
+            return fail("DEFAULT left adaptive jitter enabled on a UDP client", reset, srv);
+        }
+        if (off.jitter_ms != 0.0) {
+            return fail("DEFAULT left a live jitter estimate on a UDP client", reset, srv);
+        }
+        printf("c_client_profile: UDP_WAN -> DEFAULT -> UDP — reliability layer off "
+               "(sequence_gaps -1, loss counters measured, buffer_target_ms -1) (%d ms)\n",
+               rwaited);
+    }
+    na_client_disconnect(reset);
+    na_client_destroy(reset);
 
     na_server_stop(srv);
     na_server_destroy(srv);
