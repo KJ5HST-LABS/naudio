@@ -512,7 +512,7 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
     # DYLD_INSERT_LIBRARIES flatly refuses one: `cannot link against bundle`, at which point dyld
     # aborts the process before main. Measured — the arms failed as harness faults, not as bridge
     # bugs, which is the tri-state working. MODULE is the intuitively correct choice here and it is
-    # wrong on the one platform this arm currently runs on.
+    # wrong on macOS.
     #
     # The HAMLIB_* variables come from pkg_check_modules inside tools/, which caches them, so they
     # are visible here; HAMLIB_LINK_LIBRARIES is NOT cached and deliberately not used.
@@ -522,7 +522,16 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
     target_link_libraries(naudio_failshim PRIVATE ${HAMLIB_LIBRARIES})
     # No "lib" prefix and a platform-native suffix: the driver passes this path straight to
     # DYLD_INSERT_LIBRARIES / LD_PRELOAD, which want the file, not a linker name.
-    set_target_properties(naudio_failshim PROPERTIES PREFIX "")
+    #
+    # C_VISIBILITY_PRESET default overrides this project's global `hidden` (CMAKE_C_VISIBILITY_PRESET
+    # above) for this target alone. Hidden is right for a shipped library and fatal for a preload one:
+    # on ELF it leaves the two interposers as LOCAL symbols — `nm` shows `t` rather than `T` and
+    # `nm -D` shows nothing at all — so LD_PRELOAD has nothing to bind and both functions are dead
+    # code. Measured on Ubuntu 24.04 / gcc 13.3 before this line existed: the shim still loaded and
+    # still printed its `armed` marker, so the fault arm failed as though the BRIDGE had regressed and
+    # reported issues #5 and #6 as live bugs. macOS never showed it, because __DATA,__interpose binds
+    # the local definition directly and does not consult the dynamic symbol table.
+    set_target_properties(naudio_failshim PROPERTIES PREFIX "" C_VISIBILITY_PRESET default)
 
     add_test(NAME naudio_bridge_fault_arm
              COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/bridge/bridge_fault_arm.sh"

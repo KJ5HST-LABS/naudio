@@ -274,6 +274,17 @@ the same observation, and the second one passes the control arm silently.
 > bridge **directly** for this reason. Wrapping it in a timeout disables the interposition with no
 > error at all, and the arms then fail as if the bridge were broken.
 
+> **ELF symbol visibility.** `LD_PRELOAD` binds through the *dynamic* symbol table, so the shim's
+> two definitions have to be exported. naudio compiles with hidden visibility globally
+> (`CMAKE_C_VISIBILITY_PRESET`), which leaves them local — `nm` shows `t` rather than `T`, and
+> `nm -D` shows nothing — and the preload then does nothing whatsoever. `naudio_failshim` sets
+> `C_VISIBILITY_PRESET default` to opt out. This trap is worse than the SIP one, because it defeats
+> the check in the paragraph above: the shim still loads and still prints its `armed` line, so the
+> marker is satisfied while both interposers are dead code, and the arms fail as though issues #5
+> and #6 had regressed rather than as a harness fault. Measured on Ubuntu 24.04 / gcc 13.3 on the
+> first Linux build of the bridge; macOS never showed it, because `__DATA,__interpose` binds the
+> local definition directly and never consults the dynamic symbol table.
+
 Reaching the TX path needs a transmitting client, because `tx_thread` calls `rig_stream_write` only
 while a TX owner exists. That is what `--tx` is for:
 
