@@ -17,6 +17,12 @@ macOS, and Windows — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
 ## Code conventions
 
 - **C++17**, no compiler extensions (`CMAKE_CXX_EXTENSIONS OFF`). Build warning-free.
+- **C11** (`CMAKE_C_STANDARD 11`, `_REQUIRED ON`) — and, unlike C++, compiler extensions are
+  deliberately left **on**. Strict `-std=c11` defines `__STRICT_ANSI__`, which on glibc hides the
+  POSIX declarations `tools/na_hamlib_bridge.c` depends on; it compiles on macOS and fails on
+  Linux, so please do not "restore the symmetry" with `CMAKE_C_EXTENSIONS OFF`. Note this is the
+  level the *tests* compile at: `include/naudio.h` itself is C99-clean, so a consumer of the C ABI
+  is not obliged to build at C11.
 - **Keep `naudio_core` pure.** No fork/exec, no PortAudio, no sockets, no threads in the core library.
   Process/device/socket/thread code goes in `naudio_pa` / `naudio_net` / `tools/` — see the target
   layout table in the [README](README.md).

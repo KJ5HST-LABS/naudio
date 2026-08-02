@@ -8,6 +8,35 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# ----------------------------------------------------------------------------
+# C standard (issue #42).
+#
+# C is this project's DELIVERABLE language -- include/naudio.h is a C ABI -- yet its level was left
+# to whatever each toolchain happened to default to, while C++ above was pinned deliberately. That
+# asymmetry WAS the bug: clang and gcc default high enough to accept the C11 _Static_assert and
+# _Alignas in tests/c_abi_smoke.c, MSVC does not, and the Windows build stayed broken for 54 commits
+# because no local toolchain could see it.
+#
+# C11 is not a new choice made here -- it is what tests/external-consumer/CMakeLists.txt,
+# tests/ffi-clients/run.sh and tests/readme-snippets/check.sh already compile at. This is simply the
+# fourth site, and the only one that never said so.
+#
+# This level is what the TESTS need, not what the header demands of a consumer: include/naudio.h is
+# C99-clean (measured with -pedantic-errors; its floor is `long long`, naudio.h:569-570). A consumer
+# is free to compile at C99.
+#
+# CMAKE_C_EXTENSIONS is deliberately NOT set OFF, and the asymmetry with CMAKE_CXX_EXTENSIONS above
+# is intentional -- please do not "fix" it. Strict -std=c11 defines __STRICT_ANSI__, which on glibc
+# hides every POSIX declaration behind a feature-test macro; tools/na_hamlib_bridge.c defines none
+# and calls clock_gettime/nanosleep/pthread_*/getopt. Measured on exactly that header+call set:
+# -std=c11 COMPILES on Apple libc and FAILS on glibc ('CLOCK_MONOTONIC' undeclared,
+# clock_gettime/nanosleep implicit). Setting it OFF would therefore look correct on a macOS laptop
+# and break the Linux bridge job -- the same platform-blind failure this issue is about. C++ escapes
+# this because libstdc++'s own headers define _GNU_SOURCE; C has no equivalent.
+# ----------------------------------------------------------------------------
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
