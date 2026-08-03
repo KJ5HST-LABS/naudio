@@ -78,12 +78,57 @@ void naproxy_stop(void* handle);
 #define NO_DROP       (-1)
 #define CORRUPT_ORDINAL 2 /* the 3rd audio packet of each block, in the corrupting arm */
 #define NO_CORRUPT    (-1)
-#define ARM_MS        3000  /* every UDP arm runs this long, so their counts are comparable */
+
+/* EVERY ARM IS BOUNDED BY INJECTED PACKETS, NEVER BY WALL CLOCK. A duration budget silently encodes
+ * the calibrating machine's speed as a hidden constant in whatever the arm asserts; a packet count is
+ * the same number on every machine. This arm's predecessor ran "3000 ms at one packet per 20 ms" and
+ * asserted a 3/4 recovery ratio against it — which held at 29/30 here and read 5/30 and then 0/30 on
+ * the macOS CI runner. See the LOSSY_* note below for why, and issue #43. */
+#define ARM_PACKETS   150   /* the fault arms and their lossless control: 30 FEC blocks of 5 */
+#define STALL_ARM_PACKETS 75 /* the queue_drops arm: shorter, because it asserts a negative */
 /* One corrupted packet per 5 leaves 4 good ones between faults, and each good packet resets
  * UdpClientConnection's consecutive-error run — so the 20-error teardown threshold
  * (MAX_CONSECUTIVE_CRC_ERRORS) is never approached and the arm measures counting, not teardown. */
-#define STALL_ARM_MS  1500  /* the queue_drops arm: shorter, because it asserts a negative */
 #define STALL_CB_MS   100   /* how long the audio callback blocks in that arm */
+
+/* The injection cadence is the PROFILE'S OWN frame period (AudioStreamConfig::UDP_FRAME_MS = 10),
+ * not a number chosen here. It used to be 20 ms, and that single arbitrary constant is most of #43:
+ * FEC recovery needs a block's surviving audio to reach the decoder before the block's parity does,
+ * and FecDecoder erases a pending block once it is older than DEFAULT_BLOCK_TIMEOUT_MS * 2 = 120 ms
+ * (FecDecoder.cpp:46-61). At the profile's designed 10 ms cadence a 5-packet block spans 50 ms, so
+ * the margin is 2.4x. At 20 ms it spans 100 ms and the margin is 1.2x — thin enough that ordinary
+ * scheduling jitter destroys the block, and the erase is SILENT (in this pipeline the reorder buffer
+ * never forwards gap markers, so the discarded block emits nothing and increments no counter). */
+#define INJECT_PERIOD_MS 10
+
+/* The lossy arm's bound: keep injecting until this many packets have actually been REPAIRED, capped
+ * by a packet budget. That is a completion count, so it measures recovery; the old ratio measured how
+ * much recovery happened to fit inside a fixed 3 s, which is a property of the machine.
+ *
+ * Both numbers are derived from a measured degradation curve, not picked. Widening this file's own
+ * injection cadence is the only knob that reproduces the CI signature on this laptop, and at 48 ms it
+ * reproduces it exactly — `recovered 0, unreconciled 0, cb_calls 120, received 156`, the macOS
+ * runner's line to the field. Sweeping the OLD arm gives: <=40 ms -> 30/30 recovered, 42 -> 25,
+ * 44 -> 18, 46 -> 8, 48 -> 7, 50 -> 0. CI's two readings, 5/30 and 0/30, sit at the 48-50 ms end.
+ *
+ * DO NOT read that curve as a constant yield to multiply by the budget: it is not linear, and past
+ * ~46 ms it collapses rather than thins (120 blocks at 48 ms returned 9 repairs, not the ~27 a
+ * constant 23% would predict). What the budget buys is measured directly instead — the arm's cliff,
+ * swept end to end:
+ *
+ *     old arm (150 packets, 3/4 ratio):  passes to 42 ms, fails from 44 ms
+ *     this arm (600 packets, 20 target): passes to 46 ms, fails from 48 ms
+ *
+ * Against nominal cadences of 20 ms and 10 ms, that is the machine-degradation factor each tolerates:
+ * ~2.1x before, ~4.6x now. The runner that filed #43 was measured at ~2.4x (it behaved like a uniform
+ * 48 ms at a nominal 20 ms), which is why the old arm failed there and why this one has roughly 2x
+ * margin left. Most of that gain is the cadence, not the budget.
+ *
+ * On a healthy machine the target is met after ~21 blocks and the arm exits in ~1 s, FASTER than the
+ * fixed 3 s it replaces. The budget is only spent when the machine is genuinely struggling. */
+#define LOSSY_TARGET_RECOVERED 20
+#define LOSSY_MAX_PACKETS      600
+#define RECOVERY_POLL_EVERY    5    /* poll the counter once per FEC block, not per packet */
 
 #define SIG_PERIOD 4
 static const unsigned char SIG_UNIT[SIG_PERIOD] = {0x5A, 0xA5, 0x3C, 0xC3};
@@ -134,13 +179,22 @@ static int gap_counters_are_unmeasured(const na_client_stats *st) {
     return st->packets_lost == -1 && st->packets_out_of_order == -1 && st->packet_loss_rate < 0.0;
 }
 
-/* Run one UDP_WAN arm through the relay for a FIXED duration. `drop_ordinal` < 0 relays losslessly
- * (the control). Both arms run the same wall clock so their counts are directly comparable — an arm
- * that stopped at the first recovery would report a count that sizes the break condition rather than
- * the effect. Fills *out with the client's final counters. Returns 1 on success. */
+/* Run one UDP_WAN arm through the relay for a FIXED NUMBER OF INJECTED PACKETS. `drop_ordinal` < 0
+ * relays losslessly (the control).
+ *
+ * `stop_after_recovered` > 0 additionally stops the arm early once the client reports that many FEC
+ * repairs. That early exit is deliberate and is NOT the mistake of stopping at the first sign of what
+ * you are looking for: the arm's assertion is "this many repairs happened within `max_packets`", so
+ * the budget — not the break — is what the result is measured against, and an arm that never reaches
+ * the target burns the whole budget and fails with real numbers. The arms that assert a NEGATIVE
+ * (nothing recovered, nothing corrupted, nothing dropped) pass 0 and always run their full budget,
+ * because a negative has nothing to complete.
+ *
+ * Fills *out with the client's final counters. Returns 1 on success. */
 static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal, int corrupt_ordinal,
-                       const char *what, int duration_ms, na_client_stats *out,
-                       long long *out_dropped, long long *out_parity, long long *out_corrupted) {
+                       const char *what, int max_packets, int stop_after_recovered,
+                       na_client_stats *out, long long *out_dropped, long long *out_parity,
+                       long long *out_corrupted) {
     char err[256];
     int proxy_port = 0;
     void *proxy =
@@ -173,14 +227,22 @@ static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal, 
         return 0;
     }
 
-    /* Drive audio for the whole budget — no early exit, in either arm. */
-    int waited = 0;
+    /* Drive audio at the profile's own frame cadence, bounded by a packet count. */
+    int injected = 0;
     na_client_stats st;
     memset(&st, 0, sizeof st);
-    while (waited < duration_ms) {
+    while (injected < max_packets) {
         na_server_inject_audio(srv, RXBUF, (int)sizeof RXBUF);
-        sleep_ms(20);
-        waited += 20;
+        ++injected;
+        sleep_ms(INJECT_PERIOD_MS);
+        if (stop_after_recovered > 0 && (injected % RECOVERY_POLL_EVERY) == 0) {
+            na_client_stats probe;
+            memset(&probe, 0, sizeof probe);
+            if (na_client_get_stats(c, &probe, sizeof probe) == NA_OK &&
+                probe.packets_recovered_by_fec >= stop_after_recovered) {
+                break;
+            }
+        }
     }
 
     if (na_client_get_stats(c, &st, sizeof st) != NA_OK) {
@@ -201,12 +263,12 @@ static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal, 
            "audio, dropped %lld, corrupted %lld, forwarded %lld parity; client recovered %lld, "
            "unreconciled %lld, reordered %lld, crc_errors %d, control_retransmits %lld, "
            "queue_drops %lld, sequence_gaps %lld, received %lld pkts / %lld B, cb_calls %ld, "
-           "rx_signature=%d (%d ms)\n",
+           "rx_signature=%d (%d injected of %d budget)\n",
            what, drop_ordinal, corrupt_ordinal, g_stall_cb_ms, naproxy_audio_seen(proxy),
            *out_dropped, *out_corrupted, *out_parity, st.packets_recovered_by_fec,
            st.fec_blocks_unreconciled, st.packets_reordered, st.crc_errors, st.control_retransmits,
            st.queue_drops, st.sequence_gaps, st.packets_received, st.bytes_received, g_cb_calls,
-           g_rx_ok, waited);
+           g_rx_ok, injected, max_packets);
 
     na_client_disconnect(c);
     na_client_destroy(c);
@@ -406,7 +468,8 @@ int main(void) {
     long long lossy_dropped = 0, lossy_parity = 0, lossy_corrupted = 0;
     memset(&lossy, 0, sizeof lossy);
     if (!run_wan_arm(srv, port, DROP_ORDINAL, NO_CORRUPT,
-                     "lossy (1 audio packet dropped per FEC block)", ARM_MS, &lossy, &lossy_dropped,
+                     "lossy (1 audio packet dropped per FEC block)", LOSSY_MAX_PACKETS,
+                     LOSSY_TARGET_RECOVERED, &lossy, &lossy_dropped,
                      &lossy_parity, &lossy_corrupted)) {
         return fail("the lossy UDP_WAN arm did not complete", NULL, srv, NULL);
     }
@@ -421,16 +484,28 @@ int main(void) {
     }
     /* THE HEADLINE: the counter a C consumer could not read before this change, moving under real
      * induced loss, through the real client — and moving by an amount that TRACKS the loss rather
-     * than merely being non-zero. Measured 29 of 30 recovered, identical across five runs; the
-     * shortfall is the final block still in flight when the arm ends. The 3/4 floor leaves room for
-     * a slower machine to end mid-block without turning a real regression into a pass. */
-    if (lossy.packets_recovered_by_fec < (lossy_dropped * 3) / 4) {
-        fprintf(stderr, "  (recovered %lld of %lld dropped — below the 3/4 floor)\n",
-                lossy.packets_recovered_by_fec, lossy_dropped);
+     * than merely being non-zero.
+     *
+     * This is a COMPLETION COUNT, not a ratio of what fit inside a fixed window. Its predecessor
+     * asserted `recovered >= 3/4 of dropped` over a 3000 ms budget, with a comment recording "29 of
+     * 30 recovered, identical across five runs". Every word of that was true and it still failed on
+     * the macOS CI runner at 5/30 and then, unchanged, at 0/30 — because five runs on one machine
+     * calibrate a number, they do not bound one. A ratio taken over a fixed duration is a measurement
+     * of the machine; "did N repairs complete, given a budget of injected packets" is not. See #43.
+     *
+     * The floor is NOT simply relaxed to fit the observation: a threshold anywhere between 0 and 22
+     * would have been passable and meaningless on the readings above. Instead the arm is given enough
+     * blocks to reach a fixed target, so a client that repairs nothing still fails. */
+    if (lossy.packets_recovered_by_fec < LOSSY_TARGET_RECOVERED) {
+        fprintf(stderr, "  (recovered %lld of %lld dropped in %d injected packets — short of the "
+                        "%d-repair target; FEC is not recovering, or is recovering far too little "
+                        "to be the layer this profile promises)\n",
+                lossy.packets_recovered_by_fec, lossy_dropped, LOSSY_MAX_PACKETS,
+                LOSSY_TARGET_RECOVERED);
         return fail("packets_recovered_by_fec does not track the induced loss", NULL, srv, NULL);
     }
     /* Upper bound: FEC cannot repair more than was lost. This is what catches a field wired to the
-     * wrong source — packets_reordered reads 116 and packets_received 153 on this same arm, so
+     * wrong source — packets_reordered reads 81 and packets_received 108 on this same arm, so
      * either would blow this bound while sailing past a bare "> 0". */
     if (lossy.packets_recovered_by_fec > lossy_dropped) {
         return fail("packets_recovered_by_fec exceeds the packets actually dropped", NULL, srv,
@@ -455,9 +530,10 @@ int main(void) {
      *   lower — every FEC recovery implies the slot was gapped first, since the pipeline is
      *           reorder -> FEC and the decoder only ever sees what the buffer already gave up on;
      *   upper — the relay's own drop count, which the library never sees.
-     * Measured 29 gaps against 30 dropped and 29 recovered, so the window is tight. A field
-     * cross-wired to a sibling blows one of these: packets_reordered reads 116 and
-     * packets_received 153 on this same arm. */
+     * Measured 21 gaps against 21 dropped and 21 recovered, so the window is tight — and note it is
+     * tight WITHOUT being calibrated: all three move together with the budget, because each is
+     * anchored to the relay rather than to a wall clock. A field cross-wired to a sibling blows one
+     * of these: packets_reordered reads 81 and packets_received 108 on this same arm. */
     if (lossy.sequence_gaps < lossy.packets_recovered_by_fec) {
         fprintf(stderr, "  (sequence_gaps %lld < recovered %lld — a slot was repaired that was "
                         "never gapped)\n", lossy.sequence_gaps, lossy.packets_recovered_by_fec);
@@ -488,7 +564,7 @@ int main(void) {
     long long clean_dropped = 0, clean_parity = 0, clean_corrupted = 0;
     memset(&clean, 0, sizeof clean);
     if (!run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, "control (same relay, nothing dropped)",
-                     ARM_MS, &clean, &clean_dropped, &clean_parity, &clean_corrupted)) {
+                     ARM_PACKETS, 0, &clean, &clean_dropped, &clean_parity, &clean_corrupted)) {
         return fail("the lossless control arm did not complete", NULL, srv, NULL);
     }
     if (clean_dropped != 0) {
@@ -526,8 +602,8 @@ int main(void) {
     long long corrupt_dropped = 0, corrupt_parity = 0, corrupt_corrupted = 0;
     memset(&corrupt, 0, sizeof corrupt);
     if (!run_wan_arm(srv, port, NO_DROP, CORRUPT_ORDINAL,
-                     "corrupting (1 audio packet per FEC block arrives with a bad CRC)", ARM_MS,
-                     &corrupt, &corrupt_dropped, &corrupt_parity, &corrupt_corrupted)) {
+                     "corrupting (1 audio packet per FEC block arrives with a bad CRC)", ARM_PACKETS,
+                     0, &corrupt, &corrupt_dropped, &corrupt_parity, &corrupt_corrupted)) {
         return fail("the corrupting UDP_WAN arm did not complete", NULL, srv, NULL);
     }
     if (corrupt_corrupted <= 0) {
@@ -580,7 +656,8 @@ int main(void) {
     g_stall_cb_ms = STALL_CB_MS;
     const int stall_ok =
         run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, "stalled consumer (audio cb blocks 100 ms)",
-                    STALL_ARM_MS, &stalled, &stalled_dropped, &stalled_parity, &stalled_corrupted);
+                    STALL_ARM_PACKETS, 0, &stalled, &stalled_dropped, &stalled_parity,
+                    &stalled_corrupted);
     g_stall_cb_ms = 0;
     if (!stall_ok) {
         return fail("the stalled-consumer arm did not complete", NULL, srv, NULL);
