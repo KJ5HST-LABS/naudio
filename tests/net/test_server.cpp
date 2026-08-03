@@ -481,10 +481,24 @@ TEST(Server, GateServerStatsIsARosterGaugeNotALifetimeTotal) {
     std::vector<std::uint8_t> frame(static_cast<std::size_t>(config.bytesPerFrame()), 0x5A);
     const int kFrames = 60;
     for (int i = 0; i < kFrames; i++) server.injectAudio(frame);
-    // Drain both so the writer threads actually complete their sends before we read.
-    for (int i = 0; i < 30; i++) {
-        (void)recvUntil(*a, PacketType::AudioRx, std::nullopt, 500);
-        (void)recvUntil(*b, PacketType::AudioRx, std::nullopt, 500);
+    // Wait on the COMPLETION CONDITION, not on a fixed drain count: keep receiving from both
+    // clients until the server reports every injected frame fanned out to both of them. A fixed
+    // count cannot establish that — it was 30 iterations for kFrames=60 per client, so it
+    // guaranteed at most half the sends and left the rest to whatever the socket buffers
+    // happened to absorb. That read 106 of 120 on the Windows runner (issue #44).
+    //
+    // The draining is load-bearing and CANNOT be replaced by a plain sleep-and-poll on stats():
+    // writerLoop() calls sendAll(), which BLOCKS once the socket buffers fill, so a reader that
+    // stops reading stalls this counter permanently rather than merely delaying it. Measured on
+    // macOS loopback: with no draining at all, packetsSent stalls at 290 of 2000 and stays flat
+    // for a full 4 s, while draining as we poll reaches 2000 in 94 ms. This arm's own 230 KB per
+    // client fits under macOS's ~556 KB buffer, which is precisely why the fixed count passed
+    // here and failed there — the old loop measured the runner's buffer size, not completion.
+    const auto sendDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (server.stats().packetsSent < 2 * kFrames &&
+           std::chrono::steady_clock::now() < sendDeadline) {
+        (void)recvUntil(*a, PacketType::AudioRx, std::nullopt, 100);
+        (void)recvUntil(*b, PacketType::AudioRx, std::nullopt, 100);
     }
 
     const ServerStats both = server.stats();
@@ -492,7 +506,11 @@ TEST(Server, GateServerStatsIsARosterGaugeNotALifetimeTotal) {
     EXPECT_EQ(both.clientsConnected, 2);
     // LOWER bound, against a quantity the library never sees: each of the two sessions was
     // handed kFrames injected frames, and every session also sends handshake control traffic.
-    EXPECT_GE(both.packetsSent, 2 * kFrames);
+    EXPECT_GE(both.packetsSent, 2 * kFrames)
+        << "the fan-out never completed within the deadline: " << both.packetsSent << " of "
+        << 2 * kFrames << " expected sends. This is a completion failure, not a threshold miss "
+        << "— every frame injected above is queued to an unbounded per-session deque, so the "
+        << "count reaches the bound unless a writer thread is stuck or dead.";
     EXPECT_GT(both.bytesSent, both.packetsSent);  // every packet carries a header + payload
 
     // THE MEASUREMENT: one client leaves. Its counters leave the sum with it.
