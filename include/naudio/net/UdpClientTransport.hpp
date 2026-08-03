@@ -41,6 +41,11 @@ public:
         }
         Socket socket = Socket::bindUdp("", 0, /*reuseAddr=*/false, err);  // ephemeral local
         if (!socket.valid()) return nullptr;
+        // Symmetric with the server's shared socket: a maximum-payload audio packet must fit,
+        // or a legal packet fails to send on macOS (see Socket::setSendBufferAtLeast). The
+        // receive side matters most here — this socket takes the server's RX fan-out.
+        socket.setSendBufferAtLeast(static_cast<int>(UdpClientConnection::MAX_DATAGRAM_SIZE) * 8);
+        socket.setRecvBufferAtLeast(static_cast<int>(UdpClientConnection::MAX_DATAGRAM_SIZE) * 8);
 
         connection_ = std::make_shared<UdpClientConnection>(
             std::move(socket), host, port, ClientAddress("client", host, port), cfg_);

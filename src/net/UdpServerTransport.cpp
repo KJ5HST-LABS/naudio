@@ -42,6 +42,11 @@ bool UdpServerTransport::bind(std::uint16_t port, std::string* err) {
     }
     socket_ = Socket::bindUdp(bindHost_, port, /*reuseAddr=*/true, err);
     if (!socket_.valid()) return false;
+    // A maximum-payload audio packet must be sendable, or the writer loop tears the whole
+    // session down on the first oversized RX frame (see Socket::setSendBufferAtLeast). The
+    // shared socket carries every client's RX fan-out, so give it room for a burst of them.
+    socket_.setSendBufferAtLeast(static_cast<int>(UdpClientConnection::MAX_DATAGRAM_SIZE) * 8);
+    socket_.setRecvBufferAtLeast(static_cast<int>(UdpClientConnection::MAX_DATAGRAM_SIZE) * 8);
     bound_.store(true);
     running_.store(true);
     demuxThread_ = std::thread([this] { demuxLoop(); });
@@ -226,6 +231,27 @@ int UdpServerTransport::crcErrors() const {
     std::lock_guard<std::mutex> lock(stateMutex_);
     int total = 0;
     for (const auto& [id, conn] : byId_) total += conn->crcErrors();
+    return total;
+}
+
+// The two counters that are only reachable on this side. Both sum over byId_ — the ACCEPTED
+// roster — and not over pending_, so a spoofed sender that never completes the handshake
+// contributes nothing.
+//
+// controlRetransmits is non-zero only when the reliability profile enables control ARQ
+// (UdpReliabilityConfig::controlReliabilityEnabled); with it off, UdpClientConnection builds no
+// ControlReliability and the sum is a true 0.
+std::int64_t UdpServerTransport::controlRetransmits() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::int64_t total = 0;
+    for (const auto& [id, conn] : byId_) total += conn->controlRetransmits();
+    return total;
+}
+
+std::int64_t UdpServerTransport::orderedQueueDrops() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::int64_t total = 0;
+    for (const auto& [id, conn] : byId_) total += conn->orderedQueueDrops();
     return total;
 }
 

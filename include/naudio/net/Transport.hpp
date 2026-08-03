@@ -88,6 +88,46 @@ public:
     virtual int adaptiveBufferTargetMs() const { return -1; }
     virtual std::int64_t controlRetransmits() const { return 0; }
 
+    // FEC blocks whose parity could not be reconciled against a contiguous run of
+    // audio packets — a control or heartbeat packet took a sequence inside the
+    // parity's range, so the range is not the encoder's block and recovery was
+    // DECLINED rather than run over the wrong member set. A lost opportunity to
+    // recover, never a correctness failure (FecDecoder.hpp).
+    virtual std::int64_t fecBlocksUnreconciled() const { return 0; }
+
+    // Packets discarded from the ordered queue because it was at capacity (a
+    // stalled or too-slow consumer). Non-zero means audio was dropped locally,
+    // after the network delivered it.
+    virtual std::int64_t orderedQueueDrops() const { return 0; }
+
+    // Sequence slots the reorder buffer gave up on and emitted as a gap — the
+    // pipeline could not deliver them in order. This is the POST-REORDER loss
+    // measure, and it is the complement of packetsLost(): exactly one of the two
+    // is measured on any given connection, because the gap tracker runs only when
+    // NO reorder buffer is engaged and this counter exists only when one IS.
+    //
+    // Counted BEFORE the FEC decoder sees the stream (the pipeline is
+    // reorder -> FEC -> ordered queue), so a slot counted here may still be
+    // refilled; the unrecovered remainder is this minus packetsRecoveredByFec().
+    // Counts every packet type sharing the sequence space — audio, parity and
+    // control alike — not audio packets alone.
+    //
+    // Defaults to -1, NOT to 0 like its neighbours above: 0 here would read as
+    // "nothing was lost", which is the one thing a loss counter must never say
+    // when it is not measuring. TCP and any passthrough profile keep the -1.
+    virtual std::int64_t sequenceGaps() const { return -1; }
+
+    // Whether packetsLost() / packetsOutOfOrder() / packetLossRate() are actually
+    // MEASURED on this connection. When false they are unavailable, and a consumer
+    // must not read their 0 as "nothing was lost".
+    //
+    // False is the common case: the sequence-gap tracker runs only when no reorder
+    // buffer is engaged (the reorder buffer owns ordering, and no post-reorder loss
+    // accounting exists), and TCP never tracks gaps at all. EVERY built-in UDP
+    // profile configures a reorder buffer, so on every one of them these three are
+    // unmeasured while packetsReordered / packetsRecoveredByFec are live.
+    virtual bool measuresSequenceGaps() const { return false; }
+
     // The remote address as a string ("ip:port"), or "" if unavailable.
     virtual std::string remoteAddress() const = 0;
 
@@ -132,11 +172,28 @@ public:
     virtual void disconnectClient(const std::shared_ptr<ClientConnection>& connection) = 0;
 
     // Aggregate statistics across all clients.
+    //
+    // THESE SUM OVER THE CURRENTLY REGISTERED CONNECTIONS ONLY. disconnectClient
+    // erases a connection from the routing map, and its counters leave the sum with
+    // it — so every aggregate here can DECREASE, and a roster that churns loses the
+    // departed clients' history entirely. They are a snapshot of the live roster, not
+    // a lifetime total, and no caller may treat them as monotonic.
     virtual std::int64_t packetsSent() const = 0;
     virtual std::int64_t packetsReceived() const = 0;
     virtual std::int64_t bytesSent() const = 0;
     virtual std::int64_t bytesReceived() const = 0;
     virtual int crcErrors() const = 0;
+
+    // Control-ARQ resends, summed over the live roster. Pure virtual rather than a
+    // defaulted 0 like ClientConnection's: all three implementations are in-tree, and
+    // a silent 0 from a forgotten override is indistinguishable from "no retransmits
+    // happened" — the one thing this counter must never say when it is not counting.
+    virtual std::int64_t controlRetransmits() const = 0;
+    // Packets discarded from a connection's ordered queue because it was at capacity —
+    // audio lost LOCALLY after the network delivered it. Unlike the client side, this is
+    // reachable here: a demux thread fills the queue while the session's application
+    // thread drains it, so a slow consumer does not stall its own producer.
+    virtual std::int64_t orderedQueueDrops() const = 0;
 
     virtual void close() = 0;
 };

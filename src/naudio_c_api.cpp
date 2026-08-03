@@ -119,6 +119,23 @@ naudio::AudioFormat makeFormat(int sample_rate, int bits_per_sample, int channel
     catch (const std::bad_alloc&) { setError(NA_ERR_NOMEM); return (sentinel); }      \
     catch (...) { setError(defaultErr); return (sentinel); }
 
+// ---- Library version -------------------------------------------------------------------
+//
+// These are compiled INTO the shared library, so they report the version of the binary a process
+// actually LOADED. That is the whole point: they read the same NAUDIO_VERSION_* macros a consumer's
+// header carries, but from the copy that was current when the LIBRARY was built — so a consumer
+// newer than the library sees the two disagree, which is how a zero-filled struct tail is told
+// apart from a genuinely-zero measurement (naudio.h, "Library version").
+//
+// Deliberately outside NA_GUARD/NA_GUARD_VAL and deliberately NOT calling setError(): neither can
+// fail, so neither clears the thread's last-error. The header documents that clear-on-entry as a
+// property of FALLIBLE calls, and c_abi_smoke.c asserts these two leave a non-OK last-error alone.
+// No allocation, no backend, no lock — safe on any thread and before any na_context exists.
+
+extern "C" int na_version_number(void) { return NAUDIO_VERSION_NUMBER; }
+
+extern "C" const char* na_version_string(void) { return NAUDIO_VERSION_STRING; }
+
 // ---- Error model -----------------------------------------------------------------------
 
 extern "C" const char* na_strerror(na_error_t err) {
@@ -155,9 +172,15 @@ extern "C" void na_context_destroy(na_context* ctx) { delete ctx; }  // Pa_Termi
 
 // ---- Enumeration / probe ---------------------------------------------------------------
 
-extern "C" int na_enumerate(na_context* ctx, na_device* out, int max) {
+// The size travels as a PARAMETER, not as an in-band first member, for the same reason it does on
+// na_client_get_stats: the library writes this struct, and an out-parameter the caller had to
+// pre-initialize would invert that contract. Here there is a second, harder reason — this call
+// fills an ARRAY. `max` is an element COUNT, so the stride below MUST be the caller's element
+// size; striding by the library's own sizeof is what walks past the end of a shorter consumer's
+// array after the first element, and mis-parses every element after it.
+extern "C" int na_enumerate(na_context* ctx, na_device* out, int max, std::size_t struct_size) {
     setError(NA_OK);
-    if (ctx == nullptr || out == nullptr || max < 0) {
+    if (ctx == nullptr || out == nullptr || max < 0 || struct_size < NA_DEVICE_SIZE_V1) {
         setError(NA_ERR_INVALID);
         return NA_ERR_INVALID;
     }
@@ -168,7 +191,19 @@ extern "C" int na_enumerate(na_context* ctx, na_device* out, int max) {
         int written = 0;
         for (const auto& d : devices) {
             if (written >= max) break;
-            na_device& slot = out[written];
+            // Stride by the CALLER's element size, never by sizeof(na_device).
+            char* base = reinterpret_cast<char*>(out) + static_cast<std::size_t>(written) * struct_size;
+            // A caller compiled against a LONGER version of this header gets each element's tail
+            // zeroed rather than left indeterminate. (A caller compiled against a shorter one
+            // cannot reach here: every field below is v1, and the floor check guarantees v1 fits.
+            // That holds because na_device HAS NO POST-V1 FIELD YET -- it is a fact about this
+            // struct's current contents, not a property of the scheme. na_client_get_stats now
+            // has one and guards it per-field; the first na_device append owes the same guard
+            // here, and this scoping stops being true the moment it lands.)
+            if (struct_size > sizeof(na_device)) {
+                std::memset(base + sizeof(na_device), 0, struct_size - sizeof(na_device));
+            }
+            na_device& slot = *reinterpret_cast<na_device*>(base);
             slot.backend_id = d.backendId;
             slot.capture_backend_id = d.captureBackendId;
             slot.playback_backend_id = d.playbackBackendId;
@@ -586,6 +621,18 @@ extern "C" na_error_t na_client_set_capture_device(na_stream_client* client, int
     });
 }
 
+extern "C" na_error_t na_client_set_tx_inject(na_stream_client* client, int enabled) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        // Frozen on connect ATTEMPT, like the callback setters: startWorkerThreads() reads the flag
+        // once to decide whether to spawn the send worker, so flipping it later would silently do
+        // nothing rather than take effect.
+        if (client->connectStarted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        client->client->setTxInjectEnabled(enabled != 0);
+        return NA_OK;
+    });
+}
+
 extern "C" na_error_t na_client_set_transport(na_stream_client* client, na_transport transport) {
     NA_GUARD(NA_ERR_BACKEND, {
         if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
@@ -606,6 +653,33 @@ extern "C" na_error_t na_client_set_transport(na_stream_client* client, na_trans
     });
 }
 
+extern "C" na_error_t na_client_set_reliability_profile(na_stream_client* client,
+                                                        na_reliability_profile profile) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        naudio::AudioStreamConfig preset;
+        switch (profile) {
+            case NA_RELIABILITY_DEFAULT: preset = naudio::AudioStreamConfig{};         break;
+            case NA_RELIABILITY_UDP_LAN: preset = naudio::AudioStreamConfig::udpLan(); break;
+            case NA_RELIABILITY_UDP_WAN: preset = naudio::AudioStreamConfig::udpWan(); break;
+            case NA_RELIABILITY_UDP_FT8: preset = naudio::AudioStreamConfig::udpFt8(); break;
+            default:
+                setError(NA_ERR_INVALID);
+                return NA_ERR_INVALID;
+        }
+        // The preset wins WHOLESALE rather than field by field, so a knob added to a preset later is
+        // carried through this ABI by default instead of being silently dropped. There is no
+        // exception list to preserve as there is on the server side: nothing else in the na_client_*
+        // surface writes AudioStreamConfig except na_client_set_transport, and the audio format the
+        // client actually streams at is the one the server pushes in its AUDIO_CONFIG at handshake.
+        if (!client->client->setConfig(preset)) {  // false == already connected (InvalidState)
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        return NA_OK;
+    });
+}
+
 extern "C" na_error_t na_client_set_identity(na_stream_client* client, const char* callsign,
                                              const char* operator_name, const char* location) {
     NA_GUARD(NA_ERR_BACKEND, {
@@ -617,6 +691,31 @@ extern "C" na_error_t na_client_set_identity(na_stream_client* client, const cha
     });
 }
 
+// ---- Caller-allocated struct versioning, library-READ direction ------------------------
+// na_client_callbacks and na_server_callbacks are allocated by the caller and only ever READ
+// here, so each carries its own size in its first member — Win32's cbSize idiom. That is what
+// lets a caller compiled against a different version of this header stay binary-compatible:
+//
+//   caller SHORTER than us  -> copy the bytes it actually allocated; the rest stay NULL, which
+//                              this ABI already defines as "that event is ignored"
+//   caller LONGER than us   -> copy what we understand and ignore the tail; this build has
+//                              nowhere to put fields it does not know about
+//
+// Byte-wise rather than field-wise on purpose. The struct is append-only, so "the fields that
+// fit" is exactly "the first min(theirs, ours) bytes", and a field-wise copy would have to be
+// re-derived by hand on every append — the staleness trap #9 describes. na_client_get_stats,
+// which the library WRITES, is field-wise for the opposite reason; see the note there.
+template <typename T>
+static na_error_t copyCallerStruct(T& dst, const T* src, std::size_t v1Size) {
+    dst = T{};
+    if (src == nullptr) { return NA_OK; }  // documented: NULL clears every callback
+    const std::size_t given = src->struct_size;
+    if (given < v1Size) { return NA_ERR_INVALID; }
+    std::memcpy(&dst, src, std::min(given, sizeof(T)));
+    dst.struct_size = sizeof(T);  // normalize: what we hold from here on is OUR layout
+    return NA_OK;
+}
+
 extern "C" na_error_t na_client_set_callbacks(na_stream_client* client,
                                               const na_client_callbacks* cbs, void* user) {
     NA_GUARD(NA_ERR_BACKEND, {
@@ -624,7 +723,10 @@ extern "C" na_error_t na_client_set_callbacks(na_stream_client* client,
         // A3: the dispatch worker reads cbs/cbUser with no lock once streaming starts. Enforce the
         // documented "set callbacks BEFORE connect" rule rather than racing a reader.
         if (client->connectStarted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
-        client->cbs = (cbs != nullptr) ? *cbs : na_client_callbacks{};
+        na_client_callbacks copy;
+        const na_error_t rc = copyCallerStruct(copy, cbs, NA_CLIENT_CALLBACKS_SIZE_V1);
+        if (rc != NA_OK) { setError(rc); return rc; }
+        client->cbs = copy;
         client->cbUser = user;
         return NA_OK;
     });
@@ -673,6 +775,20 @@ extern "C" na_error_t na_client_set_capture_muted(na_stream_client* client, int 
         if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
         client->client->setCaptureMuted(muted != 0);
         return NA_OK;
+    });
+}
+
+extern "C" int na_client_inject_tx_audio(na_stream_client* client, const unsigned char* pcm,
+                                         int n_bytes) {
+    NA_GUARD_VAL(NA_ERR_BACKEND, NA_ERR_BACKEND, {
+        if (client == nullptr || pcm == nullptr || n_bytes <= 0) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        // Len-return: bytes accepted. 0 is a legitimate outcome (not connected / inject not enabled
+        // / PTT inactive), so it is NOT mapped to an error — see the header contract.
+        return static_cast<int>(client->client->injectTxAudio(
+            reinterpret_cast<const std::uint8_t*>(pcm), static_cast<std::size_t>(n_bytes)));
     });
 }
 
@@ -757,6 +873,66 @@ extern "C" int na_client_server_tx_owner(na_stream_client* client, char* buf, in
         const std::string owner = client->client->serverTxOwner();  // by value -> may bad_alloc
         copyStr(buf, static_cast<std::size_t>(len), owner);
         return static_cast<int>(owner.size());
+    });
+}
+
+// ---- Reliability counters --------------------------------------------------------------
+// A field-by-field copy out of ClientStats rather than a memcpy or a layout assertion: the C
+// struct is a FROZEN ABI surface and the C++ one is free to gain fields, so the two must be
+// allowed to diverge. Every na_client_stats field the caller's `struct_size` covers is written
+// on every non-error path (the unmeasured -1s included), so a caller never has to pre-zero the
+// struct — which is exactly why the size travels as a PARAMETER here and not as an in-band
+// first member the way the two callback tables carry it. An out-parameter that the caller had
+// to initialize before the call would invert this contract, and every call site in the tree
+// (README.md's compiled snippet included) declares the struct uninitialized.
+//
+// Field-wise, not byte-wise, for the mirror of the reason copyCallerStruct above is byte-wise:
+// this side has no second na_client_stats to copy from, only a differently-shaped C++ struct.
+//
+// 0.2.0 appended the first post-v1 field, so the guard this comment used to describe in the future
+// tense is now below and load-bearing: EVERY post-v1 field is written only if the CALLER's declared
+// size reaches it. The floor check rejects anything under v1 and nothing more, which is the whole
+// point -- a v1-compiled consumer is exactly who this scheme exists to keep working, and it is
+// still entitled to call a 0.2.0 library with `sizeof` its own shorter struct.
+
+extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out,
+                                          std::size_t struct_size) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr || out == nullptr || struct_size < NA_CLIENT_STATS_SIZE_V1) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        // A caller compiled against a LONGER version of this header gets its tail zeroed rather
+        // than left indeterminate. (A caller compiled against a SHORTER one absolutely can reach
+        // here -- a v1 consumer calling a 0.2.0 library is the case this whole scheme is for --
+        // which is why every post-v1 field below is guarded on struct_size individually. The
+        // unguarded writes are exactly the v1 set, which the floor check guarantees fits.)
+        if (struct_size > sizeof(na_client_stats)) {
+            std::memset(reinterpret_cast<char*>(out) + sizeof(na_client_stats), 0,
+                        struct_size - sizeof(na_client_stats));
+        }
+        const naudio::net::ClientStats s = client->client->stats();
+        out->connected = s.connected ? 1 : 0;
+        out->packets_sent = static_cast<long long>(s.packetsSent);
+        out->packets_received = static_cast<long long>(s.packetsReceived);
+        out->bytes_sent = static_cast<long long>(s.bytesSent);
+        out->bytes_received = static_cast<long long>(s.bytesReceived);
+        out->crc_errors = s.crcErrors;
+        out->packets_reordered = static_cast<long long>(s.packetsReordered);
+        out->packets_recovered_by_fec = static_cast<long long>(s.packetsRecoveredByFec);
+        out->fec_blocks_unreconciled = static_cast<long long>(s.fecBlocksUnreconciled);
+        out->control_retransmits = static_cast<long long>(s.controlRetransmits);
+        out->queue_drops = static_cast<long long>(s.queueDrops);
+        out->jitter_ms = s.jitterMs;
+        out->buffer_target_ms = s.bufferTargetMs;
+        out->packets_lost = static_cast<long long>(s.packetsLost);
+        out->packets_out_of_order = static_cast<long long>(s.packetsOutOfOrder);
+        out->packet_loss_rate = s.packetLossRate;
+        // ---- end of v1. Everything below is guarded on the CALLER's declared size. ----
+        if (struct_size >= NA_CLIENT_STATS_SIZE_V2) {
+            out->sequence_gaps = static_cast<long long>(s.sequenceGaps);
+        }
+        return NA_OK;
     });
 }
 
@@ -957,6 +1133,67 @@ extern "C" na_error_t na_server_set_max_clients(na_audio_server* server, int max
     });
 }
 
+extern "C" na_error_t na_server_set_audio_format(na_audio_server* server, int sample_rate,
+                                                 int bits_per_sample, int channels) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        // v1 wire carries signed 16-bit PCM only; 1 or 2 channels; positive rate. naudio does not
+        // resample/convert — injected bytes must match this layout exactly.
+        if (sample_rate <= 0 || bits_per_sample != 16 || (channels != 1 && channels != 2)) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        server->pendingConfig.sampleRate    = sample_rate;
+        server->pendingConfig.bitsPerSample = bits_per_sample;
+        server->pendingConfig.channels      = channels;
+        return NA_OK;
+    });
+}
+
+extern "C" na_error_t na_server_set_reliability_profile(na_audio_server* server,
+                                                        na_reliability_profile profile) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        naudio::AudioStreamConfig preset;
+        switch (profile) {
+            case NA_RELIABILITY_DEFAULT: preset = naudio::AudioStreamConfig{};         break;
+            case NA_RELIABILITY_UDP_LAN: preset = naudio::AudioStreamConfig::udpLan(); break;
+            case NA_RELIABILITY_UDP_WAN: preset = naudio::AudioStreamConfig::udpWan(); break;
+            case NA_RELIABILITY_UDP_FT8: preset = naudio::AudioStreamConfig::udpFt8(); break;
+            default:
+                setError(NA_ERR_INVALID);
+                return NA_ERR_INVALID;
+        }
+        // The preset wins WHOLESALE and the EXCEPTION LIST is explicit, rather than the reverse.
+        // Which way round this goes decides which mistake is silent, so it is worth being blunt
+        // about: a field-by-field copy makes a knob added to a preset later default to NOT being
+        // applied through this ABI, diverging the C and C++ paths with no compile error and no
+        // failing test. Assigning wholesale makes it carried by default, and the only thing a
+        // future field has to earn is a place on the four-line exception list below.
+        //
+        // ADDING A FIELD TO AudioStreamConfig? It is carried by the profile automatically. Add it
+        // below ONLY if some other na_server_* setter also writes it — that is what the list is:
+        // the fields this ABI lets a caller set independently, which must therefore survive a
+        // profile call made in either order (the promise in naudio.h on this function).
+        //
+        // Nothing else needs preserving today: txIdleTimeoutMs is the one remaining field, no
+        // na_server_* setter writes it and no preset changes it, so it is default on both sides.
+        naudio::AudioStreamConfig& pc = server->pendingConfig;
+        const std::int32_t rate = pc.sampleRate;       // na_server_set_audio_format
+        const std::int32_t bits = pc.bitsPerSample;    // na_server_set_audio_format
+        const std::int32_t chan = pc.channels;         // na_server_set_audio_format
+        const std::int32_t maxc = pc.maxClients;       // na_server_set_max_clients
+        pc = preset;
+        pc.sampleRate    = rate;
+        pc.bitsPerSample = bits;
+        pc.channels      = chan;
+        pc.maxClients    = maxc;
+        return NA_OK;
+    });
+}
+
 extern "C" na_error_t na_server_set_capture_device(na_audio_server* server, int backend_id) {
     NA_GUARD(NA_ERR_BACKEND, {
         if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
@@ -991,7 +1228,10 @@ extern "C" na_error_t na_server_set_callbacks(na_audio_server* server,
         if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
         // The dispatch worker reads cbs/cbUser with no lock once running. Enforce "set before start".
         if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
-        server->cbs = (cbs != nullptr) ? *cbs : na_server_callbacks{};
+        na_server_callbacks copy;
+        const na_error_t rc = copyCallerStruct(copy, cbs, NA_SERVER_CALLBACKS_SIZE_V1);
+        if (rc != NA_OK) { setError(rc); return rc; }
+        server->cbs = copy;
         server->cbUser = user;
         return NA_OK;
     });
@@ -1130,5 +1370,48 @@ extern "C" int na_server_tx_owner(na_audio_server* server, char* buf, int len) {
             server->server ? server->server->txOwner() : std::string();  // by value -> may bad_alloc
         copyStr(buf, static_cast<std::size_t>(len), owner);
         return static_cast<int>(owner.size());
+    });
+}
+
+// The server-side mirror of na_client_get_stats, and it repeats that function's shape exactly:
+// a field-by-field copy out of ServerStats (the C struct is a FROZEN ABI surface while the C++ one
+// is free to gain fields, so the two must be allowed to diverge), every field written on every
+// non-error path so a caller never pre-zeroes, and the size travelling as an explicit PARAMETER
+// because this is a struct the library WRITES.
+//
+// na_server_stats has no post-v1 fields yet, so the floor check is currently the only size gate
+// and every write below is unconditional. The moment a field is APPENDED it must be guarded on
+// the caller's declared size individually — see na_client_get_stats, where `sequence_gaps` is the
+// worked example, and note that the zero-fill below covers only the opposite case (a caller
+// LONGER than us), never this one.
+extern "C" na_error_t na_server_get_stats(na_audio_server* server, na_server_stats* out,
+                                          std::size_t struct_size) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr || out == nullptr || struct_size < NA_SERVER_STATS_SIZE_V1) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        // A caller compiled against a LONGER version of this header gets its tail zeroed rather
+        // than left indeterminate.
+        if (struct_size > sizeof(na_server_stats)) {
+            std::memset(reinterpret_cast<char*>(out) + sizeof(na_server_stats), 0,
+                        struct_size - sizeof(na_server_stats));
+        }
+        // Before na_server_start there is no AudioStreamServer at all (it is built lazily with the
+        // final config), which is the same "no live source" case ServerStats reports as
+        // running == false — so a not-started server yields defaults, not an error.
+        const naudio::net::ServerStats s =
+            server->server ? server->server->stats() : naudio::net::ServerStats{};
+        out->running = s.running ? 1 : 0;
+        out->clients_connected = s.clientsConnected;
+        out->packets_sent = static_cast<long long>(s.packetsSent);
+        out->packets_received = static_cast<long long>(s.packetsReceived);
+        out->bytes_sent = static_cast<long long>(s.bytesSent);
+        out->bytes_received = static_cast<long long>(s.bytesReceived);
+        out->crc_errors = s.crcErrors;
+        out->control_retransmits = static_cast<long long>(s.controlRetransmits);
+        out->queue_drops = static_cast<long long>(s.queueDrops);
+        // ---- end of v1. A future append is guarded on struct_size here. ----
+        return NA_OK;
     });
 }

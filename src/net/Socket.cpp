@@ -384,6 +384,37 @@ Socket Socket::bindUdp(const std::string& bindHost, std::uint16_t port,
     return Socket(fd);
 }
 
+namespace {
+// Raise one SO_*BUF option to at least `bytes`. Kernels commonly return a doubled value
+// from getsockopt (Linux) or clamp to kern.ipc.maxsockbuf (macOS), so the request is
+// verified by reading the option back rather than trusting setsockopt's return.
+bool raiseSocketBuffer(socket_t h, int optname, int bytes) {
+    if (h == kInvalidSocket || bytes <= 0) return false;
+    int current = 0;
+    socklen_t len = sizeof(current);
+    if (::getsockopt(h, SOL_SOCKET, optname, reinterpret_cast<char*>(&current), &len) == 0 &&
+        current >= bytes) {
+        return true;  // already large enough — never shrink it
+    }
+    int want = bytes;
+    ::setsockopt(h, SOL_SOCKET, optname, reinterpret_cast<char*>(&want), sizeof(want));
+    current = 0;
+    len = sizeof(current);
+    if (::getsockopt(h, SOL_SOCKET, optname, reinterpret_cast<char*>(&current), &len) != 0) {
+        return false;
+    }
+    return current >= bytes;
+}
+}  // namespace
+
+bool Socket::setSendBufferAtLeast(int bytes) {
+    return raiseSocketBuffer(handle_.load(), SO_SNDBUF, bytes);
+}
+
+bool Socket::setRecvBufferAtLeast(int bytes) {
+    return raiseSocketBuffer(handle_.load(), SO_RCVBUF, bytes);
+}
+
 bool Socket::setRecvTimeout(int ms) {
     socket_t h = handle_.load();
     if (h == kInvalidSocket) return false;

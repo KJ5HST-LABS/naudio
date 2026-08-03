@@ -14,7 +14,7 @@
 
 ## Status
 
-The audio streaming stack is **implemented and tested** (the device layer, the `0xAF01` codec, the reliability primitives, the multi-tenant TCP/UDP server + client, and the full networking C ABI — both the `na_client_*` and `na_server_*` surfaces). It installs as a package: `find_package(naudio)` or pkg-config resolves the C ABI **and** the C++ API. The build runs **286 hardware-free ctests** green, including the language-neutral conformance golden vectors and the README snippet compile-gate. What is hardware-gated (real PortAudio capture/playback, on-air decode) is exercised by opt-in smokes and the `na_audio_daemon` driver, not by CI; see **Known limitations** below.
+The audio streaming stack is **implemented and tested** (the device layer, the `0xAF01` codec, the reliability primitives, the multi-tenant TCP/UDP server + client, and the full networking C ABI — both the `na_client_*` and `na_server_*` surfaces). It installs as a package: `find_package(naudio)` or pkg-config resolves the C ABI **and** the C++ API. The build runs **291 hardware-free ctests** green, including the language-neutral conformance golden vectors and the documentation snippet compile-gate (every fenced `c`/`cpp` block in this file and in `docs/hamlib-streaming-bridge.md` is compiled against the real headers). A separate CI job runs the Python, Java and Rust example clients and diffs each one's hand-declared `na_device` against a C reference, so a layout change cannot silently break them. What is hardware-gated (real PortAudio capture/playback, on-air decode) is exercised by opt-in smokes and the `na_audio_daemon` driver, not by CI; see **Known limitations** below.
 
 ---
 
@@ -26,7 +26,7 @@ The audio streaming stack is **implemented and tested** (the device layer, the `
 | `naudio_pa` | static lib | `naudio_core` + the PortAudio device backend. |
 | `naudio_net` | static lib | The transport layer — TCP/UDP sockets, per-client threads, the multi-tenant `AudioStreamServer`, and `AudioStreamClient`. Backend-agnostic (takes a `DeviceBackend*`). |
 | `naudio` | **shared lib** | The public artifact: the **C ABI** (`include/naudio.h`) over the internal backends, exporting **only** the `na_*` surface (hidden visibility + `SOVERSION`). This is what a C / Hamlib consumer links and what `make install` ships, alongside `naudio.pc`. |
-| `tools/` | app | The **hardware smoke daemon** (`na_audio_daemon`) — runs the real `AudioStreamServer` / `AudioStreamClient` over a live PortAudio device, the path ctest (fake backend only) cannot reach. An exerciser, **not** an audio primitive: it lives outside the libraries to keep the core pure + portable. |
+| `tools/` | apps | The **hardware smoke daemon** (`na_audio_daemon`) — runs the real `AudioStreamServer` / `AudioStreamClient` over a live PortAudio device, the path ctest (fake backend only) cannot reach. An exerciser, **not** an audio primitive: it lives outside the libraries to keep the core pure + portable. Also the optional **Hamlib streaming bridge** (`na_hamlib_bridge`), which re-originates a Hamlib `rig_stream_*` audio stream onto naudio's wire so it survives a lossy/WAN hop — off by default, and needs a libhamlib that no release ships yet: see **[docs/hamlib-streaming-bridge.md](docs/hamlib-streaming-bridge.md)**. |
 | `examples/` | apps | The **examples suite** — a "play to speakers" client in C, C++, Python, Java, and Rust, plus a small demo source. Each links the public shared `naudio` and uses **only** `naudio.h`, proving the C ABI is self-sufficient from C and from any FFI consumer. See **[examples/README.md](examples/README.md)**. |
 
 ---
@@ -36,7 +36,7 @@ The audio streaming stack is **implemented and tested** (the device layer, the `
 ```bash
 cmake -S . -B build
 cmake --build build
-ctest --test-dir build --output-on-failure      # 286 logic + codec + C-ABI tests, no hardware
+ctest --test-dir build --output-on-failure      # 291 logic + codec + C-ABI tests, no hardware
 ```
 
 Dependencies resolve from a system / Homebrew install when present (PortAudio via `pkg-config`,
@@ -76,7 +76,7 @@ ABI has two surfaces.
 
 na_context* ctx = na_context_create();                   // one backend init per context
 na_device devs[32];
-int n = na_enumerate(ctx, devs, 32);                     // count, or a negative na_error_t
+int n = na_enumerate(ctx, devs, 32, sizeof devs[0]);     // count, or a negative na_error_t
 na_capture_stream* s =
     na_open_capture(ctx, devs[0].capture_backend_id, 48000, 16, 2, /*out_actual_channels=*/NULL);
 int16_t buf[480 * 2];
@@ -100,12 +100,15 @@ na_stream_client* c =                                    // host, port, and rost
     na_client_create(NA_CLIENT_BACKEND_SYSTEM, "192.168.1.20", 4533, "my-client");
 na_client_set_transport(c, NA_TRANSPORT_TCP);            // NA_CLIENT_BACKEND_NULL = headless RX, no PortAudio
 na_client_set_audio_cb(c, on_pcm, user);                 // the hot-path RX PCM sink
+events.struct_size = sizeof events;                      // REQUIRED — see "Binary compatibility"
 na_client_set_callbacks(c, &events, user);               // connected / stream / roster / error events
 na_client_set_playback_device(c, playback_id);           // REQUIRED for RX (any id on the NULL backend)
 if (na_client_connect(c, errbuf, sizeof errbuf) != NA_OK) {
     /* connect failed — errbuf holds the reason (also via na_last_error()) */
 }
 /* ... receive PCM through on_pcm until done ... */
+na_client_stats st;                                      // reliability counters for THIS connection
+na_client_get_stats(c, &st, sizeof st);                  // packets_recovered_by_fec, reordered, jitter...
 na_client_disconnect(c);
 na_client_destroy(c);
 ```
@@ -115,6 +118,109 @@ The networking client wraps the C++ `AudioStreamClient`; the matching server is 
 (create / configure / start / inject-RX / extract-TX / roster + TX callbacks). See
 **[examples/README.md](examples/README.md)** for the example clients (play to speakers, in five
 languages) and the demo source.
+
+### Binary compatibility
+
+Read this if you package naudio, or link it as a shared library you did not build yourself.
+
+**Source compatibility is promised; binary compatibility begins at the first tag.** Nothing has been
+tagged, `SOVERSION` is `0`, and no released consumer exists — so the C ABI is still free to change
+shape. The rules below are what it commits to *from* the first tagged release, and the mechanism
+they rest on is already in place.
+
+**Every caller-allocated struct tells the library how large the caller believes it to be.** Without
+that, appending a single field to a future release would make the library read or write past the end
+of a struct allocated by a consumer compiled against the older header — silently, with no symbol
+rename and no link error. How the size travels depends on which side *writes* the struct:
+
+| Struct | Direction | How its size travels | Floor the library enforces |
+|---|---|---|---|
+| `na_client_callbacks` | library **reads** | in-band: `cbs.struct_size = sizeof cbs` | `NA_CLIENT_CALLBACKS_SIZE_V1` |
+| `na_server_callbacks` | library **reads** | in-band: `cbs.struct_size = sizeof cbs` | `NA_SERVER_CALLBACKS_SIZE_V1` |
+| `na_client_stats` | library **writes** | parameter: `na_client_get_stats(c, &st, sizeof st)` | `NA_CLIENT_STATS_SIZE_V1` |
+| `na_device` | library **writes** (array) | parameter: `na_enumerate(ctx, devs, max, sizeof devs[0])` | `NA_DEVICE_SIZE_V1` |
+
+The split is not stylistic. A table the library only reads can carry its own size as a first member —
+Win32's `cbSize` idiom — and callers already `memset` these, so it is one line beside the existing
+one. An *out*-parameter cannot: requiring a caller to pre-initialize a struct the library fills would
+invert the contract these have always had, which is that nothing needs pre-zeroing. For `na_device`
+it is not even a preference — `na_enumerate` fills an **array** and its `max` is an element *count*,
+so only the caller's own element size can say where element *k* begins.
+
+```c
+#include <string.h>
+
+na_client_callbacks cbs;                 /* library READS it -> size travels in-band  */
+memset(&cbs, 0, sizeof cbs);
+cbs.struct_size = sizeof cbs;            /* NA_ERR_INVALID without this — 0 is below the floor */
+
+na_context* ctx = na_context_create();
+na_device devs[32];                      /* library WRITES it -> size is a parameter  */
+int n = na_enumerate(ctx, devs, 32, sizeof devs[0]);
+na_context_destroy(ctx);
+```
+
+**What the declared size buys, in both directions.** The library treats it as a hard bound:
+
+- A library **newer** than the consumer writes only the prefix the consumer allocated, and reads only
+  the fields it declared. An appended field cannot scribble past the end of an already-compiled
+  consumer's struct — the hazard this exists for. For `na_enumerate` it also means each element lands
+  in the consumer's own slot instead of the array walking off its end after the first one.
+- A library **older** than the consumer fills the fields it knows and **zero-fills** the remainder, so
+  the tail is defined rather than indeterminate. On its own that makes the tail *defined*, not
+  *informative* — a zero there reads exactly like a measured zero. The version accessors below are
+  what separate them.
+
+A size below the struct's `_SIZE_V1` floor is rejected with `NA_ERR_INVALID`, which is what an
+accidentally-zero size gives you — the common mistake fails loudly at the call rather than quietly in
+memory.
+
+**Telling a zero-fill from a zero.** Two versions exist and they are not the same number: the one you
+**compiled** against (`NAUDIO_VERSION_MAJOR` / `_MINOR` / `_PATCH`, and the derived
+`NAUDIO_VERSION_NUMBER` and `NAUDIO_VERSION_STRING`) and the one you **loaded**
+(`na_version_number()` and `na_version_string()`, answered by the shared library itself). A packager,
+a distro upgrade, or an `LD_LIBRARY_PATH` can make them differ. This matters most for
+`na_client_stats`, which deliberately encodes *"the library is not measuring this"* as `-1`, so the
+zero-fill and the sentinel conventions collide exactly in that tail.
+
+```c
+#include <stdio.h>
+
+/* At startup: is the library you LOADED as new as the header you COMPILED against? */
+if (na_version_number() < NAUDIO_VERSION_NUMBER)
+    printf("naudio %s loaded, built against %s — newer fields read as zero-fill\n",
+           na_version_string(), NAUDIO_VERSION_STRING);
+
+/* Per field: sequence_gaps arrived in 0.2.0, so it carries a measurement only on 0.2.0 or
+   later. On anything older, na_client_get_stats zero-filled that tail and the 0 means
+   nothing. The -1 check is a second, separate question: this library IS new enough, but
+   this connection may still not be measuring (no reorder buffer engaged). */
+na_stream_client* c = na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", 4533, "demo");
+na_client_stats st;
+na_client_get_stats(c, &st, sizeof st);
+
+if (na_version_number() >= NA_VERSION_ENCODE(0, 2, 0) && st.sequence_gaps >= 0)
+    printf("%lld sequence gaps\n", st.sequence_gaps);
+```
+
+Always compare **through** `NA_VERSION_ENCODE` rather than spelling the arithmetic — the packing is
+an implementation detail, and only that macro and `na_version_number()` are promised to agree on it.
+The ordering is total for components within `NA_VERSION_MAX_COMPONENT` (so `0.999.999 < 1.0.0`).
+Both accessors are infallible: no allocation, no backend, callable before `na_context_create()` and
+from any thread, and they leave `na_last_error()` untouched. The header's macros cannot drift from
+the SONAME — CMake refuses to configure a build where they disagree with `project(VERSION)`.
+
+**The growth rule these constants encode:** fields are only ever **appended**, each one **naming the
+version it arrived in**, so the comparison above is always writable; and each `_SIZE_V1` is
+frozen as `offsetof(<v1's last field>) + sizeof(<its type>)` rather than a byte literal, so appending
+does not move it and the value stays correct on a 32-bit build where these mostly-pointer structs are
+smaller. Any change that is *not* an append — reordering, resizing, or removing a field — is an soname
+break, and `SOVERSION` tracks the major version for exactly that.
+
+**Outside this promise:** the `0xAF01` wire format is frozen separately by
+[the spec](docs/audio-streaming-protocol-v1.md) and is unaffected by any of the above; and the C++ API
+under `naudio/**` ships as **static archives** with no binary-stability promise — link the shared
+`naudio` C ABI if you need one.
 
 ---
 

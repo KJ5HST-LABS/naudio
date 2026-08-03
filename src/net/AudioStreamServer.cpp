@@ -299,11 +299,26 @@ void AudioStreamServer::ClientSession::writerLoop() {
             item = std::move(outQueue_.front());
             outQueue_.pop_front();
         }
-        const bool ok = item.control.has_value()
+        const bool isControl = item.control.has_value();
+        const std::size_t audioBytes = isControl ? 0 : item.audio.size();
+        const bool ok = isControl
                             ? connection_->sendControl(*item.control)
-                            : connection_->sendRxAudio(item.audio.data(), 0, item.audio.size());
+                            : connection_->sendRxAudio(item.audio.data(), 0, audioBytes);
         if (!ok) {
-            close();  // dead client — auto-remove
+            // Auto-remove the dead client — but never silently. This close() drops the session,
+            // which unregisters it from the mixer and so releases any TX channel it held: an
+            // operator mid-transmission goes off the air here. Reporting only the disconnect
+            // (below, via notifyClientDisconnected) leaves no trace of WHY, and the cause is
+            // often a send the kernel refused rather than a client that went away — e.g. an
+            // RX frame larger than the socket's send buffer (EMSGSIZE). Name the direction and
+            // the size so an oversized-frame kill is distinguishable from a real disconnect.
+            if (isControl) {
+                server_->notifyError(clientId_, "Send error: control message");
+            } else {
+                server_->notifyError(clientId_, "Send error: RX audio frame (" +
+                                                    std::to_string(audioBytes) + " bytes)");
+            }
+            close();
             return;
         }
     }
@@ -741,6 +756,37 @@ int AudioStreamServer::port() const {
         transport = transport_;
     }
     return transport ? transport->port() : -1;
+}
+
+ServerStats AudioStreamServer::stats() const {
+    ServerStats s;
+    // A shared_ptr copy under runMutex_, then read OUTSIDE it — the same lock-drop discipline
+    // the sessions use, and it also keeps the transport alive across the reads even if stop()
+    // races us and drops transport_.
+    std::shared_ptr<ServerTransport> transport;
+    {
+        std::lock_guard<std::mutex> lock(runMutex_);
+        transport = transport_;
+    }
+    if (!transport) return s;  // not started (or already stopped): defaults, running == false
+
+    s.running = true;
+    // clientCount() takes sessionsMutex_, which is NOT held here and is never held with
+    // runMutex_ — the two are independent and this is the only site that reads both.
+    s.clientsConnected = clientCount();
+    s.packetsSent = transport->packetsSent();
+    s.packetsReceived = transport->packetsReceived();
+    s.bytesSent = transport->bytesSent();
+    s.bytesReceived = transport->bytesReceived();
+    s.crcErrors = transport->crcErrors();
+    s.controlRetransmits = transport->controlRetransmits();
+    s.queueDrops = transport->orderedQueueDrops();
+    // Deliberately NOT a consistent snapshot across fields: each aggregate takes the
+    // transport's routing-map lock independently, so a client can join or leave between two of
+    // them. Holding one lock across all eight would serialize the read against every accept and
+    // disconnect for no benefit a diagnostic counter can use. Per-field skew is bounded by one
+    // roster change, and the roster is already documented as the thing these sum over.
+    return s;
 }
 
 void AudioStreamServer::threadStarted() {

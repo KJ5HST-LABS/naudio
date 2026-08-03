@@ -26,7 +26,15 @@
  *       once a client is connected — the extract WIRING, since a NULL-backend client cannot
  *       capture real TX);
  *   (4) clean disconnect leaves the server at zero clients and on_client_disconnected fires;
- *       na_server_stop fires on_stopped and flips is_running to 0; destroy of both is clean.
+ *       na_server_stop fires on_stopped and flips is_running to 0; destroy of both is clean;
+ *   (5) the transport/profile ordering naudio.h promises — na_server_set_transport and
+ *       na_server_set_reliability_profile both write the transport and the LAST ONE CALLED WINS —
+ *       observed through which client kind can reach the resulting server, plus the reset the
+ *       shared profile type promises: NA_RELIABILITY_DEFAULT really undoes a UDP profile;
+ *   (6) the other half of that promise — na_server_set_reliability_profile leaves the fields the
+ *       other config setters own alone, so they compose in either order. Only max-clients is
+ *       observable through the public ABI; the arm's own comment records what is not, and why.
+ *       Runs early (before section 2) because it needs no started server.
  * Returns non-zero (failing the ctest) on any contract violation.
  */
 #include <stdio.h>
@@ -119,6 +127,198 @@ static void sleep_ms(int ms) {
 #endif
 }
 
+/* ---- transport/profile ordering (section 5) --------------------------------------------------
+ *
+ * naudio.h promises that na_server_set_transport and na_server_set_reliability_profile BOTH write
+ * the transport and that the LAST ONE CALLED WINS. Nothing in the C ABI reads the transport back,
+ * so it is observed the only way a C consumer can: by which client kind can reach the server. A
+ * UDP-only server refuses a client left on the ABI-default TCP transport at connect (SO_ERROR=61),
+ * and a TCP-only server refuses a UDP-profile client at handshake. This mirrors
+ * tests/c_client_profile.c's assert_cannot_reach_udp_server onto the server's own setter pair.
+ *
+ * ARM D PINS A SECOND SENTENCE, stated on the shared na_reliability_profile type rather than on
+ * either setter: NA_RELIABILITY_DEFAULT "mirrors a default-constructed AudioStreamConfig — plain
+ * TCP with the whole reliability layer off, so it is the reset rather than a UDP profile"
+ * (include/naudio.h:361-363). The CLIENT half of that claim has been pinned since
+ * c_client_profile.c:211-214; the server's profile setter was passed UDP_WAN only, so a DEFAULT
+ * case that had quietly become a no-op would have kept the whole suite green while contradicting
+ * the shipped contract. Same asymmetry arms A-C closed, one sentence over. */
+
+#define ORD_PROFILE_ONLY           0  /* control: profile(UDP_WAN) alone         -> UDP serves */
+#define ORD_PROFILE_THEN_TRANSPORT 1  /* profile(UDP_WAN) -> set_transport(TCP)  -> TCP serves */
+#define ORD_TRANSPORT_THEN_PROFILE 2  /* set_transport(TCP) -> profile(UDP_WAN)  -> UDP serves */
+#define ORD_PROFILE_THEN_DEFAULT   3  /* profile(UDP_WAN) -> profile(DEFAULT)    -> TCP serves */
+
+/* Start a NULL-backend server on an ephemeral port with the two setters called in `order`.
+ * Returns NULL (having already destroyed the handle) on any failure. */
+static na_audio_server* ordering_server(int order, int* out_port) {
+    char err[256];
+    na_audio_server* s = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+    if (s == NULL) {
+        fprintf(stderr, "FAIL: na_server_create (ordering arm)\n");
+        return NULL;
+    }
+    int ok = 1;
+    if (order == ORD_TRANSPORT_THEN_PROFILE)
+        ok = ok && na_server_set_transport(s, NA_TRANSPORT_TCP) == NA_OK;
+    ok = ok && na_server_set_reliability_profile(s, NA_RELIABILITY_UDP_WAN) == NA_OK;
+    if (order == ORD_PROFILE_THEN_TRANSPORT)
+        ok = ok && na_server_set_transport(s, NA_TRANSPORT_TCP) == NA_OK;
+    if (order == ORD_PROFILE_THEN_DEFAULT)  /* the reset, applied THROUGH the profile setter */
+        ok = ok && na_server_set_reliability_profile(s, NA_RELIABILITY_DEFAULT) == NA_OK;
+    if (!ok) {
+        fprintf(stderr, "FAIL: an ordering-arm config setter was rejected\n");
+        na_server_destroy(s);
+        return NULL;
+    }
+    if (na_server_start(s, err, (int)sizeof err) != NA_OK) {
+        fprintf(stderr, "FAIL: na_server_start (ordering arm) (%s)\n", err);
+        na_server_destroy(s);
+        return NULL;
+    }
+    *out_port = na_server_port(s);
+    return s;
+}
+
+/* Probe `port` with one client kind: 1 if the connect succeeded, 0 if it was refused, -1 if the
+ * harness itself failed. `udp_client` applies the UDP_WAN profile (which selects UDP); otherwise
+ * the client is left on the ABI-default transport, exactly as c_client_profile.c's probes are. */
+static int reaches(int port, int udp_client, const char* what) {
+    char err[256];
+    err[0] = '\0';
+    na_stream_client* c = na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", port, what);
+    if (c == NULL) {
+        fprintf(stderr, "FAIL: na_client_create (%s)\n", what);
+        return -1;
+    }
+    na_client_set_playback_device(c, 0);  /* REQUIRED for RX even on the NULL backend */
+    na_client_set_auto_reconnect(c, 0);   /* a retry storm would only slow the refusal down */
+    if (udp_client && na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN) != NA_OK) {
+        fprintf(stderr, "FAIL: profile rejected on the %s probe\n", what);
+        na_client_destroy(c);
+        return -1;
+    }
+    const na_error_t rc = na_client_connect(c, err, (int)sizeof err);
+    if (rc == NA_OK) na_client_disconnect(c);
+    na_client_destroy(c);
+    if (rc != NA_OK) printf("    %s refused (%s)\n", what, err);
+    return rc == NA_OK ? 1 : 0;
+}
+
+/* One ordering arm end to end. BOTH client kinds are probed and BOTH results asserted against the
+ * arm's expected pair, which is what makes the control real: no constant-returning probe can
+ * satisfy arm A's (connected, refused) and arm B's (refused, connected) at once, so a detector
+ * blind to the transport fails whichever expectation it contradicts instead of reporting agreement
+ * and reading as corroboration (Learning 58).
+ *
+ * The client expected to CONNECT is probed first because it is always the fast one: a client whose
+ * transport the server does not serve is refused instantly over TCP (SO_ERROR=61) but pays the
+ * full 10 s handshake timeout over UDP, since a datagram sent at a port with no UDP listener draws
+ * no reply. Probing in this order keeps a regression's report in milliseconds. The TWO slow probes
+ * — arm B's UDP one and arm D's — are the whole cost of this section, and neither is redundant with
+ * its arm's TCP probe: the TCP probe catches a setter that did nothing (the server stays UDP and
+ * refuses it instantly), while only the UDP probe catches one that selected DUAL and left the
+ * server answering both, which no TCP probe can see because a DUAL server accepts it happily.
+ *
+ * MEASURED, so that nobody has to re-derive it before deciding whether to keep them: on a healthy
+ * arm D the TCP probe returns in 1.2 ms and the UDP probe in 10000.3 ms — the whole 10 s is
+ * src/net/AudioStreamClient.cpp:24's kConnectTimeoutMs, and no public setter shortens it. The cost
+ * is therefore paid on GREEN runs only; under either regression the arm reports in milliseconds.
+ * Keeping it was a deliberate call, not an oversight — do not "optimise" a UDP probe away without
+ * replacing what it catches.
+ *
+ * IF YOU RE-AUDIT THESE BY MUTATION, note that the two checks below are not independent detectors:
+ * a mutation that makes a setter a no-op violates BOTH of an arm's expectations, and the UDP check
+ * is evaluated first, so it fires and MASKS the TCP one. Each was confirmed live by neutralising
+ * the check that masks it and re-running the same mutation — read WHICH assertion fired, never
+ * merely that something went red (Learning 54). Returns 1 on success. */
+static int check_ordering_arm(int order, const char* name, int want_udp, int want_tcp) {
+    int port = -1;
+    na_audio_server* s = ordering_server(order, &port);
+    if (s == NULL) return 0;
+    printf("  ordering arm %s (port %d)\n", name, port);
+
+    int got_udp, got_tcp;
+    if (want_udp) {
+        got_udp = reaches(port, 1, "udp-profile");
+        got_tcp = reaches(port, 0, "tcp-default");
+    } else {
+        got_tcp = reaches(port, 0, "tcp-default");
+        got_udp = reaches(port, 1, "udp-profile");
+    }
+    na_server_stop(s);
+    na_server_destroy(s);
+    if (got_udp < 0 || got_tcp < 0) return 0;
+
+    if (got_udp != want_udp) {
+        fprintf(stderr, "FAIL: ordering arm %s — the UDP-profile client %s, want %s\n", name,
+                got_udp ? "connected" : "was refused", want_udp ? "connected" : "refused");
+        return 0;
+    }
+    if (got_tcp != want_tcp) {
+        fprintf(stderr, "FAIL: ordering arm %s — the TCP-default client %s, want %s\n", name,
+                got_tcp ? "connected" : "was refused", want_tcp ? "connected" : "refused");
+        return 0;
+    }
+    return 1;
+}
+
+/* ---- profile / config-setter composition (section 6) -----------------------------------------
+ *
+ * na_server_set_reliability_profile applies a preset but must leave the four fields the OTHER
+ * na_server_* config setters own untouched — sample rate, bits, channels and max-clients — so the
+ * setters compose in either order. That is the promise at include/naudio.h:786-787.
+ *
+ * WHAT IS MEASURABLE HERE, AND WHAT IS NOT. Only max-clients is observable through the public C
+ * ABI: na_server_max_clients reports the configured value pre-start. The three audio-format fields
+ * have NO public accessor, and the obvious byte-volume route is a DEAD detector —
+ * na_server_inject_audio broadcasts the caller's buffer verbatim
+ * (src/net/AudioStreamServer.cpp:733-741), so a client receives the same byte count whatever format
+ * the server carries. Measured, not assumed: deleting `pc.sampleRate = rate;` from the setter
+ * leaves all 299 tests GREEN. That is why this section pins one field rather than four, and the
+ * unguarded three are tracked as an issue rather than left as folklore.
+ *
+ * THE THIRD ARM IS WHAT MAKES THE FIRST TWO MEAN ANYTHING. An order-independence claim predicts
+ * arm A == arm B, and an accessor stuck on any constant satisfies that perfectly. The profile-only
+ * arm must read the DEFAULT instead, so a blind accessor fails here and only here. It is NOT a
+ * second preservation check — every preset carries the default max-clients, so a clobbering profile
+ * leaves this arm looking correct. Arm A is the clobber detector.
+ *
+ * Placed before section (2) because it needs no started server — create/destroy only, no port, no
+ * measurable suite time — and because section (2) reads the same accessor at :359+13: evaluating
+ * the blind-instrument control first keeps a mutation of the accessor landing HERE instead of being
+ * masked downstream.
+ */
+#define COMPOSE_MAX_CLIENTS 7  /* != the documented default (4), so the two are distinguishable */
+
+/* max-clients on a throwaway pre-start server, with na_server_set_max_clients placed on either side
+ * of the profile call. Returns -1 on a setup fault, which no arm accepts as an answer. */
+static int compose_max_clients(int set_before, int set_after) {
+    int seen;
+    na_audio_server* s = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+    if (s == NULL) return -1;
+    if (set_before && na_server_set_max_clients(s, COMPOSE_MAX_CLIENTS) != NA_OK) goto fault;
+    if (na_server_set_reliability_profile(s, NA_RELIABILITY_UDP_WAN) != NA_OK) goto fault;
+    if (set_after && na_server_set_max_clients(s, COMPOSE_MAX_CLIENTS) != NA_OK) goto fault;
+    seen = na_server_max_clients(s);
+    na_server_destroy(s);
+    return seen;
+fault:
+    na_server_destroy(s);
+    return -1;
+}
+
+/* The default the accessor reports on an untouched server — derived from the library rather than
+ * spelled here, so this stays a preservation check and not a restatement of the default. */
+static int default_max_clients(void) {
+    int seen;
+    na_audio_server* s = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+    if (s == NULL) return -1;
+    seen = na_server_max_clients(s);
+    na_server_destroy(s);
+    return seen;
+}
+
 int main(void) {
     /* ---- (1) invalid-argument contract (no server / hardware) ---- */
 
@@ -138,6 +338,17 @@ int main(void) {
         fprintf(stderr, "FAIL: NULL-server setters/start/inject not NA_ERR_INVALID\n");
         return 1;
     }
+    /* na_server_get_stats, NULL-server half. The NULL-out and below-the-floor halves need a
+     * REAL server handle to be meaningful, so they are asserted at the live-reading site below
+     * rather than with a fabricated pointer here. */
+    {
+        na_server_stats st;
+        if (na_server_get_stats(NULL, &st, sizeof st) != NA_ERR_INVALID) {
+            fprintf(stderr, "FAIL: na_server_get_stats(NULL) not NA_ERR_INVALID\n");
+            return 1;
+        }
+    }
+
     /* NULL-safe no-ops must not crash, and the NULL-server getters return their sentinels. */
     na_server_stop(NULL);
     na_server_destroy(NULL);
@@ -145,6 +356,74 @@ int main(void) {
         na_server_client_count(NULL) != -1 || na_server_max_clients(NULL) != -1) {
         fprintf(stderr, "FAIL: NULL-server query accessors wrong\n");
         return 1;
+    }
+
+    /* New config setters (na_server_set_audio_format / _set_reliability_profile): NULL-server contract
+     * plus a throwaway server exercising the exact config the na_hamlib_bridge uses — the UDP WAN
+     * reliability profile (FEC on) + mono 48k S16 — and the invalid-value rejections. */
+    if (na_server_set_audio_format(NULL, 48000, 16, 2) != NA_ERR_INVALID ||
+        na_server_set_reliability_profile(NULL, NA_RELIABILITY_UDP_WAN) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: NULL-server format/reliability setters not NA_ERR_INVALID\n");
+        return 1;
+    }
+    {
+        na_audio_server* cfg = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+        if (cfg == NULL) {
+            fprintf(stderr, "FAIL: na_server_create (cfg probe) (%s)\n", na_strerror(na_last_error()));
+            return 1;
+        }
+        if (na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+            na_server_set_audio_format(cfg, 48000, 16, 1) != NA_OK) {
+            fprintf(stderr, "FAIL: UDP_WAN + mono-S16 config setters rejected\n");
+            na_server_destroy(cfg);
+            return 1;
+        }
+        if (na_server_set_audio_format(cfg, 48000, 24, 1) != NA_ERR_INVALID ||   /* bits != 16 */
+            na_server_set_audio_format(cfg, 48000, 16, 3) != NA_ERR_INVALID ||   /* channels 3 */
+            na_server_set_audio_format(cfg, 0, 16, 2)     != NA_ERR_INVALID ||   /* rate 0     */
+            na_server_set_reliability_profile(cfg, (na_reliability_profile)99) != NA_ERR_INVALID) {
+            fprintf(stderr, "FAIL: invalid format/profile values not rejected\n");
+            na_server_destroy(cfg);
+            return 1;
+        }
+        na_server_destroy(cfg);  /* never started — clean create/destroy */
+    }
+
+    /* ---- (6) the profile leaves what the other config setters own alone ----
+     * Three arms, three distinct jobs — see the comment block above compose_max_clients. Each
+     * assertion stands alone so a mutation lands on the one property it breaks. */
+    {
+        const int dflt  = default_max_clients();
+        const int arm_a = compose_max_clients(1, 0);  /* set_max_clients -> profile */
+        const int arm_b = compose_max_clients(0, 1);  /* profile -> set_max_clients */
+        const int arm_c = compose_max_clients(0, 0);  /* profile alone -> must read the default */
+
+        if (dflt < 0 || arm_a < 0 || arm_b < 0 || arm_c < 0) {
+            fprintf(stderr, "FAIL: a composition arm could not be configured\n");
+            return 1;
+        }
+        if (arm_a != COMPOSE_MAX_CLIENTS) {  /* the clobber detector */
+            fprintf(stderr, "FAIL: the profile clobbered max-clients set before it — got %d, "
+                            "want %d\n", arm_a, COMPOSE_MAX_CLIENTS);
+            return 1;
+        }
+        if (arm_b != COMPOSE_MAX_CLIENTS) {
+            fprintf(stderr, "FAIL: max-clients set after the profile did not stick — got %d, "
+                            "want %d\n", arm_b, COMPOSE_MAX_CLIENTS);
+            return 1;
+        }
+        if (arm_c == COMPOSE_MAX_CLIENTS) {  /* the blind-instrument control */
+            fprintf(stderr, "FAIL: the profile-only arm reads %d — na_server_max_clients cannot "
+                            "discriminate, so arms A and B prove nothing\n", arm_c);
+            return 1;
+        }
+        if (arm_c != dflt) {
+            fprintf(stderr, "FAIL: the profile moved max-clients off the default — got %d, want %d\n",
+                    arm_c, dflt);
+            return 1;
+        }
+        printf("  (6) profile composition: max-clients %d preserved in both orders; profile-only "
+               "reads the default %d\n", COMPOSE_MAX_CLIENTS, dflt);
     }
 
     /* ---- (2) create + configure + start a NULL-backend server on an ephemeral port ---- */
@@ -163,8 +442,25 @@ int main(void) {
         return 1;
     }
 
+    /* struct_size is validated on the server side too, and the server is not yet started, so
+     * the "set before start" guard cannot be what rejects these. */
+    na_server_callbacks sized;
+    memset(&sized, 0, sizeof sized);
+    if (na_server_set_callbacks(server, &sized, NULL) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: na_server_set_callbacks with struct_size=0 not rejected\n");
+        na_server_destroy(server);
+        return 1;
+    }
+    sized.struct_size = sizeof sized;
+    if (na_server_set_callbacks(server, &sized, NULL) != NA_OK) {
+        fprintf(stderr, "FAIL: na_server_set_callbacks with a correct struct_size rejected\n");
+        na_server_destroy(server);
+        return 1;
+    }
+
     na_server_callbacks scbs;
     memset(&scbs, 0, sizeof scbs);
+    scbs.struct_size = sizeof scbs;
     scbs.on_started = srv_on_started;
     scbs.on_stopped = srv_on_stopped;
     scbs.on_client_connected = srv_on_client_connected;
@@ -206,7 +502,9 @@ int main(void) {
     /* Config is frozen after start. */
     if (na_server_set_max_clients(server, 8) != NA_ERR_INVALID ||
         na_server_set_callbacks(server, &scbs, NULL) != NA_ERR_INVALID ||
-        na_server_set_tx_audio_cb(server, srv_on_tx_audio, NULL) != NA_ERR_INVALID) {
+        na_server_set_tx_audio_cb(server, srv_on_tx_audio, NULL) != NA_ERR_INVALID ||
+        na_server_set_audio_format(server, 48000, 16, 2) != NA_ERR_INVALID ||
+        na_server_set_reliability_profile(server, NA_RELIABILITY_UDP_WAN) != NA_ERR_INVALID) {
         fprintf(stderr, "FAIL: config setters not frozen after start\n");
         na_server_destroy(server);
         return 1;
@@ -223,6 +521,7 @@ int main(void) {
     }
     na_client_callbacks ccbs;
     memset(&ccbs, 0, sizeof ccbs);
+    ccbs.struct_size = sizeof ccbs;
     ccbs.on_connected = cli_on_connected;
     na_client_set_callbacks(client, &ccbs, NULL);
     na_client_set_audio_cb(client, cli_on_rx_audio, NULL);
@@ -242,6 +541,7 @@ int main(void) {
      * flags land on the server/client dispatch threads slightly after the wire-level connect
      * — poll for them here rather than asserting them immediately after the loop, or a busy
      * scheduler loses that race. na_server_client_count is mutex-guarded (safe to poll). */
+    long long srv_packets_sent_with_client = 0;
     int waited = 0;
     while (waited < 3000 &&
            !(atomic_load(&g_cli_rx_ok) && atomic_load(&g_cli_connected) &&
@@ -269,6 +569,87 @@ int main(void) {
         na_client_destroy(client);
         na_server_destroy(server);
         return 1;
+    }
+
+    /* ---- na_server_get_stats: a LIVE reading, from pure C ----
+     * The two counters this call exists for are control_retransmits and queue_drops, neither of
+     * which can carry information on a client. Their VALUES are provoked and bounded in
+     * tests/net/test_server.cpp (a server observed at 6 retransmits, and queue_drops pinned at 0
+     * while the drain keeps up); what is asserted here is the C-ABI surface itself — that the
+     * struct is C-compilable, the call is C-callable, the size parameter behaves, and a live
+     * server reports a live roster. */
+    {
+        na_server_stats st;  /* deliberately NOT pre-zeroed: the library writes every field */
+
+        /* The remaining two thirds of the invalid contract, against a real handle: a NULL out,
+         * and a struct_size below the v1 floor. The floor is the guard that stops a caller
+         * compiled against a SHORTER header from having its struct overrun — asserted one byte
+         * under, which is the only interesting value, since anything smaller is caught by the
+         * same comparison. */
+        if (na_server_get_stats(server, NULL, sizeof st) != NA_ERR_INVALID ||
+            na_server_get_stats(server, &st, NA_SERVER_STATS_SIZE_V1 - 1) != NA_ERR_INVALID) {
+            fprintf(stderr, "FAIL: na_server_get_stats NULL-out / below-floor not NA_ERR_INVALID\n");
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+
+        if (na_server_get_stats(server, &st, sizeof st) != NA_OK) {
+            fprintf(stderr, "FAIL: na_server_get_stats on a running server\n");
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        if (st.running != 1 || st.clients_connected != 1) {
+            fprintf(stderr, "FAIL: server stats running=%d clients=%d (want 1/1)\n",
+                    st.running, st.clients_connected);
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        /* Non-vacuity: the connection really is carrying traffic, so the zeros below are
+         * measurements of a live server rather than of an idle one. */
+        if (st.packets_sent <= 0 || st.bytes_sent <= st.packets_sent) {
+            fprintf(stderr, "FAIL: server stats packets_sent=%lld bytes_sent=%lld\n",
+                    st.packets_sent, st.bytes_sent);
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        /* Documented expectations on a healthy loopback server: no corruption, and no local
+         * queue loss because the receive path never blocks (see the na_server_stats contract). */
+        if (st.crc_errors != 0 || st.queue_drops != 0) {
+            fprintf(stderr, "FAIL: healthy server reported crc_errors=%d queue_drops=%lld\n",
+                    st.crc_errors, st.queue_drops);
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        srv_packets_sent_with_client = st.packets_sent;  /* for the roster-gauge check below */
+    }
+
+    /* The OVER-SIZED caller: a consumer compiled against a FUTURE header that appended fields.
+     * The library must fill what it knows and ZERO the tail rather than leave it indeterminate,
+     * so an appended field reads as a defined 0 instead of stack garbage. Poisoned first, so
+     * "zeroed by the library" and "never written" are distinguishable. */
+    {
+        unsigned char big[sizeof(na_server_stats) + 32];
+        memset(big, 0xAB, sizeof big);
+        if (na_server_get_stats(server, (na_server_stats*)big, sizeof big) != NA_OK) {
+            fprintf(stderr, "FAIL: na_server_get_stats with an over-sized struct_size\n");
+            na_client_destroy(client);
+            na_server_destroy(server);
+            return 1;
+        }
+        for (size_t i = sizeof(na_server_stats); i < sizeof big; i++) {
+            if (big[i] != 0) {
+                fprintf(stderr, "FAIL: over-sized tail not zero-filled at byte %zu (0x%02X)\n",
+                        i, big[i]);
+                na_client_destroy(client);
+                na_server_destroy(server);
+                return 1;
+            }
+        }
     }
 
     /* TX-extract WIRING: with a client connected, the mixer playback loop drains the (empty) TX
@@ -304,12 +685,56 @@ int main(void) {
         return 1;
     }
 
+    /* THE ROSTER-GAUGE CONTRACT, asserted from C because it is the one way na_server_stats
+     * differs from na_client_stats and the one a consumer will get wrong. These are sums over the
+     * clients connected RIGHT NOW, so the departed client's counters left with it and packets_sent
+     * must have DROPPED — a C consumer computing a delta across this boundary would read a
+     * negative throughput. If this ever stops holding, the header contract is stale. */
+    {
+        na_server_stats st;
+        if (na_server_get_stats(server, &st, sizeof st) != NA_OK) {
+            fprintf(stderr, "FAIL: na_server_get_stats after disconnect\n");
+            na_server_destroy(server);
+            return 1;
+        }
+        if (st.clients_connected != 0) {
+            fprintf(stderr, "FAIL: stats roster %d after disconnect (want 0)\n",
+                    st.clients_connected);
+            na_server_destroy(server);
+            return 1;
+        }
+        if (st.packets_sent >= srv_packets_sent_with_client) {
+            fprintf(stderr, "FAIL: packets_sent did not decrease when the client left "
+                    "(%lld -> %lld); na_server_stats promises it is a roster gauge\n",
+                    srv_packets_sent_with_client, st.packets_sent);
+            na_server_destroy(server);
+            return 1;
+        }
+        printf("  roster gauge: packets_sent %lld (1 client) -> %lld (0 clients)\n",
+               srv_packets_sent_with_client, st.packets_sent);
+    }
+
+    /* A STOPPED server is not an error — it is running == 0 with defaults, the same rule
+     * na_client_stats.connected states. Asserted after na_server_stop below. */
+
     na_server_stop(server);
     if (na_server_is_running(server)) {
         fprintf(stderr, "FAIL: server still running after na_server_stop\n");
         na_server_destroy(server);
         return 1;
     }
+    {
+        na_server_stats st;
+        if (na_server_get_stats(server, &st, sizeof st) != NA_OK || st.running != 0 ||
+            st.clients_connected != 0 || st.packets_sent != 0) {
+            fprintf(stderr, "FAIL: stopped server stats running=%d clients=%d packets_sent=%lld "
+                    "(want 0/0/0, and NOT an error)\n",
+                    st.running, st.clients_connected, st.packets_sent);
+            na_server_destroy(server);
+            return 1;
+        }
+    }
+
     for (int i = 0; i < 50 && !atomic_load(&g_srv_stopped); i++) sleep_ms(20);
     if (!atomic_load(&g_srv_stopped)) {
         fprintf(stderr, "FAIL: server on_stopped never fired\n");
@@ -318,6 +743,29 @@ int main(void) {
     }
 
     na_server_destroy(server);  /* idempotent stop + join + drain dispatcher + free */
+
+    /* ---- (5) transport/profile ordering — the last setter to write the transport wins ----
+     * The header states this on na_server_set_reliability_profile; before this section nothing
+     * asserted it, while the client's identical claim was pinned by c_client_profile.c:203-214.
+     * A regression that made either setter a no-op after the other would have kept the whole suite
+     * green while contradicting the shipped contract. Arm A is the control the claim requires to
+     * DIFFER from arm B; arm C is the same expectation reached in the opposite order, which is
+     * what pins the profile as the winner when IT is the later call.
+     *
+     * Arm D is the profile setter answering for ITSELF rather than against set_transport: it is the
+     * only arm in which no na_server_set_transport call appears at all, so it is the one that can
+     * tell a real NA_RELIABILITY_DEFAULT reset from a no-op. Its expectation is arm B's, reached
+     * without the other setter. */
+
+    if (!check_ordering_arm(ORD_PROFILE_ONLY, "A: profile(UDP_WAN) alone [control]", 1, 0) ||
+        !check_ordering_arm(ORD_PROFILE_THEN_TRANSPORT,
+                            "B: profile(UDP_WAN) -> set_transport(TCP)", 0, 1) ||
+        !check_ordering_arm(ORD_TRANSPORT_THEN_PROFILE,
+                            "C: set_transport(TCP) -> profile(UDP_WAN)", 1, 0) ||
+        !check_ordering_arm(ORD_PROFILE_THEN_DEFAULT,
+                            "D: profile(UDP_WAN) -> profile(DEFAULT) [the reset]", 0, 1)) {
+        return 1;
+    }
 
     printf("c_server_smoke OK (port=%d, client RX byte-identical, roster=1, TX-extract frames=%d "
            "@ %d bytes, clean disconnect+stop)\n", port, atomic_load(&g_tx_frames),

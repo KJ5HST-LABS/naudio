@@ -412,6 +412,14 @@ std::int64_t UdpClientConnection::packetsRecoveredByFec() const {
     return fecDecoder_ ? fecDecoder_->packetsRecoveredByFec() : 0;
 }
 
+std::int64_t UdpClientConnection::sequenceGaps() const {
+    std::lock_guard<std::mutex> lock(pipe_);
+    // -1 rather than 0 when there is no reorder buffer: with none engaged nothing
+    // here is measuring loss (trackSequence covers that case instead), and a 0
+    // would read as "nothing was lost". Mirrors measuresSequenceGaps() inverted.
+    return reorderBuffer_ ? reorderBuffer_->gapsEmitted() : -1;
+}
+
 double UdpClientConnection::jitterMs() const {
     std::lock_guard<std::mutex> lock(pipe_);
     return jitterEstimator_ ? jitterEstimator_->jitterMs() : 0.0;
@@ -425,6 +433,19 @@ int UdpClientConnection::adaptiveBufferTargetMs() const {
 std::int64_t UdpClientConnection::controlRetransmits() const {
     std::lock_guard<std::mutex> lock(pipe_);
     return controlReliability_ ? controlReliability_->controlRetransmits() : 0;
+}
+
+std::int64_t UdpClientConnection::fecBlocksUnreconciled() const {
+    std::lock_guard<std::mutex> lock(pipe_);
+    return fecDecoder_ ? fecDecoder_->fecBlocksUnreconciled() : 0;
+}
+
+bool UdpClientConnection::measuresSequenceGaps() const {
+    // trackSequence() is reached only in the two branches of the receive path that
+    // have no reorder buffer (enqueueReceived / receiveFromSocket). With one
+    // engaged the gap counters are never written, so they are unmeasured — not zero.
+    std::lock_guard<std::mutex> lock(pipe_);
+    return !reorderBuffer_.has_value();
 }
 
 void UdpClientConnection::close() {

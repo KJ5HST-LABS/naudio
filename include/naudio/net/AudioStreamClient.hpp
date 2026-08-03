@@ -54,6 +54,59 @@ public:
     virtual void onTxReleased() {}
 };
 
+// A point-in-time snapshot of the live connection's transport and reliability
+// counters — the diagnostic view AudioClientListener deliberately omits (see the
+// note on that class). Read with AudioStreamClient::stats(). Every field is a
+// cumulative total for the CURRENT connection, not a rate: a reconnect installs a
+// fresh connection and the counters restart from zero.
+//
+// UNAVAILABLE vs ZERO. packetsLost / packetsOutOfOrder / packetLossRate are -1 when
+// the connection does not measure sequence gaps, which is the case on every built-in
+// UDP profile (they all engage a reorder buffer) and on TCP. -1 means "not measured";
+// it never means "nothing was lost". See ClientConnection::measuresSequenceGaps.
+struct ClientStats {
+    // True only when a live connection supplied these numbers. False leaves every
+    // field at its default below — a default, not a reading.
+    bool connected = false;
+
+    std::int64_t packetsSent = 0;
+    std::int64_t packetsReceived = 0;
+    std::int64_t bytesSent = 0;
+    std::int64_t bytesReceived = 0;
+    int crcErrors = 0;
+
+    // Live on any UDP profile that configures the corresponding subsystem; 0 when
+    // that subsystem is off (and on TCP, which has none of them).
+    std::int64_t packetsReordered = 0;
+    std::int64_t packetsRecoveredByFec = 0;
+    std::int64_t fecBlocksUnreconciled = 0;
+    // These two are ALWAYS 0 here, on every profile. Both are written by live paths that only a
+    // server-side connection reaches: a client's only critical control message is DISCONNECT, sent
+    // after the thread that pumps the retransmit sweep has exited; and a client fills and drains its
+    // ordered queue from one thread, so the queue cannot back up to its 2048-packet cap (a slow
+    // consumer loses audio in the kernel socket buffer instead, which nothing here counts --
+    // not even sequenceGaps below, since that buffer tail-drops and leaves no hole to see). They are
+    // 0 rather than -1 because -1 is reserved for "not measured" — these are measured, and the
+    // client simply never produces the event. See the na_client_stats contract in naudio.h.
+    std::int64_t controlRetransmits = 0;
+    std::int64_t queueDrops = 0;
+    double jitterMs = 0.0;
+    int bufferTargetMs = -1;  // -1 when adaptive jitter is off
+
+    // -1 == unmeasured on this connection (the common case — see above).
+    std::int64_t packetsLost = -1;
+    std::int64_t packetsOutOfOrder = -1;
+    double packetLossRate = -1.0;
+
+    // Sequence slots the reorder buffer gave up on — the post-reorder loss measure,
+    // and the exact COMPLEMENT of the three above: a reorder buffer is engaged on
+    // every built-in UDP profile, so this is live precisely where they are -1, and
+    // -1 here precisely where they are live. Counted before the FEC decoder gets its
+    // chance to refill the slot, so the unrecovered remainder is this minus
+    // packetsRecoveredByFec. See Transport::sequenceGaps for the full contract.
+    std::int64_t sequenceGaps = -1;
+};
+
 // Client for connecting to an AudioStreamServer.
 //
 // Receives RX audio from the server into a local (virtual) playback device, and captures TX
@@ -89,6 +142,12 @@ public:
     void setPlaybackDevice(int backendId) { playbackDeviceId_ = backendId; }
     // The capture device is OPTIONAL (only needed for TX).
     void setCaptureDevice(int backendId) { captureDeviceId_ = backendId; }
+    // TX audio can INSTEAD be injected (see injectTxAudio) — the headless path, symmetric to
+    // AudioStreamServer::injectAudio on the RX side. Must be set BEFORE connect(): it decides
+    // whether the send worker is started, and connect() starts the workers once. Independent of
+    // the capture device; with both set, captured and injected audio interleave in one TX ring.
+    void setTxInjectEnabled(bool v) { txInjectEnabled_.store(v); }
+    bool isTxInjectEnabled() const { return txInjectEnabled_.load(); }
 
     // --- Identification (sent to the server so other clients see who shares the radio) ---
     void setCallsign(std::string callsign) { callsign_ = std::move(callsign); }
@@ -137,9 +196,31 @@ public:
         playbackMuted_.store(pttActive);
     }
 
+    // --- TX inject (no capture device) ---
+    // Queue TX audio for the send worker directly, for a client that cannot capture (the NULL
+    // backend) or should not. Requires setTxInjectEnabled(true) BEFORE connect(), otherwise the
+    // send worker never runs and this always returns 0.
+    //
+    // `pcm` MUST already match config()'s layout (sampleRate / bitsPerSample / channels) — nothing
+    // here resamples or converts. Non-blocking: the TX ring overwrites its oldest bytes on overrun,
+    // exactly as it does for captured audio.
+    //
+    // Gated on the SAME captureMuted_ flag the capture loop uses, so setPTT() governs injected and
+    // captured audio identically — a client that has not asserted PTT transmits nothing either way.
+    // Returns bytes accepted: 0 when not connected, when the send worker is not running, or when
+    // PTT is inactive.
+    std::size_t injectTxAudio(const std::uint8_t* pcm, std::size_t nBytes);
+
     // --- Latency ---
     void measureLatency();
     std::int64_t measuredLatencyMs() const { return measuredLatencyMs_.load(); }
+
+    // --- Reliability / transport counters ---
+    // A snapshot of the current connection's counters (see ClientStats). Safe to call
+    // at any time from any thread; returns ClientStats{} with connected == false when
+    // there is no live connection (before connect, between reconnect attempts, after
+    // disconnect). The counters belong to the connection, so a reconnect restarts them.
+    ClientStats stats() const;
 
     // --- Listeners ---
     void addStreamListener(AudioClientListener* listener);
@@ -247,6 +328,9 @@ private:
     // so the event is exactly-once; that discipline breaks if a future refactor makes
     // the client reconnectable-after-disconnect by clearing this flag.
     std::atomic<bool> closed_{false};
+    // Read by startWorkerThreads() to decide whether to spawn the send worker without a capture
+    // device; atomic because the setter and connect() may be on different threads.
+    std::atomic<bool> txInjectEnabled_{false};
     std::atomic<bool> captureMuted_{true};    // start muted (RX mode)
     std::atomic<bool> playbackMuted_{false};  // start unmuted (hear RX)
     std::atomic<std::int64_t> measuredLatencyMs_{0};

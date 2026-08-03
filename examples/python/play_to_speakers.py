@@ -129,7 +129,11 @@ _CB_VOID = C.CFUNCTYPE(None, C.c_void_p)                                 # (user
 
 
 class NaClientCallbacks(C.Structure):
+    # struct_size is FIRST and must be set by the caller (see "Binary compatibility" in
+    # naudio.h) — the library reads it to learn which fields this caller actually allocated,
+    # and rejects the call with NA_ERR_INVALID if it is left at 0.
     _fields_ = [
+        ("struct_size", C.c_size_t),
         ("on_connected", _CB_ID2),       # (client_id, server_addr, user)
         ("on_disconnected", _CB_ID),
         ("on_stream_started", _CB_ID),
@@ -155,7 +159,9 @@ def bind(lib):
     lib.na_context_create.argtypes = []
     lib.na_context_create.restype = C.c_void_p
     lib.na_context_destroy.argtypes = [C.c_void_p]
-    lib.na_enumerate.argtypes = [C.c_void_p, C.POINTER(NaDevice), C.c_int]
+    # The 4th argument is the caller's sizeof(na_device): na_enumerate strides the array by it,
+    # so an appended field can never make the library walk off the end of OUR array.
+    lib.na_enumerate.argtypes = [C.c_void_p, C.POINTER(NaDevice), C.c_int, C.c_size_t]
     lib.na_enumerate.restype = C.c_int
 
     lib.na_client_create.argtypes = [C.c_int, C.c_char_p, C.c_int, C.c_char_p]
@@ -188,7 +194,7 @@ def enumerate_devices(lib):
         sys.exit("na_context_create failed: " + lib.na_strerror(lib.na_last_error()).decode())
     try:
         arr = (NaDevice * 64)()
-        n = lib.na_enumerate(ctx, arr, 64)
+        n = lib.na_enumerate(ctx, arr, 64, C.sizeof(NaDevice))
         if n < 0:
             sys.exit("na_enumerate failed: " + lib.na_strerror(n).decode())
         return [arr[i] for i in range(n)]
@@ -295,6 +301,7 @@ def main():
         log("[client] disconnected")
 
     cbs = NaClientCallbacks()
+    cbs.struct_size = C.sizeof(NaClientCallbacks)  # REQUIRED — NA_ERR_INVALID without it
     cbs.on_connected = _CB_ID2(on_connected)
     cbs.on_stream_started = _CB_ID(on_stream_started)
     cbs.on_error = _CB_ID2(on_error)

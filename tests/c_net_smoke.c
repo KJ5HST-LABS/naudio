@@ -43,6 +43,29 @@ extern void  nasmoke_server_stop(void* handle);
 /* A known RX payload — injected by the server, expected byte-identically at the audio callback. */
 static const unsigned char KNOWN[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x42};
 
+/* The TX counterpart (section 4). A whole-payload compare is not usable in this direction: the
+ * server's mixer re-frames TX into bytesPerFrame() chunks and pads with silence when the ring runs
+ * dry, so what the callback sees is frame-aligned, not inject-aligned. Instead the payload is a
+ * repeating 4-byte signature, and the callback scans for two consecutive periods — a match that
+ * silence (all zero) cannot produce and that survives any framing. Sized well over one 20ms stereo
+ * frame (3840 bytes) so every read lands inside the pattern. */
+#define TXSIG_PERIOD 4
+static const unsigned char TXSIG_UNIT[TXSIG_PERIOD] = {0x11, 0x22, 0x33, 0x44};
+static unsigned char TXSIG[8192];
+static volatile int g_tx_ok = 0;  /* set when the signature reaches the server's TX callback */
+
+static void on_tx_audio(const unsigned char* pcm, size_t n_bytes, void* user) {
+    (void)user;
+    if (pcm == NULL || n_bytes < TXSIG_PERIOD * 2) return;
+    for (size_t i = 0; i + (TXSIG_PERIOD * 2) <= n_bytes; i++) {
+        if (memcmp(pcm + i, TXSIG_UNIT, TXSIG_PERIOD) == 0 &&
+            memcmp(pcm + i + TXSIG_PERIOD, TXSIG_UNIT, TXSIG_PERIOD) == 0) {
+            g_tx_ok = 1;
+            return;
+        }
+    }
+}
+
 /* Cross-thread flags: callbacks fire on the client's internal worker threads; main polls these.
  * `volatile` + the 20ms nanosleep barriers in the poll loop suffice for a smoke. The load-bearing
  * roster/connection gates additionally use the C++-mutex/atomic-guarded accessors below. */
@@ -77,6 +100,8 @@ static void sleep_ms(int ms) {
 }
 
 int main(void) {
+    for (size_t i = 0; i < sizeof TXSIG; i++) TXSIG[i] = TXSIG_UNIT[i % TXSIG_PERIOD];
+
     /* ---- (1) invalid-argument contract (no server / hardware) ---- */
 
     if (na_client_create(NA_CLIENT_BACKEND_NULL, NULL, 4533, "x") != NULL ||
@@ -96,6 +121,11 @@ int main(void) {
     }
     if (na_client_connect(NULL, NULL, 0) != NA_ERR_INVALID) {
         fprintf(stderr, "FAIL: na_client_connect(NULL) not NA_ERR_INVALID\n");
+        return 1;
+    }
+    if (na_client_set_tx_inject(NULL, 1) != NA_ERR_INVALID ||
+        na_client_inject_tx_audio(NULL, KNOWN, (int)sizeof KNOWN) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: NULL-client TX-inject setters not NA_ERR_INVALID\n");
         return 1;
     }
     /* NULL-safe no-ops must not crash. */
@@ -125,6 +155,7 @@ int main(void) {
 
     na_client_callbacks cbs;
     memset(&cbs, 0, sizeof cbs);
+    cbs.struct_size = sizeof cbs;
     cbs.on_connected = on_connected;
     cbs.on_clients_update = on_clients_update;
     na_client_set_callbacks(client, &cbs, NULL);
@@ -177,6 +208,26 @@ int main(void) {
         nasmoke_server_stop(server);
         return 1;
     }
+    /* TX inject is frozen on connect (it decides whether the send worker spawns, and connect
+     * spawns the workers once) — flipping it now must be rejected, not silently ignored. */
+    if (na_client_set_tx_inject(client, 1) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: na_client_set_tx_inject not frozen after connect\n");
+        na_client_destroy(client);
+        nasmoke_server_stop(server);
+        return 1;
+    }
+    /* This client never enabled TX inject, so it has no send worker. The TX ring is allocated for
+     * every connection regardless, so the write would otherwise succeed and be silently dropped —
+     * inject must report 0 rather than bytes that can never leave the process. Keyed up first, to
+     * prove it is the inject flag being tested here and not the PTT gate. */
+    na_client_set_ptt(client, 1);
+    if (na_client_inject_tx_audio(client, KNOWN, (int)sizeof KNOWN) != 0) {
+        fprintf(stderr, "FAIL: TX inject accepted bytes without na_client_set_tx_inject\n");
+        na_client_destroy(client);
+        nasmoke_server_stop(server);
+        return 1;
+    }
+    na_client_set_ptt(client, 0);
 
     /* ---- (3) clean disconnect ---- */
 
@@ -204,7 +255,106 @@ int main(void) {
         return 1;
     }
 
-    printf("c_net_smoke OK (port=%d, RX frame received via C callback, roster=1, clean disconnect)\n",
+    /* ---- (4) TX round-trip: client inject -> server mixer -> server tx-audio callback ----
+     *
+     * The mirror of section (2): there the server injected RX and the client's callback saw it;
+     * here the client injects TX and the SERVER's callback sees it. This proves the TX direction
+     * end-to-end hardware-free, which was impossible before na_client_inject_tx_audio — a NULL
+     * backend cannot capture (openCaptureStream throws), so a headless client had no TX source.
+     *
+     * This section uses a C-ABI server (na_server_*) rather than the C++ fixture above, because
+     * only the C-ABI NULL backend exposes mixed TX to C, via na_server_set_tx_audio_cb. */
+
+    na_audio_server* txsrv = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+    if (txsrv == NULL) {
+        fprintf(stderr, "FAIL: na_server_create (tx round-trip) (%s)\n",
+                na_strerror(na_last_error()));
+        return 1;
+    }
+    na_server_set_tx_audio_cb(txsrv, on_tx_audio, NULL);
+    char txerr[256];
+    if (na_server_start(txsrv, txerr, (int)sizeof txerr) != NA_OK) {
+        fprintf(stderr, "FAIL: na_server_start (tx round-trip) (%s)\n", txerr);
+        na_server_destroy(txsrv);
+        return 1;
+    }
+
+    na_stream_client* txc =
+        na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", na_server_port(txsrv), "c-tx-smoke");
+    if (txc == NULL) {
+        fprintf(stderr, "FAIL: na_client_create (tx) (%s)\n", na_strerror(na_last_error()));
+        na_server_stop(txsrv);
+        na_server_destroy(txsrv);
+        return 1;
+    }
+    na_client_set_playback_device(txc, 0);
+    na_client_set_auto_reconnect(txc, 0);
+    if (na_client_set_tx_inject(txc, 1) != NA_OK) {
+        fprintf(stderr, "FAIL: na_client_set_tx_inject rejected before connect\n");
+        na_client_destroy(txc);
+        na_server_stop(txsrv);
+        na_server_destroy(txsrv);
+        return 1;
+    }
+    if (na_client_connect(txc, txerr, (int)sizeof txerr) != NA_OK) {
+        fprintf(stderr, "FAIL: na_client_connect (tx) (%s)\n", txerr);
+        na_client_destroy(txc);
+        na_server_stop(txsrv);
+        na_server_destroy(txsrv);
+        return 1;
+    }
+
+    /* Bad arguments on a live client: NULL pcm / non-positive length. */
+    if (na_client_inject_tx_audio(txc, NULL, 16) != NA_ERR_INVALID ||
+        na_client_inject_tx_audio(txc, TXSIG, 0) != NA_ERR_INVALID ||
+        na_client_inject_tx_audio(txc, TXSIG, -1) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: na_client_inject_tx_audio bad args not NA_ERR_INVALID\n");
+        na_client_destroy(txc);
+        na_server_stop(txsrv);
+        na_server_destroy(txsrv);
+        return 1;
+    }
+
+    /* PTT gate: injected audio obeys the same keying rule as captured audio, so a client that has
+     * not asserted PTT must accept 0 bytes (documented as "not an error"). */
+    if (na_client_inject_tx_audio(txc, TXSIG, (int)sizeof TXSIG) != 0) {
+        fprintf(stderr, "FAIL: TX inject accepted bytes with PTT inactive\n");
+        na_client_destroy(txc);
+        na_server_stop(txsrv);
+        na_server_destroy(txsrv);
+        return 1;
+    }
+
+    na_client_set_ptt(txc, 1);  /* key up: capture unmuted => inject accepted */
+    int accepted = na_client_inject_tx_audio(txc, TXSIG, (int)sizeof TXSIG);
+    if (accepted <= 0) {
+        fprintf(stderr, "FAIL: TX inject accepted %d bytes with PTT active\n", accepted);
+        na_client_destroy(txc);
+        na_server_stop(txsrv);
+        na_server_destroy(txsrv);
+        return 1;
+    }
+
+    /* Keep feeding until the signature reaches the server's TX callback (≤3s). Continuous feed
+     * also holds the mixer's TX grant, which the idle timeout would otherwise release. */
+    waited = 0;
+    while (waited < 3000 && !g_tx_ok) {
+        na_client_inject_tx_audio(txc, TXSIG, (int)sizeof TXSIG);
+        sleep_ms(20);
+        waited += 20;
+    }
+
+    na_client_destroy(txc);
+    na_server_stop(txsrv);
+    na_server_destroy(txsrv);
+
+    if (!g_tx_ok) {
+        fprintf(stderr, "FAIL: injected TX audio never reached the server tx-audio callback\n");
+        return 1;
+    }
+
+    printf("c_net_smoke OK (port=%d, RX frame received via C callback, roster=1, clean disconnect, "
+           "TX inject round-trip)\n",
            port);
     return 0;
 }

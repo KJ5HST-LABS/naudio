@@ -128,6 +128,25 @@ int TcpServerTransport::crcErrors() const {
     return total;
 }
 
+// Both of these sum ClientConnection's base defaults on TCP — TcpClientConnection overrides
+// neither, because TCP has no control-ARQ layer (the stream is already reliable) and no ordered
+// queue (there is nothing to reorder, so receivePacket reads the framing FSM directly). They are
+// therefore a constant 0 here, and that 0 is accurate rather than unmeasured: the events cannot
+// occur, as opposed to occurring uncounted.
+std::int64_t TcpServerTransport::controlRetransmits() const {
+    std::lock_guard<std::mutex> lock(connectionsMutex_);
+    std::int64_t total = 0;
+    for (const auto& [id, conn] : connections_) total += conn->controlRetransmits();
+    return total;
+}
+
+std::int64_t TcpServerTransport::orderedQueueDrops() const {
+    std::lock_guard<std::mutex> lock(connectionsMutex_);
+    std::int64_t total = 0;
+    for (const auto& [id, conn] : connections_) total += conn->orderedQueueDrops();
+    return total;
+}
+
 void TcpServerTransport::close() {
     bound_.store(false);
 

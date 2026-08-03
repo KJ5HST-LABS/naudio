@@ -96,7 +96,10 @@ extern "C" {
 
     fn na_context_create() -> *mut NaContext;
     fn na_context_destroy(ctx: *mut NaContext);
-    fn na_enumerate(ctx: *mut NaContext, out: *mut NaDevice, max: c_int) -> c_int;
+    // `struct_size` is our own size_of::<NaDevice>(): na_enumerate strides the array by it, so an
+    // appended field cannot make the library walk off the end of our Vec.
+    fn na_enumerate(ctx: *mut NaContext, out: *mut NaDevice, max: c_int, struct_size: usize)
+        -> c_int;
 
     fn na_client_create(
         backend: c_int,
@@ -206,7 +209,8 @@ fn enumerate() -> Result<Vec<NaDevice>, String> {
         }
         // NaDevice is plain old data (ints + char arrays), so zeroed is a valid value.
         let mut devs: Vec<NaDevice> = (0..MAX_DEVICES).map(|_| std::mem::zeroed()).collect();
-        let n = na_enumerate(ctx, devs.as_mut_ptr(), MAX_DEVICES as c_int);
+        let n = na_enumerate(ctx, devs.as_mut_ptr(), MAX_DEVICES as c_int,
+                             std::mem::size_of::<NaDevice>());
         na_context_destroy(ctx);
         if n < 0 {
             return Err(format!("na_enumerate: {}", strerror(n)));

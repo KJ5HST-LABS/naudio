@@ -6,6 +6,206 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **`na_server_get_stats` + `na_server_stats` (`@since 0.2.0`) — the server-side counters, where the
+  two fields that carry no information on a client actually move.** `na_client_stats` documents
+  `control_retransmits` and `queue_drops` as always 0 on a client: both are written by paths only a
+  server-side connection reaches. Until now there was nowhere in the C ABI to read them from —
+  `na_server_get_stats` did not exist — so two fields shipped in the public ABI with no surface that
+  could observe them. The new call reports the five aggregates the transports already computed
+  (`packets_`/`bytes_` + `crc_errors`) plus those two and a `clients_connected` roster size, and the
+  size travels as an explicit `struct_size` **parameter**, matching `na_client_get_stats`, because
+  this is a struct the library writes. `NA_SERVER_STATS_SIZE_V1` is the floor.
+
+  **It is a gauge over the live roster, not a lifetime total** — the one contract difference from
+  `na_client_stats`, and the one most likely to be got wrong. Every field is summed across the
+  clients connected *at the moment of the call*, so a client that disconnects takes its counters out
+  of the sum and these fields **can decrease**. Measured rather than reasoned about: two clients
+  being fanned 60 frames each read `packets_sent` 127, and 64 after one disconnected. A consumer
+  computing a delta across a roster change reads negative throughput; the header says so, and both
+  the C++ and the pure-C suites assert the decrease.
+
+  `control_retransmits` is now **observed non-zero on a real server session** for the first time —
+  6 resends from 3 distinct unacked critical control messages, bounded above by the retransmit
+  attempt limit and below by the client's own count of duplicate control datagrams, a quantity the
+  server never computes. Previous coverage drove the counter at the class level via a synthetic
+  NACK, which proved the mechanism and not that a server reaches it.
+
+  `queue_drops`, by contrast, is **reachable in principle and unreached in practice**, and issue
+  #29's stated reason for expecting it to move — that a demux thread fills the queue while the
+  application thread drains it — turns out not to be sufficient. 20,000 packets pushed as fast as
+  the socket would accept them arrived complete and left the counter at 0, because the server's
+  receive path has no blocking step in it by design. The counter is correctly wired: a consumer
+  artificially stalled 1 ms per packet produced 57,115 drops from 60,001 received. So it is a safety
+  net that fires if a blocking step is ever introduced on the receive path, not a meter on normal
+  operation — and the 0 is committed as an executable assertion so the limitation cannot quietly
+  become folklore.
+
+- **`na_client_stats.sequence_gaps` (`@since 0.2.0`) — the post-reorder loss measure, and the first
+  field appended under the struct-size promise.** Until now no counter in this struct could report
+  loss on a profile a consumer can actually select: `packets_lost` and its two siblings are `-1` on
+  every built-in UDP profile, because the sequence-gap tracker runs only where no reorder buffer is
+  engaged and all of them engage one, while `queue_drops` cannot move on a client at all. The new
+  field is the exact **complement** of those three — it carries a reading precisely where they read
+  `-1`, and reads `-1` itself precisely where they carry one — so between them a reading always
+  exists. The measurement is `PacketReorderBuffer`'s existing gap count, which the conformance
+  vectors already pinned but which reached no consumer.
+  Two things it deliberately does **not** claim, both stated on the field:
+  - **Not final loss.** It is counted before the FEC decoder sees the stream (the pipeline is
+    reorder → FEC → queue), so a slot counted here may still be refilled by parity; the unrecovered
+    remainder is `sequence_gaps - packets_recovered_by_fec`. It also counts every packet type
+    sharing the sequence space — audio, parity and control alike.
+  - **Not local loss.** Issue #29 proposed this counter as `socket_buffer_drops`, expecting it to
+    surface a too-slow consumer's kernel-dropped datagrams. It cannot, and measurement is what
+    settled it: an overflowing socket buffer **tail-drops**, so a stalled consumer reads an unbroken
+    prefix of the stream and stops early, leaving no hole for any gap-based counter to find. Driven
+    to 8 s, a client stalled to roughly a quarter of the offered rate read 127 of 400 forwarded
+    packets with `sequence_gaps` at 0. Local loss remains unreported by this struct; the test suite
+    asserts that 0 deliberately so the limitation stays executable.
+
+  This is also the first exercise of the size mechanism added below: the field is written **only**
+  when the caller's declared `struct_size` reaches it, so a consumer compiled against the v1 header
+  can call a 0.2.0 library and keep its shorter struct intact. `NA_CLIENT_STATS_SIZE_V2` is that
+  threshold; `NA_CLIENT_STATS_SIZE_V1` remains the floor and is unchanged. The library version moves
+  **0.1.0 → 0.2.0** accordingly (header macros and `project(VERSION)` together, as the configure-time
+  gate requires), which changes the SONAME to `libnaudio.0.2.0` — a relink, no source change: no v1
+  field moved and no existing call site needs an edit.
+
+- **`na_version_number()` and `na_version_string()` — the run-time half of the binary-compatibility
+  promise, so a zero-filled struct tail can be read as fill rather than as a measurement.** The
+  struct-size work above made an older library's tail *defined*; it could not make it *informative*,
+  because the zero it writes is indistinguishable from a measured zero — and `na_client_stats`
+  encodes "the library is not measuring this" as `-1` on purpose, so the two conventions collide
+  exactly there. The accessors are compiled into the shared library, so they report the binary a
+  process actually **loaded**, while the new `NAUDIO_VERSION_MAJOR` / `_MINOR` / `_PATCH` macros
+  (and the derived `NAUDIO_VERSION_NUMBER` / `NAUDIO_VERSION_STRING`) report what the caller
+  **compiled** against. Comparing them separates fill from measurement, given that every field
+  appended after the first tag names the version it arrived in — a rule now stated in the growth
+  policy. Comparisons go through `NA_VERSION_ENCODE(major, minor, patch)`, whose ordering is total
+  for components within `NA_VERSION_MAX_COMPONENT`. Both accessors are infallible — no allocation,
+  no backend, callable on any thread before `na_context_create()` — and neither touches
+  `na_last_error()`, which the header documents as a property of fallible calls only. The header's
+  version macros are hand-written, because the public header is deliberately generated by nothing;
+  a configure-time check in `CMakeLists.txt` makes them unbuildable if they drift from
+  `project(VERSION)`, since a version that answers *wrongly* is worse than one that does not answer.
+
+### Changed
+- **BREAKING (C ABI): all four caller-allocated structs now carry their own size, so an
+  appended field stops being an out-of-bounds access against an already-compiled consumer.** None
+  of them recorded how large the caller believed them to be, so adding any field to a future
+  release would have made the library read or write past the end of a struct allocated by a
+  consumer compiled against the older header — silently, with no symbol rename and no link error.
+  The mechanism follows the struct's **direction**, because one size does not fit both:
+  - `na_client_callbacks` and `na_server_callbacks` are **read** by the library and gain an in-band
+    `size_t struct_size` as their first member, set by the caller (Win32's `cbSize` idiom). Callers
+    already `memset` these, so it is one line beside the existing one. `na_client_set_callbacks` /
+    `na_server_set_callbacks` return `NA_ERR_INVALID` below `NA_CLIENT_CALLBACKS_SIZE_V1` /
+    `NA_SERVER_CALLBACKS_SIZE_V1`, which includes the `0` an unset field carries.
+  - `na_client_stats` is **written** by the library, so its size travels as an explicit parameter:
+    `na_client_get_stats(client, out, sizeof *out)`, `NA_ERR_INVALID` below
+    `NA_CLIENT_STATS_SIZE_V1`. An in-band member would have required callers to initialize an
+    out-parameter, inverting this struct's long-standing "never needs pre-zeroing" contract.
+  - `na_device` is **written by the library as an ARRAY**, so its size likewise travels as a
+    parameter: `na_enumerate(ctx, out, max, sizeof out[0])`, `NA_ERR_INVALID` below
+    `NA_DEVICE_SIZE_V1`. This is the case where the old signature was not merely awkward but
+    unsound — `max` is an element *count*, and the library strode the array by its **own**
+    `sizeof(na_device)`. Appending a field would therefore have written every element after the
+    first past its slot in a consumer's array and mis-parsed all of them. The library now strides
+    by the caller's element size, and `na_device`'s layout itself is unchanged.
+  In every direction the library honours the caller's declared size as a hard bound: a shorter
+  caller keeps its un-allocated tail untouched, and a longer one has its extra bytes zero-filled
+  (stats, and each device element) or ignored (callbacks). Nothing has
+  been tagged and `SOVERSION` is still 0, so no released consumer exists to break.
+  Consumers that bind the ABI by hand rather than through the header — the Python, Java and Rust
+  example clients — need the new argument at their `na_enumerate` call sites; their `na_device`
+  layouts are byte-for-byte unchanged.
+  The resulting promise is now written down for packagers as **"Binary compatibility"** in
+  `README.md`, condensed at the top of `include/naudio.h`: what the declared size guarantees in each
+  version direction, and the append-only growth rule the `NA_*_SIZE_V1` floors encode. An older
+  library's zero-filled tail is defined but reads the same as a genuine zero; the version accessors
+  added below are what tell the two apart.
+
+### Fixed
+- **`na_client_stats` no longer claims two counters can move on a client when they cannot** — the
+  struct's contract listed `control_retransmits` as live on `NA_RELIABILITY_UDP_LAN` / `_FT8`, and
+  described `queue_drops` as reporting a consumer too slow to drain the queue. Neither is reachable
+  through `na_client_*` on any profile. Only a *critical* control type is tracked for retransmission
+  and the sole critical message a client sends is `DISCONNECT`, dispatched after the thread that
+  pumps the retransmit sweep has exited; and a client fills and drains its ordered queue from one
+  thread — the receive path empties the queue before reading the socket — so the queue cannot reach
+  its 2048-packet cap, and a slow consumer instead loses audio in the kernel's socket buffer, which
+  no counter reports. Both fields still exist, still read 0, and are now documented as carrying no
+  information on a client (they remain live on the server side of the same class). No ABI change:
+  the struct layout, field order and sizes are unchanged. `crc_errors`, by contrast, is genuinely
+  live on a client and is now covered by a test that corrupts datagrams in flight rather than
+  dropping them — a dropped datagram never arrives, so no amount of loss testing could move it.
+- **FEC no longer presents a mis-reconciled block as recovered audio** — the XOR parity header
+  carries a *count* of audio packets, which the decoder read as the contiguous sequence range
+  `[startSeq, startSeq + blockSize)`. That is the encoder's block only while the block's audio
+  packets are consecutive, and the connection's sequence counter is shared with control and
+  heartbeat traffic: one control message sent between two audio packets of a block displaced the
+  block's last packet out of the range. A single loss in such a block then emitted the lost frame
+  XORed with the displaced one — a whole frame of wrong samples delivered as recovered audio, and a
+  quiet one, since without loss the block still looked complete and XOR of two same-signal S16
+  payloads almost always stays inside the source's amplitude range. Such a block is now **declined**
+  (counted by `FecDecoder::fecBlocksUnreconciled`) and its lost packet stays lost, exactly as with
+  FEC disabled. Affects UDP profiles with FEC enabled; documented as limitation **R5** in
+  `docs/protocols.md`.
+
+### Added
+- **Client-side reliability counters on the C ABI** — `na_client_get_stats()` fills one
+  `na_client_stats` with the current connection's transport and reliability totals, including
+  `packets_recovered_by_fec`, `fec_blocks_unreconciled`, `packets_reordered`, `crc_errors` and the
+  jitter estimate. These were private to `AudioStreamClient`, reachable through neither an accessor
+  nor a listener, so a consumer could *enable* loss recovery but not observe it: showing that FEC
+  repaired anything meant inferring it from delivered-byte parity against a separate no-loss control
+  run, which cannot distinguish "FEC recovered 29 packets" from "nothing was dropped this time".
+  `AudioStreamClient::stats()` exposes the same snapshot to C++ consumers.
+  `packets_lost` / `packets_out_of_order` / `packet_loss_rate` report **-1 for "not measured"**
+  rather than 0: the sequence-gap tracker runs only when no reorder buffer is engaged and every UDP
+  profile configures one, so a 0 there would read as "nothing was lost".
+- **Client-side reliability profiles on the C ABI** — `na_client_set_reliability_profile()` applies a
+  `na_reliability_profile` (transport + framing + FEC / reorder / adaptive jitter / control-ARQ) in
+  one call, before connect. This is the only way to enable a client's loss-recovery layer:
+  `na_client_set_transport()` selects the transport and nothing else, so a client configured with it
+  alone ran UDP with the whole reliability layer off and discarded every FEC parity packet the server
+  sent. Selecting a UDP profile makes a separate `na_client_set_transport()` call unnecessary; both
+  setters write the transport and the last one wins.
+- **Client-side TX audio injection on the C ABI** — `na_client_inject_tx_audio()` feeds a client's
+  TX path directly, and `na_client_set_tx_inject()` enables it before connect. Together they make
+  the `na_client_*` surface symmetric with `na_server_inject_audio()` on the RX side, so a headless
+  client with no capture device (the `NA_CLIENT_BACKEND_NULL` backend, which cannot capture) can
+  originate TX audio. Injected audio obeys the same PTT gate as captured audio.
+- **Server-side audio format and UDP reliability profiles on the C ABI** —
+  `na_server_set_audio_format()` and `na_server_set_reliability_profile()` let a C consumer configure
+  what the server puts on the wire, which until now was reachable only from C++.
+  `na_server_set_transport()` could already select UDP, but the FEC / reorder / adaptive-jitter /
+  control-ARQ settings that make UDP worth selecting lived solely in the C++ `AudioStreamConfig`
+  presets, and the `na_server_*` surface had no format setter at all, so the advertised format was
+  pinned to its 48000 / 16 / 2 default. A C or Hamlib consumer could therefore stand up a UDP server
+  with naudio's entire resilience stack switched off, and could not serve mono. Both are pre-start
+  configuration like the rest of the `na_server_set_*` family, returning `NA_ERR_INVALID` on a NULL
+  server or after `na_server_start()`.
+  - `na_server_set_audio_format(server, sample_rate, bits_per_sample, channels)` sets the format the
+    server advertises and broadcasts. **The v1 wire carries signed 16-bit PCM**, so `bits_per_sample`
+    must be 16 and `channels` 1 or 2, with `sample_rate` > 0; any other combination is rejected with
+    `NA_ERR_INVALID` rather than silently converted. naudio does not resample or change channel
+    count, so the bytes fed to `na_server_inject_audio()` — and those delivered to
+    `na_server_tx_audio_cb` — must already match this layout.
+  - `na_server_set_reliability_profile(server, profile)` applies one `na_reliability_profile` —
+    transport, framing and the whole reliability bundle — in a single call. **Selecting a UDP
+    profile makes a separate `na_server_set_transport()` call unnecessary**, because the profile
+    carries the transport with it. It leaves the audio format and max-clients untouched, so it and
+    `na_server_set_audio_format()` **compose order-independently** — neither undoes the other
+    whichever is called first, and the same holds for `na_server_set_max_clients()`.
+    `na_server_set_transport()` is the one exception: it and the profile setter both write the
+    transport, and the last one called wins.
+  The `na_reliability_profile` enum arrives with these setters and is shared with the client setter
+  above: `NA_RELIABILITY_DEFAULT` (the plain defaults — TCP, with FEC, reorder, jitter and
+  control-ARQ all off), `NA_RELIABILITY_UDP_LAN`, `NA_RELIABILITY_UDP_WAN` (the resilient
+  remote-operating profile: XOR FEC + adaptive jitter + reorder + control-ARQ) and
+  `NA_RELIABILITY_UDP_FT8`. Both ends must select the same one — a server on
+  `NA_RELIABILITY_UDP_WAN` sends parity packets that a client left on any other profile receives and
+  discards, with no loss recovery and no error.
 - **Initial release of the naudio C/C++ audio-streaming toolkit.**
   - **net-audio wire protocol, spec v1** — the frozen `0xAF01` frame contract: versioned framing
     with per-frame CRC32, a 32-bit sequence + reorder buffer, adaptive (RFC-3550-style) jitter

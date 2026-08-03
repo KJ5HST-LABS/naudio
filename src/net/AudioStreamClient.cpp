@@ -312,14 +312,19 @@ void AudioStreamClient::startWorkerThreads() {
         threadFinished();
     }).detach();
 
-    // Capture + send (only if a capture device is configured — TX is optional).
+    // Capture (device -> TX ring). Only with a capture device; TX is optional.
     if (cap) {
         threadStarted();
         std::thread([this, tx, cap, mono, cfg]() {
             captureLoop(tx, cap, mono, cfg);
             threadFinished();
         }).detach();
+    }
 
+    // Send (TX ring -> server). Runs for a capture device OR for injectTxAudio, which is the only
+    // TX source available to a backend that cannot capture (the C ABI's NULL client backend throws
+    // on openCaptureStream). Without either, there is no TX producer and the worker would idle.
+    if (cap || txInjectEnabled_.load()) {
         threadStarted();
         std::thread([this, conn, tx, generation, cfg]() {
             sendLoop(conn, tx, generation, cfg);
@@ -476,6 +481,29 @@ void AudioStreamClient::sendLoop(std::shared_ptr<ClientConnection> connection,
             }
         }
     }
+}
+
+// The third TX producer path, alongside captureLoop: feed the same ring from the caller's thread
+// instead of from a capture device. Mirrors AudioStreamServer::injectAudio (grab the per-generation
+// shared_ptr under runMutex_, then work outside the lock) so a concurrent reconnect swapping the
+// ring cannot leave us writing into freed memory.
+std::size_t AudioStreamClient::injectTxAudio(const std::uint8_t* pcm, std::size_t nBytes) {
+    if (pcm == nullptr || nBytes == 0) return 0;
+    if (!connected_.load() || closed_.load()) return 0;
+    // The TX ring is allocated for every connection, capture device or not, so writing without the
+    // send worker would succeed and then be silently discarded. Refuse instead: the return value is
+    // the caller's only signal, and it must not report bytes that can never leave the process.
+    if (!txInjectEnabled_.load()) return 0;
+    // Same gate as captureLoop, so setPTT() governs both TX sources identically.
+    if (captureMuted_.load()) return 0;
+
+    std::shared_ptr<AudioRingBuffer> tx;
+    {
+        std::lock_guard<std::mutex> lock(runMutex_);
+        tx = txBuffer_;
+    }
+    if (!tx) return 0;  // not connected yet, or resources already closed
+    return tx->write(pcm, 0, nBytes);
 }
 
 void AudioStreamClient::heartbeatLoop(std::shared_ptr<ClientConnection> connection,
@@ -817,6 +845,46 @@ void AudioStreamClient::measureLatency() {
     if (!connected_.load()) return;
     auto conn = currentConnection();
     if (conn) conn->sendControl(ControlMessage::latencyProbe(nowNanos()));
+}
+
+// ---------------------------------------------------------------------------
+// Reliability / transport counters
+// ---------------------------------------------------------------------------
+
+ClientStats AudioStreamClient::stats() const {
+    ClientStats s;
+    // A shared_ptr copy, so the connection cannot be torn down under us mid-read
+    // even if a reconnect swaps connection_ while we are collecting.
+    const std::shared_ptr<ClientConnection> conn = currentConnection();
+    if (!conn) return s;  // no live connection: defaults, connected == false
+
+    s.connected = true;
+    s.packetsSent = conn->packetsSent();
+    s.packetsReceived = conn->packetsReceived();
+    s.bytesSent = conn->bytesSent();
+    s.bytesReceived = conn->bytesReceived();
+    s.crcErrors = conn->crcErrors();
+    s.packetsReordered = conn->packetsReordered();
+    s.packetsRecoveredByFec = conn->packetsRecoveredByFec();
+    s.fecBlocksUnreconciled = conn->fecBlocksUnreconciled();
+    s.controlRetransmits = conn->controlRetransmits();
+    s.queueDrops = conn->orderedQueueDrops();
+    s.jitterMs = conn->jitterMs();
+    s.bufferTargetMs = conn->adaptiveBufferTargetMs();
+
+    // Left at -1 (unmeasured) unless the connection actually runs the gap tracker.
+    // Reporting the untouched 0 here would read as "no loss", which is the one thing
+    // these counters must never be allowed to say (ClientStats).
+    if (conn->measuresSequenceGaps()) {
+        s.packetsLost = conn->packetsLost();
+        s.packetsOutOfOrder = conn->packetsOutOfOrder();
+        s.packetLossRate = conn->packetLossRate();
+    }
+    // Unconditional: the connection itself returns -1 when it is not measuring, so
+    // there is no predicate to gate on here. It is the complement of the block above
+    // — live exactly when those three are -1 — and the two are never both readings.
+    s.sequenceGaps = conn->sequenceGaps();
+    return s;
 }
 
 // ---------------------------------------------------------------------------

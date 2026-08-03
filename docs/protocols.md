@@ -54,15 +54,16 @@ flowchart TB
 | **naudio code** | `naudio_core` (codec) + `naudio_net` (server/client) + `na_client_*` C ABI |
 | **Verified by** | conformance golden vectors + live interop (`first_frame_hex`) |
 
-## Reliability stack — accepted limitations (R1, R3, R4)
+## Reliability stack — accepted limitations (R1, R3, R4, R5)
 
 The `0xAF01` reliability primitives (jitter / FEC / reorder / ARQ) carry a few edge-boundary
-behaviors. **R3** and **R4** follow from the **protocol's own definitions** — they are properties of
-the frozen `0xAF01` wire contract, not implementation bugs — so they are **documented rather than
-"fixed"**: changing either behavior would diverge from the frozen wire. **R1** is a *defensive bound*
-naudio adds over a latent unbounded loop in the literal protocol definition; it changes no observable
-behavior within the realistic sequence regime (or any conformance vector), only the pathological
-out-of-range case. They are recorded here so consumers understand the edge boundaries.
+behaviors. **R3**, **R4** and **R5** follow from the **protocol's own definitions** — they are
+properties of the frozen `0xAF01` wire contract, not implementation bugs — so they are **documented
+rather than "fixed"**: changing any of them would diverge from the frozen wire. **R1** is a
+*defensive bound* naudio adds over a latent unbounded loop in the literal protocol definition; it
+changes no observable behavior within the realistic sequence regime (or any conformance vector), only
+the pathological out-of-range case. They are recorded here so consumers understand the edge
+boundaries.
 
 ### R3 — Sequence numbers do not wrap (`PacketReorderBuffer`)
 
@@ -94,6 +95,33 @@ packet that was lost.
   variable-length payload type.
 - **Mitigation if ever needed:** carry an explicit per-packet length, or restrict FEC to fixed-size
   frames (the current audio usage already satisfies this).
+
+### R5 — FEC recovery is declined when a block's audio is not contiguous (`FecDecoder`)
+
+The parity header carries a **start sequence** and a **count** of audio packets, with no per-slot
+sequence list. A decoder can therefore only read the block as the range
+`[startSeq, startSeq + blockSize)` — which is the encoder's block exactly while the block's audio
+packets hold **consecutive** sequence numbers. They need not: the connection's sequence counter is
+shared with `CONTROL` and `HEARTBEAT` traffic, so a control message sent between two audio packets of
+the same block takes a sequence number inside that range and displaces the block's last audio packet
+past the end of it.
+
+When that happens the range is **not** the block, and naudio **declines recovery** for it (counted by
+`FecDecoder::fecBlocksUnreconciled`) — the lost packet stays lost, exactly as if FEC were disabled.
+
+- **Why it's accepted:** the frozen parity header has no way to express the block's true membership,
+  so a decoder cannot reconstruct it. The alternative is worse than a missed recovery: XOR-ing across
+  a range that is neither the parity's member set nor a subset of it emits the lost frame XORed with
+  the displaced one — **a whole frame of wrong samples presented as recovered audio**. That corruption
+  is doubly quiet: with no loss the interloping packet fills the slot so the block looks complete, and
+  the XOR of two same-signal S16 payloads preserves `bit15 == bit14`, so the result almost always lands
+  back inside the source's amplitude range. (This was issue #23, where the visible symptom was a single
+  out-of-range sample per run.)
+- **Cost:** one block's recovery opportunity per control message that lands mid-block. Control traffic
+  is rare during streaming (roster updates on connect/disconnect, latency responses, TX arbitration),
+  and heartbeats are only sent when the send path is otherwise idle.
+- **Mitigation if ever needed:** a v2 parity header carrying the block's member sequences, or a
+  separate sequence space for audio — both **wire changes**, so neither is a v1 fix.
 
 ### R1 — `forceFlush` silence-gap fill is bounded (defensive)
 

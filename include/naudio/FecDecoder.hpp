@@ -25,6 +25,14 @@ namespace naudio {
 // is impossible and a NULL (silence) is emitted for each gap. Blocks that don't
 // receive a parity within the timeout are flushed as-is.
 //
+// A fourth outcome guards the three above: the parity's sequence range is only
+// the encoder's block while the block's audio packets are contiguous, and the
+// connection's sequence counter is shared with control/heartbeat traffic. A
+// non-audio packet inside the range therefore proves the range is not the block,
+// and recovery is DECLINED (counted by fecBlocksUnreconciled) rather than run
+// over the wrong member set — which would emit a whole frame of wrong samples as
+// if it were recovered audio. See handleParity() and issue #23.
+//
 // Recovery is byte-exact ONLY for uniform-length blocks (all packets in a block
 // the same size), which holds for the fixed-size PCM audio frames this decoder
 // is built for. The frozen 5-byte parity header carries no per-slot length, so a
@@ -75,6 +83,13 @@ public:
     std::int64_t fecBlocksComplete() const;
     std::int64_t fecBlocksFailed() const;
 
+    // Blocks whose sequence range could not be reconciled with the parity's audio
+    // count, and so were declined rather than recovered — see handleParity(). A
+    // non-zero value means control/heartbeat traffic is interleaving with audio
+    // inside FEC blocks, which costs those blocks their recovery; it is a loss of
+    // opportunity, never a loss of correctness.
+    std::int64_t fecBlocksUnreconciled() const;
+
     void reset();
 
 private:
@@ -102,6 +117,10 @@ private:
 
     void emit(const AudioPacket* p);
 
+    // Whether a packet type carries audio, i.e. whether the encoder would have
+    // recorded it into a FEC block. Only these participate in a block.
+    static bool isAudio(PacketType type);
+
     // The key of an existing block whose sequence range covers `sequence`.
     std::optional<std::int32_t> matchingBlockKey(std::int32_t sequence) const;
 
@@ -126,6 +145,7 @@ private:
     std::int64_t packetsRecoveredByFec_ = 0;
     std::int64_t fecBlocksComplete_ = 0;
     std::int64_t fecBlocksFailed_ = 0;
+    std::int64_t fecBlocksUnreconciled_ = 0;
 };
 
 }  // namespace naudio

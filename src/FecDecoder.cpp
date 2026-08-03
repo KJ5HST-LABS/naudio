@@ -66,12 +66,19 @@ std::int64_t FecDecoder::fecBlocksComplete() const { return fecBlocksComplete_; 
 
 std::int64_t FecDecoder::fecBlocksFailed() const { return fecBlocksFailed_; }
 
+std::int64_t FecDecoder::fecBlocksUnreconciled() const { return fecBlocksUnreconciled_; }
+
+bool FecDecoder::isAudio(PacketType type) {
+    return type == PacketType::AudioRx || type == PacketType::AudioTx;
+}
+
 void FecDecoder::reset() {
     activeBlocks_.clear();
     nextEmitSeq_ = -1;
     packetsRecoveredByFec_ = 0;
     fecBlocksComplete_ = 0;
     fecBlocksFailed_ = 0;
+    fecBlocksUnreconciled_ = 0;
 }
 
 void FecDecoder::emit(const AudioPacket* p) {
@@ -147,15 +154,51 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
         }
     }
 
-    // Count missing packets in the block's range.
+    // Count missing packets in the block's range, and check that the range really
+    // IS the encoder's block.
+    //
+    // The parity header carries a start sequence and a COUNT of audio packets;
+    // reading that count as the contiguous range [startSeq, startSeq + blockSize)
+    // is only valid while the block's audio packets hold consecutive sequence
+    // numbers. They need not. FecEncoder::recordAndMaybeEmit is driven exclusively
+    // from the audio send paths, but the connection's sequence counter is shared
+    // with control and heartbeat traffic — so a single control message sent
+    // between two audio packets of the same block takes a sequence number INSIDE
+    // this range and displaces the block's last audio packet just past the end of
+    // it. The range then holds blockSize-1 of the block's packets plus a stranger.
+    //
+    // Left unchecked that is silent audio corruption, not a failed recovery: one
+    // slot reads as missing, the XOR runs over a set that is neither the parity's
+    // nor a subset of it, and the emitted "recovered" packet is the XOR of the
+    // truly-lost frame with the displaced one — a full frame of wrong samples,
+    // delivered as if it were good audio. It stays invisible without loss (the
+    // stranger fills the slot, so nothing looks missing) and it survives the
+    // obvious content check, because XOR of two same-signal S16 payloads preserves
+    // bit15 == bit14 and so almost always lands back inside the source's range.
+    //
+    // A true block is audio-only, so a non-audio packet in range proves the range
+    // is not the block. There is no wire-safe way to recover the real membership —
+    // the FROZEN parity header carries no per-slot sequence list — so decline:
+    // count it and leave the lost packet lost, exactly as with FEC disabled. That
+    // costs one block's recovery per interleaved control message and never emits a
+    // frame the sender did not send. See issue #23.
     std::int32_t missingCount = 0;
     std::int32_t missingSeq = -1;
+    bool rangeIsAudioOnly = true;
     for (std::int64_t s = startSeq; s < blockEnd; ++s) {
         const std::int32_t seq = static_cast<std::int32_t>(s);
-        if (block.packets.find(seq) == block.packets.end()) {
+        auto pit = block.packets.find(seq);
+        if (pit == block.packets.end()) {
             ++missingCount;
             missingSeq = seq;
+        } else if (!isAudio(pit->second.packetType())) {
+            rangeIsAudioOnly = false;
         }
+    }
+
+    if (!rangeIsAudioOnly) {
+        ++fecBlocksUnreconciled_;
+        return;  // `block` is a local — dropping it discards the range
     }
 
     if (missingCount == 0) {

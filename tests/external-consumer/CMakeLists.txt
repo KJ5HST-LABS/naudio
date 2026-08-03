@@ -5,7 +5,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(naudio_external_consumer LANGUAGES C CXX)
 
+# _REQUIRED ON on both: without it CMake silently DECAYS to whatever the toolchain supports, which
+# is the same "the level is whatever you happened to get" defect as issue #42, one layer out. The
+# consumer only needs C99 (naudio.h is C99-clean), but this gate should fail loudly rather than
+# quietly compile at a level nobody chose.
 set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 

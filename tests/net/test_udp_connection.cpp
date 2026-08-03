@@ -123,6 +123,48 @@ TEST(UdpConnection, ServerFedReorderEmitsInSequenceOrder) {
     EXPECT_EQ(got[2].sequence(), 2);
     EXPECT_EQ(got[3].sequence(), 3);
     EXPECT_GE(conn.packetsReordered(), 1);  // seq 2 was buffered then reordered out
+    // Reordering is not loss: every slot was eventually delivered, so no gap was emitted.
+    EXPECT_EQ(conn.sequenceGaps(), 0);
+}
+
+// sequenceGaps() is MEASURED only when a reorder buffer exists, and reports -1 otherwise --
+// the same "unavailable is not zero" convention packetsLost() uses, pointed the other way.
+//
+// This pair lives here rather than in the C-ABI arms because the -1 branch is UNREACHABLE from
+// the public C surface: na_client_set_reliability_profile offers lan/wan/ft8 and every one of
+// them sets reorderWindowSize = 8, so no C consumer can build a connection that takes it. A
+// mutation turning that -1 into 0 therefore passes the entire C-ABI suite -- the TCP arm there
+// asserts -1, but TCP is a different transport whose value comes from Transport's base default,
+// so it never exercises this branch at all. Without these two tests the branch is untested.
+TEST(UdpConnection, SequenceGapsUnmeasuredWithoutAReorderBuffer) {
+    Socket shared = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    UdpClientConnection conn(&shared, "127.0.0.1", 9999,
+                             ClientAddress("udp-1", "127.0.0.1", 9999), passthroughCfg());
+    // Not 0: nothing is counting here, and a 0 would read as "nothing was lost".
+    EXPECT_EQ(conn.sequenceGaps(), -1);
+    // The complement holds in this direction too -- passthrough is where the gap TRACKER runs.
+    EXPECT_TRUE(conn.measuresSequenceGaps());
+}
+
+TEST(UdpConnection, SequenceGapsCountsSlotsTheReorderBufferGaveUpOn) {
+    UdpReliabilityConfig cfg;
+    cfg.reorderWindowSize = 4;
+    cfg.reorderMaxHoldMs = 0;  // flush on the next check rather than waiting on a real clock
+    Socket shared = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    UdpClientConnection conn(&shared, "127.0.0.1", 9999,
+                             ClientAddress("udp-1", "127.0.0.1", 9999), cfg);
+
+    EXPECT_EQ(conn.sequenceGaps(), 0);        // measured, and nothing lost yet
+    EXPECT_FALSE(conn.measuresSequenceGaps());  // ...so the OTHER counters are the dead ones
+
+    conn.enqueueReceived(rxPacket(0, payloadFor(0)), 23);
+    // 1 and 2 never arrive. 3 sits ahead of nextExpected and cannot drain; a zero hold means the
+    // next timeout check force-flushes, emitting one gap per missing slot.
+    conn.enqueueReceived(rxPacket(3, payloadFor(3)), 23);
+    conn.receivePacket(20);
+    conn.receivePacket(20);
+
+    EXPECT_EQ(conn.sequenceGaps(), 2) << "one gap per slot the buffer gave up on (1 and 2)";
 }
 
 // THE GATE (deterministic): one data packet of a parity block is withheld; the
