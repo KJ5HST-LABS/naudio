@@ -70,6 +70,13 @@ bool clientHandshake(ClientConnection& c, const std::string& name) {
 }
 
 // Waits until clientCount() reaches `n` (bounded).
+//
+// NOT a barrier for injectAudio, and it is weaker than it looks: sessions_ is populated at accept
+// (AudioStreamServer.cpp:659), BEFORE the session's run thread is even started at :662. So this is
+// already satisfied while the server is still waiting to read CONNECT_REQUEST, and it adds no
+// ordering whatsoever over the clientHandshake() that callers put on the line above it. The session
+// does not become a broadcast target until :224, fourteen lines after the CONNECT_ACCEPT the
+// handshake waits for. Use waitForClientsUpdate below to order an inject. (Issue #46.)
 bool waitForClientCount(const AudioStreamServer& server, int n, int budgetMs) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -79,9 +86,16 @@ bool waitForClientCount(const AudioStreamServer& server, int n, int budgetMs) {
     return server.clientCount() == n;
 }
 
-// Drains frames until a CLIENTS_UPDATE with clientCount == expectedCount arrives. Reaching
-// this state means every session has registered as a broadcast target (the roster broadcast
-// fires after addTarget + streaming), so a subsequent injectAudio fans out to all of them.
+// Drains frames until a CLIENTS_UPDATE with clientCount == expectedCount arrives. This is the
+// barrier a subsequent injectAudio needs — but it is PER-CONNECTION, not per-roster.
+//
+// What makes it sound is the receiving end, not the sending end: ClientSession::sendControlMessage
+// (AudioStreamServer.cpp:88-90) drops the roster message unless the RECEIVING session's own
+// streaming_ is set, and streaming_ is set at :240, after that same session's addTarget at :224.
+// So arrival on `c` proves `c` is a registered broadcast target. It proves nothing about the other
+// expectedCount-1 sessions the message is merely counting — those are in sessions_ from accept
+// time and may still be short of :224. Every client that must receive an injected frame therefore
+// needs its own wait; waiting on one and injecting for two is issue #46's defect.
 bool waitForClientsUpdate(ClientConnection& c, int expectedCount, int budgetMs) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -174,7 +188,9 @@ TEST(Server, SingleClientHandshakeAndInjectedRx) {
     auto cc = client.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
     ASSERT_TRUE(cc) << err;
     ASSERT_TRUE(clientHandshake(*cc, "tester"));
-    ASSERT_TRUE(waitForClientCount(server, 1, 2000));
+    // The roster count is not this arm's precondition — see waitForClientCount above. One frame is
+    // injected, once, and a frame injected before addTarget fans out to nothing and is not retried.
+    ASSERT_TRUE(waitForClientsUpdate(*cc, 1, 3000));
 
     std::vector<std::uint8_t> payload = {0x10, 0x20, 0x30, 0x40};
     server.injectAudio(payload);
@@ -474,6 +490,11 @@ TEST(Server, GateServerStatsIsARosterGaugeNotALifetimeTotal) {
     ASSERT_TRUE(b);
     ASSERT_TRUE(clientHandshake(*a, "A"));
     ASSERT_TRUE(clientHandshake(*b, "B"));
+    // BOTH waits are load-bearing: each proves only its own connection reached addTarget, and this
+    // arm's bound counts the fan-out to both. Waiting on b alone left A free to still be short of
+    // AudioStreamServer.cpp:224 when the 60 frames went out — measured here at 2 runs in 20 with a
+    // 300 ms delay injected before addTarget, and deterministic when only A's session is delayed.
+    ASSERT_TRUE(waitForClientsUpdate(*a, 2, 3000));
     ASSERT_TRUE(waitForClientsUpdate(*b, 2, 3000));
     ASSERT_TRUE(waitForClientCount(server, 2, 2000));
 
@@ -561,7 +582,11 @@ TEST(Server, ServerStatsControlAndQueueCountersAreZeroOnTcp) {
     auto cc = client.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
     ASSERT_TRUE(cc) << err;
     ASSERT_TRUE(clientHandshake(*cc, "tester"));
-    ASSERT_TRUE(waitForClientCount(server, 1, 2000));
+    // Same barrier as the arms above. This arm's assertions would survive losing every injected
+    // frame — packetsSent is non-zero from handshake traffic alone — so the roster count did not
+    // make it FAIL, it made the EXPECT_GT below vacuous in exactly the way its comment denies, and
+    // cost 5 s of timeouts doing it (measured under an injected addTarget delay).
+    ASSERT_TRUE(waitForClientsUpdate(*cc, 1, 3000));
 
     std::vector<std::uint8_t> payload = {0x10, 0x20, 0x30, 0x40};
     for (int i = 0; i < 20; i++) server.injectAudio(payload);
