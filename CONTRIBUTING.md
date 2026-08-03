@@ -22,7 +22,13 @@ macOS, and Windows — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
   POSIX declarations `tools/na_hamlib_bridge.c` depends on; it compiles on macOS and fails on
   Linux, so please do not "restore the symmetry" with `CMAKE_C_EXTENSIONS OFF`. Note this is the
   level the *tests* compile at: `include/naudio.h` itself is C99-clean, so a consumer of the C ABI
-  is not obliged to build at C11.
+  is not obliged to build at C11. **That is enforced, not merely asserted** — the
+  `naudio_c99_header_gate` ctest arm compiles a TU including the header at
+  `-std=c99 -pedantic-errors` on every run (`tests/c99-header-gate/`). So a `_Static_assert`,
+  `_Alignas` or anonymous union added to the **public header** will fail the suite even though the
+  rest of the build accepts it; that is deliberate, and the fix is to use a C99 construct — or, if
+  the floor genuinely has to rise, to change this sentence and the one in `CMakeLists.txt` with it
+  and say why.
 - **Keep `naudio_core` pure.** No fork/exec, no PortAudio, no sockets, no threads in the core library.
   Process/device/socket/thread code goes in `naudio_pa` / `naudio_net` / `tools/` — see the target
   layout table in the [README](README.md).

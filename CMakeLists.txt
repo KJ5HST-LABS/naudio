@@ -23,7 +23,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 #
 # This level is what the TESTS need, not what the header demands of a consumer: include/naudio.h is
 # C99-clean (measured with -pedantic-errors; its floor is `long long`, naudio.h:569-570). A consumer
-# is free to compile at C99.
+# is free to compile at C99. That sentence is no longer a measurement someone took once -- the
+# `naudio_c99_header_gate` ctest arm re-checks it on every run (tests/c99-header-gate/, issue #45),
+# because every other gate compiling C against this header does so at C11 or higher and so none of
+# them can see the floor rise.
 #
 # CMAKE_C_EXTENSIONS is deliberately NOT set OFF, and the asymmetry with CMAKE_CXX_EXTENSIONS above
 # is intentional -- please do not "fix" it. Strict -std=c11 defines __STRICT_ANSI__, which on glibc
@@ -500,6 +503,41 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
                  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/readme-snippets/check.sh"
                               "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
                               "${CMAKE_CURRENT_SOURCE_DIR}/docs/hamlib-streaming-bridge.md")
+    endif()
+
+    # C99 consumer gate: compile a translation unit that includes include/naudio.h at
+    # -std=c99 -pedantic-errors. The comment at the top of this file and CONTRIBUTING.md both
+    # promise a consumer that the header is C99-clean and that only the TESTS need C11 — and until
+    # now nothing re-checked it, because every gate that compiles C against this header does so at
+    # C11 or higher (tests/external-consumer/CMakeLists.txt, tests/ffi-clients/run.sh,
+    # tests/readme-snippets/check.sh, and this build). A future _Static_assert or _Alignas in the
+    # header would compile clean in all four, silently raise the floor for every C99 consumer, and
+    # leave both of those sentences false in the shipped tree. Issue #45.
+    #
+    # This is #42's shape one layer out, with the difference that #42 was at least LOUD on MSVC:
+    # the C99 consumer who would notice this one is not in the repo, so the gate has to stand in
+    # for them. check.cmake carries its own positive control for the same reason — see its header.
+    #
+    # Compiler-gated rather than platform-gated, and the distinction is the point: -pedantic-errors
+    # has no MSVC equivalent (MSVC has no C99 mode at all), so the skip is about the FRONT END, not
+    # about Windows. A MinGW or MSYS toolchain runs this gate perfectly well. clang-cl is excluded
+    # too — it reports CMAKE_C_COMPILER_ID as Clang while driving an MSVC-style command line that
+    # spells these flags differently. The header's constructs are platform-neutral, so the
+    # Linux + macOS matrix covers them; the skip costs no coverage. It is announced rather than
+    # silent because a gate that fails to register reports the same green as one that passed.
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
+       AND NOT CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        add_test(NAME naudio_c99_header_gate
+                 COMMAND "${CMAKE_COMMAND}"
+                         "-DNA_CC=${CMAKE_C_COMPILER}"
+                         "-DNA_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/include"
+                         "-DNA_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/c99-header-gate"
+                         "-DNA_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/c99-header-gate"
+                         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/c99-header-gate/check.cmake")
+        file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/c99-header-gate")
+    else()
+        message(STATUS "naudio: C99 header gate SKIPPED — ${CMAKE_C_COMPILER_ID} has no "
+                       "-pedantic-errors equivalent (issue #45; Linux/macOS cover the header)")
     endif()
 endif()
 
