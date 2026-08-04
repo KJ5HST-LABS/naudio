@@ -360,6 +360,25 @@ TEST(Server, GateTxArbitrationGrantAndDeniedOnce) {
 
 // THE GATE (idle release): a client that claims TX and goes idle is released by the
 // independent idle thread (TX_RELEASED). Bounded wait.
+//
+// ON THE PRE-DRAIN WINDOW (#49). The one-shot sendTxAudio below is not ordered against the
+// session's drain: clientHandshake returns when the server sends CONNECT_ACCEPT
+// (AudioStreamServer.cpp:210) and the receiveLoop thread is not started until :234, while
+// waitForClientCount adds no ordering at all (see its comment at the top of this file). The
+// window is real and it is TRANSPORT-INDEPENDENT — TCP is not what makes this arm safe, which is
+// worth writing down because it is the natural assumption. On UDP a pre-drain datagram is not
+// discarded either: the demux thread parks it in the same per-connection ordered queue
+// (UdpServerTransport.cpp:102), which is precisely how the UDP handshake works at all — the
+// CONNECT_REQUEST that CREATES the connection is enqueued before any ClientSession exists.
+//
+// What actually makes it safe is runLoop's ordering: mixer->registerClient (:225) and the writer
+// thread (:229) both precede the receiveLoop spawn (:234), so any AUDIO_TX the drain can possibly
+// see is already past registration and the grant's reply path is already live. What TCP adds is
+// only that the holding buffer is lossless — a flow-controlled kernel socket buffer — where
+// UDP's is a 2048-packet oldest-drop queue behind a socket given 8 datagrams of headroom, and an
+// AUDIO_TX carries no control ARQ, so a lost one-shot send is never retried. At this arm's depth
+// of a single 64-byte frame that difference cannot bite; at flood depth it does, which is why
+// ServerQueueDropsStayZeroWhileTheDrainKeepsUp waits on TX_GRANTED instead.
 TEST(Server, GateTxIdleReleaseEndToEnd) {
     AudioStreamConfig config{};
     config.txIdleTimeoutMs = 100;
@@ -688,15 +707,41 @@ TEST(Server, GateServerControlRetransmitsObservedNonZero) {
 //
 // The issue argues the counter moves on a server because "a demux thread fills the queue while
 // the application thread drains it", i.e. that the producer/consumer split is sufficient. It is
-// not. Measured here: 20k TX packets pushed as fast as the socket accepts them arrive complete
-// and leave queue_drops at 0, because the session's receive path is non-blocking END TO END by
-// design (the writer-bridge decision, §3.2) — handleTxAudio only writes into the mixer's ring
-// buffer, so the drain keeps pace with the demux thread and the 2048-packet queue never backs up.
+// not. Measured here: 20k TX packets pushed as fast as the socket accepts them leave queue_drops
+// at 0, because the session's receive path is non-blocking END TO END by design (the
+// writer-bridge decision, §3.2) — handleTxAudio only writes into the mixer's ring buffer, so the
+// drain keeps pace with the demux thread and the 2048-packet queue never backs up.
+//
+// WHY THE HEADLINE IS NOT GATED ON `packetsReceived >= sent` (issue #49). That field cannot
+// express "the drain kept up": the DEMUX thread increments it as the FIRST statement of
+// enqueueReceived (UdpClientConnection.cpp:175), ahead of every branch that could then discard
+// the packet and ahead of the queue on either path — note udpLan() gives the SERVER connection a
+// reorder buffer (reorderBufferSize = 8, copied to cfg.reorderWindowSize at
+// AudioStreamServer.cpp:435), so the offer that feeds the queue here is the reorder emit callback
+// at UdpClientConnection.cpp:81, not the passthrough one at :205; the client's own
+// reorderWindowSize = 0 below governs only the client. And offer evicts rather than blocks, so
+// the drain applies no back-pressure and every drop is a packet that already counted. Measured by
+// stalling receiveLoop 1 ms per packet: packets_received 20001, UNCHANGED from a healthy run,
+// alongside 17859 queue drops. A dead drain therefore SATISFIES that guard rather than falsifying
+// it. (The one way the drain could ever move the number is indirectly, by letting a connection be
+// reaped — ServerStats sums the LIVE roster, so a departure subtracts; that needs a 10 s
+// CONNECTION_TIMEOUT_MS and cannot happen inside this arm's ~1 s.) What the guard's skip branch
+// really keyed on was arrival loss upstream of the queue — and that is what silently disabled
+// this arm on Linux for its whole life: ubuntu-latest delivers ~14.5k of 20000 because the
+// loopback receive buffer is capped at net.core.rmem_max = 212992, and the shortfall equalled the
+// kernel's own UDP RcvbufErrors delta exactly, three runs of three. macOS loses none, which is
+// the only reason the assertion ever ran at all.
+//
+// So the premise is stated over the queue's own input instead, and ASSERTED rather than skipped:
+// a 0 has teeth only if more than kDefaultMaxSize packets were enqueued, since below that the
+// queue could not have overflowed even with a dead drain. Measured margin 7.1x on Linux (the
+// loss-heaviest platform) and 9.8x on macOS. A skip is invisible in a green summary; this arm's
+// whole value is being an executable negative, so it now runs on every platform or fails loudly.
 //
 // That the counter WORKS was established separately and in two places: its arithmetic at the
 // class level (test_udp_connection.cpp, OrderedQueueBoundedUnderFlood — 200 dropped past a
-// 2048 cap), and its wiring through ServerStats by stalling the consumer 1 ms per packet in a
-// throwaway mutation, which produced 57115 drops from 60001 received. So a 0 here is a real
+// 2048 cap), and its wiring through ServerStats by the 1 ms consumer stall above (which is also
+// this arm's positive control: with it applied, the assertion below fails). So a 0 here is a real
 // measurement of a real server, not a broken counter.
 //
 // Committed as a NEGATIVE on purpose, the same way c_client_stats.c pins the client-side
@@ -716,9 +761,23 @@ TEST(Server, ServerQueueDropsStayZeroWhileTheDrainKeepsUp) {
     auto cc = client.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
     ASSERT_TRUE(cc) << err;
     ASSERT_TRUE(cc->sendControl(ControlMessage::connectRequest("flood", AudioPacket::VERSION)));
-    ASSERT_TRUE(waitForClientCount(server, 1, 3000));
 
     std::vector<std::uint8_t> pcm(960, 0x11);
+
+    // BARRIER: prove the drain is EXECUTING before flooding it. waitForClientCount does not —
+    // sessions_ is populated at accept, before the run thread starts (see its comment above), so
+    // it is satisfied while the server has yet to read CONNECT_REQUEST. Nor would
+    // waitForClientsUpdate: the roster broadcast is sent at AudioStreamServer.cpp:241, after the
+    // receiveLoop thread is CONSTRUCTED at :234, and construction is not execution — nothing
+    // between :237 and :241 synchronises with that thread, and receiveLoop sets no state before
+    // it blocks in receivePacket. TX_GRANTED is the one observable that is only reachable THROUGH
+    // the drain: receiveLoop -> handleTxAudio -> AudioMixer::submitTxAudio -> claimTxChannelLocked
+    // -> onTxGranted. Its arrival is proof the loop ran, not that a thread object exists.
+    ASSERT_TRUE(cc->sendTxAudio(pcm.data(), pcm.size()));
+    ASSERT_TRUE(recvUntil(*cc, PacketType::Control, ControlType::TxGranted, 3000).has_value())
+        << "no TX_GRANTED: nothing proves the session's receiveLoop ever consumed a packet, so "
+        << "the flood below would be racing the drain into existence";
+
     const int kSend = 20000;
     int sent = 0;
     for (int i = 0; i < kSend; i++) {
@@ -730,21 +789,29 @@ TEST(Server, ServerQueueDropsStayZeroWhileTheDrainKeepsUp) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     const ServerStats s = server.stats();
 
-    // The counter is bounded by what actually arrived, whatever the machine's speed — a
-    // relationship, not a threshold, so it holds on a loaded CI runner too.
+    // Holds BY CONSTRUCTION under enqueue-time counting — every drop is a packet that incremented
+    // packets_received on the same connection first — so this detects nothing and is kept only as
+    // an executable statement of that subset relationship, which the header does not spell out.
     EXPECT_LE(s.queueDrops, s.packetsReceived);
 
-    // The headline is conditional on the premise it depends on: drops are 0 BECAUSE the drain
-    // kept up. On a machine slow enough to fall behind, the premise fails and asserting 0 would
-    // be asserting something this arm never established.
-    if (s.packetsReceived >= sent) {
-        EXPECT_EQ(s.queueDrops, 0)
-            << "the server drained every one of " << sent << " flooded packets yet still "
-            << "reported queue drops — the receive path has acquired a blocking step";
-    } else {
-        GTEST_SKIP() << "drain fell behind (" << s.packetsReceived << " of " << sent
-                     << "); the zero-drop premise does not hold on this machine";
-    }
+    // The premise, over the queue's own input rather than over what the client believes it sent.
+    // packets_received counts the whole session, so it runs 2 ahead of the flood (CONNECT_REQUEST
+    // and the barrier's own TX frame) — never compare it to `sent` as though they were the
+    // same population; the capacity is what it is measured against.
+    ASSERT_GT(s.packetsReceived, static_cast<std::int64_t>(BlockingPacketQueue::kDefaultMaxSize))
+        << s.packetsReceived << " packets reached the server's queue (the client got " << sent
+        << " of " << kSend << " onto the wire), fewer than its "
+        << BlockingPacketQueue::kDefaultMaxSize
+        << "-packet capacity — so it could not have overflowed even with a dead drain, and a 0 "
+        << "below would prove nothing. This is arrival loss UPSTREAM of the queue (kernel "
+        << "socket-buffer overflow, a rejected sender, a CRC failure at crc_errors="
+        << s.crcErrors << "), never drain lag: packets_received is incremented at enqueue";
+
+    EXPECT_EQ(s.queueDrops, 0)
+        << "the server enqueued " << s.packetsReceived << " packets, "
+        << (s.packetsReceived / static_cast<std::int64_t>(BlockingPacketQueue::kDefaultMaxSize))
+        << "x the queue's capacity, and still reported " << s.queueDrops << " queue drops — the "
+        << "receive path has acquired a blocking step";
 
     server.stop();
 }

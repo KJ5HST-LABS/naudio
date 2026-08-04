@@ -904,11 +904,18 @@ typedef struct na_server_stats {
      * impossible on a client (see na_client_stats.queue_drops).
      *
      * BUT EXPECT 0, AND DO NOT READ THAT 0 AS "THE SERVER IS HEALTHY". The server's receive path
-     * has no blocking step in it by design, so the drain keeps pace with the network and the
+     * has no blocking step in it by design, so the drain keeps pace with the demux thread and the
      * 2048-packet queue does not back up under load: 20000 packets pushed as fast as the socket
-     * would accept them arrived complete and left this at 0. The counter is correctly wired — a
-     * consumer artificially stalled 1 ms per packet produced 57115 drops from 60001 received — so
-     * a non-zero value here is a real and serious signal. It is best understood as a safety net
+     * would accept them left this at 0. The evidence for "the drain kept pace" is that 0 standing
+     * against an enqueued volume many times the queue's capacity — NOT that the packets all
+     * arrived, which is a fact about the network and varies by platform (a Linux loopback capped
+     * at net.core.rmem_max delivers ~72% of that flood where macOS delivers all of it).
+     * packets_received cannot support the claim either way: it is incremented at ENQUEUE, ahead of
+     * the queue, so a fully stalled server still reports every arriving packet as received. The
+     * counter is correctly wired — a consumer artificially stalled 1 ms per packet produced 57115
+     * drops from 60001 received, and 17859 from 20001 in a second measurement, both with
+     * packets_received unchanged from a healthy run — so a non-zero value here is a real and
+     * serious signal. It is best understood as a safety net
      * that fires if a blocking step is ever introduced on the receive path, not as a meter that
      * reports on normal operation. Note this is a DIFFERENT reason from the client's: there the
      * event cannot occur at all, here it can and simply does not. */

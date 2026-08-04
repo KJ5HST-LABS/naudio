@@ -33,9 +33,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `queue_drops`, by contrast, is **reachable in principle and unreached in practice**, and issue
   #29's stated reason for expecting it to move — that a demux thread fills the queue while the
   application thread drains it — turns out not to be sufficient. 20,000 packets pushed as fast as
-  the socket would accept them arrived complete and left the counter at 0, because the server's
-  receive path has no blocking step in it by design. The counter is correctly wired: a consumer
-  artificially stalled 1 ms per packet produced 57,115 drops from 60,001 received. So it is a safety
+  the socket would accept them left the counter at 0, because the server's receive path has no
+  blocking step in it by design. The evidence is that 0 standing against an enqueued volume many
+  times the 2048-packet capacity — not that the packets all arrived, which varies by platform and
+  says nothing about the drain in any case, since `packets_received` is incremented at enqueue.
+  The counter is correctly wired: a consumer artificially stalled 1 ms per packet produced 57,115
+  drops from 60,001 received, with `packets_received` unchanged from a healthy run. So it is a safety
   net that fires if a blocking step is ever introduced on the receive path, not a meter on normal
   operation — and the 0 is committed as an executable assertion so the limitation cannot quietly
   become folklore.
