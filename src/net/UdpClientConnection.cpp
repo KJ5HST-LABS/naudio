@@ -254,6 +254,43 @@ ReceiveResult UdpClientConnection::receivePacket(int timeoutMs) {
         // Server-fed: packets come from the demux -> pipeline -> ordered queue.
         std::optional<AudioPacket> p = orderedQueue_.poll(timeoutMs);
         if (p) return ReceiveResult::of(std::move(*p));
+        // Nothing was ready within the deadline. This limb is the server-fed mirror of
+        // receiveFromSocket's IoStatus::TimedOut limb below, and it exists for the same
+        // reason: both hold-timeouts in the pipeline are driven by the CONSUMER, because
+        // the arrival path cannot drive them. enqueueReceived ticks the reorder buffer
+        // only when a datagram arrives, so a hold that expires DURING A PAUSE in traffic
+        // is never noticed, and it never ticks the FEC decoder at all. Before this limb
+        // existed a server-fed connection was measurably worse than its client-owned
+        // sibling on identical config (issue #52):
+        //   - a packet held behind a gap was stranded until traffic resumed, i.e. real
+        //     audio was never delivered (measured: server-fed delivered [0], the client
+        //     [0,2], after 600 ms of silence with a live consumer);
+        //   - the decoder's derived idle bound never ran, so the repair cache was bounded
+        //     only by MAX_PENDING_PACKETS (measured: 0 packets released against the
+        //     client's 12, after 3x the 490 ms udpWan bound).
+        // Two further reasons this limb is the right PLACE, and enqueueReceived is not —
+        // both of which a later tidy-up would undo:
+        //   - the arrival path runs on ONE demuxThread_ shared by every UDP client on the
+        //     transport (UdpServerTransport.hpp:112, started once at :52), while this runs
+        //     on the per-session receive thread, so flush work here does not multiply
+        //     through the server's single serialization point;
+        //   - a tick after reorderBuffer_->insert() would be SELF-MASKING, because
+        //     getOrCreateBlock refreshes touchedAtMs on every pending insert: it would
+        //     read ~0 elapsed against the bound and so fire only when the datagram that
+        //     woke it contributed nothing to the decoder — never in the case it is for.
+        // ORDERING IS LOAD-BEARING: poll FIRST, then take pipe_. Taking pipe_ before a
+        // blocking poll would hold it for up to timeoutMs and stall the demux thread,
+        // which needs the same mutex in enqueueReceived. The re-poll afterwards collects
+        // anything the flush just emitted, so a released packet is returned on this call
+        // rather than waiting for the next one.
+        {
+            std::lock_guard<std::mutex> lock(pipe_);
+            if (reorderBuffer_) reorderBuffer_->checkTimeout();
+            if (fecDecoder_) fecDecoder_->checkTimeout();
+        }
+        if (std::optional<AudioPacket> q = orderedQueue_.poll()) {
+            return ReceiveResult::of(std::move(*q));
+        }
         return ReceiveResult::noData();
     }
 

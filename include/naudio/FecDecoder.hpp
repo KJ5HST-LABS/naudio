@@ -82,13 +82,17 @@ public:
     // stream-config layer. The static_assert lives at the connection, which sees
     // both (src/net/UdpClientConnection.cpp).
     static constexpr std::int64_t MAX_PENDING_IDLE_MS = 500;
-    // Hard ceiling on packets retained for repair, enforced on insert rather than
-    // on a tick — checkTimeout() is never called on a server-fed connection
-    // (UdpClientConnection.cpp: the reorder-engaged branch ticks only the reorder
-    // buffer), so a time bound alone would leave that path unbounded. Sized as four
-    // maximum blocks: the block in flight, the leftovers the last parity re-filed,
-    // the reorder window's front-run, and one block of slack. The 10 is derived
-    // from the encoder's validated range; the 4 is a stated headroom choice.
+    // Hard ceiling on packets retained for repair, enforced on INSERT rather than on a
+    // tick. The two bounds are not redundant and neither subsumes the other: the idle
+    // timeout bounds STALENESS and cannot bound volume, because a peer that keeps
+    // sending refreshes touchedAtMs on every insert and so holds the bound open
+    // indefinitely; this cap bounds VOLUME and cannot bound staleness, because it only
+    // moves when something arrives. Enforcing on insert is also what makes the cap hold
+    // when nothing ticks the decoder at all — an application that stops calling
+    // receivePacket() gets no tick in either connection mode (see checkTimeout()).
+    // Sized as four maximum blocks: the block in flight, the leftovers the last parity
+    // re-filed, the reorder window's front-run, and one block of slack. The 10 is
+    // derived from the encoder's validated range; the 4 is a stated headroom choice.
     static constexpr std::size_t MAX_PENDING_PACKETS = 4 * FecEncoder::MAX_BLOCK_SIZE;
 
     explicit FecDecoder(Emitter emitter, std::int64_t blockTimeoutMs = DEFAULT_BLOCK_TIMEOUT_MS);
@@ -119,6 +123,32 @@ public:
 
     // Flushes timed-out blocks, emitting a NULL silence for each missing slot,
     // using the injected clock.
+    //
+    // WHO DRIVES THIS (issue #52). The decoder has no thread and no timer, so the idle
+    // bound above exists only to the extent that something calls this. That driver is
+    // the CONSUMER, in both connection modes, and it is deliberately not the arrival
+    // path: an arrival-driven tick cannot fire during a PAUSE in traffic, which is
+    // precisely when a block goes stale. Nor is a pause the only case — datagrams can
+    // keep arriving while NOTHING reaches this decoder, because a consumed control ACK,
+    // a CRC failure, and a reorder buffer dropping late sequences all return before the
+    // decoder is reached (the last is unbounded: PacketReorderBuffer drops a sequence
+    // below nextExpected_ with no emission and no timer). A consumer-driven tick covers
+    // those too, because in every one of them the ordered queue is empty as well, which
+    // is the condition the tick hangs off. UdpClientConnection therefore ticks from
+    // whichever limb observes "nothing was ready within the deadline" —
+    // receiveFromSocket's IoStatus::TimedOut limb when the connection owns its socket,
+    // and receivePacket's server-fed limb when the server demux feeds it.
+    //
+    // The two modes are held deliberately SYMMETRIC. Before #52 the server-fed limb had
+    // no tick, so the same class with the same config behaved differently depending on
+    // which mode constructed it, and the difference was measurable: after 3x udpWan's
+    // derived 490 ms bound with a live consumer, a client-owned connection released all
+    // 12 held packets and a server-fed one released 0. If a third receive mode is ever
+    // added, it owes a tick on its own no-data path — the reachability of this method is
+    // a property of the CALLER, and nothing in this class can assert it.
+    //
+    // A consumer that stops polling gets no tick and is bounded by MAX_PENDING_PACKETS
+    // alone; that is the cap's job, not a gap in this one.
     void checkTimeout();
 
     // Flushes timed-out blocks with an explicit "now" (the testable form). The

@@ -128,6 +128,31 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **A server-side UDP connection no longer strands a reordered packet, or holds a repair cache
+  forever, while traffic is paused** — the reorder buffer and the FEC decoder both hold packets
+  against a deadline, and neither owns a thread, so each expires only when a caller ticks it. A
+  client-owned connection ticked both from the limb that observes "no datagram arrived within the
+  deadline". The server-fed connection — the one
+  `na_server_set_reliability_profile(NA_RELIABILITY_UDP_WAN)` builds — had no such limb: its only
+  tick was on packet *arrival*, which cannot fire during a pause, and it never ticked the FEC
+  decoder at all.
+
+  Two consequences, both measured on identical config against the client-owned sibling. A packet
+  held behind a sequence gap was **never delivered** while traffic was paused: after 600 ms of
+  silence with a live consumer polling, the server-fed connection had delivered `[0]` where the
+  client delivered `[0,2]`. That is lost **audio**, not merely a lost repair opportunity. And the
+  decoder's derived idle bound never ran: after 1470 ms — three times `UDP_WAN`'s derived
+  490 ms — the server released **0** of 12 held packets against the client's **12**, so the
+  repair cache was bounded only by its packet cap, and a timeout discard could not be
+  distinguished from a cap eviction.
+
+  Both hold-timeouts are now ticked from the server-fed no-data limb as well, making the two
+  receive modes symmetric; each measurement above now reports the client's value on both. The
+  ordering is load-bearing and documented: the ordered queue is polled *first* and the pipeline
+  mutex taken only afterwards, because holding it across the poll's deadline would stall the demux
+  thread for the whole timeout. No ABI change, no wire change. Pinned by two arms that assert the
+  two modes *agree* rather than asserting a number per mode, since the defect was a divergence.
+
 - **FEC no longer discards a block whose own packets are still arriving** — on
   `NA_RELIABILITY_UDP_WAN`, the only profile with FEC enabled, an arrival stall could destroy a
   whole block's repair. The decoder held each block's audio for a fixed 120 ms measured from the

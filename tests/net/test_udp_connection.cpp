@@ -23,7 +23,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -482,4 +485,152 @@ TEST(UdpConnection, FecAccessorsReportUnmeasuredWhenFecIsOff) {
                              ClientAddress("udp-nofec", "127.0.0.1", 9999), passthroughCfg());
     EXPECT_EQ(-1, conn.fecPendingIdleTimeoutMs());
     EXPECT_EQ(-1, conn.fecPendingPacketsDiscarded());
+}
+
+// ---------------------------------------------------------------------------
+// Consumer-driven hold timeouts, in BOTH receive modes (issue #52)
+// ---------------------------------------------------------------------------
+//
+// The reorder buffer and the FEC decoder both hold packets against a deadline, and
+// neither owns a thread — so each hold expires only when a caller ticks it. That caller
+// is the CONSUMER's no-data limb in both modes, never the arrival path, because an
+// arrival-driven tick cannot fire during a pause in traffic and a pause is exactly when a
+// hold goes stale. Before #52 only the client-owned limb ticked; the server-fed limb
+// (the connection na_server_set_reliability_profile(NA_RELIABILITY_UDP_WAN) builds) did
+// not, so the same class with the same config behaved differently by construction mode.
+//
+// Both arms below assert the two modes AGREE, rather than asserting a number per mode.
+// That is deliberate: the defect was a divergence, so the assertion that catches it
+// coming back is an equality. The client-owned side doubles as #52's criterion-3
+// evidence — if a fix had changed client behaviour, these arms would fail on the client
+// leg, not silently pass.
+
+namespace {
+
+// The shape both arms drive, with the derived pending bound pinned to the FLOOR
+// (MIN_PENDING_IDLE_MS) so an idle-timeout arm costs ~120 ms instead of udpWan's 490.
+// The derivation itself is pinned by
+// FecPendingIdleBoundIsDerivedFromTheNegotiatedStreamShape above; this is not that test.
+UdpReliabilityConfig floorBoundCfg(int reorderMaxHoldMs) {
+    UdpReliabilityConfig c;
+    c.reorderWindowSize = 8;  // what every shipping UDP preset sets
+    c.reorderMaxHoldMs = reorderMaxHoldMs;
+    c.fecEnabled = true;
+    // The encoder's own validated minimum, not a literal — initPipeline constructs a
+    // FecEncoder from this field and it throws outside MIN..MAX_BLOCK_SIZE.
+    c.fecBlockSize = static_cast<int>(FecEncoder::MIN_BLOCK_SIZE);
+    c.frameDurationMs = 1;
+    c.jitterMaxMs = 0;  // block period (2) + hold + 0 -> clamped up to the floor
+    return c;
+}
+
+// Polls the way AudioStreamServer::ClientSession::receiveLoop does, until `done` holds on
+// what has been delivered so far, or the budget expires. Bounded by COMPLETION rather
+// than wall clock: slower hardware simply takes another poll. Safe in this direction —
+// waiting longer only makes an already-elapsed hold timeout more certain to be observed,
+// never less. The budget is a FAILURE ceiling, not the expected cost.
+// Returns the sequences delivered while polling.
+using Delivered = std::vector<std::int32_t>;
+Delivered pollUntil(ClientConnection& c, int budgetMs,
+                    const std::function<bool(const Delivered&)>& done) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
+    Delivered seqs;
+    while (std::chrono::steady_clock::now() < deadline) {
+        ReceiveResult r = c.receivePacket(25);
+        if (r.hasPacket()) seqs.push_back(r.packet->sequence());
+        if (done(seqs)) break;
+    }
+    return seqs;
+}
+
+}  // namespace
+
+// The FEC decoder's idle bound must actually RUN in both modes. Measured before the fix:
+// after 3x udpWan's 490 ms bound with a live consumer, a client-owned connection released
+// all 12 held packets and a server-fed one released 0.
+TEST(UdpConnection, BothReceiveModesTickTheFecIdleBound) {
+    // Well under the cap, so a discard here CANNOT be a cap eviction. That is this arm's
+    // discriminator: with the cap ruled out, the idle timeout is the only mechanism left
+    // that can move the counter, so a non-zero reading cannot be explained any other way.
+    const int fed = 6;
+    ASSERT_LT(static_cast<std::size_t>(fed), FecDecoder::MAX_PENDING_PACKETS);
+
+    std::int64_t discarded[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        const bool serverFed = (mode == 0);
+        Socket sock = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+        ASSERT_TRUE(sock.valid());
+        const ClientAddress addr("udp-52-fec", "127.0.0.1", 9999);
+        std::unique_ptr<UdpClientConnection> conn;
+        if (serverFed) {  // Socket* ctor -> ownsSocket == false
+            conn = std::make_unique<UdpClientConnection>(&sock, "127.0.0.1", 9999, addr,
+                                                         floorBoundCfg(0));
+        } else {  // Socket-by-value ctor -> ownsSocket == true; no peer, so it times out
+            conn = std::make_unique<UdpClientConnection>(std::move(sock), "127.0.0.1", 9999,
+                                                         addr, floorBoundCfg(0));
+        }
+        ASSERT_EQ(FecDecoder::MIN_PENDING_IDLE_MS, conn->fecPendingIdleTimeoutMs());
+
+        for (int i = 0; i < fed; i++) conn->enqueueReceived(rxPacket(i, payloadFor(i)), 23);
+        ASSERT_EQ(0, conn->fecPendingPacketsDiscarded())
+            << "mode " << mode << ": the cap evicted before the idle bound was under test, so a "
+            << "later non-zero reading would not isolate the timeout";
+
+        // The packets themselves are delivered on arrival — the pending block is a repair
+        // cache, so what the timeout discards is never audio.
+        UdpClientConnection& c = *conn;
+        const Delivered got = pollUntil(
+            c, 2000, [&c](const Delivered&) { return c.fecPendingPacketsDiscarded() > 0; });
+        EXPECT_EQ(fed, static_cast<int>(got.size())) << "mode " << mode;
+
+        discarded[mode] = conn->fecPendingPacketsDiscarded();
+        EXPECT_GT(discarded[mode], 0)
+            << (serverFed ? "server-fed" : "client-owned")
+            << ": the idle bound never ran. The decoder owns no thread, so the bound exists "
+               "only where a caller ticks it — this mode's no-data limb has stopped doing so "
+               "(FecDecoder::checkTimeout's contract, issue #52).";
+    }
+    EXPECT_EQ(discarded[0], discarded[1])
+        << "the two receive modes disagree about the idle bound on identical config — the "
+           "asymmetry #52 removed has come back";
+}
+
+// The same dead limb also stranded REAL AUDIO, which is the more severe half: a packet
+// held behind a gap was never released while traffic was paused, because the only tick
+// was on arrival. Measured before the fix, after 600 ms of silence with a live consumer:
+// server-fed delivered [0], client-owned delivered [0,2].
+TEST(UdpConnection, BothReceiveModesReleaseAReorderHoldWhileTrafficIsPaused) {
+    std::vector<std::int32_t> delivered[2];
+    for (int mode = 0; mode < 2; mode++) {
+        const bool serverFed = (mode == 0);
+        Socket sock = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+        ASSERT_TRUE(sock.valid());
+        const ClientAddress addr("udp-52-reorder", "127.0.0.1", 9999);
+        std::unique_ptr<UdpClientConnection> conn;
+        if (serverFed) {
+            conn = std::make_unique<UdpClientConnection>(&sock, "127.0.0.1", 9999, addr,
+                                                         floorBoundCfg(10));
+        } else {
+            conn = std::make_unique<UdpClientConnection>(std::move(sock), "127.0.0.1", 9999,
+                                                         addr, floorBoundCfg(10));
+        }
+
+        // seq 1 is withheld, so seq 2 is HELD by the reorder buffer awaiting the gap. Then
+        // traffic stops: nothing further arrives, so an arrival-driven tick can never fire
+        // and only the consumer's own deadline can release seq 2.
+        conn->enqueueReceived(rxPacket(0, payloadFor(0)), 23);
+        conn->enqueueReceived(rxPacket(2, payloadFor(2)), 23);
+
+        UdpClientConnection& c = *conn;
+        delivered[mode] =
+            pollUntil(c, 2000, [](const Delivered& s) { return s.size() >= 2; });
+        EXPECT_EQ(Delivered({0, 2}), delivered[mode])
+            << (serverFed ? "server-fed" : "client-owned")
+            << ": a packet held behind a gap was not released while traffic was paused. This "
+               "loses AUDIO, not just a repair opportunity — the hold timeout is ticked from "
+               "the consumer's no-data limb, and this mode's has stopped (issue #52).";
+    }
+    EXPECT_EQ(delivered[0], delivered[1])
+        << "the two receive modes disagree about releasing a reorder hold on identical config";
 }
