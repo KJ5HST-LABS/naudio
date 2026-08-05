@@ -16,6 +16,7 @@
 //                  one datagram withheld, and the ARQ NACK-retransmit / ACK path).
 // Hardware-free.
 
+#include "naudio/FecDecoder.hpp"
 #include "naudio/FecEncoder.hpp"
 #include "naudio/net/Socket.hpp"
 #include "naudio/net/UdpClientConnection.hpp"
@@ -418,4 +419,67 @@ TEST(UdpConnection, CloseMakesReceiveReturnDead) {
     ReceiveResult r = conn.receivePacket(100);
     EXPECT_TRUE(r.closed);
     conn.close();  // idempotent
+}
+
+// ---------------------------------------------------------------------------
+// FEC pending-block retention (issue #47)
+// ---------------------------------------------------------------------------
+
+// Pins the DERIVATION, not the constants it is built from. The decoder's pending
+// idle bound is computed in initPipeline from the negotiated stream shape; this
+// arm feeds it the shape udpWan actually ships and asserts the number that comes
+// out, so a fill site that silently stops copying frameDurationMs — or a term
+// quietly dropped from the formula — fails here rather than degrading recovery in
+// the field, where the failure is invisible (nothing is emitted and no other
+// counter moves).
+TEST(UdpConnection, FecPendingIdleBoundIsDerivedFromTheNegotiatedStreamShape) {
+    Socket shared = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    ASSERT_TRUE(shared.valid());
+
+    // Exactly what AudioStreamConfig::udpWan() produces, the only preset with FEC on.
+    UdpReliabilityConfig cfg;
+    cfg.reorderWindowSize = 8;
+    cfg.reorderMaxHoldMs = 40;
+    cfg.fecEnabled = true;
+    cfg.fecBlockSize = 5;
+    cfg.frameDurationMs = 10;   // UDP_FRAME_MS
+    cfg.jitterMinMs = 60;
+    cfg.jitterMaxMs = 400;      // UDP_WAN_BUFFER_MAX_MS
+    UdpClientConnection conn(&shared, "127.0.0.1", 9999,
+                             ClientAddress("udp-wan", "127.0.0.1", 9999), cfg);
+
+    // block period (5 * 10) + reorder hold (40) + jitter max (400)
+    EXPECT_EQ(490, conn.fecPendingIdleTimeoutMs());
+    EXPECT_GT(conn.fecPendingIdleTimeoutMs(), FecDecoder::MIN_PENDING_IDLE_MS)
+        << "the derived term is entirely masked by the floor — the derivation is decoration";
+    EXPECT_EQ(0, conn.fecPendingPacketsDiscarded());
+}
+
+// The clamp is applied to the DERIVED value, not just to hand-set ones. A peer
+// supplies frameDurationMs as an unvalidated u16 (ControlMessage), and the client
+// applies it during the handshake, so an absurd cadence must not turn the repair
+// cache into an unbounded hold.
+TEST(UdpConnection, AnAbsurdPeerSuppliedCadenceCannotUnboundThePendingBlock) {
+    Socket shared = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    ASSERT_TRUE(shared.valid());
+
+    UdpReliabilityConfig cfg;
+    cfg.fecEnabled = true;
+    cfg.fecBlockSize = 10;
+    cfg.frameDurationMs = 65535;  // the widest a u16 can carry
+    cfg.jitterMaxMs = 400;
+    UdpClientConnection conn(&shared, "127.0.0.1", 9999,
+                             ClientAddress("udp-absurd", "127.0.0.1", 9999), cfg);
+
+    EXPECT_EQ(FecDecoder::MAX_PENDING_IDLE_MS, conn.fecPendingIdleTimeoutMs());
+}
+
+// FEC off: no decoder, so both accessors report "unmeasured" rather than zero.
+TEST(UdpConnection, FecAccessorsReportUnmeasuredWhenFecIsOff) {
+    Socket shared = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    ASSERT_TRUE(shared.valid());
+    UdpClientConnection conn(&shared, "127.0.0.1", 9999,
+                             ClientAddress("udp-nofec", "127.0.0.1", 9999), passthroughCfg());
+    EXPECT_EQ(-1, conn.fecPendingIdleTimeoutMs());
+    EXPECT_EQ(-1, conn.fecPendingPacketsDiscarded());
 }
