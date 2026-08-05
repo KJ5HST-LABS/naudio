@@ -100,6 +100,7 @@ std::shared_ptr<ClientTransport> AudioStreamClient::createTransport() {
             rc.reorderMaxHoldMs = cfg.reorderMaxHoldMs;
             rc.fecEnabled = cfg.fecEnabled;
             rc.fecBlockSize = cfg.fecBlockSize;
+            rc.frameDurationMs = cfg.frameDurationMs;
             rc.adaptiveJitterEnabled = cfg.adaptiveJitterEnabled;
             rc.jitterMinMs = cfg.bufferMinMs;
             rc.jitterMaxMs = cfg.bufferMaxMs;
