@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -633,4 +634,77 @@ TEST(UdpConnection, BothReceiveModesReleaseAReorderHoldWhileTrafficIsPaused) {
     }
     EXPECT_EQ(delivered[0], delivered[1])
         << "the two receive modes disagree about releasing a reorder hold on identical config";
+}
+
+// The tick above is what MAKES the decoder's retention reachable, and reachability is not
+// free: a slot the decoder discards was already delivered on arrival, so a later parity
+// that reads the hole as peer loss "recovers" a byte-exact DUPLICATE. This arm drives the
+// whole pipeline — reorder buffer, decoder, real FecEncoder parity — and asserts no frame
+// is ever delivered twice at ZERO packet loss. Measured at 6 frames for 5 sent before
+// FecDecoder's discarded-slot guard existed, on BOTH modes (the client-owned one predates
+// #52 entirely, so this was a live defect, not one #52 introduced).
+TEST(UdpConnection, NeitherReceiveModeFabricatesADuplicateAfterADiscard) {
+    for (int mode = 0; mode < 2; mode++) {
+        const bool serverFed = (mode == 0);
+        Socket sock = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+        ASSERT_TRUE(sock.valid());
+        const ClientAddress addr("udp-52-dup", "127.0.0.1", 9999);
+        std::unique_ptr<UdpClientConnection> conn;
+        if (serverFed) {
+            conn = std::make_unique<UdpClientConnection>(&sock, "127.0.0.1", 9999, addr,
+                                                         floorBoundCfg(0));
+        } else {
+            conn = std::make_unique<UdpClientConnection>(std::move(sock), "127.0.0.1", 9999,
+                                                         addr, floorBoundCfg(0));
+        }
+        UdpClientConnection& c = *conn;
+
+        // A real 5-packet block and its real parity, so the declared range is whatever the
+        // shipping encoder emits rather than something this test invented.
+        FecEncoder enc(5);
+        std::vector<AudioPacket> blk;
+        std::optional<AudioPacket> parity;
+        for (int i = 0; i < 5; i++) {
+            AudioPacket p = rxPacket(i, payloadFor(i));
+            blk.push_back(p);
+            if (auto e = enc.recordAndMaybeEmit(p)) parity = *e;
+        }
+        ASSERT_TRUE(parity.has_value());
+        parity->setSequence(5);
+
+        std::map<std::int32_t, int> seen;
+        auto collect = [&](int budgetMs) {
+            auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
+            while (std::chrono::steady_clock::now() < deadline) {
+                ReceiveResult r = c.receivePacket(25);
+                if (r.hasPacket()) seen[r.packet->sequence()]++;
+            }
+        };
+
+        // seq 0 arrives and is delivered, then the block idles past the bound so the tick
+        // discards its stored copy — leaving exactly ONE hole, which is the only shape that
+        // can fabricate (two or more missing cannot be recovered at all).
+        c.enqueueReceived(blk[0], 200);
+        collect(120);
+        ASSERT_EQ(1, seen[0]) << "mode " << mode << ": premise — seq 0 was delivered on arrival";
+        collect(static_cast<int>(FecDecoder::MIN_PENDING_IDLE_MS + 200));
+        ASSERT_GT(c.fecPendingPacketsDiscarded(), 0)
+            << "mode " << mode << ": premise — the stored copy of seq 0 must have been discarded";
+
+        for (int i = 1; i < 5; i++) c.enqueueReceived(blk[i], 200);
+        c.enqueueReceived(*parity, 200);
+        collect(300);
+
+        int total = 0;
+        for (auto& [seq, n] : seen) {
+            total += n;
+            EXPECT_EQ(1, n) << (serverFed ? "server-fed" : "client-owned") << ": seq " << seq
+                            << " delivered " << n << " times. A discarded slot was recovered as a "
+                               "duplicate of audio already delivered (FecDecoder's "
+                               "discarded-slot guard, issue #52).";
+        }
+        EXPECT_EQ(5, total) << (serverFed ? "server-fed" : "client-owned")
+                            << ": " << total << " frames delivered for 5 sent";
+    }
 }

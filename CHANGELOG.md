@@ -128,6 +128,23 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **FEC no longer "recovers" a slot the decoder itself discarded, which delivered a duplicate audio
+  frame at zero packet loss.** The decoder emits each audio packet to the application on arrival and
+  keeps only a copy for repair. When retention released that copy — either the idle timeout or the
+  packet cap — a later parity had no way to tell the resulting hole from a packet the peer never
+  sent: with exactly one such hole it ran the XOR, whose remainder is precisely the released frame,
+  and delivered a **byte-exact duplicate of audio the application already had** while counting it as
+  a repair. Measured on `NA_RELIABILITY_UDP_WAN` with **no packet loss at all**: six frames
+  delivered for five sent.
+
+  This was reachable on any client whose peer paused mid-block for longer than the derived
+  pending-block bound (490 ms on `UDP_WAN`), which for a PTT-gated transmit lane is ordinary rather
+  than exceptional. The decoder now records the sequences retention destroys and declines recovery
+  for any parity range containing one, counting it in the existing "unreconciled" total alongside
+  the interleaved-control case it already tracked. A genuinely missing packet is still recovered —
+  only a slot the decoder itself released is refused, which costs that block its repair and never
+  emits a frame the sender did not send. No ABI change, no wire change.
+
 - **A server-side UDP connection no longer strands a reordered packet, or holds a repair cache
   forever, while traffic is paused** — the reorder buffer and the FEC decoder both hold packets
   against a deadline, and neither owns a thread, so each expires only when a caller ticks it. A

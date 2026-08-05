@@ -161,10 +161,14 @@ public:
     std::int64_t fecBlocksFailed() const;
 
     // Blocks whose sequence range could not be reconciled with the parity's audio
-    // count, and so were declined rather than recovered — see handleParity(). A
-    // non-zero value means control/heartbeat traffic is interleaving with audio
-    // inside FEC blocks, which costs those blocks their recovery; it is a loss of
-    // opportunity, never a loss of correctness.
+    // count, and so were declined rather than recovered — see handleParity(). Always a
+    // loss of opportunity, never a loss of correctness. TWO distinct causes reach it and
+    // the counter alone cannot tell them apart:
+    //   1. control/heartbeat traffic interleaving with audio inside a block, so the
+    //      parity's range holds a stranger and is not the block (issue #23);
+    //   2. a slot whose stored copy THIS CLASS discarded for retention — recovering it
+    //      would emit a byte-exact duplicate of already-delivered audio (issue #52).
+    // Cause 2 moves pendingPacketsDiscarded() as well; cause 1 does not.
     std::int64_t fecBlocksUnreconciled() const;
 
     // Audio packets dropped from the pending block without ever being offered to a
@@ -241,6 +245,15 @@ private:
     std::int64_t pendingIdleMs_;
     Clock clock_ = &FecDecoder::defaultNowMs;
     std::map<std::int32_t, FecBlock> activeBlocks_;
+    // Sequences whose STORED packet this class destroyed for retention reasons (the idle
+    // timeout, or the MAX_PENDING_PACKETS cap). Those packets were already emitted to the
+    // application on arrival, so without this record a later parity reads the hole as peer
+    // loss and "recovers" a byte-exact duplicate of delivered audio. handleParity declines
+    // any range containing one, and prunes everything below each parity's end; capPending
+    // bounds it for a peer that never sends parity at all. Evicted missingSequences
+    // entries are deliberately NOT recorded — a slot that was always missing is
+    // legitimately recoverable.
+    std::set<std::int32_t> discardedSequences_;
     std::int32_t nextEmitSeq_ = -1;  // set-only ordering hint
     std::int64_t packetsRecoveredByFec_ = 0;
     std::int64_t fecBlocksComplete_ = 0;
