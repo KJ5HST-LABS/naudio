@@ -84,6 +84,14 @@ void UdpClientConnection::initPipeline(const UdpReliabilityConfig& cfg) {
         static_assert(FecDecoder::MAX_PENDING_IDLE_MS ==
                           AudioStreamConfig::MAX_INITIAL_BUFFERING_MS,
                       "the pending-block ceiling is the max receiver buffering; keep them equal");
+        // No test covers the three UdpReliabilityConfig fill sites individually,
+        // because a fill site that forgets frameDurationMs leaves the struct default
+        // in place and that default is WIDER than any UDP preset's cadence — so the
+        // bound over-widens and the suite stays green (measured). That fail-safe is
+        // the entire reason a missed copy is survivable, so it is asserted here
+        // rather than left as a comment for someone to tidy the default away.
+        static_assert(UdpReliabilityConfig{}.frameDurationMs >= AudioStreamConfig::UDP_FRAME_MS,
+                      "a forgotten frameDurationMs copy must over-widen the FEC bound, never narrow it");
         const std::int64_t blockPeriodMs = std::int64_t{std::max(0, cfg.fecBlockSize)} *
                                            std::max(0, cfg.frameDurationMs);
         fecDecoder_->setPendingIdleTimeoutMs(blockPeriodMs + std::max(0, cfg.reorderMaxHoldMs) +
