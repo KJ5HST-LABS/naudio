@@ -37,8 +37,14 @@ public:
     // Overhead bytes in the parity payload: 4 (startSeq) + 1 (blockSize).
     static constexpr std::size_t PARITY_HEADER_SIZE = 5;
 
+    // The validated block-size range. The constructor enforces it; FecDecoder
+    // derives its pending-retention cap from MAX_BLOCK_SIZE rather than restating
+    // the number, so the two cannot drift.
+    static constexpr std::size_t MIN_BLOCK_SIZE = 2;
+    static constexpr std::size_t MAX_BLOCK_SIZE = 10;
+
     // Creates an encoder. blockSize is the number of audio packets per FEC block
-    // and must be 2-10.
+    // and must be MIN_BLOCK_SIZE..MAX_BLOCK_SIZE.
     explicit FecEncoder(std::size_t blockSize);
 
     // Records an audio packet's payload for FEC calculation. Returns a parity

@@ -14,6 +14,7 @@
 #include <set>
 
 #include "naudio/AudioPacket.hpp"
+#include "naudio/FecEncoder.hpp"
 
 namespace naudio {
 
@@ -55,7 +56,53 @@ public:
     // Default block timeout in milliseconds.
     static constexpr std::int64_t DEFAULT_BLOCK_TIMEOUT_MS = 60;
 
+    // --- Pending-block retention policy (issue #47) ---
+    //
+    // The pending block is a REPAIR CACHE, not a delivery queue. process() emits
+    // each audio packet BEFORE storing a copy of it, and the stored copies are read
+    // only by handleParity's missing-count and XOR. So discarding the pending block
+    // costs a repair opportunity and never costs audio or adds latency — which is
+    // why the time bound below is generous and memory is bounded by a packet count
+    // instead.
+    //
+    // The bound is IDLE, not lifetime: it is measured from the last insert into the
+    // block (touchedAtMs), so it expresses a maximum in-block ARRIVAL GAP and is
+    // independent of how many packets the block holds. A lifetime bound tightens as
+    // blocks lengthen — at the largest legal shape (MAX_BLOCK_SIZE 10 x 20 ms
+    // frames = a 200 ms block period) it is already shorter than one block period,
+    // so it would discard a block whose own packets are still arriving normally.
+    //
+    // MIN is the historical bound (DEFAULT_BLOCK_TIMEOUT_MS * 2 = 120), which makes
+    // any derived value MONOTONE-WIDENING: no configuration can regress.
+    static constexpr std::int64_t MIN_PENDING_IDLE_MS = DEFAULT_BLOCK_TIMEOUT_MS * 2;
+    // MAX is AudioStreamConfig::MAX_INITIAL_BUFFERING_MS. A repair that arrives
+    // later than the project's declared maximum receiver buffering cannot be
+    // played, so holding the block past it buys nothing. Not referenced by symbol:
+    // this header is a leaf of the reliability layer and does not depend on the
+    // stream-config layer. The static_assert lives at the connection, which sees
+    // both (src/net/UdpClientConnection.cpp).
+    static constexpr std::int64_t MAX_PENDING_IDLE_MS = 500;
+    // Hard ceiling on packets retained for repair, enforced on insert rather than
+    // on a tick — checkTimeout() is never called on a server-fed connection
+    // (UdpClientConnection.cpp: the reorder-engaged branch ticks only the reorder
+    // buffer), so a time bound alone would leave that path unbounded. Sized as four
+    // maximum blocks: the block in flight, the leftovers the last parity re-filed,
+    // the reorder window's front-run, and one block of slack. The 10 is derived
+    // from the encoder's validated range; the 4 is a stated headroom choice.
+    static constexpr std::size_t MAX_PENDING_PACKETS = 4 * FecEncoder::MAX_BLOCK_SIZE;
+
     explicit FecDecoder(Emitter emitter, std::int64_t blockTimeoutMs = DEFAULT_BLOCK_TIMEOUT_MS);
+
+    // Sets the pending block's idle timeout, clamped to
+    // [MIN_PENDING_IDLE_MS, MAX_PENDING_IDLE_MS]. The connection derives the value
+    // from the negotiated stream shape; see UdpClientConnection::initPipeline.
+    // The CONSTRUCTOR's blockTimeoutMs is deliberately left unclamped (the pending
+    // bound starts at blockTimeoutMs * 2) so tests can drive short windows; every
+    // production caller goes through this clamped setter.
+    void setPendingIdleTimeoutMs(std::int64_t idleMs);
+
+    // The pending block's current idle timeout, in milliseconds.
+    std::int64_t pendingIdleTimeoutMs() const;
 
     // Overrides the monotonic-millis clock used for block creation timestamps
     // (testability — §3.3). Production uses the default steady-clock source.
@@ -90,6 +137,16 @@ public:
     // opportunity, never a loss of correctness.
     std::int64_t fecBlocksUnreconciled() const;
 
+    // Audio packets dropped from the pending block without ever being offered to a
+    // parity — - by the idle timeout, or by the MAX_PENDING_PACKETS cap. This is the
+    // ONLY observable for issue #47's failure: when the pending block is discarded,
+    // fecBlocksFailed does not move (its increment is guarded on a non-empty
+    // missingSequences, and the client's reorder->FEC chain drops gap markers, so
+    // that set is always empty in production) and nothing is emitted. A non-zero
+    // value means repair opportunities were lost to arrival stalls, never that
+    // audio was lost — the packets themselves were emitted on arrival.
+    std::int64_t pendingPacketsDiscarded() const;
+
     void reset();
 
 private:
@@ -100,12 +157,15 @@ private:
     struct FecBlock {
         std::int32_t startSeq;
         std::int32_t blockSize;
-        std::int64_t createdAtMs;
+        // Last insert into this block, NOT its creation time — the pending bound is
+        // an idle bound (see MIN_PENDING_IDLE_MS). getOrCreateBlock refreshes it on
+        // every access to the pending block, which is every insert path.
+        std::int64_t touchedAtMs;
         std::map<std::int32_t, AudioPacket> packets;
         std::set<std::int32_t> missingSequences;
 
-        FecBlock(std::int32_t s, std::int32_t bs, std::int64_t created)
-            : startSeq(s), blockSize(bs), createdAtMs(created) {}
+        FecBlock(std::int32_t s, std::int32_t bs, std::int64_t touched)
+            : startSeq(s), blockSize(bs), touchedAtMs(touched) {}
 
         // Whether `sequence` falls in [startSeq, startSeq + blockSize).
         bool covers(std::int32_t sequence) const {
@@ -124,9 +184,18 @@ private:
     // The key of an existing block whose sequence range covers `sequence`.
     std::optional<std::int32_t> matchingBlockKey(std::int32_t sequence) const;
 
-    // Gets the block at `key`, creating a fresh pending-shaped block (timestamped
-    // from the injected clock) if absent.
+    // Gets the block at `key`, creating a fresh pending-shaped block if absent.
+    // For the pending block this also REFRESHES touchedAtMs from the injected
+    // clock, which is what makes the pending bound an idle bound: every insert
+    // path (storeInBlock, recordMissing, and handleParity's re-file of
+    // out-of-range leftovers) reaches the block through here.
     FecBlock& getOrCreateBlock(std::int32_t key);
+
+    // Enforces MAX_PENDING_PACKETS on the pending block by evicting lowest-sequence
+    // entries. Counts into pendingPacketsDiscarded_ and EMITS NOTHING — the class
+    // invariant is that emission happens only after internal state is settled, and
+    // this runs mid-insert, including from inside handleParity's re-file loop.
+    void capPending(FecBlock& block);
 
     void storeInBlock(std::int32_t sequence, AudioPacket packet);
 
@@ -139,6 +208,7 @@ private:
 
     Emitter emitter_;
     std::int64_t blockTimeoutMs_;
+    std::int64_t pendingIdleMs_;
     Clock clock_ = &FecDecoder::defaultNowMs;
     std::map<std::int32_t, FecBlock> activeBlocks_;
     std::int32_t nextEmitSeq_ = -1;  // set-only ordering hint
@@ -146,6 +216,7 @@ private:
     std::int64_t fecBlocksComplete_ = 0;
     std::int64_t fecBlocksFailed_ = 0;
     std::int64_t fecBlocksUnreconciled_ = 0;
+    std::int64_t pendingPacketsDiscarded_ = 0;
 };
 
 }  // namespace naudio

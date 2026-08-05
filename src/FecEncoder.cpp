@@ -13,7 +13,7 @@
 namespace naudio {
 
 FecEncoder::FecEncoder(std::size_t blockSize) : blockSize_(blockSize) {
-    if (blockSize < 2 || blockSize > 10) {
+    if (blockSize < MIN_BLOCK_SIZE || blockSize > MAX_BLOCK_SIZE) {
         throw std::invalid_argument("blockSize must be 2-10");
     }
 }

@@ -334,4 +334,114 @@ TEST(FecDecoder, MissingParityTimesOut) {
     EXPECT_EQ(1, s.gaps);
 }
 
+// ---- Pending-block retention (issue #47) ----
+//
+// The four arms below pin the retention POLICY, which is the thing #47 got wrong.
+// They use the injected clock, so they measure the policy and never the machine
+// they run on.
+
+// THE #47 REGRESSION ARM. A block whose own packets are still arriving must not be
+// discarded, however long the block takes in total.
+//
+// Shape mirrors udpWan: a 5-packet block, one packet lost, one parity. The packets
+// are spaced 40 ms apart, so the block spans 200 ms end to end — well past the
+// pre-fix 120 ms bound — while no single ARRIVAL GAP exceeds 40 ms. checkTimeoutAt
+// is driven between arrivals because that is what the client does (its decoder tick
+// hangs off the socket recv timeout).
+//
+// Pre-fix this recovered 0: the bound was measured from block CREATION, so the
+// block was erased at t=1160 (160 > 120) and the parity then found every slot
+// missing. Post-fix the bound is measured from the last insert, so a 40 ms gap
+// never trips a 120 ms idle bound and the single loss is repaired.
+TEST(FecDecoder, ArrivingPacketsKeepTheirBlockAliveRegardlessOfBlockSpan) {
+    DecSink s;
+    FecDecoder d(s.emitter());  // default: 120 ms pending idle bound
+    std::int64_t now = 1000;
+    d.setClock([&now]() { return now; });
+
+    std::vector<std::vector<std::uint8_t>> pl;
+    for (int i = 0; i < 5; ++i) pl.push_back({static_cast<std::uint8_t>(i + 1), 0x55});
+
+    for (int i = 0; i < 5; ++i) {
+        d.checkTimeoutAt(now);         // the client ticks the decoder on socket idle
+        if (i != 2) d.processPacket(rx(i, pl[i]));  // seq 2 is lost on the wire
+        now += 40;                     // 40 ms between arrivals; 200 ms across the block
+    }
+    d.checkTimeoutAt(now);
+    d.processPacket(buildParity(0, pl));
+
+    EXPECT_EQ(1, d.packetsRecoveredByFec()) << "a block whose packets kept arriving was discarded";
+    EXPECT_EQ(0, d.pendingPacketsDiscarded());
+    const AudioPacket* rec = s.find(2);
+    ASSERT_NE(nullptr, rec);
+    EXPECT_EQ(pl[2], rec->payload());  // byte-exact repair
+}
+
+// The bound must still BITE — a widened timeout that never expires is an unbounded
+// buffer, not a fix. A genuine idle gap past the bound discards the block, and the
+// discard is COUNTED, which is what stops #47's failure mode from being silent
+// again: fecBlocksFailed cannot move here (its increment is guarded on a non-empty
+// missingSequences, and the client's reorder->FEC chain drops gap markers).
+TEST(FecDecoder, AnIdleGapPastTheBoundDiscardsThePendingBlockAndCountsIt) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::int64_t now = 1000;
+    d.setClock([&now]() { return now; });
+
+    std::vector<std::vector<std::uint8_t>> pl;
+    for (int i = 0; i < 5; ++i) pl.push_back({static_cast<std::uint8_t>(i + 1), 0x55});
+    d.processPacket(rx(0, pl[0]));  // pending created and touched at t=1000
+
+    d.checkTimeoutAt(1120);  // exactly at the bound: 120 is not > 120
+    EXPECT_EQ(0, d.pendingPacketsDiscarded()) << "the bound is strict >, so 120 must survive";
+
+    d.checkTimeoutAt(1121);  // one past it
+    EXPECT_EQ(1, d.pendingPacketsDiscarded()) << "the erase path is unreachable — unbounded buffer";
+    EXPECT_EQ(0, d.fecBlocksFailed()) << "fecBlocksFailed cannot see this; that is why #47 was silent";
+    EXPECT_EQ(0, s.gaps);  // nothing is emitted: the packets were already delivered on arrival
+
+    // The parity now finds nothing and cannot repair.
+    d.processPacket(buildParity(0, pl));
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
+}
+
+// Retention is bounded by PACKET COUNT as well as by time, because the time bound
+// alone leaves two holes: a client whose peer never sends parity refreshes the idle
+// bound on every arrival and so never expires, and checkTimeout() is never called
+// at all on a server-fed connection.
+TEST(FecDecoder, PendingRetentionIsCappedWhenNoParityEverArrives) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::int64_t now = 1000;
+    d.setClock([&now]() { return now; });
+
+    const int over = 10;
+    const int total = static_cast<int>(FecDecoder::MAX_PENDING_PACKETS) + over;
+    for (int i = 0; i < total; ++i) {
+        d.processPacket(rx(i, {static_cast<std::uint8_t>(i), 0x11}));
+        now += 1;  // arrivals keep refreshing the idle bound — time never saves us here
+    }
+
+    EXPECT_EQ(over, d.pendingPacketsDiscarded()) << "pending retention grew without bound";
+    EXPECT_EQ(total, static_cast<int>(s.packets.size()))
+        << "capping the repair cache must not affect delivery — every packet is emitted on arrival";
+}
+
+// The derived bound is clamped by the decoder, not merely by its caller, so the
+// clamp holds against every present and future caller.
+TEST(FecDecoder, PendingIdleTimeoutIsClampedToItsDocumentedRange) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    EXPECT_EQ(FecDecoder::MIN_PENDING_IDLE_MS, d.pendingIdleTimeoutMs());  // 2x the default
+
+    d.setPendingIdleTimeoutMs(1);
+    EXPECT_EQ(FecDecoder::MIN_PENDING_IDLE_MS, d.pendingIdleTimeoutMs());
+
+    d.setPendingIdleTimeoutMs(1000 * 1000);
+    EXPECT_EQ(FecDecoder::MAX_PENDING_IDLE_MS, d.pendingIdleTimeoutMs());
+
+    d.setPendingIdleTimeoutMs(300);
+    EXPECT_EQ(300, d.pendingIdleTimeoutMs());  // in range, taken verbatim
+}
+
 }  // namespace
