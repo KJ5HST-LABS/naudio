@@ -127,6 +127,12 @@ struct UdpReliabilityConfig {
     int reorderMaxHoldMs = 30;
     bool fecEnabled = false;
     int fecBlockSize = 5;
+    // The negotiated frame cadence. Carried only so the connection can derive the
+    // FEC block PERIOD (fecBlockSize * frameDurationMs) for the decoder's pending
+    // idle bound — see initPipeline and issue #47. The default matches
+    // AudioStreamConfig::DEFAULT_FRAME_MS, which is >= every UDP preset's value, so
+    // a fill site that forgets this field over-widens the bound and never narrows it.
+    int frameDurationMs = 20;
     bool adaptiveJitterEnabled = false;
     int jitterMinMs = 0;
     int jitterMaxMs = 0;
@@ -228,6 +234,17 @@ public:
     int adaptiveBufferTargetMs() const override;
     std::int64_t controlRetransmits() const override;
     std::int64_t fecBlocksUnreconciled() const override;
+
+    // Audio packets the FEC decoder dropped from its pending block without ever
+    // offering them to a parity — repair opportunities lost to arrival stalls or to
+    // the retention cap. Never a loss of audio: those packets were emitted on
+    // arrival. -1 when FEC is off. See FecDecoder::pendingPacketsDiscarded.
+    std::int64_t fecPendingPacketsDiscarded() const;
+
+    // The decoder's pending idle bound, derived in initPipeline from the negotiated
+    // stream shape (issue #47); -1 when FEC is off. Exposed so a test can pin the
+    // DERIVATION rather than only the constants it is built from.
+    std::int64_t fecPendingIdleTimeoutMs() const;
 
     // True only when trackSequence() actually runs — i.e. when NO reorder buffer is
     // engaged. With one engaged (every built-in UDP profile) the receive path never

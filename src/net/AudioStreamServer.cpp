@@ -436,6 +436,7 @@ std::shared_ptr<ServerTransport> AudioStreamServer::createTransport() {
             cfg.reorderMaxHoldMs = config_.reorderMaxHoldMs;
             cfg.fecEnabled = config_.fecEnabled;
             cfg.fecBlockSize = config_.fecBlockSize;
+            cfg.frameDurationMs = config_.frameDurationMs;
             cfg.adaptiveJitterEnabled = config_.adaptiveJitterEnabled;
             cfg.jitterMinMs = config_.bufferMinMs;
             cfg.jitterMaxMs = config_.bufferMaxMs;

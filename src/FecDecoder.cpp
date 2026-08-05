@@ -18,9 +18,17 @@
 namespace naudio {
 
 FecDecoder::FecDecoder(Emitter emitter, std::int64_t blockTimeoutMs)
-    : emitter_(std::move(emitter)), blockTimeoutMs_(blockTimeoutMs) {}
+    : emitter_(std::move(emitter)),
+      blockTimeoutMs_(blockTimeoutMs),
+      pendingIdleMs_(blockTimeoutMs * 2) {}
 
 void FecDecoder::setClock(Clock clock) { clock_ = std::move(clock); }
+
+void FecDecoder::setPendingIdleTimeoutMs(std::int64_t idleMs) {
+    pendingIdleMs_ = std::clamp(idleMs, MIN_PENDING_IDLE_MS, MAX_PENDING_IDLE_MS);
+}
+
+std::int64_t FecDecoder::pendingIdleTimeoutMs() const { return pendingIdleMs_; }
 
 void FecDecoder::process(std::optional<AudioPacket> packet, std::int32_t sequence) {
     if (packet.has_value() && packet->packetType() == PacketType::FecParity) {
@@ -47,16 +55,27 @@ void FecDecoder::checkTimeoutAt(std::int64_t nowMs) {
     std::vector<std::int32_t> toRemove;
     std::size_t nullsToEmit = 0;
     std::int64_t failedIncrements = 0;
+    std::int64_t discarded = 0;
     for (const auto& [key, block] : activeBlocks_) {
-        const std::int64_t limitMs = (key == PENDING_KEY) ? blockTimeoutMs_ * 2 : blockTimeoutMs_;
-        if (nowMs - block.createdAtMs > limitMs) {
+        // The PENDING limb is an IDLE bound measured from the last insert; the
+        // per-block limb below it is DEAD CODE and kept only so the shape is
+        // explicit. getOrCreateBlock is the sole insertion into activeBlocks_ and
+        // stamps every entry FecBlock(PENDING_KEY, 0, ...) regardless of `key`, so
+        // covers() (which needs sequence < startSeq + blockSize) is false for every
+        // sequence, matchingBlockKey always returns nullopt, and handleParity's
+        // block is a local that is never re-inserted. activeBlocks_ therefore holds
+        // at most one entry and it is always PENDING_KEY.
+        const std::int64_t limitMs = (key == PENDING_KEY) ? pendingIdleMs_ : blockTimeoutMs_;
+        if (nowMs - block.touchedAtMs > limitMs) {
             nullsToEmit += block.missingSequences.size();
             if (!block.missingSequences.empty()) ++failedIncrements;
+            discarded += static_cast<std::int64_t>(block.packets.size());
             toRemove.push_back(key);
         }
     }
     for (std::int32_t key : toRemove) activeBlocks_.erase(key);
     fecBlocksFailed_ += failedIncrements;
+    pendingPacketsDiscarded_ += discarded;
     for (std::size_t i = 0; i < nullsToEmit; ++i) emit(nullptr);
 }
 
@@ -67,6 +86,8 @@ std::int64_t FecDecoder::fecBlocksComplete() const { return fecBlocksComplete_; 
 std::int64_t FecDecoder::fecBlocksFailed() const { return fecBlocksFailed_; }
 
 std::int64_t FecDecoder::fecBlocksUnreconciled() const { return fecBlocksUnreconciled_; }
+
+std::int64_t FecDecoder::pendingPacketsDiscarded() const { return pendingPacketsDiscarded_; }
 
 bool FecDecoder::isAudio(PacketType type) {
     return type == PacketType::AudioRx || type == PacketType::AudioTx;
@@ -79,6 +100,7 @@ void FecDecoder::reset() {
     fecBlocksComplete_ = 0;
     fecBlocksFailed_ = 0;
     fecBlocksUnreconciled_ = 0;
+    pendingPacketsDiscarded_ = 0;
 }
 
 void FecDecoder::emit(const AudioPacket* p) {
@@ -96,18 +118,37 @@ FecDecoder::FecBlock& FecDecoder::getOrCreateBlock(std::int32_t key) {
     auto it = activeBlocks_.find(key);
     if (it == activeBlocks_.end()) {
         it = activeBlocks_.emplace(key, FecBlock(PENDING_KEY, 0, clock_())).first;
+    } else if (key == PENDING_KEY) {
+        // Idle bound: every insert path reaches the pending block through here, so
+        // refreshing on access is what keeps the timeout measuring the gap BETWEEN
+        // arrivals rather than the block's total lifetime (issue #47).
+        it->second.touchedAtMs = clock_();
     }
     return it->second;
 }
 
+void FecDecoder::capPending(FecBlock& block) {
+    while (block.packets.size() > MAX_PENDING_PACKETS) {
+        block.packets.erase(block.packets.begin());
+        ++pendingPacketsDiscarded_;
+    }
+    while (block.missingSequences.size() > MAX_PENDING_PACKETS) {
+        block.missingSequences.erase(block.missingSequences.begin());
+    }
+}
+
 void FecDecoder::storeInBlock(std::int32_t sequence, AudioPacket packet) {
     const std::int32_t key = matchingBlockKey(sequence).value_or(PENDING_KEY);
-    getOrCreateBlock(key).packets.insert_or_assign(sequence, std::move(packet));
+    FecBlock& block = getOrCreateBlock(key);
+    block.packets.insert_or_assign(sequence, std::move(packet));
+    if (key == PENDING_KEY) capPending(block);
 }
 
 void FecDecoder::recordMissing(std::int32_t sequence) {
     const std::int32_t key = matchingBlockKey(sequence).value_or(PENDING_KEY);
-    getOrCreateBlock(key).missingSequences.insert(sequence);
+    FecBlock& block = getOrCreateBlock(key);
+    block.missingSequences.insert(sequence);
+    if (key == PENDING_KEY) capPending(block);
 }
 
 void FecDecoder::handleParity(const AudioPacket& parityPacket) {
@@ -152,6 +193,11 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
                 getOrCreateBlock(PENDING_KEY).missingSequences.insert(seq);
             }
         }
+        // The re-filed leftovers bypass storeInBlock/recordMissing, so cap here too.
+        // Counting only — capPending never emits, which preserves this class's
+        // invariant that nothing is emitted while internal state is mid-flight.
+        auto refiled = activeBlocks_.find(PENDING_KEY);
+        if (refiled != activeBlocks_.end()) capPending(refiled->second);
     }
 
     // Count missing packets in the block's range, and check that the range really

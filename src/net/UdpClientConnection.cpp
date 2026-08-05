@@ -61,6 +61,41 @@ void UdpClientConnection::initPipeline(const UdpReliabilityConfig& cfg) {
         fecDecoder_.emplace([this](const AudioPacket* p) {
             if (p) orderedQueue_.offer(*p);
         });
+
+        // How long the decoder may hold a block waiting for the rest of it, derived
+        // from the negotiated stream shape rather than from a fixed constant
+        // (issue #47). Every term is a quantity this profile already declares:
+        //
+        //   block period      fecBlockSize * frameDurationMs — the span the block's
+        //                     own packets occupy at the designed cadence
+        //   reorder hold      the reorder buffer sits AHEAD of the decoder, so it
+        //                     can delay any member of the block by up to this much
+        //   jitter max        bufferMaxMs, the largest delay variation this profile
+        //                     says it will absorb. The decoder must not give up on a
+        //                     block sooner than the jitter buffer is willing to wait
+        //                     for a packet, or the reliability layer quits before the
+        //                     thing it exists to serve.
+        //
+        // udpWan — the only preset that enables FEC — derives 5*10 + 40 + 400 = 490 ms
+        // against the 120 ms this used to be. The setter clamps to
+        // [MIN_PENDING_IDLE_MS, MAX_PENDING_IDLE_MS]; the ceiling matters because
+        // frameDurationMs arrives from the peer as an unvalidated u16, and a repair
+        // later than the project's maximum receiver buffering cannot be played.
+        static_assert(FecDecoder::MAX_PENDING_IDLE_MS ==
+                          AudioStreamConfig::MAX_INITIAL_BUFFERING_MS,
+                      "the pending-block ceiling is the max receiver buffering; keep them equal");
+        // No test covers the three UdpReliabilityConfig fill sites individually,
+        // because a fill site that forgets frameDurationMs leaves the struct default
+        // in place and that default is WIDER than any UDP preset's cadence — so the
+        // bound over-widens and the suite stays green (measured). That fail-safe is
+        // the entire reason a missed copy is survivable, so it is asserted here
+        // rather than left as a comment for someone to tidy the default away.
+        static_assert(UdpReliabilityConfig{}.frameDurationMs >= AudioStreamConfig::UDP_FRAME_MS,
+                      "a forgotten frameDurationMs copy must over-widen the FEC bound, never narrow it");
+        const std::int64_t blockPeriodMs = std::int64_t{std::max(0, cfg.fecBlockSize)} *
+                                           std::max(0, cfg.frameDurationMs);
+        fecDecoder_->setPendingIdleTimeoutMs(blockPeriodMs + std::max(0, cfg.reorderMaxHoldMs) +
+                                             std::max(0, cfg.jitterMaxMs));
     }
 
     // Reorder buffer emits to the FEC decoder (if FEC is on) or directly to the
@@ -438,6 +473,16 @@ std::int64_t UdpClientConnection::controlRetransmits() const {
 std::int64_t UdpClientConnection::fecBlocksUnreconciled() const {
     std::lock_guard<std::mutex> lock(pipe_);
     return fecDecoder_ ? fecDecoder_->fecBlocksUnreconciled() : 0;
+}
+
+std::int64_t UdpClientConnection::fecPendingPacketsDiscarded() const {
+    std::lock_guard<std::mutex> lock(pipe_);
+    return fecDecoder_ ? fecDecoder_->pendingPacketsDiscarded() : -1;
+}
+
+std::int64_t UdpClientConnection::fecPendingIdleTimeoutMs() const {
+    std::lock_guard<std::mutex> lock(pipe_);
+    return fecDecoder_ ? fecDecoder_->pendingIdleTimeoutMs() : -1;
 }
 
 bool UdpClientConnection::measuresSequenceGaps() const {

@@ -93,12 +93,17 @@ void naproxy_stop(void* handle);
 
 /* The injection cadence is the PROFILE'S OWN frame period (AudioStreamConfig::UDP_FRAME_MS = 10),
  * not a number chosen here. It used to be 20 ms, and that single arbitrary constant is most of #43:
- * FEC recovery needs a block's surviving audio to reach the decoder before the block's parity does,
- * and FecDecoder erases a pending block once it is older than DEFAULT_BLOCK_TIMEOUT_MS * 2 = 120 ms
- * (FecDecoder.cpp:46-61). At the profile's designed 10 ms cadence a 5-packet block spans 50 ms, so
- * the margin is 2.4x. At 20 ms it spans 100 ms and the margin is 1.2x — thin enough that ordinary
- * scheduling jitter destroys the block, and the erase is SILENT (in this pipeline the reorder buffer
- * never forwards gap markers, so the discarded block emits nothing and increments no counter). */
+ * FEC recovery needs a block's surviving audio to still be held by the decoder when the block's
+ * parity arrives, and the decoder used to discard a pending block once it was 120 ms old MEASURED
+ * FROM THE BLOCK'S CREATION — so a wide cadence killed blocks whose own packets were still arriving.
+ * The erase was SILENT (in this pipeline the reorder buffer never forwards gap markers, so the
+ * discarded block emitted nothing and moved no counter), which is why #43 presented as an
+ * unexplained zero.
+ *
+ * That is now history: #47 made the bound IDLE (measured from the last insert) and derived it from
+ * the negotiated stream shape, and FecDecoder::pendingPacketsDiscarded counts the discard. The
+ * cadence stays at the profile's 10 ms because a test should drive the subsystem at the rate the
+ * profile declares, not because the margin is thin. */
 #define INJECT_PERIOD_MS 10
 
 /* The lossy arm's bound: keep injecting until this many packets have actually been REPAIRED, capped
@@ -116,13 +121,22 @@ void naproxy_stop(void* handle);
  * constant 23% would predict). What the budget buys is measured directly instead — the arm's cliff,
  * swept end to end:
  *
- *     old arm (150 packets, 3/4 ratio):  passes to 42 ms, fails from 44 ms
- *     this arm (600 packets, 20 target): passes to 46 ms, fails from 48 ms
+ *     old arm (150 packets, 3/4 ratio):          passes to 42 ms, fails from 44 ms
+ *     this arm, before #47 (600 pkts, 20 target): passes to 46 ms, fails from 48 ms
+ *     this arm, after  #47:                       passes to 246 ms, fails at 250 ms
  *
- * Against nominal cadences of 20 ms and 10 ms, that is the machine-degradation factor each tolerates:
- * ~2.1x before, ~4.6x now. The runner that filed #43 was measured at ~2.4x (it behaved like a uniform
- * 48 ms at a nominal 20 ms), which is why the old arm failed there and why this one has roughly 2x
- * margin left. Most of that gain is the cadence, not the budget.
+ * Re-swept after #47 widened the decoder's pending bound (10/48/100/150/200/230/240/245/246 ms all
+ * reach the 20-repair target; 250 ms returns 11). 248 ms is UNMEASURED — the sweep was cut short —
+ * so the cliff is somewhere in (246, 250].
+ *
+ * Against the profile's nominal 10 ms cadence that is the machine-degradation factor the arm
+ * tolerates: ~4.6x before #47, ~24x after. The runner that filed #43 was measured at ~2.4x (it
+ * behaved like a uniform 48 ms at a nominal 20 ms).
+ *
+ * The cliff is NOT simply "2 x cadence exceeds the 490 ms bound". That arithmetic predicts a cliff
+ * just past 245 ms and 246 ms still passes, so the edge is set by the packet budget and by blocks
+ * lost to interleaved control traffic (`unreconciled` climbs from 0 at 48 ms to 10 by 245 ms) as
+ * well as by the bound. Stated as a measurement, not as a derivation.
  *
  * On a healthy machine the target is met after ~21 blocks and the arm exits in ~1 s, FASTER than the
  * fixed 3 s it replaces. The budget is only spent when the machine is genuinely struggling. */

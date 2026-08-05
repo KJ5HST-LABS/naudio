@@ -128,6 +128,29 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **FEC no longer discards a block whose own packets are still arriving** — on
+  `NA_RELIABILITY_UDP_WAN`, the only profile with FEC enabled, an arrival stall could destroy a
+  whole block's repair. The decoder held each block's audio for a fixed 120 ms measured from the
+  block's *creation*, so a block still filling normally could be dropped mid-flight and the parity
+  then found every slot missing. Measured against a 5-packet block at the profile's 10 ms cadence
+  with one packet lost, a single **91 ms** stall was enough — unremarkable on the WAN link this
+  profile exists for.
+
+  The bound is now measured from the **last packet added** to the block, so it expresses a maximum
+  arrival *gap* and no longer tightens as blocks lengthen, and its size is derived from the stream
+  shape the profile declares — block period + reorder hold + the jitter buffer's own maximum —
+  rather than from a constant. `UDP_WAN` derives 490 ms against the previous 120, moving the
+  smallest fatal stall from 91 ms to 471 ms; the end-to-end recovery arm's cliff moves from 48 ms
+  to ~250 ms of injection cadence. The tolerance is a gap between packets that *arrive*, so a run
+  of N consecutive losses consumes N+1 frame intervals of it.
+
+  Retention is additionally capped by packet count, so a peer that never sends parity cannot grow
+  the buffer without bound. Discarded packets are now counted rather than vanishing silently —
+  previously nothing was emitted and no counter moved, which is why this cost two sessions to
+  diagnose. The count is not yet exposed through the C ABI. No ABI change, no wire change; audio
+  delivery is unaffected, since packets are emitted on arrival and the block retains only copies
+  for repair.
+
 - **`na_client_stats` no longer claims two counters can move on a client when they cannot** — the
   struct's contract listed `control_retransmits` as live on `NA_RELIABILITY_UDP_LAN` / `_FT8`, and
   described `queue_drops` as reporting a consumer too slow to drain the queue. Neither is reachable
