@@ -104,7 +104,7 @@ Immediately following the header:
 | `AUDIO_TX` | `0x01` | client → server | Transmit audio (subject to arbitration, §7). |
 | `CONTROL` | `0x02` | both | Carries a `ControlMessage` (§6). |
 | `HEARTBEAT` | `0x03` | both | Keep-alive (§6.5). |
-| `FEC_PARITY` | `0x04` | server → client (UDP) | XOR parity packet for a FEC block (§5.2, §8.2). |
+| `FEC_PARITY` | `0x04` | both (UDP) | XOR parity packet for a FEC block (§5.2, §8.2). Emitted from **both** audio send paths, so a client protects its `AUDIO_TX` lane exactly as a server protects `AUDIO_RX`. (This row read "server → client" until 2026-08-06; the implementation has always sent parity in both directions, and the row was corrected rather than the behaviour — see issue #55.) |
 
 An unknown type value MUST cause the frame to be rejected (decode returns "no packet").
 
@@ -367,7 +367,8 @@ Note `minMs` is **added inside** the formula (a floor baked into the value) *and
 
 **Decoder.** Audio packets are emitted immediately on arrival *and* retained for recovery. A parity frame's `startSeq`/`blockSize` define the block `[startSeq, startSeq+N)`:
 - **0 missing:** parity is redundant; discard.
-- **1 missing:** recover it — `lost = xorData XOR (all present payloads in the block)` (truncating each present payload to the parity length). Emit the recovered packet as `AUDIO_RX` with `sequence = missingSeq`.
+- **1 missing:** recover it — `lost = xorData XOR (all present payloads in the block)` (truncating each present payload to the parity length). Emit the recovered packet **with the block's own audio type** (`AUDIO_RX` for an RX block, `AUDIO_TX` for a TX block — read off a present member, not assumed) and `sequence = missingSeq`. This is a *local delivery* rule, not a wire rule: a recovered packet is handed to the application and is never serialized or sent. Stamping it `AUDIO_RX` unconditionally makes a receiver route a repaired TX frame to its default branch and drop it silently while counting the repair (issue #55).
+- **Declined:** if the range cannot be shown to be the encoder's block, do not recover — see `docs/protocols.md` R5. The range is not the block whenever a non-audio packet occupies a slot inside it, whenever a member of the block is found at or past `startSeq + blockSize`, or whenever a slot's stored copy was released before the parity arrived. The decoder MUST NOT key this decision on the parity frame's own sequence number: §3.4 constrains that field only to be monotonic and shared, so conforming senders may number it differently.
 - **2+ missing:** unrecoverable; emit a gap marker (silence) for each still-missing slot.
 
 A block that does not complete within the **block timeout (default 60 ms)** is flushed (gaps for the missing). Audio packets arriving *before* their parity are held in a pending block (cleared after **2× timeout**).

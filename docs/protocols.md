@@ -96,7 +96,7 @@ packet that was lost.
 - **Mitigation if ever needed:** carry an explicit per-packet length, or restrict FEC to fixed-size
   frames (the current audio usage already satisfies this).
 
-### R5 — FEC recovery is declined when a block's audio is not contiguous (`FecDecoder`)
+### R5 — FEC recovery is declined when the parity's range cannot be shown to BE the block (`FecDecoder`)
 
 The parity header carries a **start sequence** and a **count** of audio packets, with no per-slot
 sequence list. A decoder can therefore only read the block as the range
@@ -107,7 +107,21 @@ the same block takes a sequence number inside that range and displaces the block
 past the end of it.
 
 When that happens the range is **not** the block, and naudio **declines recovery** for it (counted by
-`FecDecoder::fecBlocksUnreconciled`) — the lost packet stays lost, exactly as if FEC were disabled.
+`FecDecoder::fecBlocksUnreconciled`, which owns the full trigger list).
+
+**The stranger does not have to arrive.** An earlier revision of this section said the corruption
+"stays invisible without loss (the interloping packet fills the slot, so the block looks complete)".
+That is true only of a stranger the decoder actually sees. Control reliability consumes `CONTROL_ACK`
+datagrams before they reach the reorder/FEC pipeline, and they draw from the same shared counter — so
+their slot reads exactly like a lost audio packet. With one such slot the XOR remainder is precisely
+the displaced member, i.e. a frame the application **already received**, and recovery would emit a
+byte-exact duplicate of it at **zero packet loss**. naudio therefore declines on evidence of the
+displaced *member* (an audio packet held at or past the range end, or one the repair cache evicted),
+not on the presence of the stranger. See issue #55.
+
+Consequently a decline **does not imply a lost packet**: in the absent-stranger case every member of
+the block was delivered and the slot that looked missing carried a control message. Only the
+present-stranger case leaves a packet genuinely lost, exactly as if FEC were disabled.
 
 - **Why it's accepted:** the frozen parity header has no way to express the block's true membership,
   so a decoder cannot reconstruct it. The alternative is worse than a missed recovery: XOR-ing across

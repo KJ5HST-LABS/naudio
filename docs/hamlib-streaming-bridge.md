@@ -522,7 +522,9 @@ block's audio packets are consecutive, and the sender's sequence counter is shar
 heartbeat traffic. The decoder now declines such a block and counts it as `fec_blocks_unreconciled`,
 leaving the packet lost exactly as it would be with FEC off, rather than emitting
 `lost ^ displaced` as recovered audio. See [#23](https://github.com/KJ5HST-LABS/naudio/issues/23) and
-`docs/protocols.md` R5.
+`docs/protocols.md` R5, which owns the decline contract — note in particular that a decline no longer
+implies a lost packet, because the interleaving control message need never reach the decoder
+([#55](https://github.com/KJ5HST-LABS/naudio/issues/55)).
 
 Not verified, and not claimed: loss on the `-m 2` netrigctl path, real hardware, and loss patterns
 other than the deterministic 1-in-N used here (no bursts, no reordering, no duplication).
