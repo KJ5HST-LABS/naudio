@@ -500,11 +500,16 @@ TEST(UdpConnection, FecAccessorsReportUnmeasuredWhenFecIsOff) {
 // (the connection na_server_set_reliability_profile(NA_RELIABILITY_UDP_WAN) builds) did
 // not, so the same class with the same config behaved differently by construction mode.
 //
-// Both arms below assert the two modes AGREE, rather than asserting a number per mode.
-// That is deliberate: the defect was a divergence, so the assertion that catches it
+// The FIRST TWO arms below assert the two modes AGREE, rather than asserting a number per
+// mode. That is deliberate: the defect was a divergence, so the assertion that catches it
 // coming back is an equality. The client-owned side doubles as #52's criterion-3
 // evidence — if a fix had changed client behaviour, these arms would fail on the client
 // leg, not silently pass.
+//
+// The THIRD arm is shaped differently on purpose: it asserts PER MODE that no sequence is
+// delivered twice. An equality would be useless there, because the duplicate it guards was
+// present in both modes — the client-owned limb has always ticked, so it had the defect
+// too. Two wrong sides agree.
 
 namespace {
 

@@ -336,9 +336,9 @@ TEST(FecDecoder, MissingParityTimesOut) {
 
 // ---- Pending-block retention (issue #47) ----
 //
-// The four arms below pin the retention POLICY, which is the thing #47 got wrong.
-// They use the injected clock, so they measure the policy and never the machine
-// they run on.
+// The seven arms below pin the retention POLICY, which is the thing #47 got wrong,
+// plus the discarded-slot guard that #52's fix turned out to require. They use the
+// injected clock, so they measure the policy and never the machine they run on.
 
 // THE #47 REGRESSION ARM. A block whose own packets are still arriving must not be
 // discarded, however long the block takes in total.

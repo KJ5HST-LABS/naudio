@@ -26,13 +26,18 @@ namespace naudio {
 // is impossible and a NULL (silence) is emitted for each gap. Blocks that don't
 // receive a parity within the timeout are flushed as-is.
 //
-// A fourth outcome guards the three above: the parity's sequence range is only
-// the encoder's block while the block's audio packets are contiguous, and the
-// connection's sequence counter is shared with control/heartbeat traffic. A
-// non-audio packet inside the range therefore proves the range is not the block,
-// and recovery is DECLINED (counted by fecBlocksUnreconciled) rather than run
-// over the wrong member set — which would emit a whole frame of wrong samples as
-// if it were recovered audio. See handleParity() and issue #23.
+// A fourth outcome guards the three above: recovery is DECLINED (counted by
+// fecBlocksUnreconciled) rather than run, on either of TWO triggers.
+//   1. The parity's sequence range is only the encoder's block while the block's
+//      audio packets are contiguous, and the connection's sequence counter is
+//      shared with control/heartbeat traffic. A non-audio packet inside the range
+//      therefore proves the range is not the block, and running the XOR over the
+//      wrong member set would emit a whole frame of wrong samples as if it were
+//      recovered audio (issue #23).
+//   2. A slot whose stored copy THIS CLASS released for retention was already
+//      emitted to the consumer on arrival, so "recovering" it would emit a
+//      byte-exact duplicate of delivered audio (issue #52).
+// See handleParity().
 //
 // Recovery is byte-exact ONLY for uniform-length blocks (all packets in a block
 // the same size), which holds for the fixed-size PCM audio frames this decoder

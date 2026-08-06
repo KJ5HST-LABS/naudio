@@ -88,11 +88,12 @@ public:
     virtual int adaptiveBufferTargetMs() const { return -1; }
     virtual std::int64_t controlRetransmits() const { return 0; }
 
-    // FEC blocks whose parity could not be reconciled against a contiguous run of
-    // audio packets — a control or heartbeat packet took a sequence inside the
-    // parity's range, so the range is not the encoder's block and recovery was
-    // DECLINED rather than run over the wrong member set. A lost opportunity to
-    // recover, never a correctness failure (FecDecoder.hpp).
+    // FEC blocks whose parity range could not be reconciled with the block, so
+    // recovery was DECLINED rather than run. A lost opportunity to recover, never a
+    // correctness failure. TWO distinct causes reach it, and
+    // FecDecoder::fecBlocksUnreconciled() owns that contract. Do not restate them
+    // here — a second copy is a second thing to drift, which is exactly how this
+    // comment came to name only one of the two.
     virtual std::int64_t fecBlocksUnreconciled() const { return 0; }
 
     // Packets discarded from the ordered queue because it was at capacity (a
