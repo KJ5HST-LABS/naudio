@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -177,6 +179,19 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
     std::vector<std::uint8_t> xorData = reader.readBytes(xorLen);
     const std::int64_t blockEnd = static_cast<std::int64_t>(startSeq) + blockSize;
 
+    // blockSize is a wire u8, so 0..255 reaches here while the encoder's validated range
+    // is MIN_BLOCK_SIZE..MAX_BLOCK_SIZE (FecEncoder's constructor enforces that on the SEND
+    // side only — nothing validates a RECEIVED header). Decline out-of-range sizes here,
+    // COUNT the decline: a silent return would leave every observable at zero, so a peer
+    // sending malformed parity would be indistinguishable from a peer sending none at all.
+    // This also makes the member-type derivation below total: blockSize >= 2 guarantees at
+    // least one present member whenever exactly one slot is missing.
+    if (blockSize < static_cast<std::int32_t>(FecEncoder::MIN_BLOCK_SIZE) ||
+        blockSize > static_cast<std::int32_t>(FecEncoder::MAX_BLOCK_SIZE)) {
+        ++fecBlocksUnreconciled_;
+        return;
+    }
+
     // Create/update the block with the real start sequence and size.
     FecBlock block(startSeq, blockSize, clock_());
     {
@@ -262,6 +277,14 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
     std::int32_t missingSeq = -1;
     bool rangeIsAudioOnly = true;
     bool rangeHasDiscardedSlot = false;
+    // The block's own audio type, read off a present member rather than assumed. The
+    // encoder records from BOTH audio send paths (sendRxAudio and sendTxAudio), so a block
+    // is an AudioRx block or an AudioTx block, and a recovered packet must carry the type
+    // its block carried — see the recovery limb. A range holding both is not one encoder's
+    // block, and picking either type would be a coin flip, so it is declined below.
+    bool memberTypeSeen = false;
+    bool rangeTypeUniform = true;
+    PacketType memberType = PacketType::AudioRx;
     for (std::int64_t s = startSeq; s < blockEnd; ++s) {
         const std::int32_t seq = static_cast<std::int32_t>(s);
         auto pit = block.packets.find(seq);
@@ -271,7 +294,68 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
             if (discardedSequences_.count(seq) != 0) rangeHasDiscardedSlot = true;
         } else if (!isAudio(pit->second.packetType())) {
             rangeIsAudioOnly = false;
+        } else if (!memberTypeSeen) {
+            memberType = pit->second.packetType();
+            memberTypeSeen = true;
+        } else if (pit->second.packetType() != memberType) {
+            rangeTypeUniform = false;
         }
+    }
+
+    // THE DISPLACEMENT WITNESS (issue #55). Computed BEFORE the prune below, which would
+    // otherwise remove part of its evidence.
+    //
+    // The two guards above see only what is IN the range. The stranger that breaks the
+    // range need never arrive at all: a consumed CONTROL_ACK draws a sequence and is
+    // returned before the reorder/FEC pipeline (see checkTimeout()'s note, which already
+    // owns that enumeration), so its slot reads exactly like a lost audio packet. With
+    // exactly one such slot the XOR remainder IS the block's displaced last member — audio
+    // the application already received — and recovery would emit a byte-exact DUPLICATE.
+    //
+    // What proves displacement is therefore not the stranger but the DISPLACED MEMBER: an
+    // audio packet the decoder is holding at or past the parity's declared block end. The
+    // reorder buffer emits in strictly ascending sequence order and drops anything below
+    // nextExpected_, so at the instant a parity is handled nothing above its own sequence
+    // has been delivered; an audio packet at or after blockEnd can therefore only be a
+    // member of THIS block that a stranger pushed out of the range.
+    //
+    // Three sources are searched, and each is load-bearing:
+    //   - the re-filed pending block, where an out-of-range leftover normally lands;
+    //   - `block` itself, because when startSeq == PENDING_KEY the find() above moves the
+    //     pending block wholesale into it and leaves no PENDING_KEY entry to search;
+    //   - discardedSequences_, because the displaced member may have been evicted by
+    //     capPending before the parity arrived (the eviction is lowest-first over a SIGNED
+    //     map, so at the int32 wrap the highest sequence sorts lowest and goes first).
+    //
+    // Distances are WRAPPING and unsigned, bounded by the forward half-space: "at or after
+    // blockEnd" is a statement about a counter §3.4 defines as two's-complement, so a
+    // signed comparison is wrong for every block whose end straddles the wrap. The
+    // half-space needs no tuning constant and reads no field the wire format leaves
+    // unspecified — in particular NOT the parity frame's own sequence number, which is
+    // deliberately never consulted: §3.4 constrains it only to be monotonic and shared, so
+    // a conforming peer may number it any way it likes (naudio's own conformance harness
+    // numbers it differently from its connection layer). A guard keyed to it would decline
+    // every block from such a peer, i.e. silently disable FEC against a legal sender.
+    const std::uint32_t uStart = static_cast<std::uint32_t>(startSeq);
+    const std::uint32_t uSize = static_cast<std::uint32_t>(blockSize);
+    const auto atOrPastBlockEnd = [uStart, uSize](std::int32_t seq) {
+        const std::uint32_t d = static_cast<std::uint32_t>(seq) - uStart;
+        return d >= uSize && d < 0x80000000u;
+    };
+    bool rangeHasDisplacedMember = false;
+    const auto scanForMember = [&](const std::map<std::int32_t, AudioPacket>& packets) {
+        for (const auto& [seq, pkt] : packets) {
+            if (isAudio(pkt.packetType()) && atOrPastBlockEnd(seq)) {
+                rangeHasDisplacedMember = true;
+            }
+        }
+    };
+    scanForMember(block.packets);
+    if (auto leftovers = activeBlocks_.find(PENDING_KEY); leftovers != activeBlocks_.end()) {
+        scanForMember(leftovers->second.packets);
+    }
+    for (std::int32_t seq : discardedSequences_) {
+        if (atOrPastBlockEnd(seq)) rangeHasDisplacedMember = true;
     }
 
     // Every sequence below this block's end is now unreachable by any future parity
@@ -280,7 +364,7 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
         discardedSequences_.lower_bound(static_cast<std::int32_t>(blockEnd));
     discardedSequences_.erase(discardedSequences_.begin(), pruneEnd);
 
-    if (!rangeIsAudioOnly || rangeHasDiscardedSlot) {
+    if (!rangeIsAudioOnly || rangeHasDiscardedSlot || !rangeTypeUniform) {
         ++fecBlocksUnreconciled_;
         return;  // `block` is a local — dropping it discards the range
     }
@@ -289,6 +373,16 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
         // All present — parity is redundant.
         ++fecBlocksComplete_;
     } else if (missingCount == 1) {
+        // Declined here rather than above, deliberately. The witness is only evidence of a
+        // FABRICATION when the recovery limb would actually run: with nothing missing the
+        // block is complete and the XOR never happens, and with 2+ missing recovery is
+        // already impossible. Checking it pre-switch would also mask the two guards above,
+        // which are the only detectors #23 and #52 have.
+        if (rangeHasDisplacedMember) {
+            ++fecBlocksUnreconciled_;
+            return;  // `block` is a local — dropping it discards the range
+        }
+
         // Exactly one missing — recover via XOR of parity ^ all present.
         //
         // LOSSLESS ONLY FOR UNIFORM-LENGTH BLOCKS. The recovered buffer is
@@ -321,7 +415,13 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
                 for (std::size_t j = 0; j < n; ++j) recovered[j] ^= p[j];
             }
         }
-        AudioPacket recoveredPacket(PacketType::AudioRx, missingSeq, std::move(recovered));
+        // The block's OWN audio type, not a hardcoded AudioRx. The encoder is driven from
+        // both audio send paths, so the TX lane is FEC-protected too — and a recovered TX
+        // frame typed AudioRx is routed to `default: break` by the server's receive switch
+        // and silently dropped, while packetsRecoveredByFec has already counted it (#55).
+        // memberTypeSeen is guaranteed by the blockSize floor at the top of this function:
+        // blockSize >= 2 with exactly one slot missing leaves at least one present member.
+        AudioPacket recoveredPacket(memberType, missingSeq, std::move(recovered));
         emit(&recoveredPacket);
         block.missingSequences.erase(missingSeq);
         ++packetsRecoveredByFec_;

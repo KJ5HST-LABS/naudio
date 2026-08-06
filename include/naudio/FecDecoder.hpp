@@ -27,17 +27,17 @@ namespace naudio {
 // receive a parity within the timeout are flushed as-is.
 //
 // A fourth outcome guards the three above: recovery is DECLINED (counted by
-// fecBlocksUnreconciled) rather than run, on either of TWO triggers.
-//   1. The parity's sequence range is only the encoder's block while the block's
-//      audio packets are contiguous, and the connection's sequence counter is
-//      shared with control/heartbeat traffic. A non-audio packet inside the range
-//      therefore proves the range is not the block, and running the XOR over the
-//      wrong member set would emit a whole frame of wrong samples as if it were
-//      recovered audio (issue #23).
-//   2. A slot whose stored copy THIS CLASS released for retention was already
-//      emitted to the consumer on arrival, so "recovering" it would emit a
-//      byte-exact duplicate of delivered audio (issue #52).
-// See handleParity().
+// fecBlocksUnreconciled) rather than run, whenever the parity's sequence range
+// cannot be shown to BE the encoder's block. The range is only the block while the
+// block's audio packets are contiguous, and the connection's sequence counter is
+// shared with control/heartbeat traffic — so a stranger taking a sequence inside
+// the range displaces a member out of it, and running the XOR over the wrong member
+// set emits either a frame of wrong samples (issue #23) or a byte-exact duplicate of
+// audio already delivered (issues #52, #55). The stranger need not arrive to do
+// this: it is invisible to the decoder when control reliability consumes it, which
+// is what made #55 reachable at ZERO packet loss.
+// The decline triggers are enumerated on fecBlocksUnreconciled() below, which owns
+// that contract. See handleParity() for the mechanism.
 //
 // Recovery is byte-exact ONLY for uniform-length blocks (all packets in a block
 // the same size), which holds for the fixed-size PCM audio frames this decoder
@@ -165,15 +165,29 @@ public:
     std::int64_t fecBlocksComplete() const;
     std::int64_t fecBlocksFailed() const;
 
-    // Blocks whose sequence range could not be reconciled with the parity's audio
-    // count, and so were declined rather than recovered — see handleParity(). Always a
-    // loss of opportunity, never a loss of correctness. TWO distinct causes reach it and
-    // the counter alone cannot tell them apart:
-    //   1. control/heartbeat traffic interleaving with audio inside a block, so the
-    //      parity's range holds a stranger and is not the block (issue #23);
-    //   2. a slot whose stored copy THIS CLASS discarded for retention — recovering it
-    //      would emit a byte-exact duplicate of already-delivered audio (issue #52).
-    // Cause 2 moves pendingPacketsDiscarded() as well; cause 1 does not.
+    // THIS COMMENT OWNS THE COUNTER'S CONTRACT. Every other statement of it — the public
+    // C ABI (`include/naudio.h`), Transport.hpp, docs/protocols.md R5 — defers here by
+    // name rather than restating the list, because a second copy is a second thing to
+    // drift. No site, including this one, states a CARDINALITY: the causes are enumerated
+    // by the `++fecBlocksUnreconciled_` sites in FecDecoder.cpp, and a count written into
+    // prose goes stale the next time one is added.
+    //
+    // Blocks whose sequence range could not be reconciled with the parity's audio count,
+    // and so were declined rather than recovered — see handleParity(). Always a loss of
+    // opportunity, never a loss of correctness. The counter cannot tell these apart:
+    //   - control/heartbeat traffic interleaving with audio inside a block, so the
+    //     parity's range holds a stranger and is not the block (issue #23);
+    //   - a slot whose stored copy THIS CLASS discarded for retention — recovering it
+    //     would emit a byte-exact duplicate of already-delivered audio (issue #52).
+    //     This one moves pendingPacketsDiscarded() as well; the others do not;
+    //   - a block member DISPLACED past the range end by a stranger that never reached
+    //     the decoder at all — a consumed CONTROL_ACK is the deterministic case, and it
+    //     needs no packet loss whatsoever (issue #55). Note what this cause implies: a
+    //     decline here does NOT mean a packet was lost. Every member was delivered, and
+    //     the slot that looked missing held a control message;
+    //   - a range whose present members disagree about their audio type, or a parity
+    //     whose declared block size is outside FecEncoder's validated range — neither is
+    //     one encoder's block, and neither can be reconciled (issue #55).
     std::int64_t fecBlocksUnreconciled() const;
 
     // Audio packets dropped from the pending block without ever being offered to a

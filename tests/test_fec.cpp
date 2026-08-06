@@ -547,4 +547,335 @@ TEST(FecDecoder, PendingIdleTimeoutIsClampedToItsDocumentedRange) {
     EXPECT_EQ(300, d.pendingIdleTimeoutMs());  // in range, taken verbatim
 }
 
+// --- Issue #55: an ABSENT in-range stranger, and the block's own audio type -------------
+//
+// #23 (above) guards the stranger that ARRIVES. Its premise — "it stays invisible without
+// loss, the stranger fills the slot so nothing looks missing" — assumes the stranger reaches
+// the decoder. Three production paths falsify that, the deterministic one being a consumed
+// CONTROL_ACK: it draws a sequence from the shared counter and is returned before the
+// reorder/FEC pipeline, so its slot reads exactly like a lost audio packet. With one such
+// slot the XOR remainder IS the block's displaced last member, and "recovery" emits a
+// byte-exact DUPLICATE of audio the application already received — at ZERO packet loss.
+//
+// What these arms assert is therefore DELIVERY MULTIPLICITY, not a counter: an equality
+// between receive modes would be useless because both modes fabricate, and a counter alone
+// cannot tell a repair from a duplicate. Each arm counts how many times each payload
+// reaches the sink.
+
+AudioPacket txp(std::int32_t seq, std::vector<std::uint8_t> data) {
+    return AudioPacket::createTxAudio(seq, std::move(data));
+}
+
+// How many emitted audio packets carry exactly `payload`.
+int deliveries(const DecSink& s, const std::vector<std::uint8_t>& payload) {
+    int n = 0;
+    for (const AudioPacket& p : s.packets) {
+        if (p.packetType() != PacketType::FecParity && p.payload() == payload) ++n;
+    }
+    return n;
+}
+
+// The canonical shape: one consumed ACK takes slot 4, displacing the block's last member to
+// seq 5 — exactly at the range end. Before the fix this fabricated a duplicate of a4.
+TEST(FecDecoder, AnAbsentStrangerDoesNotFabricateADuplicateAtZeroLoss) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a0{0x10, 0x20}, a1{0x30, 0x40}, a2{0x50, 0x60}, a3{0x70, 0x01},
+        a4{0x02, 0x03};
+    // Sender drew: a0=0 a1=1 a2=2 a3=3 [CONTROL_ACK=4] a4=5, parity=6.
+    AudioPacket parity = buildParity(0, {a0, a1, a2, a3, a4});
+    parity.setSequence(6);
+
+    d.processPacket(rx(0, a0));
+    d.processPacket(rx(1, a1));
+    d.processPacket(rx(2, a2));
+    d.processPacket(rx(3, a3));
+    // seq 4 is NEVER presented — the ACK was consumed by control reliability.
+    d.processPacket(rx(5, a4));
+    d.processPacket(parity);
+
+    EXPECT_EQ(0, d.packetsRecoveredByFec()) << "nothing was lost — there is nothing to recover";
+    EXPECT_EQ(1, d.fecBlocksUnreconciled());
+    EXPECT_EQ(nullptr, s.find(4)) << "slot 4 held a consumed control ACK, not audio";
+    EXPECT_EQ(5u, s.packets.size()) << "5 sent, 5 delivered";
+    EXPECT_EQ(1, deliveries(s, a4)) << "the displaced member must not be delivered twice";
+}
+
+// THE ARM THAT SEPARATES THIS GUARD FROM THE ISSUE'S LITERAL WORDING. #55 proposes declining
+// when an audio packet sits at exactly `startSeq + blockSize`. Two back-to-back ACKs put the
+// displaced member one slot FURTHER out, and a `== blockEnd` lookup finds nothing there.
+// This is the natural interleaving, not a corner case: CLIENTS_UPDATE and TX_GRANTED are both
+// critical types, so two arriving together generate two ACKs, each drawing a sequence.
+TEST(FecDecoder, TwoAbsentStrangersStillDeclineWithTheMemberPastTheRangeEnd) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a0{0x10, 0x20}, a1{0x30, 0x40}, a2{0x50, 0x60}, a3{0x70, 0x01},
+        a4{0x02, 0x03};
+    // Sender drew: a0=0 a1=1 a2=2 a3=3 [ACK=4] [ACK=5] a4=6, parity=7.
+    AudioPacket parity = buildParity(0, {a0, a1, a2, a3, a4});
+    parity.setSequence(7);
+
+    d.processPacket(rx(0, a0));
+    d.processPacket(rx(1, a1));
+    d.processPacket(rx(2, a2));
+    d.processPacket(rx(3, a3));
+    d.processPacket(rx(6, a4));  // displaced to blockEnd + 1, NOT blockEnd
+    d.processPacket(parity);
+
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
+    EXPECT_EQ(1, d.fecBlocksUnreconciled());
+    EXPECT_EQ(1, deliveries(s, a4)) << "a witness one slot past blockEnd is still a witness";
+    EXPECT_EQ(5u, s.packets.size());
+}
+
+// The displaced member can be GONE by the time the parity arrives: capPending evicts
+// lowest-first over a SIGNED map, so at the int32 wrap the highest sequence sorts lowest and
+// is evicted first. discardedSequences_ is then the only surviving evidence — this is the
+// arm for that limb of the witness, which no other arm reaches.
+TEST(FecDecoder, ADisplacedMemberEvictedByThePacketCapIsStillDeclined) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    const std::int32_t S = 2147483643;  // S+5 wraps to INT32_MIN
+    std::vector<std::uint8_t> a0{0x10, 0x20}, a1{0x30, 0x40}, a2{0x50, 0x60}, a3{0x70, 0x01},
+        a4{0x02, 0x03};
+
+    // Fill the repair cache so every later insert evicts.
+    for (std::size_t i = 0; i < FecDecoder::MAX_PENDING_PACKETS; ++i) {
+        d.processPacket(rx(2147483600 + static_cast<std::int32_t>(i),
+                           {static_cast<std::uint8_t>(i), 0xEE}));
+    }
+    d.processPacket(rx(S, a0));
+    d.processPacket(rx(S + 1, a1));
+    d.processPacket(rx(S + 2, a2));
+    // S + 3 is the absent stranger.
+    d.processPacket(rx(S + 4, a3));
+    d.processPacket(rx(static_cast<std::int32_t>(static_cast<std::uint32_t>(S) + 5), a4));
+
+    AudioPacket parity = buildParity(S, {a0, a1, a2, a3, a4});
+    d.processPacket(parity);
+
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
+    EXPECT_EQ(1, d.fecBlocksUnreconciled());
+    EXPECT_EQ(1, deliveries(s, a4)) << "the evicted member was already delivered on arrival";
+}
+
+// startSeq == PENDING_KEY makes handleParity's activeBlocks_.find(startSeq) hit the pending
+// block and move it wholesale into the local `block`, leaving no PENDING_KEY entry. A witness
+// search that reads only the pending block finds an empty map. Reachable without a hostile
+// peer: §3.4 specifies two's-complement overflow, so the shared counter reaches INT32_MIN.
+TEST(FecDecoder, AnAbsentStrangerAtTheCounterWrapIsStillDeclined) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    const std::int32_t S = -2147483648;  // INT32_MIN == the pending block's sentinel key
+    std::vector<std::uint8_t> a0{0x10, 0x20}, a1{0x30, 0x40}, a2{0x50, 0x60}, a3{0x70, 0x01},
+        a4{0x02, 0x03};
+
+    d.processPacket(rx(S, a0));
+    d.processPacket(rx(S + 1, a1));
+    d.processPacket(rx(S + 2, a2));
+    d.processPacket(rx(S + 3, a3));
+    // S + 4 is the absent stranger; the member it displaced is at S + 5.
+    d.processPacket(rx(S + 5, a4));
+    d.processPacket(buildParity(S, {a0, a1, a2, a3, a4}));
+
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
+    EXPECT_EQ(1, d.fecBlocksUnreconciled());
+    EXPECT_EQ(1, deliveries(s, a4));
+}
+
+// THE NEGATIVE CONTROL. A genuine single loss with no stranger anywhere must still recover —
+// a guard that declines everything would pass every arm above and destroy the feature.
+TEST(FecDecoder, AGenuineLossStillRecoversWhenNothingIsDisplaced) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a0{0x10, 0x20}, a1{0x30, 0x40}, a2{0x50, 0x60}, a3{0x70, 0x01},
+        a4{0x02, 0x03};
+    d.processPacket(rx(0, a0));
+    d.processPacket(rx(1, a1));
+    // a2 genuinely lost on the wire.
+    d.processPacket(rx(3, a3));
+    d.processPacket(rx(4, a4));
+    d.processPacket(buildParity(0, {a0, a1, a2, a3, a4}));
+
+    EXPECT_EQ(1, d.packetsRecoveredByFec());
+    EXPECT_EQ(0, d.fecBlocksUnreconciled());
+    const AudioPacket* rec = s.find(2);
+    ASSERT_NE(nullptr, rec);
+    EXPECT_EQ(a2, rec->payload()) << "byte-exact repair of the genuinely lost frame";
+}
+
+// The guard must never read the parity frame's OWN sequence number. §3.4 constrains it only
+// to be monotonic and shared across types, so a conforming peer may number it any way it
+// likes — and this repo ships such a peer: the conformance harness numbers parity at
+// startSeq. A guard keyed to that field would decline every block from a legal sender, i.e.
+// silently disable FEC. This arm is the executable form of that deliberate constraint.
+TEST(FecDecoder, TheAbsentStrangerGuardIgnoresTheParityFramesOwnSequence) {
+    std::vector<std::uint8_t> a0{0x10, 0x20}, a1{0x30, 0x40}, a2{0x50, 0x60}, a3{0x70, 0x01},
+        a4{0x02, 0x03};
+    for (std::int32_t paritySeq : {0, 5, 6, 7, 999}) {
+        DecSink s;
+        FecDecoder d(s.emitter());
+        AudioPacket parity = buildParity(0, {a0, a1, a2, a3, a4});
+        parity.setSequence(paritySeq);
+        d.processPacket(rx(0, a0));
+        d.processPacket(rx(1, a1));
+        d.processPacket(rx(2, a2));
+        d.processPacket(rx(3, a3));
+        d.processPacket(rx(5, a4));  // slot 4 absent — the consumed ACK
+        d.processPacket(parity);
+
+        EXPECT_EQ(1, d.fecBlocksUnreconciled()) << "parity sequence " << paritySeq;
+        EXPECT_EQ(0, d.packetsRecoveredByFec()) << "parity sequence " << paritySeq;
+        EXPECT_EQ(1, deliveries(s, a4)) << "parity sequence " << paritySeq;
+    }
+}
+
+// THE ANTI-MASKING ARM FOR ISSUE #23, and it is not optional.
+//
+// #55's displacement witness fires on an audio packet at or past blockEnd — which is present
+// in the ORDINARY #23 layout too, because the stranger displaced a member out there. So the
+// witness silently absorbs #23's detector: MEASURED, deleting `rangeIsAudioOnly` from the
+// decline leaves the whole suite green, and only deleting the witness as well turns
+// ControlInsideBlockRangeDeclinesRecoveryInsteadOfCorrupting red. Without the arm below,
+// #23's guard could be removed by a future session with no test saying otherwise (L45/L54).
+//
+// The isolating shape denies the witness its evidence: the stranger is PRESENT in range, and
+// the member it displaced never arrives. Two frames of the block are then unaccounted for —
+// which is exactly issue #23's corruption case, where the XOR remainder would be
+// `lost ^ displaced` rather than either frame.
+TEST(FecDecoder, APresentStrangerIsDeclinedEvenWithNothingPastTheRangeEnd) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a0{0x10, 0x20}, a1{0x30, 0x40}, a2{0x50, 0x60}, a3{0x70, 0x01},
+        a4{0x02, 0x03};
+    // Sender drew: a0=0 a1=1 a2=2 [CONTROL=3] a3=4 a4=5, parity=6.
+    // Received: 0,1,2 and the control at 3. Both a3 (seq 4) and a4 (seq 5) are lost.
+    AudioPacket parity = buildParity(0, {a0, a1, a2, a3, a4});
+    parity.setSequence(6);
+
+    d.processPacket(rx(0, a0));
+    d.processPacket(rx(1, a1));
+    d.processPacket(rx(2, a2));
+    d.processPacket(AudioPacket(PacketType::Control, 3, {'C', 'U'}));
+    d.processPacket(parity);
+
+    EXPECT_EQ(1, d.fecBlocksUnreconciled()) << "the present stranger alone must decline this";
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
+    EXPECT_EQ(nullptr, s.find(4)) << "emitting here would be a3 ^ a4 — a frame of wrong samples";
+    int audio = 0;
+    for (const AudioPacket& p : s.packets) {
+        if (p.packetType() == PacketType::AudioRx) ++audio;
+    }
+    EXPECT_EQ(3, audio) << "only the three real audio frames were delivered (the sink also "
+                           "sees the control packet, which the decoder passes through)";
+}
+
+// THE ANTI-MASKING ARM FOR ISSUE #52's CAP LIMB, for the same reason as the arm above.
+//
+// ASlotEvictedByThePacketCapIsAlsoDeclinedRatherThanDuplicated fills the repair cache with
+// AUDIO, so #55's witness sees packets past blockEnd and co-declines: MEASURED, deleting
+// `rangeHasDiscardedSlot` leaves that arm green and reddens only its timeout twin. The
+// witness needs an AUDIO packet past the range end, so filling the cache with CONTROL
+// traffic instead denies it that evidence and leaves the discarded-slot guard as the only
+// decliner. (The first shape I reasoned through was wrong — I concluded the cap limb could
+// not be isolated at all, because I forgot the witness is type-filtered.)
+TEST(FecDecoder, ACapEvictedSlotIsDeclinedEvenWithNoAudioPastTheRangeEnd) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::int64_t now = 1000;
+    d.setClock([&now]() { return now; });  // never advanced: the TIMEOUT limb must not fire
+
+    std::vector<std::vector<std::uint8_t>> pl;
+    for (int i = 0; i < 5; ++i) pl.push_back({static_cast<std::uint8_t>(i + 1), 0x55});
+    for (int i = 0; i < 5; ++i) d.processPacket(rx(i, pl[i]));
+    // Control traffic fills the repair cache to one past the cap, evicting exactly seq 0.
+    const int controls = static_cast<int>(FecDecoder::MAX_PENDING_PACKETS) - 4;
+    for (int i = 0; i < controls; ++i) {
+        d.processPacket(AudioPacket(PacketType::Control, 5 + i, {'C', 'U'}));
+    }
+    ASSERT_EQ(1, d.pendingPacketsDiscarded()) << "premise: the cap evicted exactly one slot";
+    ASSERT_NE(nullptr, s.find(0)) << "premise: seq 0 was delivered on arrival before eviction";
+
+    d.processPacket(buildParity(0, {pl[0], pl[1], pl[2], pl[3], pl[4]}));
+
+    EXPECT_EQ(0, d.packetsRecoveredByFec())
+        << "a cap-evicted slot was recovered — a duplicate of audio already delivered";
+    EXPECT_EQ(1, d.fecBlocksUnreconciled());
+    EXPECT_EQ(1, deliveries(s, pl[0])) << "seq 0 must be delivered exactly once";
+}
+
+// --- Issue #55 defect 2: the recovered packet carries its BLOCK's audio type -------------
+//
+// The encoder is driven from both audio send paths, so the client-to-server TX lane is
+// FEC-protected too. A recovered frame typed AudioRx is routed to `default: break` by
+// AudioStreamServer::ClientSession::receiveLoop and silently dropped, while
+// packetsRecoveredByFec has already counted it — FEC that repairs nothing and says it did.
+TEST(FecDecoder, ATxLaneBlockRecoversAsAudioTxNotAudioRx) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a0{0x11, 0x21}, a1{0x31, 0x41}, a2{0x51, 0x61};
+    d.processPacket(txp(0, a0));
+    // a1 genuinely lost.
+    d.processPacket(txp(2, a2));
+    d.processPacket(buildParity(0, {a0, a1, a2}));
+
+    EXPECT_EQ(1, d.packetsRecoveredByFec());
+    const AudioPacket* rec = s.find(1);
+    ASSERT_NE(nullptr, rec);
+    EXPECT_EQ(PacketType::AudioTx, rec->packetType()) << "a TX block must recover as AudioTx";
+    EXPECT_EQ(a1, rec->payload());
+}
+
+// The no-regression twin: an RX block still recovers as AudioRx. Without this, hardcoding the
+// type the other way would pass the arm above.
+TEST(FecDecoder, AnRxLaneBlockStillRecoversAsAudioRx) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a0{0x11, 0x21}, a1{0x31, 0x41}, a2{0x51, 0x61};
+    d.processPacket(rx(0, a0));
+    d.processPacket(rx(2, a2));
+    d.processPacket(buildParity(0, {a0, a1, a2}));
+
+    EXPECT_EQ(1, d.packetsRecoveredByFec());
+    const AudioPacket* rec = s.find(1);
+    ASSERT_NE(nullptr, rec);
+    EXPECT_EQ(PacketType::AudioRx, rec->packetType());
+}
+
+// A range holding both audio types is not one encoder's block — the type to stamp on the
+// recovered packet would be a coin flip, so it is declined rather than guessed.
+TEST(FecDecoder, ATypeMixedRangeIsDeclinedRatherThanGuessed) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a0{0x11, 0x21}, a1{0x31, 0x41}, a2{0x51, 0x61};
+    d.processPacket(rx(0, a0));
+    d.processPacket(txp(2, a2));  // disagrees with slot 0
+    d.processPacket(buildParity(0, {a0, a1, a2}));
+
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
+    EXPECT_EQ(1, d.fecBlocksUnreconciled());
+    EXPECT_EQ(nullptr, s.find(1));
+}
+
+// blockSize is a wire u8: 0..255 arrives, while the encoder's validated range is 2..10 and
+// nothing validates a RECEIVED header. Declining is not enough — the decline must be COUNTED,
+// or a peer sending malformed parity is indistinguishable from one sending none.
+TEST(FecDecoder, AnOutOfRangeBlockSizeIsDeclinedAndCounted) {
+    for (std::uint8_t bad : {std::uint8_t{0}, std::uint8_t{1}, std::uint8_t{11},
+                             std::uint8_t{255}}) {
+        DecSink s;
+        FecDecoder d(s.emitter());
+        std::vector<std::uint8_t> a0{0x11, 0x21};
+        d.processPacket(rx(0, a0));
+        // Hand-built parity: [startSeq:4 BE][blockSize:1][xor], blockSize forced out of range.
+        std::vector<std::uint8_t> payload{0, 0, 0, 0, bad, 0xAA, 0xBB};
+        d.processPacket(AudioPacket(PacketType::FecParity, 5, std::move(payload)));
+
+        EXPECT_EQ(1, d.fecBlocksUnreconciled()) << "blockSize " << static_cast<int>(bad);
+        EXPECT_EQ(0, d.packetsRecoveredByFec()) << "blockSize " << static_cast<int>(bad);
+        EXPECT_EQ(0, d.fecBlocksComplete()) << "blockSize " << static_cast<int>(bad);
+        EXPECT_EQ(1u, s.packets.size()) << "blockSize " << static_cast<int>(bad);
+    }
+}
+
 }  // namespace
