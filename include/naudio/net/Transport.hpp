@@ -90,10 +90,11 @@ public:
 
     // FEC blocks whose parity range could not be reconciled with the block, so
     // recovery was DECLINED rather than run. A lost opportunity to recover, never a
-    // correctness failure. TWO distinct causes reach it, and
+    // correctness failure. Several distinct causes reach it, and
     // FecDecoder::fecBlocksUnreconciled() owns that contract. Do not restate them
-    // here — a second copy is a second thing to drift, which is exactly how this
-    // comment came to name only one of the two.
+    // here, and do not state how many there are — a second copy is a second thing to
+    // drift, which is exactly how this comment came to name only one of them and then
+    // to claim there were two.
     virtual std::int64_t fecBlocksUnreconciled() const { return 0; }
 
     // Packets discarded from the ordered queue because it was at capacity (a

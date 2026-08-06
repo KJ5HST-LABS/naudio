@@ -128,6 +128,36 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **FEC no longer fabricates a duplicate audio frame when an interleaving control packet never
+  reaches the decoder, and a repaired transmit frame is no longer silently discarded.** Two defects
+  in the same recovery path (issue #55).
+
+  *The fabrication.* A block's parity is read as the range `[startSeq, startSeq + blockSize)`, which
+  is the encoder's block only while the block's audio is contiguous. The existing guard for that
+  (issue #23) inspected only packets **present** in the range, on the premise that an interleaving
+  control message fills its slot and so is visible. Control reliability falsifies the premise: a
+  `CONTROL_ACK` draws a sequence from the shared counter and is consumed before the reorder/FEC
+  pipeline, so its slot is simply absent and reads exactly like a lost audio packet. With one such
+  slot the XOR remainder is the block member the stranger displaced — a frame the application
+  **already received** — so the decoder delivered a byte-exact duplicate of it and counted a repair.
+  Measured with **no packet loss at all**: six frames delivered for five sent. The decoder now
+  declines when it holds evidence of the displaced *member* (an audio packet at or past the range
+  end, in the repair cache or already evicted from it) rather than looking for the stranger. It
+  deliberately does **not** consult the parity frame's own sequence number, which §3.4 leaves free
+  for a conforming sender to choose; keying on it would silently disable FEC against a legal peer.
+
+  *The discarded repair.* Recovered packets were stamped `AUDIO_RX` unconditionally, though the
+  encoder is driven from both audio send paths and a client protects its `AUDIO_TX` lane the same
+  way. A repaired transmit frame therefore arrived at the server typed as receive audio, hit the
+  `default` branch of the session's receive switch and was dropped — while the repair counter had
+  already incremented. Recovery now carries the block's own audio type, read off a present member;
+  a range whose members disagree, or whose declared block size is outside the encoder's validated
+  range, is declined rather than guessed. The recovered packet is delivered locally and never
+  serialized, so this is a delivery fix, not a wire change.
+
+  The two shipped together deliberately: fixing the type alone would have promoted the fabricated
+  frames from "silently dropped" to "submitted to the transmit mixer". No ABI change, no wire change.
+
 - **FEC no longer "recovers" a slot the decoder itself discarded, which delivered a duplicate audio
   frame at zero packet loss.** The decoder emits each audio packet to the application on arrival and
   keeps only a copy for repair. When retention released that copy — either the idle timeout or the

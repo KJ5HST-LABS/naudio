@@ -577,18 +577,23 @@ typedef struct na_client_stats {
     /* FEC blocks whose parity range could not be reconciled with the block, so recovery was
      * declined rather than run. Always a lost opportunity, never corrupted audio, and it is
      * what separates "no parity ever arrived" from "the parity arrived and was declined".
-     * TWO distinct causes reach this counter and it cannot tell them apart:
-     *   1. control or heartbeat traffic took a sequence inside the parity's range, so the
-     *      range is not the encoder's block and the XOR would run over the wrong member set.
-     *      The packet stays lost exactly as it would with FEC off.
-     *   2. the slot's stored copy was released from the repair buffer before the parity
-     *      arrived. That packet was ALREADY delivered on arrival, so "recovering" it would
-     *      emit a byte-exact duplicate — it is declined for that reason, not for loss.
-     * Cause 1 tracks control-traffic interleave, so a non-zero value here alongside a low
-     * packets_recovered_by_fec is the expected shape on a busy roster, not a defect. Cause 2
-     * needs no control traffic at all — a peer that pauses mid-block is enough. The count of
-     * packets dropped from the repair buffer, which is what would separate the two, is not
-     * exposed on this ABI. */
+     * Several distinct causes reach this counter and it cannot tell them apart (the list is
+     * NOT exhaustive and carries no count on purpose — a number in prose goes stale):
+     *   - control or heartbeat traffic took a sequence inside the parity's range, so the
+     *     range is not the encoder's block and the XOR would run over the wrong member set;
+     *   - that same interleave with the stranger never reaching the decoder at all, which is
+     *     what a consumed control ACK looks like. This needs NO packet loss to happen;
+     *   - the slot's stored copy was released from the repair buffer before the parity
+     *     arrived. That packet was ALREADY delivered on arrival, so "recovering" it would
+     *     emit a byte-exact duplicate.
+     * DO NOT read a decline as "a packet was lost". In the second and third cases above
+     * nothing was lost: every audio frame of the block was delivered, and the slot that
+     * looked missing held a control message or a copy the decoder had already released. In
+     * the first case the packet does stay lost, exactly as it would with FEC off.
+     * A non-zero value here alongside a low packets_recovered_by_fec is the expected shape on
+     * a busy roster, not a defect: control traffic is what interleaves. The count of packets
+     * dropped from the repair buffer, which is what would separate the causes, is not exposed
+     * on this ABI. The full trigger list is owned by FecDecoder::fecBlocksUnreconciled(). */
     long long fec_blocks_unreconciled;
     /* Control-ARQ resends (reliability layer, not audio). ALWAYS 0 ON A CLIENT: only a critical
      * control type is tracked for retransmission, and of the four control messages a client sends
