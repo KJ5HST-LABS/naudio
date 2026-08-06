@@ -713,3 +713,118 @@ TEST(UdpConnection, NeitherReceiveModeFabricatesADuplicateAfterADiscard) {
                             << ": " << total << " frames delivered for 5 sent";
     }
 }
+
+// --- Issue #55: the production trigger, end to end through a real connection ------------
+//
+// Every other #55 arm drives FecDecoder directly. These two drive a real
+// UdpClientConnection, because the defect's trigger is a property of the CONNECTION, not of
+// the decoder: control reliability consumes a CONTROL_ACK and returns before the
+// reorder/FEC pipeline, so the sequence that ACK drew never reaches the decoder at all. A
+// unit arm has to SIMULATE that absence; here it is the real shape.
+
+// Both receive modes, one in-block sequence consumed as a control ACK. Asserted per mode as
+// delivery multiplicity rather than as an equality between modes: the modes AGREE while
+// both fabricate, so an equality would pass on the broken build (#52's arms could use an
+// equality because that defect was a divergence; this one is not).
+TEST(UdpConnection, NeitherReceiveModeFabricatesADuplicateForAConsumedControlSlot) {
+    for (int mode = 0; mode < 2; mode++) {
+        const bool serverFed = (mode == 0);
+        Socket sock = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+        ASSERT_TRUE(sock.valid());
+        const ClientAddress addr("udp-55-stranger", "127.0.0.1", 9999);
+        std::unique_ptr<UdpClientConnection> conn;
+        if (serverFed) {
+            conn = std::make_unique<UdpClientConnection>(&sock, "127.0.0.1", 9999, addr,
+                                                         floorBoundCfg(0));
+        } else {
+            conn = std::make_unique<UdpClientConnection>(std::move(sock), "127.0.0.1", 9999,
+                                                         addr, floorBoundCfg(0));
+        }
+        UdpClientConnection& c = *conn;
+
+        // A real 5-packet block whose members are NOT contiguous: sequence 4 was drawn by a
+        // control message, so the block's last member sits at 5. The parity comes from the
+        // shipping encoder, so the declared range is whatever it really emits.
+        FecEncoder enc(5);
+        std::vector<AudioPacket> blk;
+        std::optional<AudioPacket> parity;
+        for (std::int32_t seq : {0, 1, 2, 3, 5}) {
+            AudioPacket p = rxPacket(seq, payloadFor(seq));
+            blk.push_back(p);
+            if (auto e = enc.recordAndMaybeEmit(p)) parity = *e;
+        }
+        ASSERT_TRUE(parity.has_value());
+
+        std::map<std::int32_t, int> seen;
+        auto collect = [&](int budgetMs) {
+            auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
+            while (std::chrono::steady_clock::now() < deadline) {
+                ReceiveResult r = c.receivePacket(25);
+                if (r.hasPacket()) seen[r.packet->sequence()]++;
+            }
+        };
+
+        // Sequence 4 is never enqueued: control reliability consumed it upstream of here.
+        for (const AudioPacket& p : blk) c.enqueueReceived(p, 200);
+        c.enqueueReceived(*parity, 200);
+        collect(300);
+
+        int total = 0;
+        for (auto& [seq, n] : seen) {
+            total += n;
+            EXPECT_EQ(1, n) << (serverFed ? "server-fed" : "client-owned") << ": seq " << seq
+                            << " delivered " << n << " times";
+        }
+        EXPECT_EQ(5, total) << (serverFed ? "server-fed" : "client-owned") << ": " << total
+                            << " frames delivered for 5 sent, at ZERO packet loss";
+        EXPECT_EQ(0, seen.count(4))
+            << (serverFed ? "server-fed" : "client-owned")
+            << ": sequence 4 carried a consumed control message, not audio — anything "
+               "delivered there is fabricated (issue #55)";
+    }
+}
+
+// The other half of #55: a repaired TRANSMIT frame must emerge from receivePacket typed
+// AudioTx. That type is exactly what AudioStreamServer::ClientSession::receiveLoop switches
+// on to reach handleTxAudio — typed AudioRx it falls to `default:` and is dropped while the
+// repair counter has already incremented. Asserting at the connection boundary is what makes
+// this a statement about routing rather than about the decoder's internals.
+TEST(UdpConnection, ARecoveredTxFrameEmergesTypedAudioTxSoTheServerCanRouteIt) {
+    Socket sock = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    ASSERT_TRUE(sock.valid());
+    const ClientAddress addr("udp-55-txtype", "127.0.0.1", 9999);
+    // Server-fed: the direction that carries client-to-server TX audio.
+    UdpClientConnection c(&sock, "127.0.0.1", 9999, addr, floorBoundCfg(0));
+
+    FecEncoder enc(5);
+    std::vector<AudioPacket> blk;
+    std::optional<AudioPacket> parity;
+    for (std::int32_t seq = 0; seq < 5; seq++) {
+        AudioPacket p = AudioPacket::createTxAudio(seq, payloadFor(seq));
+        blk.push_back(p);
+        if (auto e = enc.recordAndMaybeEmit(p)) parity = *e;
+    }
+    ASSERT_TRUE(parity.has_value());
+
+    // Sequence 2 is genuinely lost on the wire — the case FEC exists for.
+    for (std::int32_t seq : {0, 1, 3, 4}) c.enqueueReceived(blk[seq], 200);
+    c.enqueueReceived(*parity, 200);
+
+    std::map<std::int32_t, AudioPacket> got;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (std::chrono::steady_clock::now() < deadline) {
+        ReceiveResult r = c.receivePacket(25);
+        if (r.hasPacket()) got.emplace(r.packet->sequence(), *r.packet);
+    }
+
+    ASSERT_EQ(1u, got.count(2)) << "the genuinely lost TX frame was not repaired at all";
+    EXPECT_EQ(PacketType::AudioTx, got.at(2).packetType())
+        << "a repaired TX frame typed AudioRx reaches `default: break` in "
+           "AudioStreamServer::ClientSession::receiveLoop and is silently dropped, while "
+           "packets_recovered_by_fec has already counted it (issue #55)";
+    EXPECT_EQ(payloadFor(2), got.at(2).payload()) << "byte-exact repair";
+    for (std::int32_t seq : {0, 1, 3, 4}) {
+        EXPECT_EQ(PacketType::AudioTx, got.at(seq).packetType()) << "seq " << seq;
+    }
+}
