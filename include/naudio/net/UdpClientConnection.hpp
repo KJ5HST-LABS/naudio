@@ -159,11 +159,20 @@ struct UdpReliabilityConfig {
 //   client-owned (ownsSocket == true):  receivePacket() reads the owned socket
 //                directly (receiveFromSocket), runs the pipeline, drains the queue.
 //
+// Both modes tick the pipeline's hold-timeouts (reorder buffer + FEC decoder) from
+// their own NO-DATA limb, not from the arrival path — see receivePacket and issue #52.
+// An arrival-driven tick cannot fire during a pause in traffic, which is exactly when a
+// hold expires; the consumer's deadline is the only clock that keeps running. Adding a
+// third receive mode means adding a tick on its no-data path too.
+//
 // Threading:
 // one `pipe` mutex guards all five recovery subsystems. It is NEVER held across a
 // socket send — every receive-path action that must send (control ACK, NACK
 // retransmit, retransmit sweep) collects packets under the lock and sends them
-// after releasing it (collect-under-lock / send-after-unlock).
+// after releasing it (collect-under-lock / send-after-unlock). For the same reason it
+// is never held across a BLOCKING QUEUE WAIT: receivePacket polls the ordered queue
+// first and takes `pipe` only afterwards, because holding it across the poll's deadline
+// would stall the demux thread in enqueueReceived for the whole timeout.
 // The emitter lambdas capture `this`, so the connection is non-movable and is
 // always held via shared_ptr. Stats are atomic for lock-free const getters.
 class UdpClientConnection : public ClientConnection {

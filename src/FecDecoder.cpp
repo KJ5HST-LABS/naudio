@@ -70,6 +70,10 @@ void FecDecoder::checkTimeoutAt(std::int64_t nowMs) {
             nullsToEmit += block.missingSequences.size();
             if (!block.missingSequences.empty()) ++failedIncrements;
             discarded += static_cast<std::int64_t>(block.packets.size());
+            // Record what we are about to destroy, so a later parity cannot mistake these
+            // slots for packets the peer never sent and "recover" a duplicate of audio the
+            // application already received. See handleParity's discarded-slot guard.
+            for (const auto& [seq, pkt] : block.packets) discardedSequences_.insert(seq);
             toRemove.push_back(key);
         }
     }
@@ -95,6 +99,7 @@ bool FecDecoder::isAudio(PacketType type) {
 
 void FecDecoder::reset() {
     activeBlocks_.clear();
+    discardedSequences_.clear();
     nextEmitSeq_ = -1;
     packetsRecoveredByFec_ = 0;
     fecBlocksComplete_ = 0;
@@ -129,11 +134,21 @@ FecDecoder::FecBlock& FecDecoder::getOrCreateBlock(std::int32_t key) {
 
 void FecDecoder::capPending(FecBlock& block) {
     while (block.packets.size() > MAX_PENDING_PACKETS) {
+        // Same reason as checkTimeoutAt's record: this packet was emitted on arrival, so
+        // once it is erased a later parity must not treat the hole as peer loss.
+        discardedSequences_.insert(block.packets.begin()->first);
         block.packets.erase(block.packets.begin());
         ++pendingPacketsDiscarded_;
     }
     while (block.missingSequences.size() > MAX_PENDING_PACKETS) {
+        // NOT recorded: a slot that was always missing is legitimately missing, and
+        // recovering it is the feature working rather than a fabrication.
         block.missingSequences.erase(block.missingSequences.begin());
+    }
+    // The record is pruned by handleParity, but a peer that never sends parity would let
+    // it grow, so bound it here on the same principle as the packet cap itself.
+    while (discardedSequences_.size() > MAX_PENDING_PACKETS) {
+        discardedSequences_.erase(discardedSequences_.begin());
     }
 }
 
@@ -228,21 +243,44 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
     // count it and leave the lost packet lost, exactly as with FEC disabled. That
     // costs one block's recovery per interleaved control message and never emits a
     // frame the sender did not send. See issue #23.
+    // A SECOND way the range can fail to be the block, with the same consequence and a
+    // different cause: a slot THIS DECODER discarded. Retention is bounded two ways
+    // (the idle timeout in checkTimeoutAt, the packet cap in capPending) and both
+    // ERASE stored packets — but the packets were already emitted to the application on
+    // arrival, so an erased slot reads here as "the peer never sent it" while in truth
+    // it was delivered. With exactly one such slot the XOR remainder is precisely that
+    // frame, so recovery would emit a BYTE-EXACT DUPLICATE of audio the application
+    // already has and count it as a repair. Measured before this guard existed: 6 frames
+    // delivered for 5 sent, at ZERO packet loss, on both receive modes.
+    //
+    // Hence discardedSequences_: the sequences retention destroyed. An absent slot found
+    // in it proves the range is unreconcilable for the same reason a stranger does, and
+    // is declined the same way. Note the asymmetry — only erased PACKETS are recorded,
+    // never evicted missingSequences entries: a slot that was always missing is
+    // legitimately missing, and recovering it is the feature working.
     std::int32_t missingCount = 0;
     std::int32_t missingSeq = -1;
     bool rangeIsAudioOnly = true;
+    bool rangeHasDiscardedSlot = false;
     for (std::int64_t s = startSeq; s < blockEnd; ++s) {
         const std::int32_t seq = static_cast<std::int32_t>(s);
         auto pit = block.packets.find(seq);
         if (pit == block.packets.end()) {
             ++missingCount;
             missingSeq = seq;
+            if (discardedSequences_.count(seq) != 0) rangeHasDiscardedSlot = true;
         } else if (!isAudio(pit->second.packetType())) {
             rangeIsAudioOnly = false;
         }
     }
 
-    if (!rangeIsAudioOnly) {
+    // Every sequence below this block's end is now unreachable by any future parity
+    // (ranges advance), so the record is pruned here rather than growing forever.
+    const auto pruneEnd =
+        discardedSequences_.lower_bound(static_cast<std::int32_t>(blockEnd));
+    discardedSequences_.erase(discardedSequences_.begin(), pruneEnd);
+
+    if (!rangeIsAudioOnly || rangeHasDiscardedSlot) {
         ++fecBlocksUnreconciled_;
         return;  // `block` is a local — dropping it discards the range
     }

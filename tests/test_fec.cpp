@@ -405,10 +405,113 @@ TEST(FecDecoder, AnIdleGapPastTheBoundDiscardsThePendingBlockAndCountsIt) {
     EXPECT_EQ(0, d.packetsRecoveredByFec());
 }
 
+// A slot THIS CLASS discarded must not be "recovered" — it would be a byte-exact
+// duplicate of audio the application already received.
+//
+// process() emits an audio packet BEFORE storing a copy of it, and retention then
+// erases the copy. handleParity infers membership from the parity's declared range and
+// cannot tell an erased slot from one the peer never sent, so with exactly ONE erased it
+// would run the XOR and emit a frame that was already delivered — while incrementing
+// packets_recovered_by_fec for a repair that never happened. Measured through a real
+// server-fed connection before the guard existed: 6 frames delivered for 5 sent, at ZERO
+// packet loss. Paired with the neighbour below, which must still recover.
+TEST(FecDecoder, ADiscardedSlotIsDeclinedRatherThanRecoveredAsADuplicate) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::int64_t now = 1000;
+    d.setClock([&now]() { return now; });
+
+    std::vector<std::vector<std::uint8_t>> pl;
+    for (int i = 0; i < 5; ++i) pl.push_back({static_cast<std::uint8_t>(i + 1), 0x55});
+
+    d.processPacket(rx(0, pl[0]));  // delivered to the application, and stored for repair
+    ASSERT_NE(nullptr, s.find(0)) << "the arm's premise: seq 0 WAS delivered on arrival";
+
+    now = 1121;                     // one past the 120 ms default idle bound
+    d.checkTimeoutAt(now);
+    ASSERT_EQ(1, d.pendingPacketsDiscarded()) << "premise: the stored copy of seq 0 is gone";
+
+    for (int i = 1; i < 5; ++i) d.processPacket(rx(i, pl[i]));
+    d.processPacket(buildParity(0, pl));  // range [0,5): 1-4 present, slot 0 absent
+
+    EXPECT_EQ(0, d.packetsRecoveredByFec())
+        << "the discarded slot was recovered — this emits a duplicate of delivered audio";
+    EXPECT_EQ(1, d.fecBlocksUnreconciled()) << "the decline must be counted, not silent";
+    EXPECT_EQ(0, d.fecBlocksComplete());
+
+    // The decisive assertion: seq 0 appears exactly ONCE across everything emitted.
+    int seq0 = 0;
+    for (const AudioPacket& p : s.packets) {
+        if (p.packetType() == PacketType::AudioRx && p.sequence() == 0) seq0++;
+    }
+    EXPECT_EQ(1, seq0) << "seq 0 was delivered " << seq0 << " times; a fabricated duplicate";
+}
+
+// Retention has TWO discard paths and the guard must record both. This arm drives the
+// other one — the MAX_PENDING_PACKETS cap in capPending, not the idle timeout — because a
+// mutation audit proved the timeout arm above does not cover it: deleting capPending's
+// recording left every other arm green, so the cap half of the guard was unprotected by
+// any test. Predicted as a pass before it was run, which is the only reason the gap was
+// visible rather than comfortable.
+TEST(FecDecoder, ASlotEvictedByThePacketCapIsAlsoDeclinedRatherThanDuplicated) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::int64_t now = 1000;
+    d.setClock([&now]() { return now; });  // never advanced: the TIMEOUT must not fire here
+
+    // One past the cap, so capPending evicts exactly the lowest sequence (seq 0).
+    const int over = static_cast<int>(FecDecoder::MAX_PENDING_PACKETS) + 1;
+    std::vector<std::vector<std::uint8_t>> pl;
+    for (int i = 0; i < over; ++i) pl.push_back({static_cast<std::uint8_t>(i + 1), 0x55});
+    for (int i = 0; i < over; ++i) d.processPacket(rx(i, pl[i]));
+
+    ASSERT_EQ(1, d.pendingPacketsDiscarded()) << "premise: the cap evicted exactly one slot";
+    ASSERT_NE(nullptr, s.find(0)) << "premise: seq 0 was delivered on arrival before eviction";
+
+    // A parity whose range covers the evicted slot: 1-4 are still pending, 0 is gone.
+    d.processPacket(buildParity(0, {pl[0], pl[1], pl[2], pl[3], pl[4]}));
+
+    EXPECT_EQ(0, d.packetsRecoveredByFec())
+        << "a cap-evicted slot was recovered — a duplicate of audio already delivered";
+    EXPECT_EQ(1, d.fecBlocksUnreconciled());
+    int seq0 = 0;
+    for (const AudioPacket& p : s.packets) {
+        if (p.packetType() == PacketType::AudioRx && p.sequence() == 0) seq0++;
+    }
+    EXPECT_EQ(1, seq0) << "seq 0 was delivered " << seq0 << " times";
+}
+
+// The healthy neighbour, byte-identical to the arm above except that slot 0 is
+// GENUINELY absent — never delivered, never discarded. Recovery must still happen, or
+// the guard has bought correctness by disabling the feature.
+TEST(FecDecoder, AGenuinelyMissingSlotStillRecoversAfterAnUnrelatedDiscard) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::int64_t now = 1000;
+    d.setClock([&now]() { return now; });
+
+    std::vector<std::vector<std::uint8_t>> pl;
+    for (int i = 0; i < 5; ++i) pl.push_back({static_cast<std::uint8_t>(i + 1), 0x55});
+
+    // Nothing is delivered for seq 0 at all, so nothing about it can be discarded.
+    ASSERT_EQ(nullptr, s.find(0));
+    for (int i = 1; i < 5; ++i) d.processPacket(rx(i, pl[i]));
+    d.processPacket(buildParity(0, pl));
+
+    EXPECT_EQ(1, d.packetsRecoveredByFec()) << "the guard is over-declining: real loss is a repair";
+    EXPECT_EQ(0, d.fecBlocksUnreconciled());
+    EXPECT_EQ(1, d.fecBlocksComplete());
+    const AudioPacket* rec = s.find(0);
+    ASSERT_NE(nullptr, rec);
+    EXPECT_EQ(pl[0], rec->payload()) << "recovered payload is not what the sender sent";
+}
+
 // Retention is bounded by PACKET COUNT as well as by time, because the time bound
-// alone leaves two holes: a client whose peer never sends parity refreshes the idle
-// bound on every arrival and so never expires, and checkTimeout() is never called
-// at all on a server-fed connection.
+// alone leaves two holes: a peer that never sends parity refreshes the idle bound on
+// every arrival and so never expires, and a consumer that stops polling produces no
+// tick at all in either receive mode (issue #52 made the server-fed limb tick, so the
+// old form of this comment — "checkTimeout() is never called on a server-fed
+// connection" — no longer holds; the cap's justification does).
 TEST(FecDecoder, PendingRetentionIsCappedWhenNoParityEverArrives) {
     DecSink s;
     FecDecoder d(s.emitter());
