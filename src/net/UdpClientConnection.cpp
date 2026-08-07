@@ -58,7 +58,13 @@ void UdpClientConnection::initPipeline(const UdpReliabilityConfig& cfg) {
     // because the queue rejects null).
     if (cfg.fecEnabled) {
         fecEncoder_.emplace(static_cast<std::size_t>(cfg.fecBlockSize));
-        fecDecoder_.emplace([this](const AudioPacket* p) {
+        fecDecoder_.emplace([this](const AudioPacket* p, Provenance) {
+            // Provenance is accepted and dropped here, deliberately. orderedQueue_ is
+            // a BlockingPacketQueue holding a bare AudioPacket, so it has nowhere to
+            // put the value — carrying it further is issue #65 phase 2, which widens
+            // the queue element. Naming the parameter's TYPE and discarding it keeps
+            // this hop honest: the decoder states provenance, and this connection
+            // does not yet propagate it.
             if (p) orderedQueue_.offer(*p);
         });
 

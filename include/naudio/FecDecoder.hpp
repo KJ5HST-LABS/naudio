@@ -15,6 +15,7 @@
 
 #include "naudio/AudioPacket.hpp"
 #include "naudio/FecEncoder.hpp"
+#include "naudio/Provenance.hpp"
 
 namespace naudio {
 
@@ -46,16 +47,27 @@ namespace naudio {
 // was shorter than the block max is reconstructed zero-extended to that length.
 // See handleParity() in FecDecoder.cpp for the full rationale.
 //
-// The emitter is a std::function<void(const AudioPacket*)> with NULL = a silence
-// gap. Input packets are taken by value (std::optional, owned); the emitter
-// borrows. The decoder emits AFTER it finishes mutating internal state in each
-// branch (no emit while iterating active blocks). The block clock is
+// The emitter is a std::function<void(const AudioPacket*, Provenance)> with NULL =
+// a silence gap. Input packets are taken by value (std::optional, owned); the
+// emitter borrows. The decoder emits AFTER it finishes mutating internal state in
+// each branch (no emit while iterating active blocks). The block clock is
 // injectable (setClock) and checkTimeoutAt(now) is the testable form.
+//
+// This decoder is the ORIGIN of provenance (issue #65) — it is the only place in
+// the project that can tell a repaired frame from a delivered one, because it is
+// the only place that builds one. Exactly one emit carries Provenance::Recovered:
+// the single-loss XOR reconstruction in handleParity. Every other emit is Live,
+// including the NULL silence gaps, which carry no packet to have a provenance.
+// Downstream consumers must not re-derive this; they carry what they are handed.
 //
 // Compiled into naudio_core (definitions in FecDecoder.cpp).
 class FecDecoder {
 public:
-    using Emitter = std::function<void(const AudioPacket*)>;
+    // The Provenance argument is deliberately NOT defaulted: a defaulted parameter
+    // would let every existing call site keep compiling while silently reporting
+    // Live, which is the exact failure this type exists to prevent. See
+    // Provenance.hpp for the measurement behind that (issue #65).
+    using Emitter = std::function<void(const AudioPacket*, Provenance)>;
     using Clock = std::function<std::int64_t()>;
 
     // Default block timeout in milliseconds.
@@ -228,7 +240,9 @@ private:
         }
     };
 
-    void emit(const AudioPacket* p);
+    // Provenance is required at every call site, never defaulted — see the Emitter
+    // alias above. `p == nullptr` is a silence gap and carries Provenance::Live.
+    void emit(const AudioPacket* p, Provenance provenance);
 
     // Whether a packet type carries audio, i.e. whether the encoder would have
     // recorded it into a FEC block. Only these participate in a block.

@@ -39,7 +39,9 @@ void FecDecoder::process(std::optional<AudioPacket> packet, std::int32_t sequenc
     }
     if (nextEmitSeq_ < 0) nextEmitSeq_ = sequence;
     if (packet.has_value()) {
-        emit(&*packet);  // emit immediately, then store for FEC
+        // Live: this packet arrived on the wire. It is emitted before it is stored,
+        // so the copy the repair cache holds has already been delivered as Live.
+        emit(&*packet, Provenance::Live);  // emit immediately, then store for FEC
         storeInBlock(sequence, std::move(*packet));
     } else {
         recordMissing(sequence);  // gap — don't emit yet (FEC may recover it)
@@ -82,7 +84,8 @@ void FecDecoder::checkTimeoutAt(std::int64_t nowMs) {
     for (std::int32_t key : toRemove) activeBlocks_.erase(key);
     fecBlocksFailed_ += failedIncrements;
     pendingPacketsDiscarded_ += discarded;
-    for (std::size_t i = 0; i < nullsToEmit; ++i) emit(nullptr);
+    // Silence gaps carry no packet, so there is nothing to have been repaired: Live.
+    for (std::size_t i = 0; i < nullsToEmit; ++i) emit(nullptr, Provenance::Live);
 }
 
 std::int64_t FecDecoder::packetsRecoveredByFec() const { return packetsRecoveredByFec_; }
@@ -110,8 +113,8 @@ void FecDecoder::reset() {
     pendingPacketsDiscarded_ = 0;
 }
 
-void FecDecoder::emit(const AudioPacket* p) {
-    if (emitter_) emitter_(p);
+void FecDecoder::emit(const AudioPacket* p, Provenance provenance) {
+    if (emitter_) emitter_(p, provenance);
 }
 
 std::optional<std::int32_t> FecDecoder::matchingBlockKey(std::int32_t sequence) const {
@@ -422,7 +425,12 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
         // memberTypeSeen is guaranteed by the blockSize floor at the top of this function:
         // blockSize >= 2 with exactly one slot missing leaves at least one present member.
         AudioPacket recoveredPacket(memberType, missingSeq, std::move(recovered));
-        emit(&recoveredPacket);
+        // THE one Recovered emit in the project. This frame never arrived on the
+        // wire — its payload is the XOR remainder of the block. Every guard above
+        // exists to make sure that remainder is a genuinely missing slot rather
+        // than one this decoder discarded (#52) or displaced (#55); provenance is
+        // what lets a downstream consumer act on the distinction (#65).
+        emit(&recoveredPacket, Provenance::Recovered);
         block.missingSequences.erase(missingSeq);
         ++packetsRecoveredByFec_;
         ++fecBlocksComplete_;
@@ -432,7 +440,8 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
             const std::int32_t seq = static_cast<std::int32_t>(s);
             if (block.packets.find(seq) == block.packets.end() &&
                 block.missingSequences.count(seq) != 0) {
-                emit(nullptr);
+                // A gap, not a repair — nothing was reconstructed here.
+                emit(nullptr, Provenance::Live);
             }
         }
         ++fecBlocksFailed_;

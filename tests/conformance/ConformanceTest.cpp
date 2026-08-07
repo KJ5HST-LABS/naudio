@@ -424,7 +424,10 @@ void runFecRecover(const Section& v) {
     }
 
     std::vector<AudioPacket> emitted;  // non-null emits, copied for inspection
-    naudio::FecDecoder dec([&emitted](const AudioPacket* p) {
+    naudio::FecDecoder dec([&emitted](const AudioPacket* p, naudio::Provenance) {
+        // This vector inspects recovered PAYLOAD bytes against the golden vectors;
+        // provenance is not part of the frozen wire format and is not asserted here.
+        // tests/test_fec.cpp owns the provenance assertions.
         if (p != nullptr) emitted.push_back(*p);
     });
     for (long seq = start; seq < start + blockSize; ++seq) {

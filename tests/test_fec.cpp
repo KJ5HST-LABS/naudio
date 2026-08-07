@@ -24,6 +24,7 @@ using naudio::AudioPacket;
 using naudio::FecDecoder;
 using naudio::FecEncoder;
 using naudio::PacketType;
+using naudio::Provenance;
 
 namespace {
 
@@ -97,17 +98,35 @@ TEST(FecEncoder, ResetsAfterEmittingParity) {
 
 // ---- FecDecoder ----
 
-// A collecting emitter: stores copies of non-null emits, counts NULL gaps.
+// A collecting emitter: stores copies of non-null emits, counts NULL gaps, and
+// records the Provenance of every emit alongside it (issue #65). The provenance
+// vectors are parallel to `packets` / `gaps` rather than folded into them, so the
+// arms that predate provenance keep reading exactly what they always read.
 struct DecSink {
     std::vector<AudioPacket> packets;
+    std::vector<Provenance> packetProvenance;  // parallel to `packets`
+    std::vector<Provenance> gapProvenance;     // one entry per NULL emit
     int gaps = 0;
     FecDecoder::Emitter emitter() {
-        return [this](const AudioPacket* p) {
-            if (p == nullptr) ++gaps; else packets.push_back(*p);
+        return [this](const AudioPacket* p, Provenance prov) {
+            if (p == nullptr) {
+                ++gaps;
+                gapProvenance.push_back(prov);
+            } else {
+                packets.push_back(*p);
+                packetProvenance.push_back(prov);
+            }
         };
     }
     const AudioPacket* find(std::int32_t seq) const {
         for (const auto& p : packets) if (p.sequence() == seq) return &p;
+        return nullptr;
+    }
+    // Provenance of the emit that delivered `seq`, or nullptr if it was never
+    // emitted. Indexes packetProvenance by the same position as `packets`.
+    const Provenance* provenanceOf(std::int32_t seq) const {
+        for (std::size_t i = 0; i < packets.size(); ++i)
+            if (packets[i].sequence() == seq) return &packetProvenance[i];
         return nullptr;
     }
 };
@@ -876,6 +895,101 @@ TEST(FecDecoder, AnOutOfRangeBlockSizeIsDeclinedAndCounted) {
         EXPECT_EQ(0, d.fecBlocksComplete()) << "blockSize " << static_cast<int>(bad);
         EXPECT_EQ(1u, s.packets.size()) << "blockSize " << static_cast<int>(bad);
     }
+}
+
+// ---- Provenance (issue #65) ----
+//
+// This decoder is the ORIGIN of provenance: it is the only place in the project
+// that can tell a repaired frame from a delivered one, because it is the only
+// place that builds one. These three arms pin that origin — one per emit site that
+// can be observed, covering all four sites in FecDecoder.cpp. Everything downstream
+// (phases 2-4) carries what it is handed, so if the origin is wrong every later
+// hop is wrong with it and no downstream test can tell.
+//
+// Both directions are asserted deliberately. An implementation that emitted
+// Recovered for EVERYTHING would satisfy "the repair is Recovered" on its own,
+// and an implementation that never set it at all — the exact failure a defaulted
+// `bool` would ship silently — would satisfy "the arrivals are Live". Only the
+// pair discriminates.
+
+// The single-loss XOR reconstruction (FecDecoder.cpp's one Recovered emit) must
+// be the ONLY emit in the block that is not Live: seq 1 never arrived, seq 0 and
+// seq 2 did.
+TEST(FecDecoder, TheRecoveredFrameIsTheOnlyEmitMarkedRecovered) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> d0{0x10, 0x20}, d1{0x30, 0x40}, d2{0x50, 0x60};
+    d.processPacket(rx(0, d0));
+    d.process(std::nullopt, 1);  // d1 lost — this is the slot FEC rebuilds
+    d.processPacket(rx(2, d2));
+    d.processPacket(buildParity(0, {d0, d1, d2}));
+
+    ASSERT_EQ(1, d.packetsRecoveredByFec()) << "premise: exactly one slot was rebuilt";
+    ASSERT_EQ(3u, s.packets.size()) << "premise: two arrivals plus the repair were emitted";
+    ASSERT_EQ(s.packets.size(), s.packetProvenance.size())
+        << "the sink's parallel vectors desynchronized";
+
+    const Provenance* recovered = s.provenanceOf(1);
+    ASSERT_NE(nullptr, recovered) << "the rebuilt slot was never emitted";
+    EXPECT_EQ(Provenance::Recovered, *recovered)
+        << "the XOR reconstruction must announce itself as a repair — this is the bit "
+           "AudioMixer needs to refuse a TX re-claim (issue #65)";
+
+    // The other direction: a packet that arrived on the wire is Live, and stays Live
+    // even though the decoder stored a copy of it in the repair cache.
+    for (std::int32_t seq : {0, 2}) {
+        const Provenance* live = s.provenanceOf(seq);
+        ASSERT_NE(nullptr, live) << "seq " << seq << " arrived but was not emitted";
+        EXPECT_EQ(Provenance::Live, *live)
+            << "seq " << seq << " arrived on the wire and must not be marked as a repair";
+    }
+}
+
+// A block with 2+ missing slots cannot be rebuilt, so its NULL silence emits carry
+// no packet and therefore no repair. Live is the correct reading and the safe one:
+// it is what every path did before provenance existed.
+TEST(FecDecoder, AnUnrecoverableGapEmitsSilenceMarkedLive) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> d0{0x10, 0x20}, d1{0x30, 0x40}, d2{0x50, 0x60};
+    d.processPacket(rx(0, d0));
+    d.process(std::nullopt, 1);
+    d.process(std::nullopt, 2);
+    d.processPacket(buildParity(0, {d0, d1, d2}));
+
+    ASSERT_EQ(1, d.fecBlocksFailed()) << "premise: the block was unrecoverable";
+    ASSERT_EQ(2, s.gaps) << "premise: silence was emitted for both gaps";
+    ASSERT_EQ(static_cast<std::size_t>(s.gaps), s.gapProvenance.size())
+        << "the sink's parallel vectors desynchronized";
+    for (Provenance prov : s.gapProvenance)
+        EXPECT_EQ(Provenance::Live, prov) << "a silence gap reconstructed nothing";
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
+}
+
+// The fourth emit site: checkTimeoutAt flushes a block that timed out waiting for a
+// parity that never came, emitting silence for each gap. Nothing was reconstructed,
+// so those gaps are Live.
+//
+// This arm exists because the site was MEASURED to be unasserted without it: flipping
+// it to Recovered reddened nothing across all 330 tests, with the object hash
+// confirming the mutation reached the binary. The other three sites were each caught
+// by an arm above; this one had no detector at all.
+TEST(FecDecoder, ATimedOutBlocksSilenceIsMarkedLive) {
+    DecSink s;
+    FecDecoder d(s.emitter(), 10);  // 10 ms block timeout; pending uses 2x = 20 ms
+    std::int64_t fakeNow = 1000;
+    d.setClock([&fakeNow]() { return fakeNow; });  // deterministic, no sleeps
+    std::vector<std::uint8_t> dd{0x01};
+    d.processPacket(rx(0, dd));
+    d.process(std::nullopt, 1);  // missing, awaiting a parity that never arrives
+    d.checkTimeoutAt(1021);      // 21 > 20 -> flush the pending block as silence
+
+    ASSERT_EQ(1, s.gaps) << "premise: the timeout flushed exactly one silence gap";
+    ASSERT_EQ(static_cast<std::size_t>(s.gaps), s.gapProvenance.size())
+        << "the sink's parallel vectors desynchronized";
+    EXPECT_EQ(Provenance::Live, s.gapProvenance.front())
+        << "a timed-out block reconstructed nothing — its silence is not a repair";
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
 }
 
 }  // namespace
