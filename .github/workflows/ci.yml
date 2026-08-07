@@ -144,8 +144,8 @@ jobs:
     # (include/naudio.h) byte-for-byte in a hand-written declaration, and until this
     # job existed nothing built or ran them. Measured on this repo: shifting
     # na_device by 8 bytes left all three printing WRONG device records and exiting
-    # 0, while ctest stayed green at 291/291 and the install + external-consumer
-    # gates passed. See tests/ffi-clients/run.sh.
+    # 0, while the entire ctest suite stayed green and the install +
+    # external-consumer gates passed. See tests/ffi-clients/run.sh.
     #
     # One platform is enough: na_device is all fixed-width ints and char arrays, so
     # its layout is identical everywhere. What varies by platform is the toolchains,

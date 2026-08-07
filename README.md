@@ -14,7 +14,7 @@
 
 ## Status
 
-The audio streaming stack is **implemented and tested** (the device layer, the `0xAF01` codec, the reliability primitives, the multi-tenant TCP/UDP server + client, and the full networking C ABI — both the `na_client_*` and `na_server_*` surfaces). It installs as a package: `find_package(naudio)` or pkg-config resolves the C ABI **and** the C++ API. The build runs **291 hardware-free ctests** green, including the language-neutral conformance golden vectors and the documentation snippet compile-gate (every fenced `c`/`cpp` block in this file and in `docs/hamlib-streaming-bridge.md` is compiled against the real headers). A separate CI job runs the Python, Java and Rust example clients and diffs each one's hand-declared `na_device` against a C reference, so a layout change cannot silently break them. What is hardware-gated (real PortAudio capture/playback, on-air decode) is exercised by opt-in smokes and the `na_audio_daemon` driver, not by CI; see **Known limitations** below.
+The audio streaming stack is **implemented and tested** (the device layer, the `0xAF01` codec, the reliability primitives, the multi-tenant TCP/UDP server + client, and the full networking C ABI — both the `na_client_*` and `na_server_*` surfaces). It installs as a package: `find_package(naudio)` or pkg-config resolves the C ABI **and** the C++ API. The whole ctest suite is **hardware-free** and runs green on Linux, macOS and Windows on every push. It covers the language-neutral conformance golden vectors and — on Linux and macOS — the documentation snippet compile-gate (every fenced `c`/`cpp` block in this file and in `docs/hamlib-streaming-bridge.md` is compiled against the real headers; that harness is POSIX-only). A separate CI job runs the Python, Java and Rust example clients and diffs each one's hand-declared `na_device` against a C reference, so a layout change cannot silently break them. What is hardware-gated (real PortAudio capture/playback, on-air decode) is exercised by opt-in smokes and the `na_audio_daemon` driver, not by CI; see **Known limitations** below.
 
 ---
 
@@ -36,7 +36,8 @@ The audio streaming stack is **implemented and tested** (the device layer, the `
 ```bash
 cmake -S . -B build
 cmake --build build
-ctest --test-dir build --output-on-failure      # 291 logic + codec + C-ABI tests, no hardware
+ctest --test-dir build --output-on-failure      # logic + codec + C-ABI tests, no hardware
+ctest --test-dir build -N | tail -1             # how many this configuration registers
 ```
 
 Dependencies resolve from a system / Homebrew install when present (PortAudio via `pkg-config`,
