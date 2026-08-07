@@ -387,6 +387,17 @@ typedef void (*na_audio_cb)(const unsigned char* pcm, size_t n_bytes, void* user
  * CONTRACT above); `user` is the pointer passed to na_client_set_callbacks.
  * String arguments are valid only for the duration of the call.
  *
+ * TX ARBITRATION AND FEC REPAIRS. The TX-arbitration events below — on_clients_update,
+ * on_tx_granted, on_tx_denied — describe what a client DID, so they fire only for audio that
+ * arrived on the wire. A transmit frame the receiver's FEC parity layer reconstructed carries
+ * no fresh intent (the peer sent it once; it was lost and rebuilt locally), so it never claims
+ * the channel, never preempts, and never denies. Two consequences a consumer can observe:
+ * a repaired frame cannot make a client that has stopped transmitting appear to start again,
+ * and it never consumes the single on_tx_denied a denial episode is allowed. A client that
+ * legitimately holds the channel still has its repaired audio mixed and transmitted. The idle
+ * lease likewise runs from the last live frame, so a transmission whose tail is carried only by
+ * repairs releases slightly early rather than over-holding. Issue #65.
+ *
  * BINARY COMPATIBILITY. This struct is CALLER-ALLOCATED and the library only ever READS it, so
  * it carries its own size in-band: set `struct_size = sizeof(na_client_callbacks)` before the
  * call. That lets the library tell a caller compiled against a shorter version from one compiled

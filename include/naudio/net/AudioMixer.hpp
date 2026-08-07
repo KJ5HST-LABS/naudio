@@ -31,6 +31,12 @@ namespace naudio::net {
 // only one client transmits at a time; the holder keeps the channel until it stops (idle
 // timeout), is preempted by a higher-priority client, or disconnects.
 //
+// "Stops" means stops sending LIVE frames. Only a directly-received frame arbitrates or
+// refreshes the lease — a frame the FEC parity layer reconstructed never claims, preempts
+// or denies (issue #65). The full state x provenance table, and the reasoning behind it,
+// live on submitTxAudio below; that comment is the OWNER of this contract and every other
+// statement of it in the tree defers to it.
+//
 // Two threads (besides the caller):
 //   * playback thread — drains the TX AudioRingBuffer into a PlaybackStream*
 //     (the existing device seam), writing silence on underrun. Runs only when started with

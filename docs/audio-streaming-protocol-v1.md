@@ -323,6 +323,24 @@ Many clients may send `AUDIO_TX`; exactly one may own the transmit channel at a 
 - The server emits `TX_GRANTED` / `TX_DENIED` / `TX_PREEMPTED` / `TX_RELEASED` accordingly (`TX_DENIED` is sent once per denial episode, not per frame, to avoid spam).
 - **Idle-release:** the owner's channel is released after `txIdleTimeoutMs` (default **500 ms**) without TX activity. Release is driven both by the playback loop and an independent periodic check (so a server with no local playback device still releases).
 
+> **Implementation note — locally reconstructed frames (non-normative; the wire is unchanged).**
+> The claim and idle-release rules above are stated in terms of frames a server *receives*. When
+> the reliability layer is carrying `AUDIO_TX` under FEC (§8), some frames are not received at all
+> but **rebuilt locally from parity** — the peer sent the frame once, it was lost, and the receiver
+> reconstructed it. This is invisible on the wire and to the sender, so it changes no framing, no
+> field, and no conformance vector; it is purely a receiver-side distinction.
+>
+> Because arbitration here is *implicit* — submitting audio **is** the claim — a reconstructed
+> frame would otherwise arbitrate on the peer's behalf without the peer having sent anything new,
+> and could re-claim a channel after its own idle-release. A server **MAY** therefore treat only
+> directly-received frames as claim / preempt / deny / lease-refresh events, while still mixing a
+> reconstructed frame's audio when the peer already owns the channel. naudio does exactly that
+> (issue #65); the owning statement of its rules is the `submitTxAudio` contract in
+> `include/naudio/net/AudioMixer.hpp`. A peer cannot distinguish a server that does this from one
+> that does not, except that the second may key a transmitter on audio nobody currently intends to
+> send — which is why naudio's bridge, whose default profile is the only FEC-enabled preset, does
+> not.
+
 > **v1 limitation (documented):** session priority is fixed at `NORMAL`; there is **no control message for a client to set or raise its priority** over the wire. In practice v1 arbitration is therefore first-come-holds with idle-release. Client-settable priority is a proposed extension (§13.3).
 
 ---
