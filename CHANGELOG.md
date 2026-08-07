@@ -128,6 +128,29 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **An FEC-reconstructed transmit frame can no longer take, hold, or contest the TX channel.**
+  Issue #65. `AudioMixer::submitTxAudio` **is** the channel-claim mechanism — there is no separate
+  "I want to transmit" call, and `releaseTx` has no production caller — so the 500 ms idle release
+  was the entire safety story. A frame the FEC layer rebuilt looked exactly like a live one, which
+  meant a repair arriving after the release could silently re-claim the channel for a client that
+  had stopped transmitting. On the bridge this is not abstract: `na_hamlib_bridge` keys a real
+  transmitter's PTT off `na_server_tx_owner()`, and its default `-R wan` profile is the only
+  FEC-enabled preset, so the reconstructed frame could key a radio.
+
+  Provenance now travels with the packet — `FecDecoder` → the ordered queue → `ReceiveResult` →
+  the server → the mixer — and the mixer decides the **arbitration verdict** and the **audio
+  write** separately. A recovered frame is written only in the one state where it has a consumer
+  (the owner's own stream) and never claims, preempts, or denies. A new outcome distinguishes
+  *"a repair we declined to act on"* from *"a client asked and was refused"*, so a repair cannot
+  spend the client's single per-episode `TX_DENIED`.
+
+  **C-visible consequences**, all of them the disappearance of spurious events: `on_tx_granted`,
+  `on_clients_update` and `on_tx_denied` no longer fire for a reconstructed frame. A client that
+  legitimately holds the channel is unaffected — its repaired audio is still mixed. One deliberate
+  behaviour change beyond that: the idle lease now runs from the last **live** frame, so a talker
+  whose tail is carried only by repairs releases up to one FEC block early. That is the direction
+  that cannot *extend* a transmission, and it was chosen for that reason.
+
 - **FEC no longer fabricates a duplicate audio frame when an interleaving control packet never
   reaches the decoder, and a repaired transmit frame is no longer silently discarded.** Two defects
   in the same recovery path (issue #55).

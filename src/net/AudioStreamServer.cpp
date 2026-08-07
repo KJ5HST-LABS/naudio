@@ -110,7 +110,7 @@ private:
     void writerLoop();
     bool performHandshake();
     std::optional<AudioPacket> receiveOnePacket(int totalTimeoutMs);
-    void handleTxAudio(const std::vector<std::uint8_t>& data);
+    void handleTxAudio(const std::vector<std::uint8_t>& data, Provenance provenance);
     void handleControlMessage(const AudioPacket& packet);
     void enqueueControl(ControlMessage message);
     void enqueueRxAudio(std::vector<std::uint8_t> data);
@@ -276,7 +276,7 @@ void AudioStreamServer::ClientSession::receiveLoop() {
 
         switch (r.packet->packetType()) {
             case PacketType::AudioTx:
-                handleTxAudio(r.packet->payload());
+                handleTxAudio(r.packet->payload(), r.provenance);
                 break;
             case PacketType::Control:
                 handleControlMessage(*r.packet);
@@ -324,7 +324,8 @@ void AudioStreamServer::ClientSession::writerLoop() {
     }
 }
 
-void AudioStreamServer::ClientSession::handleTxAudio(const std::vector<std::uint8_t>& data) {
+void AudioStreamServer::ClientSession::handleTxAudio(const std::vector<std::uint8_t>& data,
+                                                     Provenance provenance) {
     txBytesSubmitted_.fetch_add(static_cast<std::int64_t>(data.size()));
 
     std::shared_ptr<AudioMixer> mixer;
@@ -334,18 +335,26 @@ void AudioStreamServer::ClientSession::handleTxAudio(const std::vector<std::uint
     }
     if (!mixer) return;
 
-    // PHASE 3 PLACEHOLDER (issue #65): hardcoded Live, so end-to-end behaviour is
-    // unchanged and the mixer's new recovered-frame rows are unreachable from here.
-    // Phase 4 replaces this with the provenance carried on the ReceiveResult, which is
-    // what actually fixes the defect. There is NO automated detector for that one-line
-    // change — ClientSession is private to this .cpp with no injection seam — so phase 4
-    // must mutate it, observe that nothing reddens, and record that.
+    // Issue #65, closed here: the provenance carried on the ReceiveResult reaches the
+    // mixer, so a frame the FEC layer reconstructed can no longer claim the TX channel,
+    // preempt a talker, or spend this client's one TX_DENIED. The mixer owns that
+    // contract (the table at AudioMixer.hpp:29-31); this call site only has to stop
+    // lying about where the frame came from.
     //
-    // TxResult::DeclinedRecovered is deliberately not handled below: falling through both
-    // branches is the correct behaviour (no bytes counted, no TX_DENIED). It cannot occur
-    // while this argument is Live.
+    // THIS HOP HAS NO AUTOMATED DETECTOR, and that is recorded rather than papered over:
+    // ClientSession is private to this .cpp with no injection seam, so nothing can drive
+    // a recovered frame through a real session and observe the mixer's reaction.
+    // Hardcoding Provenance::Live here leaves the ENTIRE SUITE GREEN — measured, not
+    // assumed (issue #65 phase 4). The asymmetric counterweight: hardcoding Recovered
+    // reddens six end-to-end arms, so the argument is provably load-bearing in one
+    // direction only. If you change this line, you get no help from ctest.
+    //
+    // TxResult::DeclinedRecovered is deliberately not handled below, and it CAN now
+    // occur: falling through both branches is exactly right for it — a repair the mixer
+    // declined must count no accepted bytes and must NOT consume the client's single
+    // per-episode TX_DENIED, which is the whole point of it being distinct from Rejected.
     const AudioMixer::TxResult result =
-        mixer->submitTxAudio(clientId_, data, Provenance::Live);
+        mixer->submitTxAudio(clientId_, data, provenance);
     if (result == AudioMixer::TxResult::Accepted) {
         txBytesAccepted_.fetch_add(static_cast<std::int64_t>(data.size()));
     } else if (result == AudioMixer::TxResult::Rejected) {
