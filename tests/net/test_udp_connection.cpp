@@ -64,6 +64,23 @@ std::vector<AudioPacket> drainN(ClientConnection& c, int n) {
     return out;
 }
 
+// drainN, but keeping each packet's Provenance (issue #65 phase 2). A separate
+// helper rather than a widened drainN: every existing arm reads a plain
+// vector<AudioPacket>, and changing that would edit ~20 assertions to test nothing.
+struct DrainedPacket {
+    AudioPacket packet;
+    Provenance provenance;
+};
+std::vector<DrainedPacket> drainNWithProvenance(ClientConnection& c, int n) {
+    std::vector<DrainedPacket> out;
+    for (int i = 0; i < n; i++) {
+        ReceiveResult r = c.receivePacket(1000);
+        if (!r.hasPacket()) break;
+        out.push_back(DrainedPacket{std::move(*r.packet), r.provenance});
+    }
+    return out;
+}
+
 // Reads one datagram from a raw peer socket and deserializes it.
 std::optional<AudioPacket> recvFromPeer(Socket& peer, int timeoutMs = 2000) {
     peer.setRecvTimeout(timeoutMs);
@@ -827,4 +844,192 @@ TEST(UdpConnection, ARecoveredTxFrameEmergesTypedAudioTxSoTheServerCanRouteIt) {
     for (std::int32_t seq : {0, 1, 3, 4}) {
         EXPECT_EQ(PacketType::AudioTx, got.at(seq).packetType()) << "seq " << seq;
     }
+}
+
+// ---- Provenance survives the carrier (issue #65 phase 2) ----
+//
+// Phase 1 made FecDecoder STATE provenance; these two arms prove it SURVIVES the
+// ordered queue and reaches receivePacket's caller. Before phase 2 the queue held a
+// bare AudioPacket, so the bit was destroyed one hop after it was set — which is the
+// hop #65's own issue text omitted, and the reason its proposed fix could not work.
+//
+// Both receive modes are covered because they are different code: the server-fed
+// limb polls the queue in receivePacket, the client-owned limb polls it in
+// receiveFromSocket, and each builds its own ReceiveResult. A single mode would
+// leave the other's construction sites unasserted.
+//
+// Both DIRECTIONS are asserted in each arm — the rebuilt slot is Recovered and every
+// delivered slot is Live. An implementation that marked everything Recovered would
+// satisfy the first half alone; one that never set it at all — exactly what a
+// defaulted field would ship silently — would satisfy the second. Only the pair
+// discriminates.
+
+TEST(UdpConnection, ServerFedRecoveredFrameReachesTheCallerMarkedRecovered) {
+    UdpReliabilityConfig cfg;
+    cfg.reorderWindowSize = 0;  // isolate FEC from reordering
+    cfg.fecEnabled = true;
+    cfg.fecBlockSize = 5;
+    Socket shared = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    UdpClientConnection conn(&shared, "127.0.0.1", 9999,
+                             ClientAddress("udp-1", "127.0.0.1", 9999), cfg);
+
+    std::vector<AudioPacket> block;
+    for (std::int32_t s = 0; s < 5; s++) block.push_back(rxPacket(s, payloadFor(s)));
+    FecEncoder encoder(5);
+    std::optional<AudioPacket> parity;
+    for (const AudioPacket& p : block) parity = encoder.recordAndMaybeEmit(p);
+    ASSERT_TRUE(parity.has_value());
+
+    for (std::int32_t s = 0; s < 5; s++) {
+        if (s == 2) continue;  // induced loss — seq 2 is the slot FEC rebuilds
+        conn.enqueueReceived(block[s], 23);
+    }
+    conn.enqueueReceived(*parity, 23);
+
+    std::vector<DrainedPacket> got = drainNWithProvenance(conn, 5);
+    ASSERT_EQ(5u, got.size()) << "premise: four arrivals plus the repair surfaced";
+    ASSERT_EQ(1, conn.packetsRecoveredByFec()) << "premise: exactly one slot was rebuilt";
+
+    int seenRecovered = 0;
+    for (const DrainedPacket& d : got) {
+        if (d.packet.sequence() == 2) {
+            ++seenRecovered;
+            EXPECT_EQ(Provenance::Recovered, d.provenance)
+                << "the rebuilt slot reached the caller without its provenance — the "
+                   "carrier dropped the bit (issue #65 phase 2)";
+            EXPECT_EQ(payloadFor(2), d.packet.payload());  // still byte-exact
+        } else {
+            EXPECT_EQ(Provenance::Live, d.provenance)
+                << "seq " << d.packet.sequence() << " arrived on the wire and must not "
+                   "be reported as a repair";
+        }
+    }
+    EXPECT_EQ(1, seenRecovered) << "the rebuilt slot never surfaced at all";
+}
+
+TEST(UdpConnection, ClientOwnedRecoveredFrameReachesTheCallerMarkedRecovered) {
+    Socket peer = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    std::uint16_t peerPort = peer.localPort();
+    Socket clientSock = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    std::uint16_t clientPort = clientSock.localPort();
+
+    UdpReliabilityConfig cfg;
+    cfg.reorderWindowSize = 0;
+    cfg.fecEnabled = true;
+    cfg.fecBlockSize = 5;
+    UdpClientConnection conn(std::move(clientSock), "127.0.0.1", peerPort,
+                             ClientAddress("client", "127.0.0.1", peerPort), cfg);
+
+    std::vector<AudioPacket> blk;
+    for (std::int32_t s = 0; s < 5; s++) blk.push_back(rxPacket(s, payloadFor(s)));
+    FecEncoder encoder(5);
+    std::optional<AudioPacket> parity;
+    for (const AudioPacket& p : blk) parity = encoder.recordAndMaybeEmit(p);
+    ASSERT_TRUE(parity.has_value());
+
+    auto sendToClient = [&](const AudioPacket& p) {
+        std::vector<std::uint8_t> b = p.serialize();
+        ASSERT_TRUE(peer.sendTo(b.data(), b.size(), "127.0.0.1", clientPort));
+    };
+    for (std::int32_t s = 0; s < 5; s++) {
+        if (s == 2) continue;  // withheld on the wire
+        sendToClient(blk[s]);
+    }
+    sendToClient(*parity);
+
+    std::vector<DrainedPacket> got;
+    for (int i = 0; i < 10 && got.size() < 5; i++) {
+        ReceiveResult r = conn.receivePacket(1000);
+        if (r.hasPacket()) got.push_back(DrainedPacket{std::move(*r.packet), r.provenance});
+        else if (r.closed) break;
+    }
+
+    ASSERT_EQ(1, conn.packetsRecoveredByFec()) << "premise: exactly one slot was rebuilt";
+    int seenRecovered = 0;
+    for (const DrainedPacket& d : got) {
+        if (d.packet.sequence() == 2) {
+            ++seenRecovered;
+            EXPECT_EQ(Provenance::Recovered, d.provenance)
+                << "the rebuilt slot lost its provenance on the client-owned path, which "
+                   "polls the queue in receiveFromSocket rather than receivePacket";
+            EXPECT_EQ(payloadFor(2), d.packet.payload());
+        } else {
+            EXPECT_EQ(Provenance::Live, d.provenance)
+                << "seq " << d.packet.sequence() << " arrived over loopback and must not "
+                   "be reported as a repair";
+        }
+    }
+    EXPECT_EQ(1, seenRecovered) << "the rebuilt slot never surfaced at all";
+}
+
+// The client-owned FEC path PRODUCTION actually takes.
+//
+// receiveFromSocket branches `if (reorderBuffer_) ... else if (fecDecoder_) ...`, and
+// udpWan — the only preset in the project with fecEnabled — sets reorderBufferSize=8
+// alongside it (AudioStreamConfig.hpp). So a real client-owned connection carrying FEC
+// ALWAYS takes the reorder limb, and never the FEC-only limb the two arms above drive
+// with reorderWindowSize=0.
+//
+// Measured before this arm existed: mutating the reorder limb's poll to discard
+// provenance reddened nothing, while the FEC-only limb's was caught — i.e. the
+// configuration under test was the one production does not use. (The pre-existing
+// ClientOwnedFecRecoversOverLoopback sets reorderWindowSize=0 as well, so that gap is
+// older than issue #65.)
+TEST(UdpConnection, ClientOwnedRecoveredFrameKeepsProvenanceThroughTheReorderLimb) {
+    Socket peer = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    std::uint16_t peerPort = peer.localPort();
+    Socket clientSock = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    std::uint16_t clientPort = clientSock.localPort();
+
+    UdpReliabilityConfig cfg;
+    cfg.reorderWindowSize = 8;   // as udpWan ships it — this is the whole point
+    cfg.reorderMaxHoldMs = 20;   // short, so the hold releases inside the arm
+    cfg.fecEnabled = true;
+    cfg.fecBlockSize = 5;
+    UdpClientConnection conn(std::move(clientSock), "127.0.0.1", peerPort,
+                             ClientAddress("client", "127.0.0.1", peerPort), cfg);
+
+    std::vector<AudioPacket> blk;
+    for (std::int32_t s = 0; s < 5; s++) blk.push_back(rxPacket(s, payloadFor(s)));
+    FecEncoder encoder(5);
+    std::optional<AudioPacket> parity;
+    for (const AudioPacket& p : blk) parity = encoder.recordAndMaybeEmit(p);
+    ASSERT_TRUE(parity.has_value());
+
+    auto sendToClient = [&](const AudioPacket& p) {
+        std::vector<std::uint8_t> b = p.serialize();
+        ASSERT_TRUE(peer.sendTo(b.data(), b.size(), "127.0.0.1", clientPort));
+    };
+    for (std::int32_t s = 0; s < 5; s++) {
+        if (s == 2) continue;  // withheld on the wire — the slot FEC rebuilds
+        sendToClient(blk[s]);
+    }
+    sendToClient(*parity);
+
+    // Drain generously: the reorder buffer holds 3/4 behind the gap until maxHold
+    // elapses, so the repair surfaces several calls later than the arrivals (and out
+    // of sequence order — that is issue #66, not this arm's subject).
+    std::vector<DrainedPacket> got;
+    for (int i = 0; i < 40 && got.size() < 5; i++) {
+        ReceiveResult r = conn.receivePacket(100);
+        if (r.hasPacket()) got.push_back(DrainedPacket{std::move(*r.packet), r.provenance});
+        else if (r.closed) break;
+    }
+
+    ASSERT_EQ(1, conn.packetsRecoveredByFec())
+        << "premise: the reorder+FEC pipeline rebuilt exactly one slot";
+    int seenRecovered = 0;
+    for (const DrainedPacket& d : got) {
+        if (d.packet.sequence() == 2) {
+            ++seenRecovered;
+            EXPECT_EQ(Provenance::Recovered, d.provenance)
+                << "the repair lost its provenance on the reorder limb — the limb every "
+                   "FEC-enabled preset actually uses";
+            EXPECT_EQ(payloadFor(2), d.packet.payload());
+        } else {
+            EXPECT_EQ(Provenance::Live, d.provenance)
+                << "seq " << d.packet.sequence() << " arrived over loopback";
+        }
+    }
+    EXPECT_EQ(1, seenRecovered) << "the rebuilt slot never surfaced";
 }

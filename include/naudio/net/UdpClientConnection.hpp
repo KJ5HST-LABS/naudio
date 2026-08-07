@@ -31,7 +31,20 @@
 
 namespace naudio::net {
 
-// A blocking FIFO of AudioPackets — the ordered queue. The reorder buffer / FEC
+// A queued packet and how it got here. The queue sits between the FEC decoder —
+// the only thing in the project that can tell a repair from an arrival, because it
+// is the only thing that builds one — and receivePacket's caller. Holding a bare
+// AudioPacket here would destroy that knowledge one hop after it exists, which is
+// exactly what issue #65 is about, so the queue carries the pair (#65 phase 2).
+//
+// Provenance is deliberately undefaulted here for the same reason as on
+// ReceiveResult: see the comment there, and Provenance.hpp for the measurement.
+struct QueuedPacket {
+    AudioPacket packet;
+    Provenance provenance;
+};
+
+// A blocking FIFO of QueuedPackets — the ordered queue. The reorder buffer / FEC
 // decoder
 // emit ordered packets here (producer side, under the connection's pipe lock);
 // receivePacket() pops them (consumer side). poll(timeoutMs) blocks up to the
@@ -47,7 +60,7 @@ public:
     explicit BlockingPacketQueue(std::size_t maxSize = kDefaultMaxSize)
         : maxSize_(maxSize == 0 ? kDefaultMaxSize : maxSize) {}
 
-    void offer(AudioPacket packet) {
+    void offer(AudioPacket packet, Provenance provenance) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (queue_.size() >= maxSize_) {
@@ -57,23 +70,23 @@ public:
                 queue_.pop_front();
                 ++drops_;
             }
-            queue_.push_back(std::move(packet));
+            queue_.push_back(QueuedPacket{std::move(packet), provenance});
         }
         cv_.notify_one();
     }
 
-    // Non-blocking pop: a packet if one is ready, else nullopt.
-    std::optional<AudioPacket> poll() {
+    // Non-blocking pop: a packet and its provenance if one is ready, else nullopt.
+    std::optional<QueuedPacket> poll() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (queue_.empty()) return std::nullopt;
-        AudioPacket p = std::move(queue_.front());
+        QueuedPacket p = std::move(queue_.front());
         queue_.pop_front();
         return p;
     }
 
     // Blocking pop with a deadline. timeoutMs == 0 blocks indefinitely (until a
     // packet arrives or shutdown()). Returns nullopt on timeout/shutdown.
-    std::optional<AudioPacket> poll(int timeoutMs) {
+    std::optional<QueuedPacket> poll(int timeoutMs) {
         std::unique_lock<std::mutex> lock(mutex_);
         auto ready = [this] { return !queue_.empty() || shutdown_; };
         if (timeoutMs <= 0) {
@@ -84,7 +97,7 @@ public:
             }
         }
         if (queue_.empty()) return std::nullopt;  // shutdown
-        AudioPacket p = std::move(queue_.front());
+        QueuedPacket p = std::move(queue_.front());
         queue_.pop_front();
         return p;
     }
@@ -111,7 +124,7 @@ public:
 private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
-    std::deque<AudioPacket> queue_;
+    std::deque<QueuedPacket> queue_;
     bool shutdown_ = false;
     std::size_t maxSize_ = kDefaultMaxSize;
     std::int64_t drops_ = 0;

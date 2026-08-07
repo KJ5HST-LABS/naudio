@@ -13,6 +13,7 @@
 
 #include "naudio/AudioPacket.hpp"
 #include "naudio/ControlMessage.hpp"
+#include "naudio/Provenance.hpp"
 #include "naudio/net/ClientAddress.hpp"
 #include "naudio/net/Socket.hpp"  // IoStatus (reused for acceptClient)
 
@@ -28,12 +29,28 @@ namespace naudio::net {
 struct ReceiveResult {
     std::optional<AudioPacket> packet;
     bool closed = false;
+    // How `packet` reached this result — see Provenance.hpp. Meaningful only when
+    // hasPacket(); the two empty results carry Live because nothing was repaired.
+    //
+    // DELIBERATELY UNDEFAULTED, and this is load-bearing rather than stylistic
+    // (issue #65). This project passes no warning flags, so a member with a default
+    // initializer would let all three factories below keep compiling untouched while
+    // silently reporting Live forever — the feature would ship doing nothing and no
+    // build would say so. With no default, every construction site must state it.
+    // Do not add a default value here, and do not replace this with a bool: `bool`
+    // and a scoped enum are not interconvertible, which is what makes the three
+    // fields below impossible to transpose in the aggregate initializers.
+    Provenance provenance;
 
     bool hasPacket() const { return packet.has_value(); }
 
-    static ReceiveResult of(AudioPacket p) { return {std::move(p), false}; }
-    static ReceiveResult noData() { return {std::nullopt, false}; }
-    static ReceiveResult dead() { return {std::nullopt, true}; }
+    static ReceiveResult of(AudioPacket p, Provenance provenance) {
+        return {std::move(p), false, provenance};
+    }
+    // No packet, so nothing was reconstructed. Live is both the accurate reading and
+    // the safe one — it is what every path did before provenance existed.
+    static ReceiveResult noData() { return {std::nullopt, false, Provenance::Live}; }
+    static ReceiveResult dead() { return {std::nullopt, true, Provenance::Live}; }
 };
 
 // Per-client connection handle for bidirectional audio streaming. Both

@@ -212,7 +212,10 @@ ReceiveResult AudioProtocolHandler::receivePacket(int timeoutMs) {
         lastReceiveTime_.store(nowMs());
         packetsReceived_.fetch_add(1);
         bytesReceived_.fetch_add(static_cast<std::int64_t>(fullPacket.size()));
-        return ReceiveResult::of(std::move(*packet));
+        // The TCP lane constructs no FEC decoder, so nothing here is ever a repair —
+        // every packet this handler surfaces was decoded from bytes that actually
+        // arrived. Always Live, by construction rather than by policy.
+        return ReceiveResult::of(std::move(*packet), Provenance::Live);
     }
 
     return ReceiveResult::noData();

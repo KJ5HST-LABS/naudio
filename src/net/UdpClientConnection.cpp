@@ -58,14 +58,11 @@ void UdpClientConnection::initPipeline(const UdpReliabilityConfig& cfg) {
     // because the queue rejects null).
     if (cfg.fecEnabled) {
         fecEncoder_.emplace(static_cast<std::size_t>(cfg.fecBlockSize));
-        fecDecoder_.emplace([this](const AudioPacket* p, Provenance) {
-            // Provenance is accepted and dropped here, deliberately. orderedQueue_ is
-            // a BlockingPacketQueue holding a bare AudioPacket, so it has nowhere to
-            // put the value — carrying it further is issue #65 phase 2, which widens
-            // the queue element. Naming the parameter's TYPE and discarding it keeps
-            // this hop honest: the decoder states provenance, and this connection
-            // does not yet propagate it.
-            if (p) orderedQueue_.offer(*p);
+        fecDecoder_.emplace([this](const AudioPacket* p, Provenance provenance) {
+            // THE hop issue #65 exists for. The decoder is the only thing that knows
+            // this frame was rebuilt rather than received; the queue now carries that
+            // through to receivePacket's caller instead of destroying it here.
+            if (p) orderedQueue_.offer(*p, provenance);
         });
 
         // How long the decoder may hold a block waiting for the rest of it, derived
@@ -119,7 +116,9 @@ void UdpClientConnection::initPipeline(const UdpReliabilityConfig& cfg) {
             reorderBuffer_.emplace(
                 static_cast<std::size_t>(cfg.reorderWindowSize), cfg.reorderMaxHoldMs,
                 [this](const AudioPacket* p) {
-                    if (p) orderedQueue_.offer(*p);
+                    // The FEC-off limb: the reorder buffer reconstructs nothing, it
+                    // only re-sequences what arrived, so everything it emits is Live.
+                    if (p) orderedQueue_.offer(*p, Provenance::Live);
                 });
         }
     }
@@ -243,7 +242,9 @@ void UdpClientConnection::enqueueReceived(const AudioPacket& packet, int rawByte
         trackSequence(packet.sequence());
     } else {
         if (packet.packetType() == PacketType::FecParity) return;  // FEC off — skip parity
-        orderedQueue_.offer(packet);
+        // The passthrough limb: no reorder buffer and no decoder, so this packet is
+        // exactly what arrived on the wire.
+        orderedQueue_.offer(packet, Provenance::Live);
         trackSequence(packet.sequence());
     }
 }
@@ -258,8 +259,8 @@ ReceiveResult UdpClientConnection::receivePacket(int timeoutMs) {
 
     if (!ownsSocket_) {
         // Server-fed: packets come from the demux -> pipeline -> ordered queue.
-        std::optional<AudioPacket> p = orderedQueue_.poll(timeoutMs);
-        if (p) return ReceiveResult::of(std::move(*p));
+        std::optional<QueuedPacket> p = orderedQueue_.poll(timeoutMs);
+        if (p) return ReceiveResult::of(std::move(p->packet), p->provenance);
         // Nothing was ready within the deadline. This limb is the server-fed mirror of
         // receiveFromSocket's IoStatus::TimedOut limb below, and it exists for the same
         // reason: both hold-timeouts in the pipeline are driven by the CONSUMER, because
@@ -294,8 +295,8 @@ ReceiveResult UdpClientConnection::receivePacket(int timeoutMs) {
             if (reorderBuffer_) reorderBuffer_->checkTimeout();
             if (fecDecoder_) fecDecoder_->checkTimeout();
         }
-        if (std::optional<AudioPacket> q = orderedQueue_.poll()) {
-            return ReceiveResult::of(std::move(*q));
+        if (std::optional<QueuedPacket> q = orderedQueue_.poll()) {
+            return ReceiveResult::of(std::move(q->packet), q->provenance);
         }
         return ReceiveResult::noData();
     }
@@ -306,8 +307,8 @@ ReceiveResult UdpClientConnection::receivePacket(int timeoutMs) {
 
 ReceiveResult UdpClientConnection::receiveFromSocket(int timeoutMs) {
     // Drain anything the pipeline already made ready.
-    if (std::optional<AudioPacket> queued = orderedQueue_.poll()) {
-        return ReceiveResult::of(std::move(*queued));
+    if (std::optional<QueuedPacket> queued = orderedQueue_.poll()) {
+        return ReceiveResult::of(std::move(queued->packet), queued->provenance);
     }
 
     socket_->setRecvTimeout(timeoutMs > 0 ? timeoutMs : 0);
@@ -321,8 +322,8 @@ ReceiveResult UdpClientConnection::receiveFromSocket(int timeoutMs) {
             if (reorderBuffer_) reorderBuffer_->checkTimeout();
             if (fecDecoder_) fecDecoder_->checkTimeout();
         }
-        if (std::optional<AudioPacket> q = orderedQueue_.poll()) {
-            return ReceiveResult::of(std::move(*q));
+        if (std::optional<QueuedPacket> q = orderedQueue_.poll()) {
+            return ReceiveResult::of(std::move(q->packet), q->provenance);
         }
         return ReceiveResult::noData();
     }
@@ -358,8 +359,8 @@ ReceiveResult UdpClientConnection::receiveFromSocket(int timeoutMs) {
         }
         for (const AudioPacket& out : outcome.outgoing) sendPacket(out);
         if (outcome.consumed) {
-            if (std::optional<AudioPacket> q = orderedQueue_.poll()) {
-                return ReceiveResult::of(std::move(*q));
+            if (std::optional<QueuedPacket> q = orderedQueue_.poll()) {
+                return ReceiveResult::of(std::move(q->packet), q->provenance);
             }
             return ReceiveResult::noData();
         }
@@ -374,22 +375,24 @@ ReceiveResult UdpClientConnection::receiveFromSocket(int timeoutMs) {
     if (reorderBuffer_) {
         reorderBuffer_->insert(*packet);
         reorderBuffer_->checkTimeout();
-        if (std::optional<AudioPacket> q = orderedQueue_.poll()) {
-            return ReceiveResult::of(std::move(*q));
+        if (std::optional<QueuedPacket> q = orderedQueue_.poll()) {
+            return ReceiveResult::of(std::move(q->packet), q->provenance);
         }
         return ReceiveResult::noData();
     } else if (fecDecoder_) {
         fecDecoder_->processPacket(*packet);
         fecDecoder_->checkTimeout();
         trackSequence(packet->sequence());
-        if (std::optional<AudioPacket> q = orderedQueue_.poll()) {
-            return ReceiveResult::of(std::move(*q));
+        if (std::optional<QueuedPacket> q = orderedQueue_.poll()) {
+            return ReceiveResult::of(std::move(q->packet), q->provenance);
         }
         return ReceiveResult::noData();
     } else {
         if (packet->packetType() == PacketType::FecParity) return ReceiveResult::noData();
         trackSequence(packet->sequence());
-        return ReceiveResult::of(std::move(*packet));
+        // Straight off the socket with no reorder buffer and no decoder in the
+        // path: nothing could have been reconstructed.
+        return ReceiveResult::of(std::move(*packet), Provenance::Live);
     }
 }
 
