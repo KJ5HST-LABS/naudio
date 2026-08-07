@@ -66,37 +66,99 @@ void AudioMixer::unregisterClient(const std::string& clientId) {
 
 AudioMixer::TxResult AudioMixer::submitTxAudio(const std::string& clientId,
                                                const std::uint8_t* data, std::size_t offset,
-                                               std::size_t length) {
+                                               std::size_t length, Provenance provenance) {
     auto client = clientFor(clientId);
-    if (!client) return TxResult::Rejected;
+    if (!client) {
+        // Unknown client. A LIVE frame from one is Rejected exactly as before. A recovered
+        // one must not be: this return precedes all arbitration, so once phase 4 forwards
+        // real provenance, Rejected here would drive the server's txDeniedCount_ and
+        // fabricate a TX_DENIED on behalf of a peer that never asked — the same defect
+        // row 4 exists to prevent, reached by a different path.
+        return provenance == Provenance::Recovered ? TxResult::DeclinedRecovered
+                                                   : TxResult::Rejected;
+    }
 
     // Callbacks are collected under the lock and invoked after unlock:
     // they do blocking sendControl writes, and running them under txMutex_ let one
     // backpressured client block every submitTxAudio call and the playback loop.
     Notifications notifications;
     TxResult result;
+    // The arbitration verdict and the audio write are now decided SEPARATELY (issue #65).
+    // They used to be one decision — `if (result == Accepted) txBuffer_.write(...)` — which
+    // is precisely what made a repair indistinguishable from a claim: any frame worth
+    // playing was, by the same test, a frame that took the channel. Each row below sets
+    // both explicitly.
+    //
+    // They still coincide on every row of the current table (writeAudio is true exactly
+    // when result is Accepted). Do NOT collapse them back on that basis: the contract is
+    // that a frame may be audible without arbitrating, and the coincidence is a property
+    // of today's four rows, not of the design.
+    bool writeAudio;
     {
         std::lock_guard<std::mutex> lock(txMutex_);
+        const bool recovered = (provenance == Provenance::Recovered);
+
         if (!txOwnership_.has_value()) {
-            claimTxChannelLocked(clientId, client->txPriority(), notifications);
-            result = TxResult::Accepted;
+            // Unowned. The channel was released and txBuffer_ cleared (releaseTxChannelLocked),
+            // so the radio is silent: a repair here would be a click, not a repair — and
+            // claiming on behalf of a peer that never sent this frame is the #65 defect.
+            if (recovered) {
+                result = TxResult::DeclinedRecovered;
+                writeAudio = false;
+            } else {
+                claimTxChannelLocked(clientId, client->txPriority(), notifications);
+                result = TxResult::Accepted;
+                writeAudio = true;
+            }
         } else if (txOwnership_->clientId == clientId) {
-            lastTxActivityTime_ = now();  // we own it — refresh activity
+            // We own it — the only state in which a repair has a consumer, so it is the
+            // only row where recovered audio is written. The lease is NOT refreshed for a
+            // repair (operator decision, 2026-08-07): the idle timeout keeps running from
+            // the last LIVE frame, so a tail carried only by repairs releases early rather
+            // than holding the channel open on reconstructed evidence.
+            if (!recovered) lastTxActivityTime_ = now();
             result = TxResult::Accepted;
+            writeAudio = true;
         } else {
             const TxPriority ourPriority = client->txPriority();
             if (canPreempt(ourPriority, txOwnership_->priority)) {
-                preemptCurrentOwnerLocked(clientId, ourPriority, notifications);
-                result = TxResult::Accepted;
+                // Someone else holds it and we outrank them. Unreachable in the shipping
+                // server — every session is hard-wired Normal and canPreempt is strict-
+                // greater, and the frozen spec pins that (audio-streaming-protocol-v1.md:326)
+                // — but specified so the proposed §13.3 priority feature cannot inherit the bug.
+                if (recovered) {
+                    result = TxResult::DeclinedRecovered;
+                    writeAudio = false;
+                } else {
+                    preemptCurrentOwnerLocked(clientId, ourPriority, notifications);
+                    result = TxResult::Accepted;
+                    writeAudio = true;
+                }
             } else {
-                const std::string holder = txOwnership_->clientId;
-                notifications.push_back(
-                    [this, holder, clientId]() { notifyTxConflict(holder, clientId); });
-                result = TxResult::Rejected;
+                // Someone else holds it and we cannot outrank them.
+                if (recovered) {
+                    // Declining SILENTLY, and be precise about what "silently" buys:
+                    // in the shipping server TX_DENIED is driven by this RETURN VALUE, not
+                    // by the notification — handleTxAudio sends it on TxResult::Rejected,
+                    // while the onTxConflict listener is wired to an empty lambda
+                    // (AudioStreamServer.cpp). So returning DeclinedRecovered rather than
+                    // Rejected is what stops a repair from spending the client's single
+                    // per-episode TX_DENIED (spec :323) and silencing its next genuine one.
+                    // Skipping the notification matters for any OTHER listener a consumer
+                    // installs, which is why both are done.
+                    result = TxResult::DeclinedRecovered;
+                    writeAudio = false;
+                } else {
+                    const std::string holder = txOwnership_->clientId;
+                    notifications.push_back(
+                        [this, holder, clientId]() { notifyTxConflict(holder, clientId); });
+                    result = TxResult::Rejected;
+                    writeAudio = false;
+                }
             }
         }
 
-        if (result == TxResult::Accepted) {
+        if (writeAudio) {
             txBuffer_.write(data, offset, length);
         }
     }

@@ -334,7 +334,18 @@ void AudioStreamServer::ClientSession::handleTxAudio(const std::vector<std::uint
     }
     if (!mixer) return;
 
-    const AudioMixer::TxResult result = mixer->submitTxAudio(clientId_, data);
+    // PHASE 3 PLACEHOLDER (issue #65): hardcoded Live, so end-to-end behaviour is
+    // unchanged and the mixer's new recovered-frame rows are unreachable from here.
+    // Phase 4 replaces this with the provenance carried on the ReceiveResult, which is
+    // what actually fixes the defect. There is NO automated detector for that one-line
+    // change — ClientSession is private to this .cpp with no injection seam — so phase 4
+    // must mutate it, observe that nothing reddens, and record that.
+    //
+    // TxResult::DeclinedRecovered is deliberately not handled below: falling through both
+    // branches is the correct behaviour (no bytes counted, no TX_DENIED). It cannot occur
+    // while this argument is Live.
+    const AudioMixer::TxResult result =
+        mixer->submitTxAudio(clientId_, data, Provenance::Live);
     if (result == AudioMixer::TxResult::Accepted) {
         txBytesAccepted_.fetch_add(static_cast<std::int64_t>(data.size()));
     } else if (result == AudioMixer::TxResult::Rejected) {

@@ -20,6 +20,7 @@
 
 #include "naudio/AudioRingBuffer.hpp"
 #include "naudio/AudioStreamConfig.hpp"
+#include "naudio/Provenance.hpp"
 #include "naudio/Stream.hpp"
 
 namespace naudio::net {
@@ -52,7 +53,19 @@ public:
     }
 
     // Result of a TX submission attempt.
-    enum class TxResult { Accepted, Rejected, Preempted };
+    //
+    // Rejected vs DeclinedRecovered is the distinction issue #65 turns on, and they are
+    // not interchangeable: Rejected answers a client that ASKED to transmit and was
+    // refused, so it owes that client a TX_DENIED. DeclinedRecovered answers a frame the
+    // FEC layer reconstructed, which carries no client intent at all — nobody asked, so
+    // nobody is owed an answer, and sending one would consume the client's single
+    // per-episode TX_DENIED (docs/audio-streaming-protocol-v1.md:323) and silence its
+    // next genuine denial.
+    //
+    // NOTE: Preempted predates this change and is never returned — the preempt branch
+    // reports Accepted. Left as-is rather than fixed here; see the DEAD ENUMERATOR note
+    // on submitTxAudio.
+    enum class TxResult { Accepted, Rejected, Preempted, DeclinedRecovered };
 
     // A TX client. Callbacks run on the mixer's threads, after the
     // lock is released; they MUST NOT re-enter the mixer.
@@ -89,10 +102,45 @@ public:
     void unregisterClient(const std::string& clientId);
 
     // Submits TX audio from a client (claim / refresh / preempt / reject).
+    //
+    // `provenance` says whether this frame arrived on the wire or was rebuilt by the FEC
+    // parity layer, and it is REQUIRED — no default (issue #65). Submitting audio IS the
+    // claim mechanism here; there is no separate "I want to transmit" call. So a frame
+    // that never ARRIVED — the peer sent it, it was lost, and the parity layer rebuilt it —
+    // could, before this parameter existed, claim the TX
+    // channel on that peer's behalf after its idle release — which on na_hamlib_bridge
+    // opens a real rig's audio path and, with -k, keys its PTT. A default value would
+    // reinstate exactly that, silently, because this project passes no warning flags.
+    //
+    // Behaviour by (ownership state x provenance) — a recovered frame never ARBITRATES,
+    // and is written only where it has a consumer:
+    //
+    //   state                  live frame                  recovered frame
+    //   ---------------------  --------------------------  ---------------------------
+    //   unowned                claim + write   Accepted     drop           DeclinedRecovered
+    //   owned by this client   refresh + write Accepted     write, NO refresh  Accepted
+    //   owned, can preempt     preempt + write Accepted     drop           DeclinedRecovered
+    //   owned, cannot preempt  reject          Rejected     drop, SILENT   DeclinedRecovered
+    //
+    // Unowned: the channel was released and txBuffer_ cleared, so the radio is silent —
+    // a repair there is a click, not a repair. Owned-by-this-client is the only state in
+    // which a repair has anywhere to go. NO REFRESH on that row is an operator decision
+    // (2026-08-07), not a derivation: it lets the idle lease keep running from the last
+    // LIVE frame, so a talker whose tail is carried only by repairs releases up to one
+    // FEC block early. That is the direction that cannot extend a transmission, which is
+    // the safety-relevant direction for a tool that keys a transmitter.
+    //
+    // DEAD ENUMERATOR WARNING (see also the Preempted note above): this project passes no
+    // warning flags, and the one production consumer
+    // (AudioStreamServer.cpp's handleTxAudio) is an if/else-if chain rather than a switch,
+    // so an unhandled TxResult value falls through silently. That fall-through is CORRECT
+    // for DeclinedRecovered — no bytes counted, no TX_DENIED — but it means a mistake
+    // there is invisible. Verify any change here by mutation, never by a clean build.
     TxResult submitTxAudio(const std::string& clientId, const std::uint8_t* data,
-                           std::size_t offset, std::size_t length);
-    TxResult submitTxAudio(const std::string& clientId, const std::vector<std::uint8_t>& data) {
-        return submitTxAudio(clientId, data.data(), 0, data.size());
+                           std::size_t offset, std::size_t length, Provenance provenance);
+    TxResult submitTxAudio(const std::string& clientId, const std::vector<std::uint8_t>& data,
+                           Provenance provenance) {
+        return submitTxAudio(clientId, data.data(), 0, data.size(), provenance);
     }
 
     // The current TX owner ("" if none).
