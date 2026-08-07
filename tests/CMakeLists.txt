@@ -22,7 +22,27 @@ find_package(Threads REQUIRED)
 target_link_libraries(naudio_tests PRIVATE naudio_core GTest::gtest_main Threads::Threads)
 
 include(GoogleTest)
-gtest_discover_tests(naudio_tests)
+
+# DISCOVERY_TIMEOUT on every gtest_discover_tests call in this file (issue #50).
+# CMake's default is 5 s, and that is not enough here: on macOS the FIRST execution
+# of a freshly linked binary pays signature / Gatekeeper validation. Measured on
+# arm64 Sequoia, timing the exact --gtest_list_tests call discovery makes —
+# naudio_tests 1.8 s, naudio_conformance_tests 19.5 s, naudio_net_tests 19.4 s cold,
+# and 0.00 s once warm. A byte-identical `cp` of a warm binary costs 5.24 s on its
+# first run, so the cost is keyed on file identity, not content: every relink is cold.
+#
+# The failure cannot self-heal, which is what makes it worth a comment. On timeout
+# make DELETES the target, so the next build links a brand-new (cold) file, times out
+# again, and deletes it again. A fresh clone plus a full build therefore fails on the
+# project's primary development platform, with an error that points at the test
+# executable rather than at the timeout. Only incremental builds that skip the relink
+# escape it — which is why it went unnoticed for so long.
+#
+# 120 s is ~6x the worst measurement and costs nothing when discovery is fast: the
+# value is a ceiling, not a wait.
+set(NA_GTEST_DISCOVERY_TIMEOUT 120)
+
+gtest_discover_tests(naudio_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT})
 
 # ----------------------------------------------------------------------------
 # Conformance harness — validates the C/C++ codec against the language-neutral
@@ -36,7 +56,7 @@ add_executable(naudio_conformance_tests conformance/ConformanceTest.cpp)
 target_link_libraries(naudio_conformance_tests PRIVATE naudio_core GTest::gtest_main)
 target_compile_definitions(naudio_conformance_tests
     PRIVATE NA_CONFORMANCE_DIR_DEFAULT="${CMAKE_SOURCE_DIR}/conformance")
-gtest_discover_tests(naudio_conformance_tests)
+gtest_discover_tests(naudio_conformance_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT})
 
 # ----------------------------------------------------------------------------
 # Net transport tests — exercise the naudio_net layer (sockets, the
@@ -57,4 +77,4 @@ add_executable(naudio_net_tests
     net/test_server.cpp
     net/test_client_e2e.cpp)
 target_link_libraries(naudio_net_tests PRIVATE naudio_net GTest::gtest_main Threads::Threads)
-gtest_discover_tests(naudio_net_tests)
+gtest_discover_tests(naudio_net_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT})
