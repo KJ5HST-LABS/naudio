@@ -11,6 +11,9 @@
 #include <utility>
 
 #include "naudio/ControlMessage.hpp"
+// CONNECTION_TIMEOUT_MS, which the outbound backlog cap is derived from. Reached
+// transitively via TcpServerTransport below, but a transitive include is not a contract.
+#include "naudio/net/AudioProtocolHandler.hpp"
 #include "naudio/net/DualServerTransport.hpp"
 #include "naudio/net/TcpServerTransport.hpp"
 #include "naudio/net/UdpClientConnection.hpp"  // UdpReliabilityConfig
@@ -49,7 +52,15 @@ public:
           clientId_(std::move(clientId)),
           connection_(std::move(connection)),
           connectTimeMs_(nowMs()),
-          sessionConfig_(server->config_) {}
+          sessionConfig_(server->config_),
+          // server_->config_, NOT sessionConfig_: a client may override the three buffer
+          // timings at handshake (performHandshake below), but bytesPerSecond() reads only
+          // sampleRate/bitsPerSample/channels, which are copied verbatim from the server's
+          // config and are not negotiable. Using the server's copy also means the capture
+          // thread never reads a field the run thread may still be assigning.
+          outQueueMaxBytes_(static_cast<std::size_t>(
+              static_cast<std::int64_t>(server->config_.bytesPerSecond()) *
+              AudioProtocolHandler::CONNECTION_TIMEOUT_MS / 1000)) {}
 
     // Launches the run thread (detached; keeps `self` alive while it runs).
     void startRunThread() {
@@ -67,8 +78,12 @@ public:
         if (closed_.load()) return false;
         // Copy the borrowed bytes and enqueue for the writer thread — NEVER block on a socket
         // send here (this runs on the shared capture thread). §3.2.
-        enqueueRxAudio(std::vector<std::uint8_t>(data + offset, data + offset + length));
-        return true;
+        //
+        // The return value is the backpressure signal, not a formality: enqueueRxAudio says
+        // false when the backlog is at its cap, and false here is what AudioBroadcaster
+        // documents as "remove me" (AudioBroadcaster.hpp:47-48). Issue #56 — do not restore
+        // the unconditional `return true` this replaced.
+        return enqueueRxAudio(std::vector<std::uint8_t>(data + offset, data + offset + length));
     }
     std::string targetId() const override { return clientId_; }
 
@@ -113,7 +128,8 @@ private:
     void handleTxAudio(const std::vector<std::uint8_t>& data, Provenance provenance);
     void handleControlMessage(const AudioPacket& packet);
     void enqueueControl(ControlMessage message);
-    void enqueueRxAudio(std::vector<std::uint8_t> data);
+    // False means the outbound backlog is at its cap and this session should be removed.
+    bool enqueueRxAudio(std::vector<std::uint8_t> data);
 
     AudioStreamServer* server_;  // back-pointer; the server outlives every session
     const std::string clientId_;
@@ -138,6 +154,32 @@ private:
     std::condition_variable outCv_;
     std::deque<Outgoing> outQueue_;
     bool outClosed_ = false;
+    // Pending RX-audio bytes in outQueue_ (control messages count 0 — see enqueueControl).
+    // Guarded by outMutex_.
+    std::size_t outQueueBytes_ = 0;
+    // The backlog cap: CONNECTION_TIMEOUT_MS worth of audio at this stream's bit rate
+    // (1,920,000 B on the default preset). Issue #56.
+    //
+    // WHY THIS QUANTITY. It makes one deadline govern both directions of "this peer has
+    // stopped making progress". The server already declares a peer dead after
+    // CONNECTION_TIMEOUT_MS of not SENDING (AudioProtocolHandler::isConnectionTimedOut);
+    // this applies the same window to a peer that will not DRAIN. The coupling is
+    // deliberate and is a real coupling: CONNECTION_TIMEOUT_MS is frozen by the wire spec
+    // (docs/audio-streaming-protocol-v1.md:289-290 and the constants table at :550-551), so
+    // moving it there moves this cap with it. That is the intended behaviour, not a
+    // side effect — but it means this line is not free to retune locally.
+    //
+    // The margin over any legitimate backlog is enormous: the widest jitter buffer any
+    // preset configures is bufferMaxMs = 300 (AudioStreamConfig.hpp:30), so a peer at this
+    // cap is 33x past the buffer that would have had to conceal the gap. Its audio was
+    // unusable long before it was evicted.
+    //
+    // INT64 ARITHMETIC IS MANDATORY — do NOT reach for AudioStreamConfig::msToBytes, which
+    // multiplies in int32 (AudioStreamConfig.hpp:82): udpIq()'s 768000 B/s x 10000 ms is
+    // 7.68e9 and overflows, and the cast to size_t would then yield an effectively infinite
+    // cap that disables this guard on a shipped preset with no diagnostic. This project
+    // passes no warning flags, so nothing would report it.
+    const std::size_t outQueueMaxBytes_;
 
     // Pacing for the run loop's heartbeat/stats wait (woken immediately on close()).
     std::mutex runStopMutex_;
@@ -151,11 +193,41 @@ void AudioStreamServer::ClientSession::enqueueControl(ControlMessage message) {
     outCv_.notify_one();
 }
 
-void AudioStreamServer::ClientSession::enqueueRxAudio(std::vector<std::uint8_t> data) {
-    std::lock_guard<std::mutex> lock(outMutex_);
-    if (outClosed_) return;
-    outQueue_.push_back(Outgoing{std::nullopt, std::move(data)});
+bool AudioStreamServer::ClientSession::enqueueRxAudio(std::vector<std::uint8_t> data) {
+    {
+        std::lock_guard<std::mutex> lock(outMutex_);
+        // Teardown in progress is NOT a backlog failure: receiveRxAudio's own closed_ check
+        // already refuses for that reason, and a session being torn down must not re-enter
+        // the eviction path. True here means "nothing to report", not "delivered".
+        if (outClosed_) return true;
+
+        if (outQueueBytes_ >= outQueueMaxBytes_) {
+            // The peer has stopped draining. Report before refusing — writerLoop's own
+            // send-failure path below sets the house standard that a client is never
+            // auto-removed silently, because the disconnect alone leaves no trace of WHY.
+            server_->outboundBacklogEvictions_.fetch_add(1);
+            server_->notifyError(clientId_,
+                                 "Outbound backlog limit reached (" +
+                                     std::to_string(outQueueBytes_) + " of " +
+                                     std::to_string(outQueueMaxBytes_) +
+                                     " bytes): client is not draining");
+            // False is the documented removal request (AudioBroadcaster.hpp:47-48). The
+            // broadcaster erases this target and its failure listener closes the session
+            // (AudioStreamServer.cpp, initializeSharedAudio), which is what both bounds the
+            // queue and frees the maxClients slot. Returning false is the whole fix; the
+            // counter and the message above are only how an operator finds out.
+            return false;
+        }
+
+        // Tested against the CURRENT depth before adding, the shape BlockingPacketQueue
+        // already uses: an empty queue always accepts one chunk however large the host made
+        // it (injectAudio forwards whatever it is given), so overshoot is bounded by exactly
+        // one chunk and a healthy client can never be refused.
+        outQueueBytes_ += data.size();
+        outQueue_.push_back(Outgoing{std::nullopt, std::move(data)});
+    }
     outCv_.notify_one();
+    return true;
 }
 
 std::optional<AudioPacket> AudioStreamServer::ClientSession::receiveOnePacket(int totalTimeoutMs) {
@@ -298,6 +370,9 @@ void AudioStreamServer::ClientSession::writerLoop() {
             if (outQueue_.empty()) return;  // closed and drained
             item = std::move(outQueue_.front());
             outQueue_.pop_front();
+            // Still under outMutex_. Controls contribute 0 in both directions, so the
+            // counter measures the audio backlog exactly and cannot drift below zero.
+            if (!item.control.has_value()) outQueueBytes_ -= item.audio.size();
         }
         const bool isControl = item.control.has_value();
         const std::size_t audioBytes = isControl ? 0 : item.audio.size();
@@ -418,6 +493,12 @@ void AudioStreamServer::ClientSession::close() {
     {
         std::lock_guard<std::mutex> lock(outMutex_);
         outClosed_ = true;
+        // outQueueBytes_ is deliberately NOT reset here. Its invariant is "exactly the RX
+        // audio bytes currently in outQueue_", and close() does not empty the queue (the
+        // writer may still be inside a send holding the front item). Zeroing it while items
+        // remain would make writerLoop's next `-=` underflow a size_t into a huge value —
+        // which nothing reads today, and which would silently disable the cap the moment
+        // anyone added a depth accessor.
     }
     outCv_.notify_all();
     runStopCv_.notify_all();

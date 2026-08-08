@@ -1072,3 +1072,151 @@ TEST(Server, ARepairDoesNotSpendADeniedClientsOneTxDenied) {
            "nothing about repairs";
     EXPECT_EQ(fx.server.txOwner(), "audio-1") << "A still holds the channel throughout";
 }
+
+// ---------------------------------------------------------------------------------------
+// Issue #56 — the outbound backlog cap, and eviction of a peer that stops draining.
+//
+// A TCP peer that stops reading closes its receive window; the session's writer thread then
+// blocks inside Socket::sendAll (src/net/Socket.cpp:469-485), which has no deadline of any
+// kind, and every frame the capture path fans out piles up behind it. These arms drive a
+// REAL ClientSession over a supplied transport whose sendRxAudio parks on entry, which is
+// that state exactly, minus the socket.
+//
+// WHY A DOUBLE AND NOT A REAL STALLED SOCKET. Wedging a real sender means filling both the
+// sender's send buffer and the receiver's receive buffer, and those are autotuned: measured
+// on this machine across three consecutive runs of one binary, the absorbed volume was
+// 548,546 / 586,251 / 741,696 bytes, with SO_SNDBUF growing 146,988 -> 335,404 mid-run. A
+// threshold arm built on that is a coin flip, and it is a different coin on every platform.
+// Parking the send makes the queue depth exactly known instead, so the boundary pair below
+// can differ by ONE frame and still be deterministic.
+//
+// WHAT THESE ARMS DO NOT COVER, stated so nobody reads more into them. They prove the queue
+// is bounded and the session is evicted. They do NOT prove the wedged writer THREAD unwinds:
+// that depends on whether closing the socket interrupts a send already blocked in the
+// kernel, which is a platform property (measured true on macOS: close() released a genuinely
+// wedged sendAll in 0 ms; unverified on Linux/Windows, where the tree has no ::shutdown() to
+// fall back on). The double releases on close() by construction, so it models the favourable
+// platform and cannot speak to the other. See issue #56's follow-up for that half.
+// ---------------------------------------------------------------------------------------
+
+namespace {
+
+// One frame at the session's own bit rate, so the arithmetic below is the shipped one.
+std::vector<std::uint8_t> backlogFrame(const AudioStreamConfig& c) {
+    return std::vector<std::uint8_t>(static_cast<std::size_t>(c.bytesPerFrame()), 0x33);
+}
+
+// How many whole frames the cap admits: CONNECTION_TIMEOUT_MS of audio.
+//
+// Derived through frameDurationMs, while production derives through bytesPerSecond
+// (AudioStreamServer.cpp, outQueueMaxBytes_) — deliberately the other route to the same
+// quantity, so this is not the production formula copied back to confirm itself.
+int framesAdmittedByCap(const AudioStreamConfig& c) {
+    return AudioProtocolHandler::CONNECTION_TIMEOUT_MS / c.frameDurationMs;
+}
+
+// Connects a scripted client and leaves its writer thread PARKED inside sendRxAudio, with
+// the queue verified empty.
+//
+// The parked-writer barrier is what makes every count below exact. One frame is injected and
+// the writer is awaited INSIDE it: at that point the item has been popped, so the backlog is
+// zero and every later inject accumulates one-for-one. Without this the writer's pop races
+// the test's injects and the boundary moves by a frame.
+std::shared_ptr<naudio::test::ScriptedClientConnection> connectWithParkedWriter(
+    ScriptedFixture& fx, const std::string& id) {
+    auto conn = connectScripted(*fx.transport, id);
+    if (!conn) return nullptr;
+    conn->stallRxAudio();
+    fx.server.injectAudio(backlogFrame(fx.config));
+    for (int i = 0; i < 500 && conn->rxAudioCalls() < 1; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return conn->rxAudioCalls() == 1 ? conn : nullptr;
+}
+
+}  // namespace
+
+// SUBJECT. One frame past the cap and the peer is gone.
+TEST(Server, AStalledWriterIsEvictedWhenTheOutboundBacklogReachesItsCap) {
+    ScriptedFixture fx;
+    std::string err;
+    ASSERT_TRUE(fx.server.start(&err)) << err;
+
+    // GUARD "the harness ran" AND "the fault fired", in one: a null return means either the
+    // session never registered or the writer never reached the parked send, and those are
+    // both setup failures rather than the subject.
+    auto conn = connectWithParkedWriter(fx, "stalled-a");
+    ASSERT_TRUE(conn) << "writer never parked inside sendRxAudio; nothing was stalled";
+    ASSERT_EQ(fx.server.clientCount(), 1) << "premise: the stalled peer is connected";
+    ASSERT_EQ(fx.server.outboundBacklogEvictions(), 0) << "premise: nothing evicted yet";
+
+    const int admitted = framesAdmittedByCap(fx.config);
+    for (int i = 0; i < admitted + 1; i++) fx.server.injectAudio(backlogFrame(fx.config));
+
+    // SUBJECT. The eviction runs synchronously on this thread — the broadcaster erases the
+    // refusing target and calls the server's failure listener before injectAudio returns —
+    // so this needs no wait, and a wait here would hide a regression that only evicts late.
+    EXPECT_EQ(fx.server.clientCount(), 0)
+        << "a peer that stopped draining was never evicted; " << conn->diagnostics();
+    EXPECT_EQ(fx.server.outboundBacklogEvictions(), 1)
+        << "the eviction is invisible to an operator: nothing counted it";
+}
+
+// BOUNDARY CONTROL. Same fault, one frame fewer, opposite verdict.
+//
+// This is what makes the subject above a statement about the CAP rather than about stalling
+// at all: a regression that evicted on the first stalled frame would satisfy the subject
+// perfectly and reddens here.
+TEST(Server, AStalledWriterIsNotEvictedOneFrameBelowTheCap) {
+    ScriptedFixture fx;
+    std::string err;
+    ASSERT_TRUE(fx.server.start(&err)) << err;
+
+    auto conn = connectWithParkedWriter(fx, "stalled-b");
+    ASSERT_TRUE(conn) << "writer never parked inside sendRxAudio; nothing was stalled";
+
+    const int admitted = framesAdmittedByCap(fx.config);
+    for (int i = 0; i < admitted; i++) fx.server.injectAudio(backlogFrame(fx.config));
+
+    EXPECT_EQ(fx.server.outboundBacklogEvictions(), 0)
+        << "the cap fired early: " << admitted << " frames is exactly "
+        << AudioProtocolHandler::CONNECTION_TIMEOUT_MS << " ms of audio and must be admitted";
+    EXPECT_EQ(fx.server.clientCount(), 1) << conn->diagnostics();
+    // The writer is still parked on the very first frame — nothing drained, so the whole
+    // backlog really is sitting in the queue and the count above is not an artefact of the
+    // session having quietly caught up.
+    EXPECT_EQ(conn->rxAudioCalls(), 1) << conn->diagnostics();
+}
+
+// HEALTHY-CLIENT CONTROL. The same volume through a peer that drains costs nothing.
+//
+// Without this, both arms above are satisfied by a cap that counts TOTAL frames sent rather
+// than the pending backlog — which would evict every long-lived client on a live server.
+TEST(Server, AClientThatDrainsIsNeverEvictedByTheSameVolume) {
+    ScriptedFixture fx;
+    std::string err;
+    ASSERT_TRUE(fx.server.start(&err)) << err;
+
+    auto conn = connectScripted(*fx.transport, "healthy-c");  // no stall armed
+    ASSERT_TRUE(conn) << "no ClientsUpdate: a real session never registered";
+
+    const int total = framesAdmittedByCap(fx.config) + 1;  // the count that evicted above
+    for (int i = 1; i <= total; i++) {
+        fx.server.injectAudio(backlogFrame(fx.config));
+        // Let the writer catch up in batches, so the backlog stays shallow by construction
+        // rather than by luck. A drainer that fell far enough behind SHOULD be evicted, and
+        // this arm is about a client that does not.
+        if (i % 50 == 0) {
+            for (int w = 0; w < 500 && conn->rxAudioCalls() < i; w++) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+
+    EXPECT_EQ(fx.server.outboundBacklogEvictions(), 0)
+        << "a client that drained everything was evicted anyway; " << conn->diagnostics();
+    EXPECT_EQ(fx.server.clientCount(), 1) << conn->diagnostics();
+    // GUARD: the frames really did reach the wire, so the zero above is a real absence and
+    // not the result of the session having died before the volume arrived.
+    EXPECT_GE(conn->rxAudioCalls(), total - 50) << conn->diagnostics();
+}

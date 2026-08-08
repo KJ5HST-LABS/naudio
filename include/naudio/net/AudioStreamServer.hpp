@@ -104,8 +104,16 @@ struct ServerStats {
 // per-session outgoing queue drained by a dedicated WRITER THREAD; the sync callbacks only
 // enqueue (never block on I/O). A direct send would block on a slow client, so the
 // per-session queue is the non-blocking path. Async-context sends (handshake
-// config/accept, tx_denied,
-// latency_response) are sent directly on the connection, whose impls serialize writes.
+// config/accept, the run loop's heartbeat, tx_denied, latency_response, and a rejected
+// client's reject message) are sent directly on the connection, whose impls serialize writes.
+//
+// That queue is BOUNDED by bytes of pending RX audio (issue #56). A TCP peer that stops
+// reading its socket closes its receive window, the writer thread blocks in send() with no
+// deadline, and the queue would otherwise grow without bound at the capture rate. At the cap
+// the session is EVICTED rather than trimmed: receiveRxAudio returns false, which is the
+// removal request AudioBroadcaster::BroadcastTarget already documents, and the broadcaster's
+// failure listener closes the session. See outboundBacklogEvictions() for the observable and
+// ClientSession::outQueueMaxBytes_ for how the cap is derived.
 //
 // Lifecycle / teardown: broadcaster_/mixer_/transport_ are held by shared_ptr behind
 // runMutex_. A session copies them out under the lock and calls into them OUTSIDE it
@@ -178,6 +186,17 @@ public:
     // the live roster, not a monotonic lifetime total.
     ServerStats stats() const;
 
+    // Sessions evicted because their outbound RX-audio backlog reached the per-session cap —
+    // a peer that stopped draining its socket (issue #56). Non-zero means a client was
+    // dropped for not READING, which an operator would otherwise see only as an unexplained
+    // disconnect; the paired notifyError names the cause.
+    //
+    // A LIFETIME TOTAL, and deliberately NOT a ServerStats field. Every ServerStats counter
+    // is a gauge over the live roster (read its contract above), and an evicted session
+    // leaves that roster — so a ServerStats counter for this event would reset itself at the
+    // instant it fired.
+    std::int64_t outboundBacklogEvictions() const { return outboundBacklogEvictions_.load(); }
+
 private:
     class ClientSession;  // defined in the .cpp
     friend class ClientSession;
@@ -230,6 +249,9 @@ private:
     mutable std::mutex sessionsMutex_;
     std::map<std::string, std::shared_ptr<ClientSession>> sessions_;
     std::atomic<int> clientIdCounter_{1};
+    // Incremented by ClientSession (a friend) at the outbound-backlog cap. Monotonic for the
+    // life of the server object — start()/stop() do not reset it.
+    std::atomic<std::int64_t> outboundBacklogEvictions_{0};
 
     std::atomic<bool> running_{false};
     std::thread acceptThread_;

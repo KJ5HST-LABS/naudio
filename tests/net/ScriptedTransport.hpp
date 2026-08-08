@@ -125,6 +125,30 @@ public:
              Provenance::Live);
     }
 
+    // Makes sendRxAudio PARK on entry until close(), modelling a TCP peer whose receive
+    // window has closed: the production writerLoop blocks inside Socket::sendAll
+    // (src/net/Socket.cpp:469-485), which has no deadline of any kind. Off by default, so no
+    // pre-existing arm changes behaviour.
+    //
+    // close() MUST release it, and does — close() already sets closed_ and notifies. This is
+    // not optional politeness: AudioStreamServer::stop() closes each session and THEN waits
+    // on an untimed thread barrier, so a latch that survived close() would turn a failed
+    // ASSERT into a ctest hang rather than a test failure. That is the hazard this file's
+    // threading note above already names, arrived at from the other direction.
+    void stallRxAudio() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stallRx_ = true;
+    }
+
+    // How many times the session's writer thread entered sendRxAudio. With the latch armed
+    // this saturates at 1 and stays there — which is the observable proving the writer is
+    // PARKED rather than merely slow, and it is the guard that separates "the induced fault
+    // fired" from "the setup ran".
+    int rxAudioCalls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return rxAudioCalls_;
+    }
+
     // --- Ledger (test thread) ---
 
     std::vector<Handed> handedOut() const {
@@ -156,7 +180,8 @@ public:
         std::string s = "scripted connection " + remote_ + ": handed out " +
                         std::to_string(handedOut_.size()) + " frame(s), inbox " +
                         std::to_string(inbox_.size()) + ", closed=" + (closed_ ? "yes" : "no") +
-                        ", controls sent {";
+                        ", rxAudioCalls=" + std::to_string(rxAudioCalls_) +
+                        ", stallRx=" + (stallRx_ ? "armed" : "off") + ", controls sent {";
         for (const auto& [type, n] : sentControls_) {
             s += std::string(" ") + controlTypeName(type) + "x" + std::to_string(n);
         }
@@ -193,7 +218,13 @@ public:
         return true;
     }
 
-    bool sendRxAudio(const std::uint8_t*, std::size_t, std::size_t) override { return true; }
+    bool sendRxAudio(const std::uint8_t*, std::size_t, std::size_t) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++rxAudioCalls_;
+        cv_.notify_all();  // wake a test waiting to observe that the writer arrived
+        if (stallRx_) cv_.wait(lock, [this]() { return !stallRx_ || closed_; });
+        return true;
+    }
     bool sendHeartbeat() override { return true; }
     // No heartbeats and never timed out: the arms are about TX provenance, and a session that
     // reaps itself mid-arm would erase the state under assertion.
@@ -232,6 +263,8 @@ private:
     std::deque<ReceiveResult> inbox_;
     std::vector<Handed> handedOut_;
     std::map<ControlType, int> sentControls_;
+    bool stallRx_ = false;
+    int rxAudioCalls_ = 0;
     bool closed_ = false;
     ClientAddress address_;
     std::string remote_;

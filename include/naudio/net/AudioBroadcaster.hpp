@@ -29,7 +29,9 @@ namespace naudio::net {
 // design decisions:
 //   * Non-blocking fan-out: a slow target cannot block the others. (At the server level
 //     the BroadcastTarget is a ClientSession that only *enqueues* to its writer thread,
-//     so receiveRxAudio never does socket I/O.)
+//     so receiveRxAudio never does socket I/O — and that enqueue is bounded, so a client
+//     that stops draining is REFUSED here rather than buffered forever. AudioStreamServer
+//     owns that contract; do not restate the bound in this file.)
 //   * snapshot-then-callback: the target map is copied under the lock and the callbacks
 //     run OUTSIDE it (collect-under-lock / dispatch-after-unlock), so a target may
 //     register/unregister concurrently without holding the fan-out lock across the call.
