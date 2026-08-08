@@ -341,18 +341,22 @@ void AudioStreamServer::ClientSession::handleTxAudio(const std::vector<std::uint
     // contract (the table at AudioMixer.hpp:29-31); this call site only has to stop
     // lying about where the frame came from.
     //
-    // THIS HOP HAS NO AUTOMATED DETECTOR, and that is recorded rather than papered over:
-    // ClientSession is private to this .cpp with no injection seam, so nothing can drive
-    // a recovered frame through a real session and observe the mixer's reaction.
-    // Hardcoding Provenance::Live here leaves the ENTIRE SUITE GREEN — measured, not
-    // assumed (issue #65 phase 4). The asymmetric counterweight: hardcoding Recovered
-    // reddens six end-to-end arms, so the argument is provably load-bearing in one
-    // direction only. If you change this line, you get no help from ctest.
+    // This hop DOES have a detector now (issue #67, which was filed because for a while it
+    // did not): Server.ARecoveredTxFrameDoesNotClaimAnUnownedTxChannel drives a real session
+    // over a supplied transport (setTransportFactory) and reddens if the argument below stops
+    // carrying what the receive path handed it. Forcing either this argument or receiveLoop's
+    // to the live value goes red there; forcing it to Recovered goes red in a larger set of
+    // end-to-end arms. Do not write that set's SIZE down here — the previous version of this
+    // comment did, and the number was wrong within one release because two of those arms are
+    // registered only in a bridge-enabled build. Measure it, do not transcribe it.
     //
     // TxResult::DeclinedRecovered is deliberately not handled below, and it CAN now
     // occur: falling through both branches is exactly right for it — a repair the mixer
     // declined must count no accepted bytes and must NOT consume the client's single
     // per-episode TX_DENIED, which is the whole point of it being distinct from Rejected.
+    // That fall-through is a contract enforced by ABSENT code, so it has its own arm rather
+    // than relying on this comment: Server.ARecoveredTxFrameOnAnUnownedChannelSendsNoTxDenied
+    // reddens if the branch below is widened to admit anything that is merely not Accepted.
     const AudioMixer::TxResult result =
         mixer->submitTxAudio(clientId_, data, provenance);
     if (result == AudioMixer::TxResult::Accepted) {
@@ -448,6 +452,11 @@ AudioFormat AudioStreamServer::formatFromConfig() const {
 }
 
 std::shared_ptr<ServerTransport> AudioStreamServer::createTransport() {
+    // A supplied factory replaces construction outright — deliberately no fallback to the
+    // config, because a caller that names a transport means it. start() null-checks the
+    // result, so a factory that returns nothing fails the start rather than reaching bind().
+    if (transportFactory_) return transportFactory_();
+
     switch (config_.transportType) {
         case TransportType::Udp: {
             auto udp = std::make_shared<UdpServerTransport>(bindHost_);
@@ -481,6 +490,12 @@ bool AudioStreamServer::start(std::string* err) {
     }
 
     auto transport = createTransport();
+    // Only reachable through setTransportFactory — the config switch always returns one —
+    // but it is reachable from public API, and the next line would dereference it.
+    if (!transport) {
+        if (err) *err = "Transport factory returned no transport";
+        return false;
+    }
     if (!transport->bind(port_, err)) return false;
     {
         std::lock_guard<std::mutex> lock(runMutex_);

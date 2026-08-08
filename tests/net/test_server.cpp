@@ -35,6 +35,8 @@
 #include "naudio/net/Transport.hpp"
 #include "naudio/net/UdpClientTransport.hpp"
 
+#include "ScriptedTransport.hpp"
+
 using namespace naudio;
 using namespace naudio::net;
 
@@ -814,4 +816,259 @@ TEST(Server, ServerQueueDropsStayZeroWhileTheDrainKeepsUp) {
         << "receive path has acquired a blocking step";
 
     server.stop();
+}
+
+// ---------------------------------------------------------------------------------------
+// Issue #67 — the server's TX provenance hop, and the DeclinedRecovered fall-through.
+//
+// These arms drive a REAL ClientSession (real handshake, real receive/writer threads, real
+// AudioMixer arbitration) over a supplied transport, and hand its receive path a frame
+// marked as reconstructed. That mark is not a wire field, so no real peer can produce it and
+// no induced-loss relay can put one in front of an UNOWNED mixer — see the reasoning in
+// tests/net/ScriptedTransport.hpp, which also names the arm covering the other half of the
+// chain (that a real connection marks a repaired frame at all).
+//
+// Where the behaviour they pin is written down, stated precisely because the two halves have
+// different standing: "TX_DENIED is sent once per denial episode" is NORMATIVE
+// (docs/audio-streaming-protocol-v1.md:323), while the treatment of locally reconstructed
+// frames is the non-normative implementation note in the same section — the wire cannot see
+// a repair, so it cannot mandate anything about one. The binding promise for a consumer is
+// the one in the frozen public C header (include/naudio.h, the provenance paragraph), and
+// that is what these arms hold the server to.
+//
+// EVERY SUBJECT HERE IS A NON-EVENT — nothing claimed, nothing sent. A passing run is
+// therefore not evidence the arms discriminate; only the mutation sweep is. Each arm
+// carries three separately-named guards for that reason: one proving the harness RAN, one
+// proving the FAULT was actually injected, and (for the absence subjects) one proving the
+// recorder could have seen the thing being asserted absent.
+// ---------------------------------------------------------------------------------------
+
+namespace {
+
+// Long enough that no arm here can outlive a TX lease. An M1-style regression claims the
+// channel and the idle thread would release it again within a second — which would let an
+// "owner is still empty" subject pass on a tree where the claim demonstrably happened.
+constexpr std::int64_t kNoIdleRelease = 3'600'000;
+
+// Frame payload; contents are irrelevant to arbitration, only provenance is.
+const std::vector<std::uint8_t> kTxFrame(320, 0x5A);
+
+// Stands a server up on a scripted transport with the TX lease pinned open.
+struct ScriptedFixture {
+    std::shared_ptr<naudio::test::ScriptedServerTransport> transport =
+        std::make_shared<naudio::test::ScriptedServerTransport>();
+    AudioStreamConfig config = [] {
+        AudioStreamConfig c;
+        c.txIdleTimeoutMs = kNoIdleRelease;
+        return c;
+    }();
+    AudioStreamServer server{0, config};
+
+    ScriptedFixture() {
+        server.setInjectOnlyMode(true);
+        auto t = transport;
+        server.setTransportFactory([t]() { return t; });
+    }
+    ~ScriptedFixture() { server.stop(); }
+};
+
+// Connects one scripted client and returns it once it is REGISTERED WITH THE MIXER.
+//
+// The barrier is deliberately ClientsUpdate and not ConnectAccept: ConnectAccept is sent at
+// AudioStreamServer.cpp:209-210, BEFORE mixer->registerClient (:225), and a TX frame that
+// arrives in that window takes the mixer's unknown-client early return
+// (src/net/AudioMixer.cpp:72-79), where a live frame is Rejected rather than Accepted. That
+// inverts the signature the ownership subject below is reading, so an arm racing this window
+// could report green on a mutated tree. broadcastClientsUpdate (:241) runs after
+// registration, so its message is proof the window is closed.
+std::shared_ptr<naudio::test::ScriptedClientConnection> connectScripted(
+    naudio::test::ScriptedServerTransport& transport, const std::string& id) {
+    auto conn = std::make_shared<naudio::test::ScriptedClientConnection>(id);
+    conn->pushConnectRequest();
+    transport.offer(conn);
+    if (!conn->waitForControl(ControlType::ClientsUpdate, 1, 5000)) return nullptr;
+    return conn;
+}
+
+// Delivers one TX frame and returns when the session has FINISHED handling it.
+//
+// The probe is the barrier. handleControlMessage answers a LatencyProbe with a direct
+// connection_->sendControl on the receive thread (AudioStreamServer.cpp:378), and
+// receiveLoop is strictly sequential (:266-289) — so the response cannot be recorded until
+// the frame pushed before it has been through handleTxAudio and the mixer. This is a
+// happens-after edge in production code, not an observation of the double's own counters.
+bool deliverTx(naudio::test::ScriptedClientConnection& conn, Provenance provenance,
+               int probeOrdinal) {
+    conn.push(AudioPacket::createTxAudio(100 + probeOrdinal, kTxFrame), provenance);
+    conn.pushLatencyProbe();
+    return conn.waitForControl(ControlType::LatencyResponse, probeOrdinal, 5000);
+}
+
+}  // namespace
+
+// The fixture's own detector. Deliberately NOT a discriminator for the provenance mutations:
+// it is here so that when the doubles break, something red names THAT rather than leaving the
+// provenance arms to fail for a reason they do not describe.
+TEST(Server, AScriptedTransportFactoryDrivesARealClientSession) {
+    ScriptedFixture fx;
+    std::string err;
+    ASSERT_TRUE(fx.server.start(&err)) << err;
+
+    // The injected transport is the one in use — a sentinel port no real transport reports.
+    EXPECT_EQ(fx.server.port(), naudio::test::ScriptedServerTransport::kScriptedPort);
+
+    auto conn = connectScripted(*fx.transport, "scripted-a");
+    ASSERT_TRUE(conn) << "no ClientsUpdate: a real session never registered with the mixer";
+
+    // A real handshake ran over the double: both messages runLoop sends on acceptance.
+    EXPECT_EQ(conn->countSent(ControlType::AudioConfig), 1) << conn->diagnostics();
+    EXPECT_EQ(conn->countSent(ControlType::ConnectAccept), 1) << conn->diagnostics();
+    EXPECT_EQ(fx.server.connectedClientIds(), std::vector<std::string>{"audio-1"});
+    EXPECT_GT(fx.transport->acceptCalls(), 0);
+}
+
+// The third state the transport-factory branch creates (L131): set, and returning nothing.
+// Without the guard in start() this is a null dereference reachable from public API.
+TEST(Server, ATransportFactoryReturningNullFailsStartCleanly) {
+    AudioStreamServer server{0};
+    server.setInjectOnlyMode(true);
+    server.setTransportFactory([]() { return std::shared_ptr<ServerTransport>{}; });
+
+    std::string err;
+    EXPECT_FALSE(server.start(&err));
+    EXPECT_FALSE(err.empty()) << "a failed start must say why";
+    EXPECT_FALSE(server.isRunning());
+}
+
+// M1 — the receive path must carry provenance to the mixer.
+//
+// Subject: a reconstructed frame arriving at an UNOWNED channel must not claim it. Carries
+// NO assertion about TX_DENIED; that observable belongs to the next arm, so that each
+// mutation reddens an arm named after it (L45 — two assertions in one arm are not two
+// detectors, the earlier masks the later).
+TEST(Server, ARecoveredTxFrameDoesNotClaimAnUnownedTxChannel) {
+    ScriptedFixture fx;
+    std::string err;
+    ASSERT_TRUE(fx.server.start(&err)) << err;
+    auto conn = connectScripted(*fx.transport, "scripted-a");
+    ASSERT_TRUE(conn) << "no ClientsUpdate: a real session never registered with the mixer";
+
+    // PRECONDITION: the row under test is the mixer's unowned row.
+    ASSERT_EQ(fx.server.txOwner(), "") << "premise: nobody owns the TX channel";
+
+    ASSERT_TRUE(deliverTx(*conn, Provenance::Recovered, 1)) << conn->diagnostics();
+
+    // GUARD "the fault was injected". Distinct from the guard above, which only proves the
+    // harness ran. This one proves the frame under test was presented as RECONSTRUCTED — the
+    // failure mode it exists for is an arm that quietly tested a live frame against a live
+    // expectation and reported green (issue #67 attempt 1 shipped exactly that shape).
+    // Asserted as the whole sequence so a missing, extra or mis-marked frame all name
+    // themselves rather than shifting a positional index.
+    ASSERT_EQ(conn->handedOut(),
+              (std::vector<naudio::test::Handed>{
+                  {PacketType::Control, Provenance::Live},    // ConnectRequest
+                  {PacketType::AudioTx, Provenance::Recovered},  // the subject
+                  {PacketType::Control, Provenance::Live}}))  // LatencyProbe
+        << conn->diagnostics();
+
+    // SUBJECT.
+    EXPECT_EQ(fx.server.txOwner(), "")
+        << "a reconstructed TX frame claimed the channel — the server stopped carrying "
+           "provenance from the receive path to the mixer (issue #65's defect, issue #67's gap)";
+
+    // POSITIVE CONTROL, and it must run AFTER the subject: it takes the identical path with
+    // the identical call, differing only in the value under test, which is what makes the
+    // subject's silence meaningful rather than merely quiet. Running it first would claim the
+    // channel and destroy the unowned precondition the subject needs (L132).
+    ASSERT_TRUE(deliverTx(*conn, Provenance::Live, 2)) << conn->diagnostics();
+    EXPECT_EQ(fx.server.txOwner(), "audio-1")
+        << "control: a LIVE frame down the same path did not claim the channel either, so the "
+           "subject above proves nothing about provenance";
+}
+
+// G3 — DeclinedRecovered must fall through both branches of handleTxAudio.
+//
+// The contract is enforced by code that is ABSENT (there is no branch for it), so there is
+// nothing to grep and no diff when it breaks. Subject carries NO ownership assertion.
+TEST(Server, ARecoveredTxFrameOnAnUnownedChannelSendsNoTxDenied) {
+    ScriptedFixture fx;
+    std::string err;
+    ASSERT_TRUE(fx.server.start(&err)) << err;
+    auto conn = connectScripted(*fx.transport, "scripted-a");
+    ASSERT_TRUE(conn) << "no ClientsUpdate: a real session never registered with the mixer";
+    ASSERT_EQ(fx.server.txOwner(), "") << "premise: nobody owns the TX channel";
+
+    ASSERT_TRUE(deliverTx(*conn, Provenance::Recovered, 1)) << conn->diagnostics();
+
+    // GUARD "the fault was injected" — as above.
+    ASSERT_EQ(conn->handedOut(),
+              (std::vector<naudio::test::Handed>{
+                  {PacketType::Control, Provenance::Live},
+                  {PacketType::AudioTx, Provenance::Recovered},
+                  {PacketType::Control, Provenance::Live}}))
+        << conn->diagnostics();
+
+    // GUARD "the recorder is live". The subject is an absence, so it must be impossible for
+    // this ledger to be empty of TX_DENIED merely because it records nothing: the handshake
+    // messages arrived through the very same sendControl the subject reads.
+    ASSERT_GE(conn->countSent(ControlType::ConnectAccept), 1)
+        << "the control recorder captured nothing at all, so an absence below is vacuous";
+
+    // SUBJECT.
+    EXPECT_EQ(conn->countSent(ControlType::TxDenied), 0)
+        << "a declined repair sent TX_DENIED — the denial branch was widened to admit "
+           "anything that is not Accepted, so a repair now spends the client's single "
+           "per-episode denial (docs/audio-streaming-protocol-v1.md:323)";
+}
+
+// The spec's actual promise, end to end over two sessions, and the only arm here whose
+// correct outcome contains a POSITIVE event — which is what makes its control load-bearing.
+//
+// Deliberately NOT orthogonal: it reddens under both provenance mutations, by two different
+// routes. The two arms above are the discriminating pair; this one is the story.
+TEST(Server, ARepairDoesNotSpendADeniedClientsOneTxDenied) {
+    ScriptedFixture fx;
+    std::string err;
+    ASSERT_TRUE(fx.server.start(&err)) << err;
+
+    // Connected serially so the id assignment is deterministic (clientIdCounter_ starts at 1).
+    auto a = connectScripted(*fx.transport, "scripted-a");
+    ASSERT_TRUE(a) << "client A never registered";
+    ASSERT_TRUE(waitForClientCount(fx.server, 1, 3000));
+    auto b = connectScripted(*fx.transport, "scripted-b");
+    ASSERT_TRUE(b) << "client B never registered";
+    ASSERT_TRUE(waitForClientCount(fx.server, 2, 3000));
+
+    // A takes the channel, putting B in the mixer's cannot-preempt row (every session is
+    // hard-wired NORMAL priority, docs/audio-streaming-protocol-v1.md:344).
+    ASSERT_TRUE(deliverTx(*a, Provenance::Live, 1)) << a->diagnostics();
+    ASSERT_EQ(fx.server.txOwner(), "audio-1") << "premise: A holds the channel";
+
+    // SUBJECT: B's repair is declined silently.
+    ASSERT_TRUE(deliverTx(*b, Provenance::Recovered, 1)) << b->diagnostics();
+
+    // GUARD "the fault was injected", carried here too even though the two arms above are the
+    // discriminating pair. Without it this arm passes with B's recovered frame never pushed at
+    // all — measured — because its subject is an absence and the barrier only proves the probe
+    // behind it was handled. Leaning on a sibling arm's guard is how a detector quietly stops
+    // detecting.
+    ASSERT_EQ(b->handedOut(),
+              (std::vector<naudio::test::Handed>{
+                  {PacketType::Control, Provenance::Live},       // ConnectRequest
+                  {PacketType::AudioTx, Provenance::Recovered},  // the subject
+                  {PacketType::Control, Provenance::Live}}))     // LatencyProbe
+        << b->diagnostics();
+
+    EXPECT_EQ(b->countSent(ControlType::TxDenied), 0)
+        << "a reconstructed frame from a non-owner fabricated a denial, spending B's single "
+           "per-episode TX_DENIED before B ever asked to transmit";
+
+    // CONTROL: B's genuine attempt still earns exactly one. Same client, same recorder, same
+    // production line — so it proves the subject's zero is a real silence, and it proves the
+    // second-order promise directly: the repair did not consume the denial B is owed here.
+    ASSERT_TRUE(deliverTx(*b, Provenance::Live, 2)) << b->diagnostics();
+    EXPECT_EQ(b->countSent(ControlType::TxDenied), 1)
+        << "control: B's genuine denial never arrived, so the subject's zero above says "
+           "nothing about repairs";
+    EXPECT_EQ(fx.server.txOwner(), "audio-1") << "A still holds the channel throughout";
 }

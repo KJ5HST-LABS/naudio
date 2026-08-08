@@ -9,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -129,6 +130,27 @@ public:
     void setInjectOnlyMode(bool injectOnly) { injectOnlyMode_.store(injectOnly); }
     bool isInjectOnlyMode() const { return injectOnlyMode_.load(); }
 
+    // Transport wiring. Supplies the ServerTransport that start() will use, replacing the
+    // one config.transportType would have selected. The transport layer is already an
+    // interface with three implementations (TCP / UDP / DUAL); this completes it by letting
+    // the choice come from the caller rather than only from the enum.
+    //
+    // A FACTORY rather than an instance, because the server's transport is per-run: start()
+    // binds it and stop() closes it and drops the reference, so a second start() needs a
+    // second transport. The factory is invoked once per start().
+    //
+    // Contract: set it before start() — start() reads it once and ignores later changes for
+    // the run in progress. start() calls bind() on what it returns, and stop() calls close()
+    // and releases the server's reference. Returning null fails start() with an error rather
+    // than crashing.
+    //
+    // It is also the seam that makes ClientSession's receive path testable: a supplied
+    // transport can hand the session a frame the FEC layer reconstructed, which no real peer
+    // can spell because provenance is not a wire field (issue #67).
+    void setTransportFactory(std::function<std::shared_ptr<ServerTransport>()> factory) {
+        transportFactory_ = std::move(factory);
+    }
+
     // Starts the server (bind + audio init + accept thread). Returns false and fills err.
     bool start(std::string* err);
     // Stops the server: closes all sessions, joins their threads, tears down audio + transport.
@@ -199,6 +221,9 @@ private:
     std::shared_ptr<AudioBroadcaster> broadcaster_;
     std::shared_ptr<AudioMixer> mixer_;
     std::shared_ptr<ServerTransport> transport_;
+    // Read once by start() (via createTransport) and never while running, so it needs no
+    // synchronization of its own — same discipline as the device-wiring setters above.
+    std::function<std::shared_ptr<ServerTransport>()> transportFactory_;
     std::unique_ptr<CaptureStream> captureStream_;
     std::unique_ptr<PlaybackStream> playbackStream_;
 
