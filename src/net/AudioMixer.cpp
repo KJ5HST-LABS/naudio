@@ -6,6 +6,7 @@
 //
 #include "naudio/net/AudioMixer.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -260,9 +261,20 @@ void AudioMixer::playbackLoop() {
 }
 
 void AudioMixer::idleLoop() {
+    // Poll at the CONFIGURED timeout's cadence rather than a fixed 500 ms, capped at 500 ms
+    // and floored at 10 ms. The cap keeps every shipped profile byte-for-byte as it was:
+    // txIdleTimeoutMs defaults to DEFAULT_TX_IDLE_TIMEOUT_MS (500) and no preset in
+    // AudioStreamConfig.hpp overrides it, so min(500, 500) is the same 500 ms tick.
+    //
+    // It matters for a caller that asks for a SHORTER timeout, where the fixed tick made the
+    // setting mean much less than it says: a 100 ms txIdleTimeoutMs released somewhere in
+    // [100, 600] ms, up to 6x its configured value, because release latency was
+    // timeout + up to one full poll period. The floor stops a pathologically small timeout
+    // from turning this into a spin loop.
+    const auto tickMs = std::min<std::int64_t>(500, std::max<std::int64_t>(10, config_.txIdleTimeoutMs));
     std::unique_lock<std::mutex> lock(idleMutex_);
     while (!idleShutdown_) {
-        idleCv_.wait_for(lock, std::chrono::milliseconds(500), [this]() { return idleShutdown_; });
+        idleCv_.wait_for(lock, std::chrono::milliseconds(tickMs), [this]() { return idleShutdown_; });
         if (idleShutdown_) break;
         lock.unlock();
         checkIdleTimeout();
