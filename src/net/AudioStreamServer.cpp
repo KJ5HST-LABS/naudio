@@ -81,7 +81,7 @@ public:
         //
         // The return value is the backpressure signal, not a formality: enqueueRxAudio says
         // false when the backlog is at its cap, and false here is what AudioBroadcaster
-        // documents as "remove me" (AudioBroadcaster.hpp:47-48). Issue #56 — do not restore
+        // documents as "remove me" (AudioBroadcaster.hpp:49-50). Issue #56 — do not restore
         // the unconditional `return true` this replaced.
         return enqueueRxAudio(std::vector<std::uint8_t>(data + offset, data + offset + length));
     }
@@ -211,7 +211,7 @@ bool AudioStreamServer::ClientSession::enqueueRxAudio(std::vector<std::uint8_t> 
                                      std::to_string(outQueueBytes_) + " of " +
                                      std::to_string(outQueueMaxBytes_) +
                                      " bytes): client is not draining");
-            // False is the documented removal request (AudioBroadcaster.hpp:47-48). The
+            // False is the documented removal request (AudioBroadcaster.hpp:49-50). The
             // broadcaster erases this target and its failure listener closes the session
             // (AudioStreamServer.cpp, initializeSharedAudio), which is what both bounds the
             // queue and frees the maxClients slot. Returning false is the whole fix; the
