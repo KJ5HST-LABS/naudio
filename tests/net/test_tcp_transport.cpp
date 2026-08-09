@@ -17,10 +17,13 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace naudio;       // AudioPacket, PacketType, ControlMessage
@@ -221,6 +224,70 @@ TEST(TcpTransport, ConnectTwiceWhileLiveFails) {
                                 2000, &err);
     EXPECT_EQ(again, nullptr);
     EXPECT_EQ(err, "Already connected");
+}
+
+// Issue #69. Socket::setSendTimeout existing is not the same as the client USING it, and
+// the difference is invisible: delete the setSendTimeout line from
+// TcpClientTransport::connect and every Socket-level arm stays green while a real client
+// goes back to parking forever. This arm covers the call site, so that deletion is a red.
+//
+// The server end accepts and then never reads, which is the #69 scenario exactly. As in
+// Socket.SendTimesOutWhenPeerStopsReading, the wedge is asserted rather than assumed and
+// the send runs on its own thread with a rescue, so a missing deadline reddens instead of
+// hanging ctest.
+//
+// It costs about five seconds, because the deadline it is proving is
+// CONNECTION_TIMEOUT_MS / 2. That is the honest price of testing the shipped value rather
+// than a convenient one.
+TEST(TcpTransport, ClientSendsGetADeadlineWhenTheServerStopsReading) {
+    TcpServerTransport server;
+    TcpClientTransport client;
+    std::shared_ptr<ClientConnection> sc, cc;
+    ASSERT_TRUE(connectPair(server, client, sc, cc));
+
+    // Filled with HEARTBEATS — the smallest frame there is — deliberately. A maximum-
+    // payload frame fills the window faster but lands mid-window, so it takes a partial
+    // write and then pays a SECOND deadline: measured 5100 ms for the frame that
+    // succeeded and 10,004 ms for the one that failed. A minimal frame can partial-write
+    // at most once, so the arm costs about one deadline instead of two and does not vary
+    // with how much room the peer happened to leave.
+    const int deadlineMs = AudioProtocolHandler::CONNECTION_TIMEOUT_MS / 2;
+    constexpr int kMaxFrames = 200000;  // >> any send buffer, at ~19 bytes a frame
+
+    std::atomic<bool> finished{false};
+    std::atomic<bool> everFailed{false};
+    std::atomic<int> sent{0};
+
+    std::thread filler([&]() {
+        while (sent.load() < kMaxFrames) {
+            if (!cc->sendHeartbeat()) {
+                everFailed.store(true);
+                break;
+            }
+            sent.fetch_add(1);
+        }
+        finished.store(true);
+    });
+
+    // 4x the deadline: covers one partial write (2x) plus scheduling slack, and is still
+    // decisively short of "never".
+    const auto ceiling = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadlineMs * 4);
+    while (!finished.load() && std::chrono::steady_clock::now() < ceiling)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+    if (!finished.load()) {
+        while (!finished.load()) sc->receivePacket(50);  // rescue: drain so it can finish
+        filler.join();
+        FAIL() << "a client send did not return within " << deadlineMs * 4
+               << " ms against a server that stopped reading — TcpClientTransport::connect "
+                  "is not arming the send deadline, or is arming a far larger one (sent "
+               << sent.load() << " frames first)";
+    }
+    filler.join();
+
+    ASSERT_TRUE(everFailed.load())
+        << "the fill reached its frame ceiling without ever blocking, so no wedge existed";
+    ASSERT_GT(sent.load(), 64) << "the send failed before the server's window filled";
 }
 
 // Validates the bind knob: a loopback-only server still accepts a loopback
