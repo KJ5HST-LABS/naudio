@@ -88,6 +88,113 @@ TEST(Socket, RecvTimesOutWhenNoData) {
     EXPECT_EQ(r.status, IoStatus::TimedOut);
 }
 
+// Issue #69. Without SO_SNDTIMEO, sendAll has no deadline at all: a peer that stops
+// reading closes our window, the send buffer fills, and ::send parks in the kernel with
+// nothing to wake it. The consequence is not a slow send — AudioProtocolHandler holds one
+// mutex across sendAll, so a parked writer wedges every other sender on the connection,
+// and AudioStreamClient::disconnect() then blocks on the very socket whose close is the
+// only thing that would release it.
+//
+// THE WEDGE IS ASSERTED, NOT ASSUMED. A send that failed immediately for some unrelated
+// reason would satisfy the deadline assertion while proving nothing, so the arm requires
+// that a substantial volume was accepted first — that is what proves the fault fired, as
+// distinct from the setup having run.
+//
+// THE SEND RUNS ON ITS OWN THREAD WITH A RESCUE. With the deadline removed the call never
+// returns, and asserting inline would hang ctest rather than reddening: the rescue drains
+// the peer so the parked send completes, joins, and FAILs. A mutation of this arm must be
+// a red, not a timeout.
+TEST(Socket, SendTimesOutWhenPeerStopsReading) {
+    Socket server, client, accepted;
+    ASSERT_TRUE(makeTcpPair(server, client, accepted));
+
+    constexpr int kDeadlineMs = 200;
+    ASSERT_TRUE(accepted.setSendTimeout(kDeadlineMs));
+    // Only so the rescue below cannot itself block; the send path is unaffected.
+    client.setRecvTimeout(50);
+
+    // `client` never reads. Push until the kernel refuses. The ceiling exists so a
+    // platform with an enormous auto-tuned buffer reports a precondition failure rather
+    // than running away.
+    const std::vector<std::uint8_t> chunk(64 * 1024, 0xAB);
+    constexpr long kFillCeilingBytes = 64L * 1024 * 1024;
+
+    std::atomic<bool> finished{false};
+    std::atomic<bool> everFailed{false};
+    std::atomic<long> accepted_bytes{0};
+    std::atomic<long> failedCallMs{-1};
+
+    std::thread filler([&]() {
+        while (accepted_bytes.load() < kFillCeilingBytes) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!accepted.sendAll(chunk.data(), chunk.size())) {
+                failedCallMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - t0)
+                                       .count());
+                everFailed.store(true);
+                break;
+            }
+            accepted_bytes.fetch_add(static_cast<long>(chunk.size()));
+        }
+        finished.store(true);
+    });
+
+    // 25x the deadline — ample margin for a loaded CI runner, and still far short of any
+    // ctest timeout.
+    const auto ceiling =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kDeadlineMs * 25);
+    while (!finished.load() && std::chrono::steady_clock::now() < ceiling)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    if (!finished.load()) {
+        std::vector<std::uint8_t> sink(1 << 20);
+        while (!finished.load()) client.recv(sink.data(), sink.size());
+        filler.join();
+        FAIL() << "sendAll never returned against a peer that stopped reading — the send "
+                  "deadline is not in effect (accepted "
+               << accepted_bytes.load() << " bytes first)";
+    }
+    filler.join();
+
+    ASSERT_TRUE(everFailed.load())
+        << "the fill reached its ceiling without ever blocking, so no wedge existed and "
+           "this arm proves nothing";
+    ASSERT_GT(accepted_bytes.load(), 64 * 1024)
+        << "sendAll failed before the peer's window filled — the failure is not the wedge";
+
+    // It waited (so the deadline is doing the work, not an instant refusal) and it stopped
+    // waiting (so the deadline is bounded). Both bounds are derived from kDeadlineMs
+    // rather than hand-picked.
+    EXPECT_GE(failedCallMs.load(), kDeadlineMs / 2);
+    EXPECT_LT(failedCallMs.load(), kDeadlineMs * 25);
+}
+
+// The control for the arm above: with the same deadline armed, a peer that DRAINS must
+// still take everything. Without it, "sendAll returned false" could not distinguish a
+// working deadline from a deadline that simply breaks sends.
+TEST(Socket, SendTimeoutDoesNotBreakADrainingPeer) {
+    Socket server, client, accepted;
+    ASSERT_TRUE(makeTcpPair(server, client, accepted));
+    ASSERT_TRUE(accepted.setSendTimeout(200));
+    client.setRecvTimeout(1000);
+
+    std::atomic<bool> stop{false};
+    std::thread drain([&]() {
+        std::vector<std::uint8_t> sink(1 << 16);
+        while (!stop.load()) client.recv(sink.data(), sink.size());
+    });
+
+    const std::vector<std::uint8_t> chunk(64 * 1024, 0xCD);
+    bool allOk = true;
+    for (int i = 0; i < 64 && allOk; i++)  // 4 MB, several times any send buffer
+        allOk = accepted.sendAll(chunk.data(), chunk.size());
+
+    stop.store(true);
+    accepted.close();
+    drain.join();
+    EXPECT_TRUE(allOk) << "the send deadline broke a healthy send to a draining peer";
+}
+
 TEST(Socket, RecvReportsClosedOnPeerHangup) {
     Socket server, client, accepted;
     ASSERT_TRUE(makeTcpPair(server, client, accepted));

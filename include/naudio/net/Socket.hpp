@@ -121,6 +121,43 @@ public:
     // Sets the receive timeout (SO_RCVTIMEO). ms == 0 means block indefinitely.
     bool setRecvTimeout(int ms);
 
+    // Sets the send timeout (SO_SNDTIMEO). ms == 0 means block indefinitely.
+    //
+    // Without it sendAll() has no deadline of any kind: a peer that stops reading closes
+    // our receive window, the send buffer fills, and ::send parks in the kernel with
+    // nothing to wake it. That is not merely a slow send — every send on a connection
+    // funnels through one mutex held across this call
+    // (AudioProtocolHandler::sendPacket), so one parked writer wedges every other sender,
+    // including a teardown path whose own socket close is the only thing that would free
+    // it (issue #69).
+    //
+    // THE DEADLINE IS PER ::send CALL, NOT PER sendAll CALL, AND THAT IS NOT A BOUND ON
+    // sendAll. A send that moves some bytes and then stalls returns the partial count, so
+    // sendAll's success limb loops and arms a FRESH deadline. A peer making repeated slow
+    // forward progress therefore extends the whole call in proportion to the frame size.
+    // Do not restate this as "about 2x" anywhere: 2 is what one partial write costs, not
+    // a ceiling.
+    //
+    // MEASURED on macOS/arm64 through the real TCP client stack, against a server that
+    // accepted and then never read: the window filled after 541,431 bytes, the next frame
+    // took 5100 ms and SUCCEEDED (one partial write), and the frame after it returned
+    // false after 10,004 ms — 2.0x a 5000 ms deadline. Measured separately at the Socket
+    // layer with the buffer pre-saturated so no partial write was possible, the same call
+    // failed at 1.0x. Both numbers are real and they differ because of how much room the
+    // peer left, which is exactly the quantity this option does not bound.
+    //
+    // So: this converts an UNBOUNDED wedge into a bounded one and is what makes teardown
+    // terminate at all (issue #69). It is not a service-level deadline. Bounding the whole
+    // call needs a budget inside sendAll's success limb, which would apply to the server's
+    // sends too and belongs with issue #56's remaining half.
+    //
+    // It needs no new error handling: the timeout reports EAGAIN/EWOULDBLOCK
+    // (WSAETIMEDOUT on Windows), which isInterrupted() does not match, so sendAll returns
+    // false on the existing limb and every caller already treats false as fatal. That is
+    // the right response — a timed-out send has left a TRUNCATED frame on the wire, so it
+    // is not retryable and the connection must go down.
+    bool setSendTimeout(int ms);
+
     // Raises SO_SNDBUF / SO_RCVBUF to at least `bytes` (never lowers an already-larger
     // buffer). Returns false if the resulting buffer is still smaller than `bytes`.
     //

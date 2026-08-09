@@ -428,6 +428,19 @@ bool Socket::setRecvTimeout(int ms) {
 #endif
 }
 
+bool Socket::setSendTimeout(int ms) {
+    socket_t h = handle_.load();
+    if (h == kInvalidSocket) return false;
+#ifdef _WIN32
+    DWORD t = static_cast<DWORD>(ms < 0 ? 0 : ms);
+    return ::setsockopt(h, SOL_SOCKET, SO_SNDTIMEO,
+                        reinterpret_cast<char*>(&t), sizeof(t)) == 0;
+#else
+    timeval tv = msToTimeval(ms < 0 ? 0 : ms);
+    return ::setsockopt(h, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+#endif
+}
+
 std::uint16_t Socket::localPort() const {
     socket_t h = handle_.load();
     if (h == kInvalidSocket) return 0;
