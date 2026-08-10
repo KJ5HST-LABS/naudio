@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "naudio/AudioStreamConfig.hpp"
+#include "naudio/FakeBackend.hpp"
 #include "naudio/Stream.hpp"
 #include "naudio/Types.hpp"
 
@@ -206,4 +207,48 @@ TEST(Broadcaster, CaptureThreadFansOutContiguousBytes) {
     for (std::size_t k = 0; k < got.size(); ++k) {
         ASSERT_EQ(got[k], static_cast<std::uint8_t>(k)) << "mismatch at byte " << k;
     }
+}
+
+// #59: the capture DEVICE dying mid-stream must not take the server process with it.
+// captureThread_ is a plain std::thread, so before the fix an escaping DeviceUnavailable was
+// std::terminate — this binary would ABORT rather than fail. Reaching the assertions at all is
+// therefore part of what the arm proves; the reported reason is the part a mutation can move.
+TEST(Broadcaster, CaptureDeviceLostMidStreamIsReportedNotFatal) {
+    AudioStreamConfig config{};
+    AudioBroadcaster b{config};
+
+    std::mutex m;
+    std::string reason;
+    b.setCaptureErrorListener([&](const std::string& r) {
+        std::lock_guard<std::mutex> l(m);
+        reason = r;
+    });
+
+    AudioFormat fmt;
+    FakeCaptureStream stream{fmt};
+    stream.throwAfterReads = 2;  // two good reads, then the device goes away
+    b.start(&stream);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> l(m);
+            if (!reason.empty()) break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    {
+        std::lock_guard<std::mutex> l(m);
+        EXPECT_NE(reason.find("injected mid-stream device loss"), std::string::npos)
+            << "capture error not reported; got: [" << reason << "]";
+    }
+    // stop() must still complete. isRunning() is deliberately NOT asserted false here: it is the
+    // lifecycle flag that stop() uses to decide whether to join, so the loop must leave it set
+    // (see captureLoop's catch). This stop() completing IS the assertion that the join contract
+    // survived the device loss — the first version of this fix cleared running_ and this line
+    // aborted the binary.
+    b.stop();
+    EXPECT_FALSE(b.isRunning());
 }

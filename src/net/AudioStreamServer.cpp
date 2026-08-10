@@ -654,9 +654,18 @@ bool AudioStreamServer::initializeSharedAudio(std::string* err) {
         if (session) session->close();
     });
 
+    // #59: mid-stream loss of the shared capture device. No clientId — the SOURCE went away, so
+    // every client is affected equally; "" is the same id the accept-error path uses.
+    broadcaster_->setCaptureErrorListener([this](const std::string& reason) {
+        notifyError("", "Capture device lost: " + reason);
+    });
+
     AudioMixer::MixerListener ml;
     ml.onTxConflict = [](const std::string&, const std::string&) {};
     ml.onTxOwnerChanged = [this](const std::string&) { broadcastClientsUpdate(); };
+    ml.onPlaybackDeviceError = [this](const std::string& reason) {
+        notifyError("", "Playback device lost: " + reason);
+    };
     mixer_->setMixerListener(ml);
 
     if (captureBackendId_.has_value()) {

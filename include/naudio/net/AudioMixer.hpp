@@ -89,6 +89,12 @@ public:
     struct MixerListener {
         std::function<void(const std::string& holding, const std::string& requesting)> onTxConflict;
         std::function<void(const std::string& newOwner)> onTxOwnerChanged;
+        // #59: the shared TX-to-rig PLAYBACK device died mid-stream and playbackLoop gave up.
+        // Empty by default and silent when unset (L125, no warning flags). Mixer.PlaybackDevice
+        // LostMidStreamIsReportedNotFatal proves the loop calls this hook; Server.PlaybackDevice
+        // LostMidStreamSurfacesOnError proves AudioStreamServer installs it. The second arm was
+        // added because deleting the wiring with only the first in place left the suite green.
+        std::function<void(const std::string& reason)> onPlaybackDeviceError;
     };
 
     explicit AudioMixer(AudioStreamConfig config);

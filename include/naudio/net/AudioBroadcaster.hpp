@@ -62,6 +62,14 @@ public:
                                                  const std::string& reason)>;
     // A transform applied to PCM before broadcast (channel routing/mute).
     using AudioTransform = std::function<std::vector<std::uint8_t>(const std::vector<std::uint8_t>&)>;
+    // Called when the CAPTURE DEVICE dies mid-stream and captureLoop gives up (#59). Distinct
+    // from BroadcastListener, which reports a failed fan-out TARGET: this is the source going
+    // away, so there is no targetId and every target is affected. Empty by default — the project
+    // passes no warning flags, so an unset hook is silent (L125). Two arms, deliberately split:
+    // Broadcaster.CaptureDeviceLostMidStreamIsReportedNotFatal proves the loop catches and calls
+    // this hook, and Server.CaptureDeviceLostMidStreamSurfacesOnError proves AudioStreamServer
+    // INSTALLS it. Only the second catches a deleted wiring — measured, not assumed.
+    using CaptureErrorListener = std::function<void(const std::string& reason)>;
 
     explicit AudioBroadcaster(AudioStreamConfig config) : config_(config) {}
     ~AudioBroadcaster() { stop(); }
@@ -70,6 +78,9 @@ public:
     AudioBroadcaster& operator=(const AudioBroadcaster&) = delete;
 
     void setBroadcastListener(BroadcastListener listener) { listener_ = std::move(listener); }
+    void setCaptureErrorListener(CaptureErrorListener listener) {
+        captureErrorListener_ = std::move(listener);
+    }
     void setAudioTransform(AudioTransform transform) {
         std::lock_guard<std::mutex> lock(transformMutex_);
         audioTransform_ = std::move(transform);
@@ -107,6 +118,7 @@ private:
     CaptureStream* captureStream_ = nullptr;  // borrowed
     std::thread captureThread_;
     BroadcastListener listener_;
+    CaptureErrorListener captureErrorListener_;
 
     std::mutex transformMutex_;
     AudioTransform audioTransform_;

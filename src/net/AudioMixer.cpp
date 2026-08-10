@@ -246,17 +246,28 @@ void AudioMixer::playbackLoop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    while (running_.load()) {
-        checkIdleTimeout();
-        const std::int32_t bytesRead = txBuffer_.read(buffer.data(), 0,
-                                                       static_cast<std::size_t>(bufferBytes),
-                                                       static_cast<std::int64_t>(config_.frameDurationMs) * 2);
-        if (bytesRead > 0) {
-            playbackStream_->write(buffer.data(), bytesRead / frameSize, kBlockForever);
-        } else if (bytesRead == 0 && txBuffer_.available() == 0) {
-            // Buffer empty — play silence to avoid audio glitches.
-            playbackStream_->write(silence.data(), bufferBytes / frameSize, kBlockForever);
+    // #59: PlaybackStream::write throws DeviceUnavailable on mid-stream device loss, and this is
+    // the SHARED TX-to-rig path — on the bridge it is the transmitter's audio. playbackThread_ is
+    // a plain std::thread, so an escaping exception is std::terminate: the whole server dies
+    // mid-transmission. Catch, report, stop driving the dead device.
+    try {
+        while (running_.load()) {
+            checkIdleTimeout();
+            const std::int32_t bytesRead =
+                txBuffer_.read(buffer.data(), 0, static_cast<std::size_t>(bufferBytes),
+                               static_cast<std::int64_t>(config_.frameDurationMs) * 2);
+            if (bytesRead > 0) {
+                playbackStream_->write(buffer.data(), bytesRead / frameSize, kBlockForever);
+            } else if (bytesRead == 0 && txBuffer_.available() == 0) {
+                // Buffer empty — play silence to avoid audio glitches.
+                playbackStream_->write(silence.data(), bufferBytes / frameSize, kBlockForever);
+            }
         }
+    } catch (const DeviceUnavailable& e) {
+        // Do NOT clear running_ — same trap as AudioBroadcaster::captureLoop: stop() early-returns
+        // on `!running_.exchange(false)` before playbackThread_.join(), so clearing it here leaves
+        // a joinable thread for the destructor to terminate on.
+        if (listener_.onPlaybackDeviceError) listener_.onPlaybackDeviceError(e.what());
     }
 }
 

@@ -87,24 +87,39 @@ void AudioBroadcaster::captureLoop() {
                                                      : config_.bytesPerFrame() / config_.samplesPerFrame();
     std::vector<std::uint8_t> buffer(static_cast<std::size_t>(frames) * frameSize);
 
-    while (running_.load()) {
-        IoResult r = captureStream_->read(buffer.data(), frames, kBlockForever);
-        const std::size_t bytesRead = static_cast<std::size_t>(r.frames) * frameSize;
-        if (bytesRead == 0) continue;
+    // #59: CaptureStream::read throws DeviceUnavailable on any mid-stream PortAudio error. This
+    // loop runs on captureThread_, a plain std::thread, so an escaping exception is
+    // std::terminate — the SERVER process dies, taking every connected client with it, and the
+    // C ABI's on_error never fires. Catch it, report the source loss, and stop capturing; the
+    // server and its sessions stay up, so clients see silence rather than a vanished peer.
+    try {
+        while (running_.load()) {
+            IoResult r = captureStream_->read(buffer.data(), frames, kBlockForever);
+            const std::size_t bytesRead = static_cast<std::size_t>(r.frames) * frameSize;
+            if (bytesRead == 0) continue;
 
-        AudioTransform xform;
-        {
-            std::lock_guard<std::mutex> lock(transformMutex_);
-            xform = audioTransform_;
+            AudioTransform xform;
+            {
+                std::lock_guard<std::mutex> lock(transformMutex_);
+                xform = audioTransform_;
+            }
+            if (xform) {
+                std::vector<std::uint8_t> chunk(
+                    buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(bytesRead));
+                std::vector<std::uint8_t> transformed = xform(chunk);
+                broadcastToTargets(transformed.data(), 0, transformed.size());
+            } else {
+                broadcastToTargets(buffer.data(), 0, bytesRead);
+            }
         }
-        if (xform) {
-            std::vector<std::uint8_t> chunk(buffer.begin(),
-                                            buffer.begin() + static_cast<std::ptrdiff_t>(bytesRead));
-            std::vector<std::uint8_t> transformed = xform(chunk);
-            broadcastToTargets(transformed.data(), 0, transformed.size());
-        } else {
-            broadcastToTargets(buffer.data(), 0, bytesRead);
-        }
+    } catch (const DeviceUnavailable& e) {
+        // Do NOT clear running_ here. It is the LIFECYCLE flag that owns the join contract:
+        // stop() is `if (!running_.exchange(false)) return;` BEFORE captureThread_.join(), so
+        // clearing it from inside the loop makes stop() early-return without joining, and the
+        // destructor then destroys a joinable thread — std::terminate, i.e. exactly the defect
+        // this catch exists to prevent, re-entered through a different door. Returning is what
+        // ends the thread; stop() still joins it.
+        if (captureErrorListener_) captureErrorListener_(e.what());
     }
 }
 

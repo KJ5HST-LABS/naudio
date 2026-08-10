@@ -1220,3 +1220,109 @@ TEST(Server, AClientThatDrainsIsNeverEvictedByTheSameVolume) {
     // not the result of the session having died before the volume arrived.
     EXPECT_GE(conn->rxAudioCalls(), total - 50) << conn->diagnostics();
 }
+
+// #59: the server's END of the device-loss path. The Broadcaster/Mixer arms prove those loops
+// catch and report; this arm is what proves AudioStreamServer actually INSTALLS the hooks, and
+// that the loss reaches a listener's onError — the surface a C consumer sees.
+//
+// It exists because a mutation measured the gap: deleting the setCaptureErrorListener wiring in
+// AudioStreamServer left the whole suite green. An unset std::function is silent under this
+// project's zero warning flags (L125), so the wiring needed its own detector.
+namespace {
+
+class DyingDeviceBackend : public DeviceBackend {
+public:
+    int throwAfterReads = -1;   // capture dies after N reads  (-1 = never)
+    int throwAfterWrites = -1;  // playback dies after N writes (-1 = never)
+
+    std::vector<RawDevice> enumerate() override { return {}; }
+    bool probeFormat(int, const AudioFormat&, Direction) override { return true; }
+    std::unique_ptr<CaptureStream> openCaptureStream(int, const AudioFormat& fmt) override {
+        auto s = std::make_unique<FakeCaptureStream>(fmt);
+        s->throwAfterReads = throwAfterReads;
+        return s;
+    }
+    std::unique_ptr<PlaybackStream> openPlaybackStream(int, const AudioFormat& fmt) override {
+        auto s = std::make_unique<FakePlaybackStream>(fmt);
+        s->throwAfterWrites = throwAfterWrites;
+        return s;
+    }
+};
+
+class ErrorRecordingListener : public AudioStreamListener {
+public:
+    void onError(const std::string&, const std::string& error) override {
+        std::lock_guard<std::mutex> l(m_);
+        errors_.push_back(error);
+    }
+    bool sawError(const std::string& needle) {
+        std::lock_guard<std::mutex> l(m_);
+        for (const auto& e : errors_) {
+            if (e.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    }
+
+private:
+    std::mutex m_;
+    std::vector<std::string> errors_;
+};
+
+}  // namespace
+
+TEST(Server, CaptureDeviceLostMidStreamSurfacesOnError) {
+    DyingDeviceBackend backend;
+    backend.throwAfterReads = 2;
+    AudioStreamConfig config{};
+    config.maxClients = 4;
+    AudioStreamServer server{0, config};
+    server.setBackend(&backend);
+    server.setCaptureDevice(0);
+
+    ErrorRecordingListener listener;
+    server.addStreamListener(&listener);
+
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!listener.sawError("Capture device lost") &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(listener.sawError("Capture device lost"));
+
+    server.stop();
+}
+
+// #59: the mixer half of the same wiring proof — the shared TX-to-rig playback device dies and
+// the loss must reach onError. Measured as necessary: with only the capture arm above, deleting
+// the ml.onPlaybackDeviceError wiring in AudioStreamServer left the suite green.
+TEST(Server, PlaybackDeviceLostMidStreamSurfacesOnError) {
+    DyingDeviceBackend backend;
+    backend.throwAfterWrites = 2;  // capture stays healthy (throwAfterReads = -1); playback dies
+    AudioStreamConfig config{};
+    config.maxClients = 4;
+    AudioStreamServer server{0, config};
+    server.setBackend(&backend);
+    // A capture device is REQUIRED to reach the playback path at all: startInternal opens the
+    // shared audio lines only under `if (captureBackendId_.has_value())`, so a playback-only
+    // server never starts AudioMixer's loop and this arm would pass vacuously without it.
+    server.setCaptureDevice(0);
+    server.setPlaybackDevice(0);
+
+    ErrorRecordingListener listener;
+    server.addStreamListener(&listener);
+
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!listener.sawError("Playback device lost") &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(listener.sawError("Playback device lost"));
+
+    server.stop();
+}

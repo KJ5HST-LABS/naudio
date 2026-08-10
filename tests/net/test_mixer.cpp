@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "naudio/AudioStreamConfig.hpp"
+#include "naudio/FakeBackend.hpp"
 
 using namespace naudio;
 using namespace naudio::net;
@@ -384,4 +385,43 @@ TEST(Mixer, ARecoveredFrameIsDeclinedWithoutSpendingTheClientsOneTxDenied) {
     EXPECT_EQ(mixer.txBuffer().available(), beforeRepair)
         << "a DECLINED recovered frame from a non-owner was written into the live "
            "talker's outgoing audio";
+}
+
+// #59: the shared TX-to-rig PLAYBACK device dying mid-stream must not take the server process
+// with it. playbackThread_ is a plain std::thread, so before the fix this was std::terminate —
+// on the bridge that is the server dying mid-transmission, with PTT keyed.
+TEST(Mixer, PlaybackDeviceLostMidStreamIsReportedNotFatal) {
+    AudioStreamConfig config{};
+    AudioMixer mixer{config};
+
+    std::mutex m;
+    std::string reason;
+    AudioMixer::MixerListener ml;
+    ml.onPlaybackDeviceError = [&](const std::string& r) {
+        std::lock_guard<std::mutex> l(m);
+        reason = r;
+    };
+    mixer.setMixerListener(ml);
+
+    AudioFormat fmt;
+    FakePlaybackStream stream{fmt};
+    stream.throwAfterWrites = 2;  // the loop writes silence when idle, so this fires promptly
+    mixer.start(&stream);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> l(m);
+            if (!reason.empty()) break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    {
+        std::lock_guard<std::mutex> l(m);
+        EXPECT_NE(reason.find("injected mid-stream device loss"), std::string::npos)
+            << "playback error not reported; got: [" << reason << "]";
+    }
+    mixer.stop();
 }
