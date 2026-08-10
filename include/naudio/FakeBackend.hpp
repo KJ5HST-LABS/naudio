@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -34,7 +35,19 @@ public:
     int   availableFrames = -1;   // bounded-read cap; -1 => unlimited (blocking always fills)
     bool* closedFlag = nullptr;   // dtor sets *closedFlag = true (observe RAII close)
 
+    // Mid-stream device loss (#59). After this many successful reads, every later read throws
+    // DeviceUnavailable — the hardware-free analog of a USB codec unplugged mid-stream, which
+    // PortAudioBackend::applyReadStatus signals the same way. -1 disables.
+    //
+    // This knob exists because FakeBackend previously threw only at OPEN time, so every ctest
+    // was structurally blind to the mid-stream path (#59's "coverage blindness"). Atomic because
+    // the throwing read runs on a device-IO worker thread while the test observes from another.
+    int throwAfterReads = -1;
+
     IoResult read(void* buffer, int frames, int timeoutMs) override {
+        if (throwAfterReads >= 0 && reads_.fetch_add(1) >= throwAfterReads) {
+            throw DeviceUnavailable("FakeCaptureStream: injected mid-stream device loss");
+        }
         IoResult r;
         r.overflowed = overflow;
         if (timeoutMs < 0 || availableFrames < 0) {
@@ -52,6 +65,7 @@ public:
 
 private:
     AudioFormat format_;
+    std::atomic<int> reads_{0};
 };
 
 // Deterministic in-memory playback stream — symmetric to FakeCaptureStream.
@@ -67,8 +81,15 @@ public:
     int   availableFrames = -1;   // bounded-write space cap; -1 => unlimited (blocking always drains)
     bool* closedFlag = nullptr;   // dtor sets *closedFlag = true (observe RAII close)
 
+    // Mid-stream device loss (#59) — symmetric to FakeCaptureStream::throwAfterReads;
+    // PortAudioBackend::applyWriteStatus is the production analog. -1 disables.
+    int throwAfterWrites = -1;
+
     IoResult write(const void* buffer, int frames, int timeoutMs) override {
         (void)buffer;
+        if (throwAfterWrites >= 0 && writes_.fetch_add(1) >= throwAfterWrites) {
+            throw DeviceUnavailable("FakePlaybackStream: injected mid-stream device loss");
+        }
         IoResult r;
         r.underflowed = underflow;
         if (timeoutMs < 0 || availableFrames < 0) {
@@ -83,6 +104,7 @@ public:
 
 private:
     AudioFormat format_;
+    std::atomic<int> writes_{0};
 };
 
 // In-memory backend for tests — no hardware. Lets unit tests drive enumeration,

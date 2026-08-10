@@ -419,15 +419,26 @@ void AudioStreamClient::playbackLoop(std::shared_ptr<AudioRingBuffer> rxBuffer,
     }
 
     const std::int64_t readTimeout = static_cast<std::int64_t>(cfg.frameDurationMs) * 2;
-    while (!closed_.load() && connected_.load()) {
-        int n = rxBuffer->read(buffer.data(), 0, static_cast<std::size_t>(frameBytes), readTimeout);
-        if (n > 0) {
-            const std::uint8_t* src = playbackMuted_.load() ? silence.data() : buffer.data();
-            playback->write(src, n / frameSize, kBlockForever);
-        } else if (rxBuffer->available() == 0) {
-            // Underrun — insert a frame of silence.
-            playback->write(silence.data(), frameBytes / frameSize, kBlockForever);
+    // #59: PlaybackStream::write throws DeviceUnavailable on ANY mid-stream PortAudio error —
+    // a USB codec unplugged, a device the OS reclaimed. This runs on a DETACHED thread (see the
+    // std::thread(...).detach() at the playbackLoop launch site), so an escaping exception is
+    // std::terminate: the whole process vanishes and the C ABI's on_error never fires. Catch it,
+    // report it, and leave the loop — `playback` is a by-value shared_ptr, so returning closes
+    // the stream by RAII while the CONNECTION stays up.
+    try {
+        while (!closed_.load() && connected_.load()) {
+            int n = rxBuffer->read(buffer.data(), 0, static_cast<std::size_t>(frameBytes),
+                                   readTimeout);
+            if (n > 0) {
+                const std::uint8_t* src = playbackMuted_.load() ? silence.data() : buffer.data();
+                playback->write(src, n / frameSize, kBlockForever);
+            } else if (rxBuffer->available() == 0) {
+                // Underrun — insert a frame of silence.
+                playback->write(silence.data(), frameBytes / frameSize, kBlockForever);
+            }
         }
+    } catch (const DeviceUnavailable& e) {
+        notifyError("local", std::string("Playback device lost: ") + e.what());
     }
 }
 
@@ -442,24 +453,30 @@ void AudioStreamClient::captureLoop(std::shared_ptr<AudioRingBuffer> txBuffer,
     std::vector<std::uint8_t> stereoBuffer(
         captureIsMono ? static_cast<std::size_t>(framesPerRead) * 4 : 0, 0);
 
-    while (!closed_.load() && connected_.load()) {
-        IoResult res = capture->read(readBuffer.data(), framesPerRead, kBlockForever);
-        if (res.frames <= 0 || captureMuted_.load()) continue;
+    // #59: same hazard as playbackLoop, on the capture side — CaptureStream::read throws
+    // DeviceUnavailable on mid-stream device loss and this thread is detached too.
+    try {
+        while (!closed_.load() && connected_.load()) {
+            IoResult res = capture->read(readBuffer.data(), framesPerRead, kBlockForever);
+            if (res.frames <= 0 || captureMuted_.load()) continue;
 
-        const std::size_t bytesRead = static_cast<std::size_t>(res.frames) * capFrameSize;
-        if (captureIsMono) {
-            std::size_t stereoBytes = 0;
-            for (std::size_t i = 0; i + 1 < bytesRead && stereoBytes + 3 < stereoBuffer.size();
-                 i += 2) {
-                stereoBuffer[stereoBytes++] = readBuffer[i];
-                stereoBuffer[stereoBytes++] = readBuffer[i + 1];
-                stereoBuffer[stereoBytes++] = readBuffer[i];
-                stereoBuffer[stereoBytes++] = readBuffer[i + 1];
+            const std::size_t bytesRead = static_cast<std::size_t>(res.frames) * capFrameSize;
+            if (captureIsMono) {
+                std::size_t stereoBytes = 0;
+                for (std::size_t i = 0; i + 1 < bytesRead && stereoBytes + 3 < stereoBuffer.size();
+                     i += 2) {
+                    stereoBuffer[stereoBytes++] = readBuffer[i];
+                    stereoBuffer[stereoBytes++] = readBuffer[i + 1];
+                    stereoBuffer[stereoBytes++] = readBuffer[i];
+                    stereoBuffer[stereoBytes++] = readBuffer[i + 1];
+                }
+                txBuffer->write(stereoBuffer.data(), 0, stereoBytes);
+            } else {
+                txBuffer->write(readBuffer.data(), 0, bytesRead);
             }
-            txBuffer->write(stereoBuffer.data(), 0, stereoBytes);
-        } else {
-            txBuffer->write(readBuffer.data(), 0, bytesRead);
         }
+    } catch (const DeviceUnavailable& e) {
+        notifyError("local", std::string("Capture device lost: ") + e.what());
     }
 }
 

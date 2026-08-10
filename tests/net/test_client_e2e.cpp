@@ -83,6 +83,29 @@ public:
     }
 };
 
+// #59: a backend whose device streams die MID-STREAM, the way PortAudio reports a codec that
+// was unplugged (applyReadStatus / applyWriteStatus throw DeviceUnavailable on any PaError).
+// FakeBackend and PacedBackend only ever failed at OPEN time, which is why the four device-IO
+// worker loops had no detector at all — the suite was structurally blind to this path.
+class DyingBackend : public DeviceBackend {
+public:
+    int throwAfterReads = -1;   // capture dies after this many reads  (-1 = never)
+    int throwAfterWrites = -1;  // playback dies after this many writes (-1 = never)
+
+    std::vector<RawDevice> enumerate() override { return {}; }
+    bool probeFormat(int, const AudioFormat&, Direction) override { return true; }
+    std::unique_ptr<CaptureStream> openCaptureStream(int, const AudioFormat& fmt) override {
+        auto s = std::make_unique<FakeCaptureStream>(fmt);
+        s->throwAfterReads = throwAfterReads;
+        return s;
+    }
+    std::unique_ptr<PlaybackStream> openPlaybackStream(int, const AudioFormat& fmt) override {
+        auto s = std::make_unique<FakePlaybackStream>(fmt);
+        s->throwAfterWrites = throwAfterWrites;
+        return s;
+    }
+};
+
 // Records the client's lifecycle / roster / TX / reconnect callbacks for assertion.
 class RecordingListener : public AudioClientListener {
 public:
@@ -99,6 +122,23 @@ public:
     void onTxGranted() override { txGranted.store(true); }
     void onReconnecting(const std::string&, int, int) override { reconnecting.store(true); }
     void onReconnected(const std::string&) override { reconnected.store(true); }
+    // #59's observable. Before this, NOTHING in tests/ read onError at all — so every
+    // error the client reports across the C ABI was untested in both directions (L145).
+    void onError(const std::string&, const std::string& error) override {
+        std::lock_guard<std::mutex> l(errorMutex);
+        errors.push_back(error);
+    }
+
+    bool sawError(const std::string& needle) {
+        std::lock_guard<std::mutex> l(errorMutex);
+        for (const auto& e : errors) {
+            if (e.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    }
+
+    std::mutex errorMutex;
+    std::vector<std::string> errors;
 
     std::atomic<bool> connected{false};
     std::atomic<bool> streamStarted{false};
@@ -249,6 +289,71 @@ TEST(Client, GateE2eRxBroadcastAndTxEvents) {
     EXPECT_TRUE(waitFor([&]() { return listener.disconnectedCount.load() >= 1; }, 2000));
     EXPECT_TRUE(waitForServerCount(server, 0, 2000));
 
+    server.stop();
+}
+
+// --- #59: mid-stream device loss must not abort the process -----------------------------
+//
+// Both client device loops run on DETACHED threads, so before the fix an escaping
+// DeviceUnavailable was std::terminate: this binary would ABORT rather than fail, and the C
+// ABI's on_error would never fire. Reaching the assertions at all is therefore half of what
+// each arm proves; sawError() is the other half, and it is the part a mutation can move.
+
+TEST(Client, PlaybackDeviceLostMidStreamIsReportedNotFatal) {
+    DyingBackend backend;
+    backend.throwAfterWrites = 3;  // a few good frames, then the device goes away
+
+    AudioStreamServer server{0, injectOnlyServerConfig()};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    AudioStreamClient client{"127.0.0.1", static_cast<std::uint16_t>(server.port())};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setAutoReconnect(false);
+
+    RecordingListener listener;
+    client.addStreamListener(&listener);
+
+    ASSERT_TRUE(client.connect(&err)) << err;
+    ASSERT_TRUE(waitFor([&]() { return listener.streamStarted.load(); }, 2000));
+
+    EXPECT_TRUE(waitFor([&]() { return listener.sawError("Playback device lost"); }, 3000));
+
+    // Still usable afterwards: disconnect() completing rather than hanging also proves
+    // threadFinished() ran, which an escaping exception would have skipped.
+    client.disconnect();
+    EXPECT_FALSE(client.isConnected());
+    server.stop();
+}
+
+TEST(Client, CaptureDeviceLostMidStreamIsReportedNotFatal) {
+    DyingBackend backend;
+    backend.throwAfterReads = 3;  // playback stays healthy; only capture dies
+
+    AudioStreamServer server{0, injectOnlyServerConfig()};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    AudioStreamClient client{"127.0.0.1", static_cast<std::uint16_t>(server.port())};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setCaptureDevice(0);
+    client.setCaptureMuted(false);
+    client.setAutoReconnect(false);
+
+    RecordingListener listener;
+    client.addStreamListener(&listener);
+
+    ASSERT_TRUE(client.connect(&err)) << err;
+    ASSERT_TRUE(waitFor([&]() { return listener.streamStarted.load(); }, 2000));
+
+    EXPECT_TRUE(waitFor([&]() { return listener.sawError("Capture device lost"); }, 3000));
+
+    client.disconnect();
+    EXPECT_FALSE(client.isConnected());
     server.stop();
 }
 
