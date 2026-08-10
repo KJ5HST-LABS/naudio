@@ -128,7 +128,31 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
-- **An FEC-reconstructed transmit frame can no longer take, hold, or contest the TX channel.**
+- **Losing an audio device mid-stream no longer kills the process — it is reported through
+  `on_error`.** Issue #59. `PlaybackStream::write` and `CaptureStream::read` throw
+  `DeviceUnavailable` on any mid-stream PortAudio error: a USB codec unplugged, a device the OS
+  reclaimed, a sample-rate change forced by another application. All four device-IO worker loops let
+  that exception escape, and none of those threads has a handler — the client's two run detached,
+  the server's two on plain `std::thread`s — so the throw was `std::terminate`. The process vanished
+  and `on_error` never fired, which is the worst available combination: no diagnosis, no chance to
+  reconnect, and nothing in the log. On the server it took every connected client down with it, and
+  on `na_hamlib_bridge` that is the server dying mid-transmission with the transmitter's PTT keyed.
+
+  All four loops now catch the exception, report it, and return. Returning closes the dead stream by
+  RAII and ends only that loop: the **connection and the server stay up**, so a client whose playback
+  device disappears keeps its session rather than dropping off the air, and the server's clients hear
+  silence instead of a peer that vanished.
+
+  **C-visible consequence:** `on_error` fires where the process previously died, with a message of
+  the form `"Playback device lost: <reason>"` or `"Capture device lost: <reason>"`. On the client
+  the `client_id` is `"local"`, matching the other client-local faults. On the server it is the
+  **empty string** — the shared capture or playback device is the *source*, so its loss affects every
+  client equally rather than any one of them, and `""` is the same id the accept-error path already
+  uses (`AudioStreamServer.cpp:740`). **No C ABI change** — no new `na_*` symbol, no struct field, no
+  wire change — so a C consumer recompiles against nothing new and simply stops losing the process.
+  The C++ surface gains two purely additive hooks in installed headers,
+  `AudioBroadcaster::setCaptureErrorListener` and `AudioMixer::MixerListener::onPlaybackDeviceError`,
+  which the server wires for you; a direct C++ embedder may set them itself.
   Issue #65. `AudioMixer::submitTxAudio` **is** the channel-claim mechanism — there is no separate
   "I want to transmit" call, and `releaseTx` has no production caller — so the 500 ms idle release
   was the entire safety story. A frame the FEC layer rebuilt looked exactly like a live one, which
