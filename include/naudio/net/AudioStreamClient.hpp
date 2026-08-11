@@ -161,6 +161,23 @@ public:
     AudioStreamConfig config() const;
     bool setConfig(AudioStreamConfig config);
 
+    // Transport wiring. Supplies the ClientTransport that connect() will use, replacing the
+    // one config.transportType would have selected. The mirror of
+    // AudioStreamServer::setTransportFactory, and the same argument applies: the transport
+    // layer is already an interface, so the choice may as well come from the caller.
+    //
+    // A FACTORY rather than an instance, because the client's transport is per-attempt: a
+    // reconnect builds a fresh one after closeResources() has dropped the old. It is invoked
+    // once per connect() AND once per reconnect attempt — which is the difference from the
+    // server, where start() calls it once per run.
+    //
+    // Contract: set it before connect(). Returning null fails that attempt with an error
+    // rather than crashing — on connect() the call returns false, and on a reconnect attempt
+    // the attempt fails and the backoff continues.
+    void setTransportFactory(std::function<std::shared_ptr<ClientTransport>()> factory) {
+        transportFactory_ = std::move(factory);
+    }
+
     // --- Lifecycle ---
     // Connects, handshakes, opens lines, starts streaming. Returns false + fills err on failure.
     bool connect(std::string* err);
@@ -310,6 +327,10 @@ private:
     // --- Config (guarded by configMutex_) ---
     mutable std::mutex configMutex_;
     AudioStreamConfig config_;
+
+    // Set once before connect() and read on every connect/reconnect attempt; not guarded,
+    // like the server's, because the contract is "set it before you start".
+    std::function<std::shared_ptr<ClientTransport>()> transportFactory_;
 
     // --- Per-generation run resources (guarded by runMutex_; shared_ptr so workers keep alive) ---
     mutable std::mutex runMutex_;

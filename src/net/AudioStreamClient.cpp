@@ -92,6 +92,11 @@ AudioFormat AudioStreamClient::formatFromConfig() const {
 }
 
 std::shared_ptr<ClientTransport> AudioStreamClient::createTransport() {
+    // A supplied factory replaces construction outright — deliberately no fallback to the
+    // config, because a caller that names a transport means it. Both call sites null-check the
+    // result, so a factory that returns nothing fails that attempt rather than dereferencing.
+    if (transportFactory_) return transportFactory_();
+
     AudioStreamConfig cfg = config();
     switch (cfg.transportType) {
         case TransportType::Udp: {
@@ -136,6 +141,12 @@ bool AudioStreamClient::connect(std::string* err) {
     }
 
     auto transport = createTransport();
+    // Only reachable through setTransportFactory — the config switch always returns one —
+    // but it is reachable from public API, and the next line would dereference it.
+    if (!transport) {
+        setErr("Transport factory returned no transport");
+        return false;
+    }
     std::string cerr;
     auto connection = transport->connect(serverHost_, serverPort_, kConnectTimeoutMs, &cerr);
     if (!connection) {
@@ -714,6 +725,13 @@ bool AudioStreamClient::reconnectInternal(std::string* err) {
         return false;
     }
     auto transport = createTransport();
+    // Same guard as connect(): the factory is consulted once per ATTEMPT, so a factory that
+    // starts returning null mid-run reaches this site rather than connect()'s. Failing the
+    // attempt (rather than dereferencing) leaves the reconnect loop to its backoff.
+    if (!transport) {
+        if (err) *err = "Transport factory returned no transport";
+        return false;
+    }
     std::string cerr;
     // Bounded connect deadline so disconnect() during a reconnect isn't stalled.
     auto connection =

@@ -586,3 +586,26 @@ TEST(Client, DisconnectStopsReconnect) {
 
     server.stop();
 }
+
+// ===========================================================================
+// The client transport seam (#71).
+// ===========================================================================
+
+// The seam itself, and the null-return guard it makes reachable. AudioStreamClient::connect
+// dereferences createTransport()'s result on the next statement, so before this guard a
+// factory returning null was a null-deref reachable from public API — the one hop that
+// mirroring AudioStreamServer::setTransportFactory does not carry across on its own. The
+// server has had this guard since #67 (src/net/AudioStreamServer.cpp, start()); the client
+// has two call sites needing it, connect() and reconnectInternal().
+TEST(Client, ConnectFailsWhenTheTransportFactoryReturnsNothing) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setTransportFactory([]() { return std::shared_ptr<ClientTransport>{}; });
+
+    std::string err;
+    EXPECT_FALSE(client.connect(&err));
+    EXPECT_NE(err.find("Transport factory"), std::string::npos) << "err was: " << err;
+    EXPECT_FALSE(client.isConnected());
+}
