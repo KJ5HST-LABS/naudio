@@ -1077,10 +1077,18 @@ TEST(Server, ARepairDoesNotSpendADeniedClientsOneTxDenied) {
 // Issue #56 — the outbound backlog cap, and eviction of a peer that stops draining.
 //
 // A TCP peer that stops reading closes its receive window; the session's writer thread then
-// blocks inside Socket::sendAll (src/net/Socket.cpp:469-485), which has no deadline of any
-// kind, and every frame the capture path fans out piles up behind it. These arms drive a
-// REAL ClientSession over a supplied transport whose sendRxAudio parks on entry, which is
-// that state exactly, minus the socket.
+// blocks inside Socket::sendAll, and every frame the capture path fans out piles up behind
+// it. These arms drive a REAL ClientSession over a supplied transport whose sendRxAudio
+// parks on entry, which is that state exactly, minus the socket.
+//
+// WHEN THESE ARMS WERE WRITTEN THAT BLOCK HAD NO DEADLINE OF ANY KIND. It does now:
+// AudioProtocolHandler's constructor arms CONNECTION_TIMEOUT_MS / 2 on every TCP connection
+// (#56's send-deadline half) and sendAll spends it as a whole-call budget (#70). The cap
+// these arms cover is still the load-bearing mechanism, not a redundant one — the deadline
+// bounds how long ONE frame can wedge the writer, while the cap bounds how much audio piles
+// up behind it and is what actually evicts the peer. The double therefore still parks
+// without a deadline; see ScriptedTransport::stallRxAudio for why that divergence is
+// deliberate.
 //
 // WHY A DOUBLE AND NOT A REAL STALLED SOCKET. Wedging a real sender means filling both the
 // sender's send buffer and the receiver's receive buffer, and those are autotuned: measured

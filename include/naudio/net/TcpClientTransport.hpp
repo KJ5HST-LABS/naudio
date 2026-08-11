@@ -10,7 +10,6 @@
 #include <memory>
 #include <string>
 
-#include "naudio/net/AudioProtocolHandler.hpp"
 #include "naudio/net/ClientAddress.hpp"
 #include "naudio/net/Socket.hpp"
 #include "naudio/net/TcpClientConnection.hpp"
@@ -32,20 +31,11 @@ public:
         Socket socket = Socket::connectTcp(host, port, timeoutMs, err);
         if (!socket.valid()) return nullptr;
 
-        // Give the send path a deadline; nothing else bounds it (issue #69). Half the
-        // no-RX death window, so a frame that cannot be pushed in this long is given up on
-        // no later than the point at which the heartbeat watchdog would already have
-        // declared the peer dead — derived from that constant rather than hand-picked. A
-        // failed send tears the connection down, which is the right outcome: a peer that
-        // has not made room for one audio frame in five seconds is not coming back.
-        //
-        // Armed HERE, on the client's own socket, and deliberately not in
-        // AudioProtocolHandler's constructor: TcpServerTransport wraps the same
-        // TcpClientConnection, so arming it there would put every server session under the
-        // same deadline. That is worth doing and is issue #56's remaining half, not this
-        // one's.
-        socket.setSendTimeout(AudioProtocolHandler::CONNECTION_TIMEOUT_MS / 2);
-
+        // The send deadline is armed by AudioProtocolHandler's constructor, which this
+        // socket reaches through TcpClientConnection below. #69 armed it here instead,
+        // explicitly deferring the server's half to #56 on the grounds that the handler
+        // covers both; #56's half is now done, so the handler is the one owner and this
+        // site would be a second copy to keep in step.
         connection_ = std::make_shared<TcpClientConnection>(
             std::move(socket), ClientAddress("client", host, port));
         return connection_;

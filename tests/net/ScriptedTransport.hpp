@@ -126,9 +126,16 @@ public:
     }
 
     // Makes sendRxAudio PARK on entry until close(), modelling a TCP peer whose receive
-    // window has closed: the production writerLoop blocks inside Socket::sendAll
-    // (src/net/Socket.cpp:469-485), which has no deadline of any kind. Off by default, so no
-    // pre-existing arm changes behaviour.
+    // window has closed: the production writerLoop blocks inside Socket::sendAll. Off by
+    // default, so no pre-existing arm changes behaviour.
+    //
+    // That park is now UNBOUNDED WHERE PRODUCTION IS BOUNDED, and deliberately so. Since
+    // #56/#70 a real session's sends carry a deadline and a whole-call budget
+    // (AudioProtocolHandler's constructor arms it), so a real wedged writer gives up after
+    // CONNECTION_TIMEOUT_MS / 2. This double keeps parking until close() because the arms
+    // built on it are about the BACKLOG CAP and the eviction it triggers, which must hold
+    // however long the writer is stuck; a double that released on its own would let a
+    // passing arm mean "the deadline fired" instead of "the cap fired".
     //
     // close() MUST release it, and does — close() already sets closed_ and notifies. This is
     // not optional politeness: AudioStreamServer::stop() closes each session and THEN waits

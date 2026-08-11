@@ -29,7 +29,28 @@ AudioProtocolHandler::AudioProtocolHandler(Socket socket)
     : socket_(std::move(socket)),
       lastSendTime_(nowMs()),
       lastReceiveTime_(nowMs()),
-      recvBuf_(AudioPacket::HEADER_SIZE, 0) {}
+      recvBuf_(AudioPacket::HEADER_SIZE, 0) {
+    // Every TCP send on this connection funnels through sendPacket's sendMutex_, so an
+    // unbounded send does not merely stall one frame — it wedges every other sender,
+    // including the watchdog and teardown paths whose job is to notice a dead peer
+    // (issues #56, #69). Arm the deadline once, here, where the connection is born.
+    //
+    // ARMED IN THE HANDLER, NOT IN THE TRANSPORTS. Both TcpClientConnection construction
+    // sites — TcpClientTransport::connect for a client and TcpServerTransport::acceptClient
+    // for a server session — end up here, so this is the single site that covers both, and a
+    // third TCP connection site would inherit it rather than have to remember it. #69 armed
+    // it in the client transport only, which left every server session with no send deadline
+    // at all; that was issue #56's remaining half and this is it.
+    //
+    // HALF THE NO-RX DEATH WINDOW, derived rather than hand-picked: a frame that cannot be
+    // pushed in this long is given up on no later than the point at which the heartbeat
+    // watchdog would already have declared the peer dead. A failed send tears the connection
+    // down, which is the right outcome — a peer that has not made room for one audio frame in
+    // five seconds is not coming back. Socket::setSendTimeout is also the whole-call budget
+    // sendAll spends across its retry loop (#70); see that header for what the pair does and
+    // does not bound.
+    socket_.setSendTimeout(CONNECTION_TIMEOUT_MS / 2);
+}
 
 AudioProtocolHandler::~AudioProtocolHandler() { close(); }
 

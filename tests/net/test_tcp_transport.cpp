@@ -226,10 +226,16 @@ TEST(TcpTransport, ConnectTwiceWhileLiveFails) {
     EXPECT_EQ(err, "Already connected");
 }
 
-// Issue #69. Socket::setSendTimeout existing is not the same as the client USING it, and
-// the difference is invisible: delete the setSendTimeout line from
-// TcpClientTransport::connect and every Socket-level arm stays green while a real client
-// goes back to parking forever. This arm covers the call site, so that deletion is a red.
+// Issue #69. Socket::setSendTimeout existing is not the same as a connection USING it, and
+// the difference is invisible: delete the setSendTimeout line from AudioProtocolHandler's
+// constructor and every Socket-level arm stays green while a real client goes back to
+// parking forever. This arm covers the call site, so that deletion is a red.
+//
+// THAT LINE MOVED. It was in TcpClientTransport::connect when this arm was written, which
+// armed clients only; #56's send-deadline half moved it into the handler constructor so
+// server sessions get it too. Both TcpClientConnection construction sites reach that
+// constructor, so this arm and its server-side counterpart below now share one mutation
+// target.
 //
 // The server end accepts and then never reads, which is the #69 scenario exactly. As in
 // Socket.SendTimesOutWhenPeerStopsReading, the wedge is asserted rather than assumed and
@@ -288,6 +294,69 @@ TEST(TcpTransport, ClientSendsGetADeadlineWhenTheServerStopsReading) {
     ASSERT_TRUE(everFailed.load())
         << "the fill reached its frame ceiling without ever blocking, so no wedge existed";
     ASSERT_GT(sent.load(), 64) << "the send failed before the server's window filled";
+}
+
+// Issue #56's remaining send-deadline half, and the mirror image of the arm above: the
+// SERVER's session writer against a client that stops reading. Until this landed that
+// direction had no deadline at all — #69 armed only TcpClientTransport::connect — and it is
+// the direction that matters more, because a server session's blocking send holds
+// sendMutex_ against the reaper and the receive thread's inline sendControl calls, so one
+// stalled peer wedges machinery serving every other client.
+//
+// The two arms are not redundant despite sharing a mutation target. Deleting the arming
+// line reddens both; arming it in TcpClientTransport::connect again — the pre-#56
+// arrangement, which is the realistic regression — reddens only this one.
+//
+// Same shape as its sibling: the wedge is asserted rather than assumed, the send runs on
+// its own thread with a rescue so a missing deadline reddens instead of hanging ctest, and
+// it costs about one CONNECTION_TIMEOUT_MS / 2 because that is the shipped value.
+TEST(TcpTransport, ServerSessionSendsGetADeadlineWhenTheClientStopsReading) {
+    TcpServerTransport server;
+    TcpClientTransport client;
+    std::shared_ptr<ClientConnection> sc, cc;
+    ASSERT_TRUE(connectPair(server, client, sc, cc));
+
+    // Heartbeats, for the reason the client-side arm gives: the smallest frame there is can
+    // partial-write at most once, so the arm costs about one deadline rather than varying
+    // with how much room the peer happened to leave.
+    const int deadlineMs = AudioProtocolHandler::CONNECTION_TIMEOUT_MS / 2;
+    constexpr int kMaxFrames = 200000;  // >> any send buffer, at ~19 bytes a frame
+
+    std::atomic<bool> finished{false};
+    std::atomic<bool> everFailed{false};
+    std::atomic<int> sent{0};
+
+    // `cc` never reads. sc is the server's own session connection.
+    std::thread filler([&]() {
+        while (sent.load() < kMaxFrames) {
+            if (!sc->sendHeartbeat()) {
+                everFailed.store(true);
+                break;
+            }
+            sent.fetch_add(1);
+        }
+        finished.store(true);
+    });
+
+    const auto ceiling =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(deadlineMs * 4);
+    while (!finished.load() && std::chrono::steady_clock::now() < ceiling)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+    if (!finished.load()) {
+        while (!finished.load()) cc->receivePacket(50);  // rescue: drain so it can finish
+        filler.join();
+        FAIL() << "a server session send did not return within " << deadlineMs * 4
+               << " ms against a client that stopped reading — AudioProtocolHandler's "
+                  "constructor is not arming the send deadline, or is arming a far larger "
+                  "one (sent "
+               << sent.load() << " frames first)";
+    }
+    filler.join();
+
+    ASSERT_TRUE(everFailed.load())
+        << "the fill reached its frame ceiling without ever blocking, so no wedge existed";
+    ASSERT_GT(sent.load(), 64) << "the send failed before the client's window filled";
 }
 
 // Validates the bind knob: a loopback-only server still accepts a loopback
