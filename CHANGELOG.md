@@ -128,6 +128,33 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **A TCP peer that stops reading can no longer stall a send indefinitely, in either direction.**
+  Issues #56 and #70. Every send on a TCP connection funnels through one mutex held across a
+  blocking write, so a peer whose receive window closes does not merely delay its own audio — it
+  parks the writer and, behind it, the heartbeat watchdog and teardown paths whose whole job is to
+  notice that the peer is dead. Two gaps are closed together.
+
+  **Server sessions now carry a send deadline at all.** It was previously armed only on the client,
+  so a server session's writer could block with nothing to release it, holding a `maxClients` slot
+  and wedging the receive thread's inline control replies for every other client on the connection.
+  It is now armed once where the connection is born, which covers both directions.
+
+  **A send deadline is now a bound on the whole write, not on each attempt.** `SO_SNDTIMEO` applies
+  per system call, so a write that moves some bytes and then stalls restarts the clock: a peer that
+  drip-feeds a little room on a timer stretched the call in proportion to how long it cared to keep
+  that up. Measured against a peer draining 32 KB every 40 ms under a 200 ms deadline: 3263 ms, 16.3
+  times the deadline, versus 201 ms once the whole-call budget is spent across the retries.
+
+  **What it does not promise, stated because the pair is easy to over-read.** The bound is the
+  configured deadline plus at most one write already in flight — the operating system's timer covers
+  a *wait for room*, not a call, so a write that keeps making progress is not interrupted (measured:
+  8 MB moved past 4 seconds inside a single call under a 1-second deadline). For audio that residual
+  is bounded by one maximum-payload frame. A timed-out send remains fatal to the connection, as it
+  already was: the frame on the wire is truncated, so it is not retryable.
+
+  No C ABI change and no wire change. `Socket::setSendTimeout` and `Socket::sendAll` are installed
+  C++ headers whose documented contract changed.
+
 - **Losing an audio device mid-stream no longer kills the process — it is reported through
   `on_error`.** Issue #59. `PlaybackStream::write` and `CaptureStream::read` throw
   `DeviceUnavailable` on any mid-stream PortAudio error: a USB codec unplugged, a device the OS
