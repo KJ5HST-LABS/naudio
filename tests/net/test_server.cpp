@@ -380,7 +380,7 @@ TEST(Server, GateTxArbitrationGrantAndDeniedOnce) {
 // UDP's is a 2048-packet oldest-drop queue behind a socket given 8 datagrams of headroom, and an
 // AUDIO_TX carries no control ARQ, so a lost one-shot send is never retried. At this arm's depth
 // of a single 64-byte frame that difference cannot bite; at flood depth it does, which is why
-// ServerQueueDropsStayZeroWhileTheDrainKeepsUp waits on TX_GRANTED instead.
+// ServerReceiveDrainClearsItsBacklogAfterAFlood waits on TX_GRANTED instead.
 TEST(Server, GateTxIdleReleaseEndToEnd) {
     AudioStreamConfig config{};
     config.txIdleTimeoutMs = 100;
@@ -709,47 +709,109 @@ TEST(Server, GateServerControlRetransmitsObservedNonZero) {
 //
 // The issue argues the counter moves on a server because "a demux thread fills the queue while
 // the application thread drains it", i.e. that the producer/consumer split is sufficient. It is
-// not. Measured here: 20k TX packets pushed as fast as the socket accepts them leave queue_drops
-// at 0, because the session's receive path is non-blocking END TO END by design (the
+// not. Measured here: 20k TX packets pushed as fast as the socket accepts them leave the queue
+// EMPTY at the end, because the session's receive path is non-blocking END TO END by design (the
 // writer-bridge decision, §3.2) — handleTxAudio only writes into the mixer's ring buffer, so the
-// drain keeps pace with the demux thread and the 2048-packet queue never backs up.
+// drain keeps pace with the demux thread and the 2048-packet queue never stays backed up.
 //
-// WHY THE HEADLINE IS NOT GATED ON `packetsReceived >= sent` (issue #49). That field cannot
-// express "the drain kept up": the DEMUX thread increments it as the FIRST statement of
-// enqueueReceived (UdpClientConnection.cpp:175), ahead of every branch that could then discard
-// the packet and ahead of the queue on either path — note udpLan() gives the SERVER connection a
-// reorder buffer (reorderBufferSize = 8, copied to cfg.reorderWindowSize at
-// AudioStreamServer.cpp:435), so the offer that feeds the queue here is the reorder emit callback
-// at UdpClientConnection.cpp:81, not the passthrough one at :205; the client's own
-// reorderWindowSize = 0 below governs only the client. And offer evicts rather than blocks, so
-// the drain applies no back-pressure and every drop is a packet that already counted. Measured by
-// stalling receiveLoop 1 ms per packet: packets_received 20001, UNCHANGED from a healthy run,
-// alongside 17859 queue drops. A dead drain therefore SATISFIES that guard rather than falsifying
-// it. (The one way the drain could ever move the number is indirectly, by letting a connection be
-// reaped — ServerStats sums the LIVE roster, so a departure subtracts; that needs a 10 s
-// CONNECTION_TIMEOUT_MS and cannot happen inside this arm's ~1 s.) What the guard's skip branch
-// really keyed on was arrival loss upstream of the queue — and that is what silently disabled
-// this arm on Linux for its whole life: ubuntu-latest delivers ~14.5k of 20000 because the
-// loopback receive buffer is capped at net.core.rmem_max = 212992, and the shortfall equalled the
-// kernel's own UDP RcvbufErrors delta exactly, three runs of three. macOS loses none, which is
-// the only reason the assertion ever ran at all.
+// WHY THE FLOOD'S OWN DROP COUNT IS NO LONGER THE ASSERTION (issue #75). It was, for most of this
+// arm's life, and it failed twice on windows-latest inside three pushes — 218 drops in 19,866
+// packets, then again on the next commit — on diffs that cannot reach the server's receive path
+// at all. Flood-time drops are a RACE, not a property: offer() evicts as soon as the queue holds
+// kDefaultMaxSize, so a drop needs only the consumer to fall that far behind the producer ONCE.
+// MEASURED here (macOS, one run each, 2026-08-11): the flood's producer runs at 9-17 packets/ms,
+// which prices 2048 packets of capacity at 120-220 ms of consumer starvation, and the failing
+// windows-latest run implies ~126 ms. One lost scheduling quantum buys that. A test does not own
+// the relative speed of two threads, so it cannot assert an exact zero on it (L91).
 //
-// So the premise is stated over the queue's own input instead, and ASSERTED rather than skipped:
-// a 0 has teeth only if more than kDefaultMaxSize packets were enqueued, since below that the
-// queue could not have overflowed even with a dead drain. Measured margin 7.1x on Linux (the
-// loss-heaviest platform) and 9.8x on macOS. A skip is invisible in a green summary; this arm's
-// whole value is being an executable negative, so it now runs on every platform or fails loudly.
+// So the flood is kept as the STRESS and the assertion moves onto a quantity scheduling cannot
+// move. After the flood settles, a SECOND burst is sent that is strictly SMALLER THAN THE QUEUE,
+// and that burst must not drop. Phase-2 packets cannot overflow the queue by themselves — there
+// are fewer of them than it holds — so this stays true even if the consumer is descheduled for
+// the whole of phase 2. A drop there therefore proves the queue was STILL HOLDING THE FLOOD'S
+// BACKLOG when they arrived, which is exactly what "the drain kept up" denies. Passing proves a
+// bound rather than a zero: the backlog had fallen to at most (capacity - the burst).
+//
+// MEASURED, macOS, one run per row, 2026-08-11, with a stall injected into receiveLoop and the
+// backlog read from a temporary counter in that same loop:
+//
+//     injected consumer stall    flood drops   backlog at 500 ms   this arm
+//     none                                 0                   1   pass
+//     one-shot,  100 ms                    0                   1   pass
+//     one-shot,  150 ms                  292                   1   pass
+//     one-shot,  300 ms                 1826                   1   pass
+//     one-shot, 1500 ms               12,953                   1   pass
+//     one-shot, 2000 ms               12,953                2049   FAIL
+//     1 ms every packet               17,028                1634   FAIL (569 phase-2 drops)
+//
+// The 1500 and 2000 rows carry IDENTICAL flood drops and opposite verdicts, which is the whole
+// change in one line: the arm no longer keys on how far the consumer once fell behind, only on
+// whether the backlog was still there when phase 2 arrived. The old assertion reddens from the
+// 150 ms row down — and windows-latest reported 218 drops, between this machine's 150 ms (292)
+// and 300 ms (1826) rows, so that CI failure is quantitatively an ordinary scheduling stall.
+// Tolerance therefore goes from a stall of ~150 ms to one of 1500 ms, >10x on the same machine
+// under the same injection, while the bottom row shows the real defect is still caught.
+//
+// What sets the boundary is not a budget that accumulates: a healthy consumer clears a full
+// 2048-packet backlog inside one 100 ms sample once it is scheduled again (the 1500 ms row's
+// backlog is 1), so the arm reddens only if starvation is STILL IN EFFECT when phase 2 runs —
+// which the 2000 ms row shows directly, its backlog still 2049 at the moment of the reading.
+//
+// SENSITIVITY, stated because this is a trade and not a strict improvement. The settle divided by
+// the burst gives the smallest per-packet blocking step the arm can still resolve: 500 ms / 1024
+// packets, about 0.5 ms. A stall milder than that drains inside the settle and is no longer
+// caught, and the flood-wide assertion did catch it on a platform quiet enough to run it.
+// Deliberate: 0.5 ms is half the 1 ms/packet stall that is this arm's own positive control, and
+// every blocking step it guards against — a mutex wait, a socket send, a condition-variable wait
+// — is milliseconds or worse. A shorter settle would buy sensitivity and spend starvation
+// tolerance.
+//
+// WHY THE PREMISE IS NOT `packetsReceived >= sent` (issue #49). That field cannot express "the
+// drain kept up": the DEMUX thread increments it as the FIRST statement of enqueueReceived
+// (UdpClientConnection.cpp:175), ahead of every branch that could then discard the packet and
+// ahead of the queue on either path — note udpLan() gives the SERVER connection a reorder buffer
+// (reorderBufferSize = 8, copied to cfg.reorderWindowSize at AudioStreamServer.cpp:435), so the
+// offer that feeds the queue here is the reorder emit callback at UdpClientConnection.cpp:81, not
+// the passthrough one at :205; the client's own reorderWindowSize = 0 below governs only the
+// client. And offer evicts rather than blocks, so the drain applies no back-pressure and every
+// drop is a packet that already counted. Re-measured 2026-08-11 by stalling receiveLoop 1 ms per
+// packet: packets_received 20002, IDENTICAL to a healthy run, alongside 17,028 queue drops. A
+// dead drain therefore SATISFIES that guard rather than falsifying it. So the premise is stated
+// over the queue's own input instead, and ASSERTED rather than skipped — a skip is invisible in a
+// green summary, and this arm's whole value is being an executable negative. Measured margin 7.1x
+// on Linux (the loss-heaviest platform) and 9.8x on macOS.
+//
+// ONE CAVEAT THAT PHASE 2 DEPENDS ON MORE THAN THE OLD SINGLE READING DID: ServerStats is a
+// roster GAUGE, not a lifetime meter — it sums the LIVE roster, so a departing client subtracts
+// its history (GateServerStatsIsARosterGaugeNotALifetimeTotal). Phase 2 reads DELTAS across two
+// calls, so a session reaped between them would make both deltas negative. It cannot happen
+// inside this arm: reaping needs a 10 s CONNECTION_TIMEOUT_MS and the arm runs in ~2.5 s, and the
+// one client is sending throughout. If it ever did, the resolvability assertion below fires on a
+// negative rather than letting a zero pass silently, and its message separates the two causes by
+// the sign of the count.
+//
+// That same asymmetry is why phase 2 SIZES ITSELF by reading packets_received rather than by
+// counting sends: what matters is how many packets reached the queue, and arrival loss upstream
+// of it is a platform property. ubuntu-latest delivers ~14.5k of 20000 in the flood because the
+// loopback receive buffer is capped at net.core.rmem_max = 212992 (the shortfall equalled the
+// kernel's own UDP RcvbufErrors delta exactly, three runs of three, when #49 measured it); macOS
+// loses none. A fixed send count would therefore mean a different burst on every platform.
+// Because packets_received is incremented ahead of the reorder buffer it OVER-counts arrivals at
+// the queue, which ends the burst early — the safe direction, since a shorter burst can only
+// produce fewer drops.
 //
 // That the counter WORKS was established separately and in two places: its arithmetic at the
 // class level (test_udp_connection.cpp, OrderedQueueBoundedUnderFlood — 200 dropped past a
-// 2048 cap), and its wiring through ServerStats by the 1 ms consumer stall above (which is also
-// this arm's positive control: with it applied, the assertion below fails). So a 0 here is a real
-// measurement of a real server, not a broken counter.
+// 2048 cap), and its wiring through ServerStats by the 1 ms consumer stall above, which is also
+// this arm's positive control: with it applied, the phase-2 assertion below fails.
 //
 // Committed as a NEGATIVE on purpose, the same way c_client_stats.c pins the client-side
 // impossibility: it keeps the limitation executable. If a future change puts a blocking step
 // back on the receive path, this arm is what notices.
-TEST(Server, ServerQueueDropsStayZeroWhileTheDrainKeepsUp) {
+//
+// Named ServerQueueDropsStayZeroWhileTheDrainKeepsUp until 2026-08-11; renamed with the #75
+// rework because the surviving assertion is about the backlog clearing, not about the flood.
+TEST(Server, ServerReceiveDrainClearsItsBacklogAfterAFlood) {
     AudioStreamConfig config = AudioStreamConfig::udpLan();
     config.maxClients = 4;
     AudioStreamServer server{0, config};
@@ -780,6 +842,11 @@ TEST(Server, ServerQueueDropsStayZeroWhileTheDrainKeepsUp) {
         << "no TX_GRANTED: nothing proves the session's receiveLoop ever consumed a packet, so "
         << "the flood below would be racing the drain into existence";
 
+    const std::int64_t kCapacity = static_cast<std::int64_t>(BlockingPacketQueue::kDefaultMaxSize);
+
+    // ---- Phase 1: the STRESS. Its own drop count is a two-thread race and is deliberately NOT
+    // asserted on — that assertion is issue #75. What the flood must establish is only that the
+    // queue was driven hard enough for phase 2's zero to mean something.
     const int kSend = 20000;
     int sent = 0;
     for (int i = 0; i < kSend; i++) {
@@ -787,33 +854,94 @@ TEST(Server, ServerQueueDropsStayZeroWhileTheDrainKeepsUp) {
     }
     ASSERT_GT(sent, kSend / 2) << "the flood never left the client; the arm proves nothing";
 
-    // Let the backlog settle, then read once.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    const ServerStats s = server.stats();
+    // The settle. Its length is the sensitivity knob, not a pause for tidiness — see the header:
+    // it sets the smallest per-packet blocking step phase 2 can resolve (kSettleMs / the burst).
+    constexpr int kSettleMs = 500;
+    std::this_thread::sleep_for(std::chrono::milliseconds(kSettleMs));
+    const ServerStats s1 = server.stats();
 
     // Holds BY CONSTRUCTION under enqueue-time counting — every drop is a packet that incremented
     // packets_received on the same connection first — so this detects nothing and is kept only as
     // an executable statement of that subset relationship, which the header does not spell out.
-    EXPECT_LE(s.queueDrops, s.packetsReceived);
+    EXPECT_LE(s1.queueDrops, s1.packetsReceived);
 
     // The premise, over the queue's own input rather than over what the client believes it sent.
     // packets_received counts the whole session, so it runs 2 ahead of the flood (CONNECT_REQUEST
     // and the barrier's own TX frame) — never compare it to `sent` as though they were the
     // same population; the capacity is what it is measured against.
-    ASSERT_GT(s.packetsReceived, static_cast<std::int64_t>(BlockingPacketQueue::kDefaultMaxSize))
-        << s.packetsReceived << " packets reached the server's queue (the client got " << sent
-        << " of " << kSend << " onto the wire), fewer than its "
-        << BlockingPacketQueue::kDefaultMaxSize
-        << "-packet capacity — so it could not have overflowed even with a dead drain, and a 0 "
-        << "below would prove nothing. This is arrival loss UPSTREAM of the queue (kernel "
+    ASSERT_GT(s1.packetsReceived, kCapacity)
+        << s1.packetsReceived << " packets reached the server's queue (the client got " << sent
+        << " of " << kSend << " onto the wire), fewer than its " << kCapacity
+        << "-packet capacity — so the flood applied no stress at all, and phase 2's zero below "
+        << "would prove nothing. This is arrival loss UPSTREAM of the queue (kernel "
         << "socket-buffer overflow, a rejected sender, a CRC failure at crc_errors="
-        << s.crcErrors << "), never drain lag: packets_received is incremented at enqueue";
+        << s1.crcErrors << "), never drain lag: packets_received is incremented at enqueue";
 
-    EXPECT_EQ(s.queueDrops, 0)
-        << "the server enqueued " << s.packetsReceived << " packets, "
-        << (s.packetsReceived / static_cast<std::int64_t>(BlockingPacketQueue::kDefaultMaxSize))
-        << "x the queue's capacity, and still reported " << s.queueDrops << " queue drops — the "
-        << "receive path has acquired a blocking step";
+    // ---- Phase 2: the ASSERTION. A burst that cannot overflow the queue on its own.
+    //
+    // Aim for half the capacity: that splits the queue evenly between the residual backlog this
+    // arm tolerates (capacity - burst) and the headroom the burst needs in order to survive a
+    // consumer descheduled for the whole of phase 2. Sized by ARRIVALS rather than by sends,
+    // because arrival loss upstream of the queue is a platform property (see the header).
+    const std::int64_t kBurstTarget = kCapacity / 2;
+    // Below this the burst can no longer resolve the 1 ms/packet stall that is this arm's
+    // positive control: detection needs the burst to exceed what such a consumer drains during
+    // the settle. Derived from those two numbers, not picked.
+    constexpr int kPositiveControlStallMsPerPacket = 1;
+    const std::int64_t kMinResolvable = kSettleMs / kPositiveControlStallMsPerPacket;
+    constexpr int kChunk = 64;
+    // Capping the SENDS below the queue's capacity is what makes "this burst cannot overflow the
+    // queue by itself" structural rather than hoped for: arrivals can never exceed sends, however
+    // the platform's loss and stats lag behave.
+    //
+    // MEASURED that this cap is INERT on a platform with no arrival loss: widening it to 8x the
+    // target leaves the arm green on macOS, because the loop reaches its target in ~1024 sends
+    // and never approaches the cap. So the cap has no detector here. That is shipped knowingly —
+    // the invariant it protects is asserted directly below, and that assertion IS covered (a
+    // mutation of it reddens), so widening the cap on a low-loss platform fails loudly rather
+    // than silently turning phase 2 back into a thread race.
+    const int kMaxRawSends = static_cast<int>(kCapacity) - 1;
+
+    int raw = 0;
+    std::int64_t enqueued2 = 0;
+    while (enqueued2 < kBurstTarget && raw < kMaxRawSends) {
+        for (int i = 0; i < kChunk && raw < kMaxRawSends; i++, raw++) {
+            cc->sendTxAudio(pcm.data(), pcm.size());
+        }
+        // Let the demux thread count what was just sent before deciding whether to send more;
+        // without this the loop overshoots by however far the stats lag the wire.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        enqueued2 = server.stats().packetsReceived - s1.packetsReceived;
+    }
+    // Let the last chunk land and be counted, so a drop it caused is inside the reading below.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const ServerStats s2 = server.stats();
+    enqueued2 = s2.packetsReceived - s1.packetsReceived;
+    const std::int64_t drops2 = s2.queueDrops - s1.queueDrops;
+
+    ASSERT_LT(enqueued2, kCapacity)
+        << "phase 2 put " << enqueued2 << " packets into a " << kCapacity << "-packet queue in "
+        << raw << " sends, so it could have overflowed on its own and the zero below would be a "
+        << "thread race again. kMaxRawSends is supposed to make that impossible — this is the "
+        << "arm's construction broken, not the server";
+    ASSERT_GE(enqueued2, kMinResolvable)
+        << "phase 2 got only " << enqueued2 << " packets to the queue in " << raw << " sends, "
+        << "below the " << kMinResolvable << " needed to resolve a "
+        << kPositiveControlStallMsPerPacket << " ms/packet stall across a " << kSettleMs
+        << " ms settle, so a zero below would be weaker than this arm claims. Two causes reach "
+        << "this, and they are told apart by the sign: a POSITIVE count short of the floor is "
+        << "arrival loss upstream of the queue, never drain lag (crc_errors=" << s2.crcErrors
+        << "); a NEGATIVE one means the session left the roster between the two readings, since "
+        << "ServerStats is a gauge over the live roster and these are deltas";
+
+    EXPECT_EQ(drops2, 0)
+        << "a " << enqueued2 << "-packet burst into a " << kCapacity << "-packet queue dropped "
+        << drops2 << ". That burst cannot overflow the queue by itself, so the queue was still "
+        << "holding at least " << (kCapacity - enqueued2 + drops2) << " packets of the flood's "
+        << "backlog " << kSettleMs << " ms after the flood ended — the receive path has acquired "
+        << "a blocking step. (The flood itself dropped " << s1.queueDrops << " of "
+        << s1.packetsReceived << " enqueued; that number is a scheduling race and is deliberately "
+        << "not asserted on — issue #75.)";
 
     server.stop();
 }
