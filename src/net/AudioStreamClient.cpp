@@ -537,9 +537,40 @@ std::size_t AudioStreamClient::injectTxAudio(const std::uint8_t* pcm, std::size_
 
 void AudioStreamClient::heartbeatLoop(std::shared_ptr<ClientConnection> connection,
                                       std::int64_t generation) {
+    // THE WATCHDOG DECISION MUST NOT SIT DOWNSTREAM OF A SEND (#71).
+    //
+    // Every TCP send on a connection funnels through AudioProtocolHandler::sendPacket, which
+    // holds one sendMutex_ across the whole Socket::sendAll. A wedged peer therefore parks any
+    // sender for a whole send budget (CONNECTION_TIMEOUT_MS / 2) plus one in-flight ::send —
+    // and it parks EVERY OTHER sender on the connection behind the lock. This loop is the
+    // client's only watchdog, so a check placed after a send is not evaluated for as long as
+    // the peer stays wedged: precisely the condition it exists to detect.
+    //
+    // MEASURED before this change, driving a wedged send through the transport seam: with the
+    // peer already timed out, isConnectionTimedOut() was not reached ONCE in 12 s and
+    // "Connection timeout" was never reported. The loop was parked inside sendHeartbeat() —
+    // note that is a different send from the measureLatency() the issue names, and both are on
+    // this critical path.
+    //
+    // WHAT THIS DOES AND DOES NOT BUY. It cannot make the loop interruptible; a send that has
+    // already parked still runs to its budget. What it bounds is how many parked sends can
+    // separate two consecutive evaluations: ONE, rather than the heartbeat's and the latency
+    // probe's both, either side of a full check interval. The second call also stops the
+    // latency probe spending a budget on a peer already declared dead — it is a pure
+    // diagnostic whose answer is worthless once the connection is gone.
+    const auto watchdogTripped = [&]() {
+        if (!connection->isConnectionTimedOut()) return false;
+        notifyError("local", "Connection timeout");
+        handleConnectionLost(generation);
+        return true;
+    };
+
     while (!closed_.load() && connected_.load()) {
         interruptibleSleepMs(kHeartbeatCheckIntervalMs);
         if (closed_.load() || !connected_.load()) break;
+
+        // Before anything that can block.
+        if (watchdogTripped()) break;
 
         if (connection->shouldSendHeartbeat()) {
             if (!connection->sendHeartbeat()) {
@@ -547,11 +578,8 @@ void AudioStreamClient::heartbeatLoop(std::shared_ptr<ClientConnection> connecti
             }
         }
 
-        if (connection->isConnectionTimedOut()) {
-            notifyError("local", "Connection timeout");
-            handleConnectionLost(generation);
-            break;
-        }
+        // Again: the send above may have parked for a whole budget.
+        if (watchdogTripped()) break;
 
         measureLatency();
     }

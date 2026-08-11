@@ -141,6 +141,28 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **The client's connection-timeout watchdog is no longer evaluated downstream of a blocking send**
+  (issue #71). `AudioStreamClient`'s heartbeat loop is the only thing that notices a peer which has
+  stopped sending, and its `isConnectionTimedOut()` check sat *between* two blocking sends — the
+  heartbeat before it and the latency probe after. Every TCP send funnels through one mutex held
+  across the whole write, so a peer whose receive window has closed parks any sender for a send
+  budget (`CONNECTION_TIMEOUT_MS / 2`) plus one in-flight write, and parks every other sender behind
+  it. The watchdog was therefore not evaluated for as long as the peer stayed wedged: precisely the
+  condition it exists to detect, and its detection latency could stretch by two budgets plus a full
+  check interval.
+
+  The check now runs **before** any send in the iteration, and **again** after the heartbeat send.
+  At most one parked send can now separate two consecutive evaluations, instead of both of them
+  either side of a check interval. The second call also stops the latency probe — a pure diagnostic
+  whose answer is worthless on a dead connection — from spending a further budget on a peer already
+  declared gone.
+
+  **This bounds the delay; it does not remove it.** A send that has already parked still runs to its
+  budget, because nothing can interrupt it from inside the loop.
+
+  **No C ABI change and no wire change** — an `on_error` reporting `"Connection timeout"` simply
+  arrives sooner against a stalled peer.
+
 - **`disconnect()` no longer pays a second send deadline on a peer already known to be gone**
   (issue #71). The courtesy DISCONNECT control is sent twice with a short yield, because on UDP a
   Winsock loopback can discard the in-flight datagram when the socket closes microseconds after

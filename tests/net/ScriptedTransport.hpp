@@ -44,6 +44,7 @@
 // here and decide what the scripted answer should be.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -99,6 +100,12 @@ inline std::ostream& operator<<(std::ostream& os, const Handed& h) {
 // double that parks a session thread turns a test failure into a ctest hang.
 class ScriptedClientConnection : public ClientConnection {
 public:
+    // Send kinds for the per-kind stall latch (see stallTxAudioSends and friends).
+    static constexpr unsigned kTxAudio = 1u << 0;
+    static constexpr unsigned kControl = 1u << 1;
+    static constexpr unsigned kHeartbeat = 1u << 2;
+    static constexpr unsigned kRawPacket = 1u << 3;
+
     explicit ScriptedClientConnection(std::string id)
         : address_(id), remote_(std::move(id)) {}
 
@@ -206,6 +213,13 @@ public:
                         ", rxAudioCalls=" + std::to_string(rxAudioCalls_) +
                         ", stallRx=" + (stallRx_ ? "armed" : "off") +
                         ", failControls=" + (failControls_ ? "armed" : "off") +
+                        ", stallMask=" + std::to_string(stallMask_) +
+                        ", sendsEntered=" + std::to_string(sendsEntered_) +
+                        ", sendsParked=" + std::to_string(sendsParked_) +
+                        ", txAudioCalls=" + std::to_string(txAudioCalls_) +
+                        ", heartbeatsSent=" + std::to_string(heartbeatsSent_) +
+                        ", timeoutChecks=" + std::to_string(timeoutChecks_.load()) +
+                        ", timedOut=" + (timedOut_.load() ? "yes" : "no") +
                         ", controls sent {";
         for (const auto& [type, n] : sentControls_) {
             s += std::string(" ") + controlTypeName(type) + "x" + std::to_string(n);
@@ -243,12 +257,86 @@ public:
         failControls_ = true;
     }
 
+    // --- The client-side wedge (#71) ---
+    //
+    // WHY A SHARED sendMutex_ AND NOT JUST A SLEEP. Every TCP send on a real connection
+    // funnels through AudioProtocolHandler::sendPacket, which holds ONE sendMutex_ across the
+    // whole Socket::sendAll (src/net/AudioProtocolHandler.cpp, sendPacket). So a wedged send
+    // does not stall one frame — it blocks every OTHER sender on the connection, which on the
+    // client means the heartbeat, the latency probe and disconnect()'s courtesy salvo. #71
+    // says this explicitly: "a double whose sendControl merely sleeps proves nothing", because
+    // the defect is CONTENTION BETWEEN TWO ClientConnection METHODS, not the latency of one.
+    //
+    // THE LATCH IS PER-KIND, and that precision is what makes the arms deterministic rather
+    // than racy. Stalling every kind at once leaves it to scheduling whether the parked sender
+    // is sendLoop or the heartbeat loop's own probe — and those two stage OPPOSITE situations:
+    // one wedges a sender the watchdog must see past, the other wedges the watchdog itself.
+    //
+    // Armed: a send of that kind records its entry, then parks HOLDING sendMutex_, so every
+    // other kind blocks behind it exactly as production blocks behind sendPacket's lock.
+    // releaseSends() lets it go with a true; close() lets it go with a FALSE, which is what a
+    // real parked ::send returns once the socket is closed under it — MEASURED on macOS/arm64
+    // at ~5 ms after the close call, errno 9 (a bare ::close, no shutdown).
+    void stallTxAudioSends() { armStall(kTxAudio); }
+    void stallHeartbeatSends() { armStall(kHeartbeat); }
+    void stallControlSends() { armStall(kControl); }
+
+    void releaseSends() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stallMask_ = 0;
+        }
+        cv_.notify_all();
+    }
+
+    // THE L136 GUARD for every arm built on stallSends(): it separates "the induced fault
+    // fired" from "the setup ran". An arm that asserts something happened WHILE a send is
+    // wedged is vacuous unless a send is actually wedged at that moment.
+    int sendsParked() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return sendsParked_;
+    }
+
+    // Blocks until a sender is parked in the serialised path. Returns false on timeout, and
+    // the caller is expected to dump diagnostics().
+    bool waitForParkedSend(int timeoutMs) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                            [this]() { return sendsParked_ > 0; });
+    }
+
+    // Every entry into the serialised send path, parked or not. The arms about the watchdog
+    // assert on this rather than on wall clock: "no send was attempted" is a statement about
+    // the mechanism, where "it finished quickly" is a statement about the machine (L84).
+    int sendsEntered() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return sendsEntered_;
+    }
+
+    int txAudioCalls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return txAudioCalls_;
+    }
+
+    int heartbeatsSent() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return heartbeatsSent_;
+    }
+
+    // How many times heartbeatLoop consulted the watchdog. Proves the loop is ITERATING, which
+    // is what tells a working check apart from a loop that never got there.
+    int timeoutChecks() const { return timeoutChecks_.load(); }
+
+    void setShouldSendHeartbeat(bool v) { shouldHeartbeat_.store(v); }
+    void setTimedOut(bool v) { timedOut_.store(v); }
+
     // Records unconditionally, including after close(). Returns true unless failControlSends()
     // has been armed: a false in the SERVER arms would make the session tear itself down
     // (src/net/AudioStreamServer.cpp:209-211) and would drop the very messages the absence
     // arms assert are absent — the harness would then produce the passing answer for the wrong
     // reason. Those arms never arm the latch, so they still see an unconditional true.
     bool sendControl(const ControlMessage& message) override {
+        std::lock_guard<std::mutex> serialize(sendMutex_);
         bool fail;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -256,9 +344,18 @@ public:
             fail = failControls_;
         }
         cv_.notify_all();
+        if (!enterSend(kControl)) return false;
         return !fail;
     }
 
+    // NOT SERIALISED ON sendMutex_, and that exclusion is load-bearing rather than an
+    // oversight. Production does serialise it — sendRxAudio funnels through the same
+    // AudioProtocolHandler::sendPacket — but this method's stall latch parks until close(),
+    // and the server arms that arm it rely on the session's RECEIVE thread still being able to
+    // answer a LatencyProbe with sendControl while the writer is parked (the BARRIER above).
+    // Put this under sendMutex_ and that barrier deadlocks, turning every one of those arms
+    // into a ctest hang rather than a failure. The client-side serialisation below models the
+    // wedge #71 is about; this one keeps the server-side arms working.
     bool sendRxAudio(const std::uint8_t*, std::size_t, std::size_t) override {
         std::unique_lock<std::mutex> lock(mutex_);
         ++rxAudioCalls_;
@@ -266,11 +363,25 @@ public:
         if (stallRx_) cv_.wait(lock, [this]() { return !stallRx_ || closed_; });
         return true;
     }
-    bool sendHeartbeat() override { return true; }
-    // No heartbeats and never timed out: the arms are about TX provenance, and a session that
-    // reaps itself mid-arm would erase the state under assertion.
-    bool shouldSendHeartbeat() override { return false; }
-    bool isConnectionTimedOut() const override { return false; }
+
+    bool sendHeartbeat() override {
+        std::lock_guard<std::mutex> serialize(sendMutex_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++heartbeatsSent_;
+        }
+        cv_.notify_all();
+        return enterSend(kHeartbeat);
+    }
+
+    // Both default to the answers the server arms have always seen — no heartbeats, never
+    // timed out — because those arms are about TX provenance and a session that reaped itself
+    // mid-arm would erase the state under assertion. The client arms opt in via the setters.
+    bool shouldSendHeartbeat() override { return shouldHeartbeat_.load(); }
+    bool isConnectionTimedOut() const override {
+        timeoutChecks_.fetch_add(1);
+        return timedOut_.load();
+    }
 
     void close() override {
         {
@@ -285,8 +396,23 @@ public:
     // --- ClientConnection: the ten the server never calls (Transport.hpp, verified) ---
 
     const ClientAddress& clientAddress() const override { return address_; }
-    bool sendTxAudio(const std::uint8_t*, std::size_t) override { return true; }
-    bool sendPacket(const AudioPacket&) override { return true; }
+
+    // Serialised and stallable: this is the send AudioStreamClient::sendLoop drives, and
+    // parking it here is how an arm stages "the TX writer is wedged holding the send lock".
+    bool sendTxAudio(const std::uint8_t*, std::size_t) override {
+        std::lock_guard<std::mutex> serialize(sendMutex_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++txAudioCalls_;
+        }
+        cv_.notify_all();
+        return enterSend(kTxAudio);
+    }
+
+    bool sendPacket(const AudioPacket&) override {
+        std::lock_guard<std::mutex> serialize(sendMutex_);
+        return enterSend(kRawPacket);
+    }
     std::int64_t timeSinceLastReceive() const override { return 0; }
     std::int64_t packetsSent() const override { return 0; }
     std::int64_t packetsReceived() const override { return 0; }
@@ -299,7 +425,37 @@ public:
     }
 
 private:
+    // Called with sendMutex_ HELD, which is the whole point — a parked sender keeps the send
+    // lock exactly as Socket::sendAll does under AudioProtocolHandler::sendPacket. Returns
+    // what the send should report: true normally, false if close() broke it.
+    //
+    // LOCK ORDER, and it is one-way everywhere in this class: sendMutex_ THEN mutex_. Never
+    // the reverse. The cv wait below releases mutex_ while parked, so close() and the ledger
+    // readers stay live against a wedged sender.
+    bool enterSend(unsigned kind) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++sendsEntered_;
+        if ((stallMask_ & kind) != 0 && !closed_) {
+            ++sendsParked_;
+            cv_.notify_all();  // wake a test waiting to observe the wedge
+            cv_.wait(lock, [this, kind]() { return (stallMask_ & kind) == 0 || closed_; });
+            --sendsParked_;
+            cv_.notify_all();
+        }
+        return !closed_;
+    }
+
+    void armStall(unsigned kind) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stallMask_ |= kind;
+        }
+        cv_.notify_all();
+    }
+
     mutable std::mutex mutex_;
+    // Mirrors AudioProtocolHandler::sendPacket's sendMutex_. Acquired BEFORE mutex_, always.
+    mutable std::mutex sendMutex_;
     mutable std::condition_variable cv_;
     std::deque<ReceiveResult> inbox_;
     std::vector<Handed> handedOut_;
@@ -308,6 +464,14 @@ private:
     bool stallRx_ = false;
     int rxAudioCalls_ = 0;
     bool closed_ = false;
+    mutable unsigned stallMask_ = 0;
+    mutable int sendsParked_ = 0;
+    mutable int sendsEntered_ = 0;
+    int txAudioCalls_ = 0;
+    int heartbeatsSent_ = 0;
+    std::atomic<bool> shouldHeartbeat_{false};
+    std::atomic<bool> timedOut_{false};
+    mutable std::atomic<int> timeoutChecks_{0};
     ClientAddress address_;
     std::string remote_;
 };

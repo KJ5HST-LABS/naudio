@@ -752,3 +752,145 @@ TEST(Client, ReconnectAttemptSurvivesATransportFactoryThatStartsReturningNothing
     // only witnesses the stall in the slow mode, so a fast run proves nothing.
     client.disconnect();
 }
+
+// ===========================================================================
+// The heartbeat loop's watchdog under a wedged send (#71).
+// ===========================================================================
+//
+// heartbeatLoop is the CLIENT'S ONLY WATCHDOG: nothing else notices a peer that has stopped
+// sending. Its problem is that it shares a lock with the data path. Every TCP send funnels
+// through AudioProtocolHandler::sendPacket, which holds one sendMutex_ across the whole
+// Socket::sendAll, so a wedged peer parks the TX writer AND everything queued behind it — the
+// watchdog included. A check placed after a send is therefore not evaluated for exactly as
+// long as the peer stays wedged, which is the condition it exists to detect.
+//
+// MEASURED on the unfixed loop through this same seam: with the peer already timed out and the
+// send path wedged, isConnectionTimedOut() was not reached ONCE in 12 s and no "Connection
+// timeout" was ever reported.
+//
+// Both arms below assert on the MECHANISM (was a send attempted? was a probe sent?) rather
+// than on elapsed time, so neither encodes this machine's speed as a threshold (L84).
+
+// THE SUBJECT: a wedged TX writer must not disable the watchdog.
+//
+// The wedge is staged on sendTxAudio specifically, so the parked thread is sendLoop and the
+// heartbeat loop is FREE — which is the production shape: the writer wedges on an audio frame
+// and every other sender queues behind it on sendMutex_. Stalling all send kinds at once would
+// leave it to scheduling whether the parked thread was the writer or the watchdog itself, and
+// those stage opposite situations.
+//
+// Before the fix the loop woke, called sendHeartbeat(), blocked on the held sendMutex_, and
+// never reached the check. After it, the check runs first and trips with no send attempted.
+TEST(Client, HeartbeatWatchdogFiresWhileTheTxWriterHoldsTheSendLock) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setTxInjectEnabled(true);  // must precede connect(): it is what starts sendLoop
+    client.setAutoReconnect(false);   // defaults TRUE; a reconnect worker would perturb the ledger
+
+    RecordingListener listener;
+    client.addStreamListener(&listener);
+
+    std::string err;
+    auto conn = connectOverScriptedTransport(client, &err);
+    ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
+    client.setPTT(true);  // captureMuted_ defaults TRUE (RX mode), and gates injectTxAudio
+
+    // Wedge the TX writer, holding the send lock.
+    conn->stallTxAudioSends();
+    std::vector<std::uint8_t> pcm(1920, 0);
+    for (int i = 0; i < 100 && conn->sendsParked() == 0; ++i) {
+        client.injectTxAudio(pcm.data(), pcm.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // THE L136 GUARD, and it is the whole reason this arm is not vacuous: everything below is
+    // a claim about what happens WHILE a send is wedged. Without a wedge the watchdog would
+    // fire trivially and the arm would pass having tested nothing.
+    ASSERT_GE(conn->sendsParked(), 1) << "the TX writer never wedged, so the arm's premise "
+                                         "never held; " << conn->diagnostics();
+    ASSERT_GE(conn->txAudioCalls(), 1) << conn->diagnostics();
+
+    conn->setShouldSendHeartbeat(true);
+    conn->setTimedOut(true);
+
+    // Budget covers one full check interval (kHeartbeatCheckIntervalMs = 3000) plus slack.
+    // Nothing releases the stall, so a pass cannot come from the wedge having ended.
+    EXPECT_TRUE(waitFor([&]() { return listener.sawError("Connection timeout"); }, 8000))
+        << "the watchdog never fired while the send lock was held; " << conn->diagnostics();
+
+    // THE DISCRIMINATOR, and the reason it is a count rather than "is a send still parked".
+    // Tripping the watchdog runs handleConnectionLost, which closes the connection — and
+    // close() releases the stall latch by design (a latch that outlived close() would turn a
+    // failed assertion into a ctest hang). So the fix's own success ENDS the wedge, and a
+    // post-hoc "still parked" check is unsatisfiable: measured 0 vs 1 when written that way.
+    //
+    // This count is the sound form of the same guard. It cannot pass vacuously in either
+    // direction: had the wedge ended on its own before the loop woke, the heartbeat send would
+    // have gone through and this would be >= 1. Zero means the check ran BEFORE any send was
+    // attempted, which is exactly the claim.
+    EXPECT_EQ(conn->heartbeatsSent(), 0) << "the watchdog decision is still downstream of a "
+                                            "send; " << conn->diagnostics();
+    EXPECT_TRUE(conn->isClosed()) << "the watchdog reported a timeout without tearing the "
+                                     "connection down; " << conn->diagnostics();
+
+    // COVERAGE NOTE from the mutation sweep, recorded rather than banked. Dropping
+    // sendMutex_ from the double's sendHeartbeat left the suite GREEN, which reads like this
+    // arm depends on the modelled contention. It does not, and a COMBINED mutation is what
+    // settles it: with the first watchdog call ALSO deleted, this arm still goes red — not
+    // because the timeout goes unreported (without the lock the heartbeat completes and the
+    // old check trips normally) but because heartbeatsSent() becomes 1. So the count above is
+    // an independent, strictly stronger detector than "the error arrived", and the
+    // serialisation's job here is fidelity to production rather than discrimination.
+    // Predicted otherwise; the measurement corrected it.
+
+    conn->releaseSends();
+    client.disconnect();
+}
+
+// THE SECOND CHECK, which the arm above cannot reach: once the peer is declared dead, the
+// latency probe must not spend another send budget on it. measureLatency() is a pure
+// diagnostic — its answer is worthless on a connection that is already gone.
+//
+// Staged by letting the watchdog pass its FIRST check while the peer is still healthy, then
+// declaring the peer dead while the heartbeat send is parked. With only the first check
+// hoisted, the loop resumes and calls measureLatency() before it re-evaluates anything, so a
+// probe goes out and the timeout is not reported until the next interval.
+TEST(Client, HeartbeatWatchdogSkipsTheLatencyProbeOnceThePeerIsDeclaredDead) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setAutoReconnect(false);
+
+    RecordingListener listener;
+    client.addStreamListener(&listener);
+
+    std::string err;
+    auto conn = connectOverScriptedTransport(client, &err);
+    ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
+
+    // Park the watchdog inside its OWN heartbeat send, with the peer still healthy so the
+    // iteration's first check passes.
+    conn->stallHeartbeatSends();
+    conn->setShouldSendHeartbeat(true);
+    ASSERT_TRUE(conn->waitForParkedSend(8000))
+        << "the heartbeat send never parked, so the arm's premise never held; "
+        << conn->diagnostics();
+    ASSERT_GE(conn->heartbeatsSent(), 1) << conn->diagnostics();
+
+    // The peer dies during the send. Capture the probe count BEFORE releasing: the assertion
+    // is that this number does not move again.
+    const int probesBeforeRelease = conn->countSent(ControlType::LatencyProbe);
+    conn->setTimedOut(true);
+    conn->releaseSends();
+
+    ASSERT_TRUE(waitFor([&]() { return listener.sawError("Connection timeout"); }, 8000))
+        << "the watchdog never fired after the wedged heartbeat send returned; "
+        << conn->diagnostics();
+    EXPECT_EQ(conn->countSent(ControlType::LatencyProbe), probesBeforeRelease)
+        << "a latency probe was spent on a peer already declared dead; " << conn->diagnostics();
+
+    client.disconnect();
+}
