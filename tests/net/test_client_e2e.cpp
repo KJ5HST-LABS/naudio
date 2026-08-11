@@ -29,6 +29,8 @@
 #include "naudio/Types.hpp"
 #include "naudio/net/AudioStreamServer.hpp"
 
+#include "ScriptedTransport.hpp"  // #71: the client-side seam's doubles
+
 using namespace naudio;
 using namespace naudio::net;
 
@@ -608,4 +610,137 @@ TEST(Client, ConnectFailsWhenTheTransportFactoryReturnsNothing) {
     EXPECT_FALSE(client.connect(&err));
     EXPECT_NE(err.find("Transport factory"), std::string::npos) << "err was: " << err;
     EXPECT_FALSE(client.isConnected());
+}
+
+// ===========================================================================
+// disconnect()'s courtesy salvo (#71).
+// ===========================================================================
+//
+// These arms need a send that FAILS ON DEMAND, which no real socket stages cheaply: a wedged
+// TCP peer costs one 5 s send budget per salvo copy (AudioProtocolHandler.cpp, the
+// CONNECTION_TIMEOUT_MS / 2 arming), and getting one wedged at all needs a peer that stops
+// reading. The scripted transport supplies the failure directly, so these run in
+// milliseconds and do not depend on how a platform absorbs loopback writes -- which is what
+// made the #70 send-budget arm unrunnable on Windows (#74).
+
+// Builds a client on a scripted connection and takes it all the way to streaming. Returns the
+// connection so the caller can arm faults and read the ledger, or null if the handshake did
+// not complete -- callers ASSERT on it, so a later assertion can never pass because the setup
+// silently failed (L136: the guard that separates "the fault fired" from "the setup ran").
+namespace {
+std::shared_ptr<naudio::test::ScriptedClientConnection> connectOverScriptedTransport(
+    AudioStreamClient& client, std::string* err) {
+    auto conn = std::make_shared<naudio::test::ScriptedClientConnection>("scripted-peer");
+    conn->pushConnectAccept();
+    auto transport = std::make_shared<naudio::test::ScriptedClientTransport>(conn);
+    client.setTransportFactory([transport]() { return transport; });
+    if (!client.connect(err)) return nullptr;
+    return conn;
+}
+}  // namespace
+
+// THE POSITIVE CONTROL for the arm below, and the proof the salvo's second copy is reachable
+// at all -- without it, "exactly one copy" cannot tell a working short-circuit from a salvo
+// that never had two copies to begin with.
+//
+// It is also the UDP contract: on UDP the first sendto succeeds, so both copies must still go
+// out with their 5 ms yields. That double-send is what stops a Winsock loopback discard from
+// costing the server its full idle timeout (see disconnect()'s salvo comment).
+TEST(Client, DisconnectSalvoSendsBothCopiesWhenTheFirstSucceeds) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+
+    std::string err;
+    auto conn = connectOverScriptedTransport(client, &err);
+    ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
+    ASSERT_TRUE(client.isConnected());
+
+    client.disconnect();
+
+    EXPECT_EQ(conn->countSent(ControlType::Disconnect), 2) << conn->diagnostics();
+}
+
+// THE SUBJECT. A first send that fails proves the socket is broken, so the second copy cannot
+// arrive and can only cost a second send budget. Before the fix the salvo ignored
+// sendControl's result and paid it anyway: worst case two budgets, ~10 s, on a peer already
+// known to be gone.
+//
+// Why this discriminates: the double RECORDS failed sends (see failControlSends). The count is
+// 2 before the fix and 1 after. If failures went unrecorded it would be 0 either way and the
+// arm would pass vacuously.
+TEST(Client, DisconnectSalvoStopsAfterAFailedFirstSend) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+
+    std::string err;
+    auto conn = connectOverScriptedTransport(client, &err);
+    ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
+    ASSERT_TRUE(client.isConnected());
+
+    conn->failControlSends();
+    client.disconnect();
+
+    // Exactly one: 0 would mean the salvo never ran at all (a different defect, and why this
+    // is EQ rather than LE), 2 would mean the second copy was still attempted.
+    EXPECT_EQ(conn->countSent(ControlType::Disconnect), 1) << conn->diagnostics();
+}
+
+// The SECOND null-guard site. reconnectInternal() consults the factory again on every
+// attempt, so a factory that starts returning null mid-run reaches this site and never
+// connect()'s -- which is the whole reason mirroring the server's single guard is not enough
+// here.
+//
+// This arm exists because the mutation sweep MEASURED that the guard had no detector:
+// `if (false)` on it left the entire suite green (361/361). Without the guard the reconnect
+// worker dereferences null, so the mutation crashes this arm rather than failing an
+// expectation -- a crash IS the detector, because not crashing is precisely the guard's job.
+TEST(Client, ReconnectAttemptSurvivesATransportFactoryThatStartsReturningNothing) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setAutoReconnect(true);
+    // TWO, and the 2 is load-bearing rather than arbitrary. The connection below dies well
+    // inside kMinStableConnectionMs (5000 ms), so handleConnectionLost takes its SHORT-LIVED
+    // branch and counts the attempt itself; at max=1 that branch reports "Connection
+    // unstable" and returns without ever calling startReconnection, so the reconnect worker
+    // -- and the guard under test -- is never reached. Measured: at max=1 this arm times out
+    // with no reconnect at all.
+    client.setMaxReconnectAttempts(2);
+    client.setReconnectDelayMs(50);  // the attempts fail instantly; this is the only wait
+
+    RecordingListener listener;
+    client.addStreamListener(&listener);
+
+    std::string err;
+    auto conn = connectOverScriptedTransport(client, &err);
+    ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
+    ASSERT_TRUE(client.isConnected());
+
+    // From here the factory yields nothing, so the reconnect attempt below must fail cleanly
+    // rather than dereference it.
+    client.setTransportFactory([]() { return std::shared_ptr<ClientTransport>{}; });
+    conn->close();  // peer goes away -> receiveLoop sees a dead read -> reconnect
+
+    ASSERT_TRUE(waitFor([&]() { return listener.sawError("Failed to reconnect"); }, 5000))
+        << "the reconnect worker never finished its attempt; " << conn->diagnostics();
+    EXPECT_TRUE(listener.reconnecting.load());
+    EXPECT_FALSE(client.isConnected());
+
+    // Explicit teardown rather than relying on the destructor.
+    //
+    // THIS ARM COSTS ~3 s AND ONLY ~158 ms OF IT IS THE SUBJECT — that is #76, not this arm's
+    // doing, and not fixable from here. Measured: the two reconnect attempts finish at 158 ms
+    // (50 ms + 100 ms backoff), then waitForWorkers() blocks ~2.85 s because reconnectLoop's
+    // exhaustion tail sets closed_ WITHOUT notifying shutdownCv_, so heartbeatLoop sleeps out
+    // its full kHeartbeatCheckIntervalMs (3000 ms, AudioStreamClient.cpp:30) before noticing.
+    // A one-line notify probe took this arm to 155 ms; it was reverted, and #76 carries it.
+    //
+    // So this duration is a FREE DETECTOR for #76: when that lands, this arm drops to ~155 ms
+    // on its own. If you are here because the arm got fast, that is the fix working.
+    client.disconnect();
 }

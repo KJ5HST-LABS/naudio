@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //
-// naudio tests — a scripted ServerTransport/ClientConnection pair.
+// naudio tests — scripted ServerTransport / ClientTransport / ClientConnection doubles.
 //
 // Copyright (C) 2025-2026 Terrell Deppe
 //
@@ -10,6 +10,13 @@
 // handshake, the receive/writer threads, the mixer and its arbitration are all REAL. The
 // only thing scripted is what comes off the wire — which is the point, because the value
 // under test (Provenance) is not a wire field and cannot be spelled by a real peer.
+//
+// THE CLIENT SIDE (issue #71) reuses the same ScriptedClientConnection through
+// ScriptedClientTransport, because ClientConnection is the one interface BOTH ends drive —
+// the server reaches it through ServerTransport::acceptClient, the client through
+// ClientTransport::connect. Only two members are client-specific (pushConnectAccept and the
+// failControlSends latch) and both are inert unless an arm asks for them, so the server arms
+// below are untouched by their presence.
 //
 // THIS FILE COVERS HOP 2 OF A TWO-HOP CHAIN, and is worthless without hop 1:
 //   hop 1  a real server-fed UDP connection genuinely marks an FEC-reconstructed frame
@@ -113,6 +120,15 @@ public:
         push(AudioPacket::createControl(0, {static_cast<std::uint8_t>(0x01)}), Provenance::Live);
     }
 
+    // The CLIENT-direction counterpart: what AudioStreamClient::performHandshake waits for
+    // after sending its ConnectRequest. It loops on receivePacket until it sees ConnectAccept
+    // or ConnectReject (src/net/AudioStreamClient.cpp:208-234), so this one push is the whole
+    // handshake as far as the client is concerned.
+    void pushConnectAccept() {
+        push(AudioPacket::createControl(0, ControlMessage::connectAccept().serialize()),
+             Provenance::Live);
+    }
+
     // THE BARRIER. A LatencyProbe is answered by the session's RECEIVE thread with a direct
     // connection_->sendControl (src/net/AudioStreamServer.cpp:378), and receiveLoop is
     // strictly sequential (:266-289). So a LatencyResponse in the ledger proves every frame
@@ -188,7 +204,9 @@ public:
                         std::to_string(handedOut_.size()) + " frame(s), inbox " +
                         std::to_string(inbox_.size()) + ", closed=" + (closed_ ? "yes" : "no") +
                         ", rxAudioCalls=" + std::to_string(rxAudioCalls_) +
-                        ", stallRx=" + (stallRx_ ? "armed" : "off") + ", controls sent {";
+                        ", stallRx=" + (stallRx_ ? "armed" : "off") +
+                        ", failControls=" + (failControls_ ? "armed" : "off") +
+                        ", controls sent {";
         for (const auto& [type, n] : sentControls_) {
             s += std::string(" ") + controlTypeName(type) + "x" + std::to_string(n);
         }
@@ -212,17 +230,33 @@ public:
         return r;
     }
 
-    // Records unconditionally and ALWAYS returns true, including after close(). A false here
-    // would make the session tear itself down (src/net/AudioStreamServer.cpp:209-211) and
-    // would drop the very messages the absence arms assert are absent — the harness would
-    // then produce the passing answer for the wrong reason.
+    // Makes every subsequent sendControl FAIL, modelling a peer whose socket is broken or
+    // whose receive window has closed for longer than the send budget (#56/#70). Off by
+    // default, so no pre-existing arm changes behaviour.
+    //
+    // Failed sends are still RECORDED, and that is what makes the #71 arm discriminate rather
+    // than pass vacuously: the arm counts ATTEMPTS. If a failure went unrecorded, the salvo
+    // would count 0 both before and after the fix and the assertion would hold for the wrong
+    // reason. Recording the attempt is the whole instrument.
+    void failControlSends() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failControls_ = true;
+    }
+
+    // Records unconditionally, including after close(). Returns true unless failControlSends()
+    // has been armed: a false in the SERVER arms would make the session tear itself down
+    // (src/net/AudioStreamServer.cpp:209-211) and would drop the very messages the absence
+    // arms assert are absent — the harness would then produce the passing answer for the wrong
+    // reason. Those arms never arm the latch, so they still see an unconditional true.
     bool sendControl(const ControlMessage& message) override {
+        bool fail;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ++sentControls_[message.messageType()];
+            fail = failControls_;
         }
         cv_.notify_all();
-        return true;
+        return !fail;
     }
 
     bool sendRxAudio(const std::uint8_t*, std::size_t, std::size_t) override {
@@ -270,6 +304,7 @@ private:
     std::deque<ReceiveResult> inbox_;
     std::vector<Handed> handedOut_;
     std::map<ControlType, int> sentControls_;
+    bool failControls_ = false;
     bool stallRx_ = false;
     int rxAudioCalls_ = 0;
     bool closed_ = false;
@@ -352,6 +387,54 @@ private:
     std::deque<std::shared_ptr<ClientConnection>> pending_;
     int acceptCalls_ = 0;
     bool bound_ = false;
+    bool closed_ = false;
+};
+
+// A ClientTransport that hands AudioStreamClient a connection the test already owns.
+//
+// The client's counterpart to ScriptedServerTransport, and the seam
+// AudioStreamClient::setTransportFactory exists to reach (issue #71). It is the only way to
+// make a client-side send FAIL on demand: AudioStreamClient::disconnect()'s courtesy salvo is
+// gated on connected_, so an arm about the salvo needs a completed handshake AND a
+// controllable send — which no real socket can stage without a genuinely wedged peer and a
+// 5 s send budget per copy.
+//
+// connect() hands out the SAME connection every time rather than a fresh one per call, so a
+// reconnect attempt lands on the object the test is already holding and its ledger keeps
+// accumulating. Handing back a new connection per attempt would silently reset the counts an
+// arm is about to assert on.
+class ScriptedClientTransport : public net::ClientTransport {
+public:
+    explicit ScriptedClientTransport(std::shared_ptr<ClientConnection> connection)
+        : connection_(std::move(connection)) {}
+
+    int connectCalls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return connectCalls_;
+    }
+
+    bool wasClosed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_;
+    }
+
+    std::shared_ptr<ClientConnection> connect(const std::string&, std::uint16_t, int,
+                                              std::string* err) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++connectCalls_;
+        if (!connection_ && err) *err = "scripted transport has no connection";
+        return connection_;
+    }
+
+    void close() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::shared_ptr<ClientConnection> connection_;
+    int connectCalls_ = 0;
     bool closed_ = false;
 };
 

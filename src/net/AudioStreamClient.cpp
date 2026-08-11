@@ -783,10 +783,19 @@ void AudioStreamClient::disconnect() {
             // twice with a short yield so a copy escapes the socket. Duplicates are
             // safe: the server's close() is idempotent on both transports, and a
             // post-removal duplicate is dropped by the demux gate.
-            conn->sendControl(ControlMessage::disconnect());
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            conn->sendControl(ControlMessage::disconnect());
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            //
+            // The second copy goes out ONLY if the first succeeded (#71). A failed send means
+            // the socket is broken or its peer has not made room in a whole send budget
+            // (CONNECTION_TIMEOUT_MS / 2, armed in AudioProtocolHandler's constructor), so the
+            // second copy cannot arrive and can only cost a second budget — up to ~10 s in
+            // disconnect(), on a peer already known to be gone. It changes nothing on UDP,
+            // which is what the salvo is for: there the first sendto succeeds, so both copies
+            // still go out with their yields.
+            if (conn->sendControl(ControlMessage::disconnect())) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                conn->sendControl(ControlMessage::disconnect());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
         }
     }
     // The remainder of doClose() (whose exchange we already won on its behalf).
