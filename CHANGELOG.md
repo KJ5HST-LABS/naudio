@@ -6,6 +6,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **`AudioStreamClient::setTransportFactory` (C++ API) — the client-side mirror of
+  `AudioStreamServer::setTransportFactory`.** Supplies the `ClientTransport` that `connect()` will
+  use, replacing the one `config.transportType` would have selected. `ClientTransport` was already a
+  pure-abstract interface with two implementations; only the injection point was missing.
+
+  One contract difference from the server's, and it is the one that matters: the server consults its
+  factory **once per run** (`start()`), whereas the client consults its own **once per attempt** — so
+  a reconnect calls it again, and a factory that starts returning null mid-run is reached by
+  `reconnectInternal()` rather than by `connect()`. Both sites now fail that attempt with an error
+  instead of dereferencing the result; on a reconnect the backoff loop continues normally.
+
+  **No C ABI change and no wire change.** This is a C++ header addition only.
+
 - **`na_server_get_stats` + `na_server_stats` (`@since 0.2.0`) — the server-side counters, where the
   two fields that carry no information on a client actually move.** `na_client_stats` documents
   `control_retransmits` and `queue_drops` as always 0 on a client: both are written by paths only a
@@ -128,6 +141,23 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **`disconnect()` no longer pays a second send deadline on a peer already known to be gone**
+  (issue #71). The courtesy DISCONNECT control is sent twice with a short yield, because on UDP a
+  Winsock loopback can discard the in-flight datagram when the socket closes microseconds after
+  `sendto`. The second copy was sent unconditionally — so against a TCP peer that had stopped
+  reading, the first send spent a whole send budget establishing that the socket was broken and the
+  second then spent another one, roughly doubling the worst case (~10 s at the default
+  `CONNECTION_TIMEOUT_MS / 2` per budget). The second copy is now sent only if the first succeeded.
+
+  **UDP behaviour is unchanged**: there the first `sendto` succeeds, so both copies still go out with
+  their yields, which is the whole point of the double-send. The salvo is also still sent on TCP
+  rather than skipped in favour of FIN — it is what closes the server's session *before* the FIN
+  arrives, and without it every clean TCP disconnect would report a receive error to the server's
+  listeners and across the C ABI to `on_error`.
+
+  **No C ABI change and no wire change** — a `na_client_disconnect` against a stalled peer simply
+  returns sooner.
+
 - **A TCP peer that stops reading can no longer stall a send indefinitely, in either direction.**
   Issues #56 and #70. Every send on a TCP connection funnels through one mutex held across a
   blocking write, so a peer whose receive window closes does not merely delay its own audio — it
