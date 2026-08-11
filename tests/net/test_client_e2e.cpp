@@ -733,14 +733,22 @@ TEST(Client, ReconnectAttemptSurvivesATransportFactoryThatStartsReturningNothing
 
     // Explicit teardown rather than relying on the destructor.
     //
-    // THIS ARM COSTS ~3 s AND ONLY ~158 ms OF IT IS THE SUBJECT — that is #76, not this arm's
-    // doing, and not fixable from here. Measured: the two reconnect attempts finish at 158 ms
-    // (50 ms + 100 ms backoff), then waitForWorkers() blocks ~2.85 s because reconnectLoop's
-    // exhaustion tail sets closed_ WITHOUT notifying shutdownCv_, so heartbeatLoop sleeps out
-    // its full kHeartbeatCheckIntervalMs (3000 ms, AudioStreamClient.cpp:30) before noticing.
-    // A one-line notify probe took this arm to 155 ms; it was reverted, and #76 carries it.
+    // THIS ARM'S DURATION IS BIMODAL — ~3 s or ~0.16 s — and only ~158 ms of it is ever the
+    // subject. Do not "fix" the slow mode here; it is #76.
     //
-    // So this duration is a FREE DETECTOR for #76: when that lands, this arm drops to ~155 ms
-    // on its own. If you are here because the arm got fast, that is the fix working.
+    // The subject is the two reconnect attempts (50 ms + 100 ms backoff). What follows is
+    // waitForWorkers(), and reconnectLoop's exhaustion tail sets closed_ WITHOUT notifying
+    // shutdownCv_ — so if heartbeatLoop is already parked in interruptibleSleepMs it sleeps out
+    // its full kHeartbeatCheckIntervalMs (3000 ms, AudioStreamClient.cpp:30) before noticing.
+    // If that thread has not reached its sleep yet when closed_ flips, it returns immediately
+    // and the arm is fast. Which way it goes is a RACE, not a platform property.
+    //
+    // MEASURED on one CI run of one commit: macos-latest 3.07 s, ubuntu-latest 3.00 s, the two
+    // lib-only jobs 0.16 s and 0.20 s; locally (macOS) four consecutive runs were all ~3.00 s,
+    // and a one-line notify_all probe on the tail took it to 155 ms. Both modes PASS -- the
+    // assertion has a 5000 ms budget against a 158 ms subject, a 31x margin either way.
+    //
+    // Corollary for whoever fixes #76: this duration is a WEAK detector, not a free one. It
+    // only witnesses the stall in the slow mode, so a fast run proves nothing.
     client.disconnect();
 }
