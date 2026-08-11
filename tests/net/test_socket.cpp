@@ -189,6 +189,25 @@ TEST(Socket, SendTimesOutWhenPeerStopsReading) {
 // really was draining WHILE the send ran: the sender is blocked in ::send, so any room the
 // peer frees is room the kernel immediately fills from our buffer, and a nonzero drain
 // during the call is therefore forward progress that was interrupted.
+//
+// NOT REGISTERED ON WINDOWS, and this is a real coverage gap rather than a tidy-up. MEASURED
+// on windows-latest (run 31448166393, the first CI trip of this arm): the timed 8 MB send
+// SUCCEEDED in 545 ms with the peer draining 0 bytes, so the fill never wedged the socket at
+// all. The mechanism is that the fill runs with kDeadlineMs already armed and Winsock
+// loopback absorbs steadily but slowly enough that one 64 KB chunk crosses 200 ms with a
+// partial write — so THE BUDGET UNDER TEST TERMINATES ITS OWN SETUP, the fill stops early
+// with the buffer not full, and the timed call sails into the remaining capacity.
+//
+// The obvious repair — fill under a long deadline, then arm the short one — was tried and
+// REJECTED ON MEASUREMENT, not on taste: it wedges the buffer properly but then the
+// un-budgeted control passes too (M1 re-run: mutant GREEN, call ended at ~1 s instead of
+// running to the ceiling), because a fully wedged buffer produces a zero-progress window
+// that ends the call on its own. The configuration below is the one mutation actually proved
+// discriminating, and it is proved on macOS only. Both facts are stated because a
+// tuned-on-one-platform arm that silently stops discriminating elsewhere is worse than an
+// arm that says where it works. Issue #74 carries both measurements and three candidate
+// designs for a detector that works on every platform.
+#ifndef _WIN32
 TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
     Socket server, client, accepted;
     ASSERT_TRUE(makeTcpPair(server, client, accepted));
@@ -284,6 +303,7 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
     EXPECT_GE(callMs.load(), kDeadlineMs / 2);
     EXPECT_LT(callMs.load(), kDeadlineMs * 8);
 }
+#endif  // !_WIN32 — see the measured Winsock note above
 
 // The control for the arms above: with the same deadline armed, a peer that DRAINS must
 // still take everything. Without it, "sendAll returned false" could not distinguish a
