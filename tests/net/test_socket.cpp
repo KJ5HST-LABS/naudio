@@ -169,7 +169,123 @@ TEST(Socket, SendTimesOutWhenPeerStopsReading) {
     EXPECT_LT(failedCallMs.load(), kDeadlineMs * 25);
 }
 
-// The control for the arm above: with the same deadline armed, a peer that DRAINS must
+// Issue #70. SO_SNDTIMEO is a deadline per ::send, so the arm above only proves the case
+// where NOTHING moves. A peer that opens a small window on a timer makes every send return
+// a partial count, and sendAll's success limb then arms a FRESH deadline — so the call
+// lasts as long as the peer cares to drip-feed, with the deadline setting the granularity
+// rather than the bound. MEASURED before this arm existed: 9 partial writes and 3263 ms
+// against a 200 ms deadline (16.3x) for a peer draining 32 KB every 40 ms.
+//
+// THE PEER BURSTS AND THEN GOES IDLE FOR LONGER THAN THE DEADLINE, deliberately. In that
+// same measurement the partial writes arose from scheduling JITTER — the drainer's sleep
+// occasionally overrunning the deadline — which is not something to build an assertion on.
+// Here the idle window (kBurstIdleMs) is longer than the deadline by construction, so every
+// ::send is guaranteed to hand back a partial count and the re-arm is not left to chance.
+//
+// WHAT PROVES THE FAULT FIRED, as opposed to the setup merely running. A dead peer also
+// makes this call return false at about one deadline, so the elapsed time alone cannot tell
+// "the budget stopped a call that was making progress" from "nothing ever moved" — the arm
+// would pass while testing the arm above (L136's shape). The discriminator is that the peer
+// really was draining WHILE the send ran: the sender is blocked in ::send, so any room the
+// peer frees is room the kernel immediately fills from our buffer, and a nonzero drain
+// during the call is therefore forward progress that was interrupted.
+TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
+    Socket server, client, accepted;
+    ASSERT_TRUE(makeTcpPair(server, client, accepted));
+
+    constexpr int kDeadlineMs = 200;
+    constexpr std::size_t kBurstBytes = 256 * 1024;
+    constexpr int kBurstIdleMs = 300;  // > kDeadlineMs, so the next send always re-arms
+    ASSERT_TRUE(accepted.setSendTimeout(kDeadlineMs));
+    client.setRecvTimeout(50);
+
+    // Fill to real backpressure first, so the timed call below starts wedged rather than
+    // streaming into an empty buffer.
+    const std::vector<std::uint8_t> chunk(64 * 1024, 0xAB);
+    constexpr long kFillCeilingBytes = 64L * 1024 * 1024;
+    long filled = 0;
+    while (filled < kFillCeilingBytes && accepted.sendAll(chunk.data(), chunk.size()))
+        filled += static_cast<long>(chunk.size());
+    ASSERT_LT(filled, kFillCeilingBytes)
+        << "the fill reached its ceiling without ever blocking, so no wedge existed and this "
+           "arm proves nothing";
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> sending{false};
+    std::atomic<long> drainedDuringCall{0};
+    std::thread burster([&]() {
+        std::vector<std::uint8_t> sink(kBurstBytes);
+        // Hold the first burst until the timed call is in flight. MEASURED without this:
+        // the burst that opens the window lands BEFORE the send starts, the budget then
+        // ends the call at ~200 ms, and the next burst is not due until 300 ms — so the
+        // call is bracketed by two bursts and drainedDuringCall reads 0, tripping the
+        // precondition below. The window still opens for the send either way; what this
+        // fixes is that the evidence lands inside the interval being measured.
+        while (!sending.load() && !stop.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        while (!stop.load()) {
+            RecvResult r = client.recv(sink.data(), sink.size());
+            if (r.status == IoStatus::Ok && sending.load())
+                drainedDuringCall.fetch_add(static_cast<long>(r.bytes));
+            std::this_thread::sleep_for(std::chrono::milliseconds(kBurstIdleMs));
+        }
+    });
+
+    // 8 MB at one burst per kBurstIdleMs is ~9.6 s of drip-feeding, so without the budget
+    // this call cannot finish inside the ceiling below — it reddens through the rescue path
+    // rather than through a tight wall-clock threshold.
+    const std::vector<std::uint8_t> big(8 * 1024 * 1024, 0xCD);
+    std::atomic<bool> finished{false};
+    std::atomic<bool> sendOk{true};
+    std::atomic<long> callMs{-1};
+
+    std::thread sender([&]() {
+        sending.store(true);
+        const auto t0 = std::chrono::steady_clock::now();
+        sendOk.store(accepted.sendAll(big.data(), big.size()));
+        callMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
+        sending.store(false);
+        finished.store(true);
+    });
+
+    const auto ceiling =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kDeadlineMs * 25);
+    while (!finished.load() && std::chrono::steady_clock::now() < ceiling)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    if (!finished.load()) {
+        stop.store(true);
+        std::vector<std::uint8_t> sink(1 << 20);  // rescue: drain hard so the send can finish
+        while (!finished.load()) client.recv(sink.data(), sink.size());
+        burster.join();
+        sender.join();
+        FAIL() << "sendAll ran past " << kDeadlineMs * 25
+               << " ms against a peer draining " << kBurstBytes << " bytes every "
+               << kBurstIdleMs
+               << " ms — the whole-call budget is not in effect, so each partial write is "
+                  "re-arming the per-send deadline (issue #70)";
+    }
+    stop.store(true);
+    burster.join();
+    sender.join();
+
+    EXPECT_FALSE(sendOk.load())
+        << "the peer never took 8 MB at one burst per " << kBurstIdleMs
+        << " ms, so this call did not end at the budget";
+    ASSERT_GT(drainedDuringCall.load(), 64 * 1024)
+        << "the peer drained nothing while the send was running, so this arm measured a "
+           "DEAD peer — the same thing SendTimesOutWhenPeerStopsReading already covers, and "
+           "the re-arm was never exercised";
+
+    // It waited (so the budget is doing the work, not an instant refusal) and it stopped
+    // well inside the drip-feed's own timescale. Both bounds derive from kDeadlineMs.
+    EXPECT_GE(callMs.load(), kDeadlineMs / 2);
+    EXPECT_LT(callMs.load(), kDeadlineMs * 8);
+}
+
+// The control for the arms above: with the same deadline armed, a peer that DRAINS must
 // still take everything. Without it, "sendAll returned false" could not distinguish a
 // working deadline from a deadline that simply breaks sends.
 TEST(Socket, SendTimeoutDoesNotBreakADrainingPeer) {

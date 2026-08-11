@@ -12,6 +12,7 @@
 
 #include "naudio/net/Socket.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <mutex>
 
@@ -170,6 +171,44 @@ timeval msToTimeval(int ms) {
     tv.tv_sec = ms / 1000;
     tv.tv_usec = (ms % 1000) * 1000;
     return tv;
+}
+
+// Reads SO_SNDTIMEO back from the kernel, in milliseconds. 0 means "no deadline" —
+// setSendTimeout(0)'s documented meaning, and also what a socket nobody configured
+// reports — so a 0 here leaves sendAll behaving exactly as it did before the budget
+// existed.
+//
+// READ BACK RATHER THAN CACHED IN A Socket MEMBER, on purpose. A member would have to be
+// carried by the move constructor and move-assignment, which today copy only handle_
+// (:224-232) — and TcpClientTransport::connect moves the socket into the connection, so a
+// missed member would silently drop the budget on the one path that matters. This project
+// passes no warning flags, so nothing would report it. The kernel is the single owner of
+// the value instead, and it cannot drift from what was actually set (issue #70).
+int sendTimeoutMs(socket_t h) {
+    if (h == kInvalidSocket) return 0;
+#ifdef _WIN32
+    DWORD t = 0;
+    int len = static_cast<int>(sizeof(t));
+    if (::getsockopt(h, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&t), &len) != 0) {
+        return 0;
+    }
+    return static_cast<int>(t);
+#else
+    timeval tv{};
+    socklen_t len = sizeof(tv);
+    if (::getsockopt(h, SOL_SOCKET, SO_SNDTIMEO, &tv, &len) != 0) return 0;
+    const long long ms =
+        static_cast<long long>(tv.tv_sec) * 1000 + static_cast<long long>(tv.tv_usec) / 1000;
+    if (ms <= 0) return 0;
+    if (ms > 0x7fffffffLL) return 0x7fffffff;  // a deadline that large is "no deadline"
+    return static_cast<int>(ms);
+#endif
+}
+
+std::int64_t elapsedMsSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
 }
 
 }  // namespace
@@ -483,11 +522,33 @@ bool Socket::sendAll(const void* buf, std::size_t len) {
     socket_t h = handle_.load();
     const char* p = static_cast<const char*>(buf);
     std::size_t left = len;
+
+    // Started unconditionally because the budget below has to cover the FIRST ::send too;
+    // starting the clock at the first partial write would exclude it. A steady_clock read is
+    // a vDSO load, not a syscall, so this costs nothing on the overwhelmingly common path
+    // where one ::send takes everything.
+    const auto callStart = std::chrono::steady_clock::now();
+    int budgetMs = -1;  // -1 = not looked up yet; 0 = no deadline configured
+
     while (left > 0) {
         int n = static_cast<int>(::send(h, p, static_cast<int>(left), kSendFlags));
         if (n > 0) {
             p += n;
             left -= static_cast<std::size_t>(n);
+            if (left == 0) break;
+
+            // A PARTIAL WRITE, so we are about to loop — and the next ::send arms a FRESH
+            // SO_SNDTIMEO. Without a whole-call budget a peer making repeated slow forward
+            // progress therefore extends this call in proportion to how much it drip-feeds,
+            // not in proportion to the deadline: MEASURED on macOS/arm64 at 9 partial
+            // writes and 3263 ms against a 200 ms deadline (16.3x) for a peer draining
+            // 32 KB every 40 ms, versus 201 ms (1.0x) with this check in place (issue #70).
+            //
+            // Looked up here rather than at function entry so a send that completes in one
+            // call pays no getsockopt at all; once fetched it is reused for the rest of the
+            // call.
+            if (budgetMs < 0) budgetMs = sendTimeoutMs(h);
+            if (budgetMs > 0 && elapsedMsSince(callStart) >= budgetMs) return false;
             continue;
         }
         int e = lastErr();

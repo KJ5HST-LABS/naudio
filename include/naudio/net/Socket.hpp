@@ -123,39 +123,45 @@ public:
 
     // Sets the send timeout (SO_SNDTIMEO). ms == 0 means block indefinitely.
     //
-    // Without it sendAll() has no deadline of any kind: a peer that stops reading closes
-    // our receive window, the send buffer fills, and ::send parks in the kernel with
-    // nothing to wake it. That is not merely a slow send — every send on a connection
+    // ONE KNOB, TWO MECHANISMS. This arms the kernel's own send deadline AND is the
+    // whole-call budget sendAll() enforces across its retry loop (issue #70); sendAll
+    // reads the value back with getsockopt rather than caching it, so there is no second
+    // copy to keep in step. Both are needed, because neither bounds the other's case.
+    //
+    // Without any of it sendAll() has no deadline whatsoever: a peer that stops reading
+    // closes our receive window, the send buffer fills, and ::send parks in the kernel
+    // with nothing to wake it. That is not merely a slow send — every send on a connection
     // funnels through one mutex held across this call
     // (AudioProtocolHandler::sendPacket), so one parked writer wedges every other sender,
     // including a teardown path whose own socket close is the only thing that would free
     // it (issue #69).
     //
-    // THE DEADLINE IS PER ::send CALL, NOT PER sendAll CALL, AND THAT IS NOT A BOUND ON
-    // sendAll. A send that moves some bytes and then stalls returns the partial count, so
-    // sendAll's success limb loops and arms a FRESH deadline. A peer making repeated slow
-    // forward progress therefore extends the whole call in proportion to the frame size.
-    // Do not restate this as "about 2x" anywhere: 2 is what one partial write costs, not
-    // a ceiling.
+    // WHAT THE KERNEL'S HALF DOES NOT COVER, and why the budget exists. SO_SNDTIMEO is a
+    // deadline per ::send call, so a send that moves some bytes and then stalls returns
+    // the partial count and sendAll's success limb arms a FRESH one. MEASURED on
+    // macOS/arm64, peer draining 32 KB every 40 ms against a 200 ms deadline: 9 partial
+    // writes and 3263 ms — 16.3x — with no budget, and 201 ms with it. Do not restate the
+    // old "about 2x" anywhere; 2 is what ONE partial write costs, and the count is set by
+    // how the peer drip-feeds, not by the deadline.
     //
-    // MEASURED on macOS/arm64 through the real TCP client stack, against a server that
-    // accepted and then never read: the window filled after 541,431 bytes, the next frame
-    // took 5100 ms and SUCCEEDED (one partial write), and the frame after it returned
-    // false after 10,004 ms — 2.0x a 5000 ms deadline. Measured separately at the Socket
-    // layer with the buffer pre-saturated so no partial write was possible, the same call
-    // failed at 1.0x. Both numbers are real and they differ because of how much room the
-    // peer left, which is exactly the quantity this option does not bound.
-    //
-    // So: this converts an UNBOUNDED wedge into a bounded one and is what makes teardown
-    // terminate at all (issue #69). It is not a service-level deadline. Bounding the whole
-    // call needs a budget inside sendAll's success limb, which would apply to the server's
-    // sends too and belongs with issue #56's remaining half.
+    // WHAT THE BUDGET'S HALF DOES NOT COVER, so the pair is not read as an exact bound.
+    // MEASURED on macOS/arm64: SO_SNDTIMEO bounds a WAIT FOR SPACE, not a call — an 8 MB
+    // send under a 1000 ms deadline ran past 4 s inside ONE ::send with zero partial
+    // returns, because room kept appearing before any single wait expired. A budget in the
+    // retry loop cannot interrupt that; the loop never iterates. So the honest contract is
+    // "the budget, plus at most one in-flight ::send", and that residual is bounded by how
+    // much a single call hands the kernel — for naudio, one maximum-payload 0xAF01 frame
+    // (16407 bytes), measured at 1.0x with a dead peer and 0.7x with one draining 8 KB per
+    // 700 ms. Truly bounding a single ::send needs non-blocking send + poll, which would
+    // make the shared fd non-blocking underneath the concurrent receive thread — a bigger
+    // change than either issue asked for.
     //
     // It needs no new error handling: the timeout reports EAGAIN/EWOULDBLOCK
     // (WSAETIMEDOUT on Windows), which isInterrupted() does not match, so sendAll returns
     // false on the existing limb and every caller already treats false as fatal. That is
     // the right response — a timed-out send has left a TRUNCATED frame on the wire, so it
-    // is not retryable and the connection must go down.
+    // is not retryable and the connection must go down. The budget returns false on the
+    // same footing and for the same reason.
     bool setSendTimeout(int ms);
 
     // Raises SO_SNDBUF / SO_RCVBUF to at least `bytes` (never lowers an already-larger
@@ -181,7 +187,10 @@ public:
     // Closed on peer EOF (recv == 0), Error otherwise. Retries EINTR internally.
     RecvResult recv(void* buf, std::size_t len);
 
-    // Writes all len bytes, looping over partial sends. Returns false on error.
+    // Writes all len bytes, looping over partial sends. Returns false on error, and also
+    // once the socket's configured send timeout has been spent across the whole call —
+    // see setSendTimeout for what that does and does not bound. With no send timeout set
+    // this loops until the bytes are gone or a send fails, exactly as it always did.
     bool sendAll(const void* buf, std::size_t len);
 
     // --- datagram I/O (UDP) ---
