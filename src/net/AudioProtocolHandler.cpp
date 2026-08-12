@@ -58,6 +58,10 @@ AudioProtocolHandler::~AudioProtocolHandler() { close(); }
 
 bool AudioProtocolHandler::sendPacket(const AudioPacket& packet) {
     std::lock_guard<std::mutex> lock(sendMutex_);
+    return sendPacketLocked(packet);
+}
+
+bool AudioProtocolHandler::sendPacketLocked(const AudioPacket& packet) {
     if (closed_.load()) return false;
 
     std::vector<std::uint8_t> data = packet.serialize();
@@ -86,6 +90,14 @@ bool AudioProtocolHandler::sendControl(const ControlMessage& message) {
 
 bool AudioProtocolHandler::sendHeartbeat() {
     return sendPacket(AudioPacket::createHeartbeat(nextSequence()));
+}
+
+bool AudioProtocolHandler::trySendControl(const ControlMessage& message) {
+    std::unique_lock<std::mutex> lock(sendMutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return false;  // another sender holds it — decline, do not queue
+    // The sequence number is allocated only AFTER the lock is won, so a declined call does
+    // not burn one and leave a gap in a sequence space nothing ever transmitted.
+    return sendPacketLocked(AudioPacket::createControl(nextSequence(), message.serialize()));
 }
 
 // ---- Receive FSM ----------------------------------------------------------

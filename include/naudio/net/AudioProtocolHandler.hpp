@@ -55,6 +55,27 @@ public:
     bool sendControl(const ControlMessage& message);
     bool sendHeartbeat();
 
+    // Best-effort control send for TEARDOWN paths: sends only if sendMutex_ is free at the
+    // instant of the call, and returns false immediately rather than queueing behind a sender
+    // that already holds it (issue #77).
+    //
+    // The lock is the point, not the send. sendPacket holds sendMutex_ across the whole
+    // Socket::sendAll, so a wedged writer blocks every OTHER sender on the connection for as
+    // long as its send budget runs — and disconnect()'s courtesy DISCONNECT paid that budget
+    // before it could even attempt its own send. A held lock means the socket is already
+    // backed up, so the courtesy frame cannot arrive promptly anyway; declining is strictly
+    // better than waiting in order to fail.
+    //
+    // WHAT THIS DOES NOT BOUND: the send itself. Once the lock is won, Socket::sendAll still
+    // spends up to the whole-call budget armed in the constructor below. This bounds the WAIT
+    // FOR THE LOCK, which was the unbounded term; the budget is deliberate and stays.
+    //
+    // false is deliberately not split into "declined" and "failed". No caller distinguishes
+    // them — both mean the frame will not arrive promptly and a retry would only wait on the
+    // same wedge — and a tri-state on a public header with no consumer is surface that can
+    // only drift.
+    bool trySendControl(const ControlMessage& message);
+
     // --- Receive (the FSM) ---
     // timeoutMs == 0 blocks. See ReceiveResult: a frame, no-data (retry), or a
     // dead connection.
@@ -83,6 +104,11 @@ private:
 
     // Outcome of a buffer fill: full, deadline-hit (progress kept), or fatal.
     enum class Fill { Filled, Timeout, Fatal };
+
+    // The send itself, with sendMutex_ ALREADY HELD by the caller. sendPacket and
+    // trySendControl differ only in how they acquire that lock, so the body lives here
+    // rather than being duplicated into the try path, where it would drift.
+    bool sendPacketLocked(const AudioPacket& packet);
 
     Fill fillRecvBuf();
     void resetRecvState();
