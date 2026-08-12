@@ -221,15 +221,16 @@ TEST(Socket, SendTimesOutWhenPeerStopsReading) {
 // pre-handshake window, and only the accepted socket can.
 //
 // THE PEER DRAINS OFTEN AND IN SMALL PIECES — kDrainIdleMs is far SHORTER than the deadline,
-// which is the opposite of what this arm used to do and is the change that made it work
-// everywhere. #74 recorded the surviving band as D < I < 2D, and that is the constraint for a
-// LARGE, RARE drain: a deadline window can then fall entirely between two bursts, the ::send
-// returns zero progress, and sendAll fails on its own limb with the budget never consulted —
-// which is exactly how the un-budgeted control used to pass. With I << D every window contains
-// several bursts, so a zero-progress window is impossible by construction and only the budget
-// can end the call.
+// which is the opposite of what this arm used to do. #74 recorded the surviving band as
+// D < I < 2D, and that is the constraint for a LARGE, RARE drain: a deadline window can then
+// fall entirely between two bursts, the ::send returns zero progress, and sendAll fails on its
+// own limb with the budget never consulted — which is exactly how the un-budgeted control used
+// to pass. With I << D a window is far likelier to contain several bursts, so the budget is
+// the only thing left that can end the call. "Far likelier" is deliberate wording; see the
+// coverage table below for the two platforms where it still does not hold.
 //
-// MEASURED, 4 shipped + 4 mutant runs per configuration, mutation = the budget check deleted:
+// MEASURED, 4 shipped + 4 mutant runs per configuration on macOS/arm64, mutation = the budget
+// check deleted:
 //
 //   buffers      shipped call ms    mutant caught
 //   default      202..303           2 of 4      <- what this arm used to be
@@ -238,8 +239,26 @@ TEST(Socket, SendTimesOutWhenPeerStopsReading) {
 // The old configuration was a COIN FLIP, not a detector, and that is the finding this rewrite
 // rests on rather than the Windows gate alone: re-running the documented M1 mutation against
 // the shipped arm on macOS/arm64 caught it in 1 of 3 runs, failing on `callMs 1631 vs 1600` —
-// a 31 ms margin on a tuned wall-clock threshold. The configuration below fails the mutant
-// through the RESCUE PATH at the 5 s ceiling instead, a ~20x margin that needs no threshold.
+// a 31 ms margin on a tuned wall-clock threshold.
+//
+// WHERE THE DISCRIMINATION IS PROVEN, AND WHERE IT IS NOT. The arm now RUNS everywhere and
+// passes everywhere, but passing everywhere is not the same as detecting everywhere, and #74
+// is still open for the gap. Same M1 mutation, one run per platform on CI:
+//
+//   platform            shipped   mutant           discriminates?
+//   macOS/arm64 local   ~300 ms   5088 ms rescue   YES (4 of 4, and 6 of 6 earlier)
+//   ubuntu-latest CI    0.25 s    5.06 s rescue    YES
+//   macos-latest CI     0.26 s    0.47 s PASSED    NO
+//   windows-latest CI   0.25 s    0.25 s PASSED    NO
+//
+// The mechanism of the two NOs is NOT the wedge — that stages correctly now on all four. It is
+// that an un-budgeted sendAll TERMINATES ITSELF quickly on those platforms: a deadline window
+// passes with no room freed, ::send returns zero progress, and sendAll fails on its own limb at
+// a few hundred ms. Both limbs then return false quickly, so no wall-clock-derived assertion
+// can separate them — which is a sharper statement of #74's problem than the issue has, and it
+// is why closing #74 on "the arm is un-gated now" would be wrong. What the arm still proves on
+// those two platforms is the premise plus a prompt bounded failure, which is real but is not
+// the budget.
 //
 // A NEGATIVE CONTROL, so the drain rate is not read as arbitrary: doubling it to 64 KB every
 // 40 ms takes BOTH the shipped arm and the mutant green — the peer then consumes the payload

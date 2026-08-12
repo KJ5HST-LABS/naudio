@@ -313,8 +313,17 @@ TEST(ProtocolHandler, TrySendControlTransmitsOnAFreeLockAndDeclinesOnceClosed) {
 //
 // POSIX ONLY, for the reason #74 records about the #70 budget arm: Winsock's loopback
 // absorption means the fill phase does not wedge the socket there, so the premise cannot be
-// staged. A seam that makes the wedge cheap on every platform (#74's first candidate, a
-// SO_SNDBUF/SO_RCVBUF primitive) would retire that gate here and there together.
+// staged.
+//
+// THE SEAM #74 PROPOSED FOR THIS NOW EXISTS — Socket::setSendBufferSize/setRecvBufferSize —
+// AND IT IS NOT ENOUGH ON ITS OWN, so do not read its arrival as a green light to delete the
+// gate below. MEASURED on windows-latest while un-gating the #70 arm: bounding the receive
+// window does NOT wedge a Winsock loopback connection, in either arrangement (pre-handshake on
+// the listener, post-accept on the accepted socket) — both absorbed an 8 MB send in ~30 ms with
+// the peer reading nothing. What does stage the wedge there is SO_SNDBUF = 0, which disables
+// Winsock's dynamic send buffering outright; see tests/net/test_socket.cpp. Applying that here
+// is unfinished work tracked by #74, and it needs its own mutation proof against THIS arm's M1
+// (try_to_lock replaced by a blocking lock_guard) rather than inheriting the #70 arm's.
 #ifndef _WIN32
 TEST(ProtocolHandler, TrySendControlDeclinesWhileAnotherSenderHoldsTheSendLock) {
     Link link;

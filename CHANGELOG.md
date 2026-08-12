@@ -6,6 +6,30 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **`Socket::setSendBufferSize` / `Socket::setRecvBufferSize` (C++ API) — socket buffer sizing that
+  can *shrink*, and that reports what the kernel actually did.** `setSendBufferAtLeast` /
+  `setRecvBufferAtLeast` only ever raise, and their never-shrink clause is load-bearing for UDP
+  (macOS refuses a `sendto()` larger than `SO_SNDBUF`), so a caller wanting a smaller buffer must
+  not be able to reach it by passing a smaller number to those. These are separate calls.
+
+  **They return the effective size rather than a bool**, because no kernel is obliged to honour the
+  request and "did it work" is only answerable by reading it back. Measured on macOS/arm64: a
+  request of 65536 *after* `connect` is honoured exactly, while the same request *before* `connect`
+  is clamped up to a floor (8192 → 65328 `SO_SNDBUF`, 8192 → 326640 `SO_RCVBUF`). Linux commonly
+  reports back double what was asked.
+
+  **A readback is not proof the change reached the wire, and on Winsock a receive buffer does not
+  bound the connection at all.** Measured on `windows-latest`: a 64 KiB receive buffer — set on the
+  listening socket *before* the handshake **and** on the accepted socket after it — still absorbed
+  an 8 MB send in ~30 ms with the peer reading nothing, while `getsockopt` reported 65536 back
+  throughout. Windows enables dynamic send buffering by default and auto-tunes `SO_SNDBUF`, so a
+  nonzero request there is advisory. `bytes == 0` is therefore legal and is the one setting that
+  disables buffering for that direction outright, forcing `::send` to wait on the peer; POSIX
+  kernels clamp 0 up to their own minimum instead, so it is not portable. Callers that depend on
+  the size must assert on the return value and, where it matters, on behaviour as well.
+
+  **No C ABI change and no wire change.** This is a C++ header addition only.
+
 - **`AudioStreamClient::setTransportFactory` (C++ API) — the client-side mirror of
   `AudioStreamServer::setTransportFactory`.** Supplies the `ClientTransport` that `connect()` will
   use, replacing the one `config.transportType` would have selected. `ClientTransport` was already a
