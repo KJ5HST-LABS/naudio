@@ -662,8 +662,10 @@ void AudioStreamClient::handleConnectionLost(std::int64_t generation) {
             if (attempts >= maxReconnectAttempts_.load()) {
                 // exchange-claim, not store: only the winner of the closed_ false→true
                 // transition emits events — a doClose() racing this branch may already
-                // have delivered the terminal disconnected event.
-                if (!closed_.exchange(true)) {
+                // have delivered the terminal disconnected event. The claim also wakes the
+                // interruptible sleepers; closeResources() above cannot, because it notifies
+                // while closed_ is still false (#76).
+                if (claimClosedAndWake()) {
                     notifyError("local",
                                 "Connection unstable - failed " + std::to_string(attempts) +
                                     " times within " + std::to_string(kMinStableConnectionMs) +
@@ -681,8 +683,10 @@ void AudioStreamClient::handleConnectionLost(std::int64_t generation) {
         // calls that BEGIN after close completes; a doClose() can flip closed_
         // between that check and here (it takes no reconnectGuard_), and it emits
         // the terminal disconnected event itself. The atomic claim of the
-        // false→true transition makes the event exactly-once.
-        if (!closed_.exchange(true)) notifyClientDisconnected("local");
+        // false→true transition makes the event exactly-once, and wakes the
+        // interruptible sleepers in the same step (#76). This is the auto-reconnect-OFF
+        // teardown path, so it is the one an embedder that disables reconnection pays.
+        if (claimClosedAndWake()) notifyClientDisconnected("local");
     }
 }
 
@@ -740,20 +744,10 @@ void AudioStreamClient::reconnectLoop() {
     // exchange-claim, not load-then-store: a doClose() (e.g. the destructor during
     // reconnect exhaustion) racing this tail must not yield a second terminal
     // disconnected event.
-    if (!closed_.exchange(true)) {
-        // WAKE THE SLEEPERS BEFORE THE CALLBACKS (#76). closed_ is shutdownCv_'s predicate, so
-        // setting it is only half the transition — a worker already parked in
-        // interruptibleSleepMs is not woken by the store and sleeps out the rest of its own
-        // interval, up to kHeartbeatCheckIntervalMs. waitForWorkers() then blocks behind it, so
-        // a consumer calling disconnect() after reconnect exhaustion paid up to 3 s of teardown
-        // with no way to opt out. Every other site that flips closed_ (disconnect(), doClose())
-        // already does this; the exhaustion tail was the one that did not. Empty lock scope, as
-        // there: it exists to close the window between a waiter evaluating the predicate and
-        // entering the wait, not to protect any state.
-        {
-            std::lock_guard<std::mutex> lock(shutdownMutex_);
-        }
-        shutdownCv_.notify_all();
+    // The claim wakes the interruptible sleepers in the same step (#76): a consumer calling
+    // disconnect() after reconnect exhaustion used to pay a whole kHeartbeatCheckIntervalMs of
+    // teardown here, with no way to opt out.
+    if (claimClosedAndWake()) {
         notifyError("local", "Failed to reconnect after " +
                                  std::to_string(reconnectAttempt_.load()) + " attempts");
         notifyClientDisconnected("local");
@@ -863,6 +857,37 @@ void AudioStreamClient::disconnect() {
     closeResources();
     notifyClientDisconnected("local");
     waitForWorkers();
+}
+
+// Claim the closed_ false→true transition AND wake everything parked on it, as ONE step.
+// Returns true only to the winner, which owes the terminal events.
+//
+// The two halves are inseparable on purpose. closed_ is shutdownCv_'s predicate, so the store is
+// only half the transition: a worker already parked in interruptibleSleepMs is not woken by it
+// and sleeps out the rest of its OWN interval — up to kHeartbeatCheckIntervalMs, 3000 ms — with
+// waitForWorkers() blocked behind it. #76 was filed against one site; measuring it found the same
+// omission at all three connection-loss claims, because a store and a notify written as two
+// statements are two things to forget. Written as one call there is nothing left to forget.
+//
+// closeResources() ALSO notifies, and that notify cannot substitute for this one: it runs while
+// closed_ is still false, so a woken waiter re-evaluates the predicate, sees false, and waits out
+// its original deadline unchanged. Only a notify AFTER the flip wakes anything. (Its own purpose
+// is the connected_ flip, which the loop conditions — not the sleep predicate — read.)
+//
+// The empty lock scope is the established idiom here and in doClose(): it exists to close the
+// window between a waiter evaluating the predicate and entering the wait, not to protect state.
+//
+// TWO SITES DELIBERATELY DO NOT USE THIS. doClose() below already flips-then-notifies and is
+// correct as written. disconnect()'s winner path must send its courtesy DISCONNECT salvo before
+// closeResources() breaks the socket (#71, #77); routing it through here would move its notify
+// ahead of that salvo and reorder a path those two issues tuned deliberately.
+bool AudioStreamClient::claimClosedAndWake() {
+    if (closed_.exchange(true)) return false;
+    {
+        std::lock_guard<std::mutex> lock(shutdownMutex_);
+    }
+    shutdownCv_.notify_all();
+    return true;
 }
 
 void AudioStreamClient::doClose() {

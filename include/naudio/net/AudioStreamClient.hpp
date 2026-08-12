@@ -279,6 +279,11 @@ private:
     bool reconnectInternal(std::string* err);
 
     // Teardown.
+    //
+    // Claim the closed_ false->true transition AND wake everything parked on it, as one step.
+    // Returns true only to the winner, which owes the terminal events. See the definition for
+    // why the two halves are inseparable and which sites deliberately do not use it (#76).
+    bool claimClosedAndWake();
     void doClose();
     void closeResources();
     void waitForWorkers();

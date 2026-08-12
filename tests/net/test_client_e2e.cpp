@@ -842,6 +842,119 @@ TEST(Client, ReconnectExhaustionWakesAWorkerParkedInAnInterruptibleSleep) {
         << elapsedMs << " ms (#76). " << conn->diagnostics();
 }
 
+// THE SECOND AND THIRD SITES of the same omission, and the reason claimClosedAndWake() exists as
+// a function rather than as three copies of two statements.
+//
+// #76 named ONE site — reconnectLoop's exhaustion tail. Probing the other two claims of the
+// closed_ false->true transition MEASURED the identical stall on both: 2937 ms with
+// auto-reconnect off and 2942 ms on the "Connection unstable" cutoff, against the tail's 2787 ms.
+// So the issue's scope was a third of the defect, and the auto-reconnect-off path is the one an
+// embedder that disables reconnection pays on every peer loss.
+//
+// What made all three the same bug is that closeResources() runs first on every one of these
+// paths and DOES notify — but while closed_ is still false, so each waiter re-evaluates the
+// predicate, sees false, and waits out its original deadline. An inert notify sitting a few
+// statements upstream is why three separate sites could each look already-handled.
+//
+// Both arms below share the structure of the one above, including the unavoidable ~3 s premise:
+// heartbeatLoop's park is only observable AFTER its first interruptibleSleepMs returns, so
+// timeoutChecks() cannot rise sooner and there is no cheaper proof that anything is parked. Do
+// not trim that wait — without it each arm races the worker to its first sleep and passes
+// vacuously whenever it wins, which is precisely the flaw that made #76's proposed detector a
+// half-time one.
+//
+// THE THREE ARMS ARE NOT REDUNDANT, measured rather than argued. Reverting each site to a raw
+// closed_.exchange(true) in turn produces a clean diagonal — only that site's arm goes RED
+// (2791 / 2937 / 2937 ms) while the other two stay green — and removing the notify from
+// claimClosedAndWake() itself reddens all three. So each arm covers exactly one claim site, and
+// the helper is the single point they share.
+TEST(Client, ConnectionLossWithAutoReconnectOffWakesAWorkerParkedInAnInterruptibleSleep) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+
+    RecordingListener listener;
+    client.addStreamListener(&listener);
+
+    std::string err;
+    auto conn = connectOverScriptedTransport(client, &err);
+    ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
+    ASSERT_TRUE(client.isConnected());
+
+    ASSERT_TRUE(waitFor([&]() { return conn->timeoutChecks() >= 2; }, 8000))
+        << "heartbeatLoop never completed a sleep cycle, so no worker was parked to be woken "
+           "and this arm would prove nothing; "
+        << conn->diagnostics();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // let it re-enter the sleep
+
+    // Auto-reconnect OFF sends handleConnectionLost down its else branch, which is the claim
+    // under test. Set it AFTER connecting so the premise above is established first.
+    client.setAutoReconnect(false);
+    conn->close();
+
+    ASSERT_TRUE(waitFor([&]() { return listener.disconnectedCount.load() > 0; }, 5000))
+        << "the loss path never claimed the terminal transition here; " << conn->diagnostics();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    client.disconnect();
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+
+    EXPECT_LT(elapsedMs, 1000)
+        << "auto-reconnect-off teardown waited out the heartbeat interval instead of being woken: "
+        << elapsedMs << " ms (#76). " << conn->diagnostics();
+}
+
+TEST(Client, UnstableConnectionCutoffWakesAWorkerParkedInAnInterruptibleSleep) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setAutoReconnect(true);
+    // 1, which is what routes this to the branch under test rather than to reconnectLoop: the
+    // connection dies inside kMinStableConnectionMs (5000 ms) so handleConnectionLost takes its
+    // short-lived branch, counts the attempt, and at max=1 reports "Connection unstable" and
+    // returns WITHOUT calling startReconnection. That early return is the third claim site.
+    // (Note the premise wait below must therefore stay well under 5000 ms to keep the
+    // connection short-lived; at ~3 s it does, with the cutoff at ~3.05 s.)
+    client.setMaxReconnectAttempts(1);
+
+    RecordingListener listener;
+    client.addStreamListener(&listener);
+
+    std::string err;
+    auto conn = connectOverScriptedTransport(client, &err);
+    ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
+    ASSERT_TRUE(client.isConnected());
+
+    ASSERT_TRUE(waitFor([&]() { return conn->timeoutChecks() >= 2; }, 8000))
+        << "heartbeatLoop never completed a sleep cycle, so no worker was parked to be woken "
+           "and this arm would prove nothing; "
+        << conn->diagnostics();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // let it re-enter the sleep
+
+    conn->close();
+
+    // Emitted inside the branch's own claim, so observing it proves THIS site is the one that
+    // flipped closed_ — not the tail, which is never reached at max=1.
+    ASSERT_TRUE(waitFor([&]() { return listener.sawError("Connection unstable"); }, 5000))
+        << "the unstable-connection cutoff never ran, so nothing flipped closed_ here; "
+        << conn->diagnostics();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    client.disconnect();
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+
+    EXPECT_LT(elapsedMs, 1000)
+        << "unstable-connection teardown waited out the heartbeat interval instead of being "
+           "woken: "
+        << elapsedMs << " ms (#76). " << conn->diagnostics();
+}
+
 // ===========================================================================
 // The heartbeat loop's watchdog under a wedged send (#71).
 // ===========================================================================
