@@ -310,6 +310,21 @@ void AudioStreamClient::startWorkerThreads() {
         pb = playbackStream_;
     }
 
+    // A disconnect() racing this connect may already have run closeResources(), which nulls
+    // connection_/rxBuffer_/playbackStream_ under runMutex_ — the same lock the snapshot above
+    // takes, so the snapshot is consistent but can legitimately be all-null (issue #57).
+    //
+    // runConnect commits connected_ under runMutex_ and then calls this OUTSIDE the lock, so
+    // there is no way to make the commit and the spawn atomic from here; the guard has to be on
+    // the spawn itself. playbackLoop dereferences before it checks anything — playback->
+    // actualFormat() is its first statement and rxBuffer->hasReachedTargetLevel() its second —
+    // so a null snapshot is a crash on a DETACHED thread, i.e. process death with no on_error.
+    //
+    // The asymmetry was the tell: captureLoop was already spawned only `if (cap)` and every
+    // worker loop is guarded by `!closed_ && connected_`, so the playback worker was the one
+    // path that could dereference a torn-down resource before testing anything.
+    if (!conn || !rx) return;
+
     // Receive (RX -> ring buffer + audio listeners; control; heartbeat ack).
     threadStarted();
     std::thread([this, conn, rx, generation, cfg]() {
@@ -318,11 +333,13 @@ void AudioStreamClient::startWorkerThreads() {
     }).detach();
 
     // Playback (RX ring buffer -> playback stream).
-    threadStarted();
-    std::thread([this, rx, pb, generation, cfg]() {
-        playbackLoop(rx, pb, generation, cfg);
-        threadFinished();
-    }).detach();
+    if (pb) {
+        threadStarted();
+        std::thread([this, rx, pb, generation, cfg]() {
+            playbackLoop(rx, pb, generation, cfg);
+            threadFinished();
+        }).detach();
+    }
 
     // Capture (device -> TX ring). Only with a capture device; TX is optional.
     if (cap) {

@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -638,6 +639,114 @@ std::shared_ptr<naudio::test::ScriptedClientConnection> connectOverScriptedTrans
     return conn;
 }
 }  // namespace
+
+// --- issue #57.2 — disconnect() racing a completing connect() ------------------------------
+//
+// A listener that signals when the connect path has passed its connected_ commit.
+//
+// IT DOES NOT PARK THE CONNECT THREAD, and the attempt to use it that way is worth recording
+// because it is the obvious approach and it FAILS SILENTLY. runConnect commits connected_ under
+// runMutex_ and then calls notifyClientConnected() (src/net/AudioStreamClient.cpp:191), which
+// looks like a synchronous hook sitting exactly in the window before startWorkerThreads(). It
+// is not: notifyClientConnected POSTS to dispatcher_ (:1121) rather than calling listeners
+// inline, so blocking inside onClientConnected blocks the DISPATCHER thread while runConnect
+// sails on. Measured, not assumed — a probe printed `startWorkerThreads ... closed=0` BEFORE
+// the test thread had even called disconnect(), and the arm passed against deliberately
+// unguarded code. Every client listener callback goes through the same dispatcher, so no
+// listener anywhere is a synchronous seam on a client worker path.
+class ConnectBlockingListener : public naudio::net::AudioClientListener {
+public:
+    void onClientConnected(const std::string&, const std::string&) override {
+        entered_.store(true);
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this]() { return released_; });
+    }
+
+    bool waitUntilEntered(int timeoutMs) const {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (entered_.load()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return entered_.load();
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::atomic<bool> entered_{false};
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool released_ = false;
+};
+
+// #57.2 — disconnect() concurrent with a completing connect() must not deadlock or crash.
+//
+// ⚠ THIS ARM IS NOT A DETECTOR FOR THE NULL-SPAWN FIX IT SITS NEXT TO. It passes identically
+// with and without the `if (!conn || !rx)` / `if (pb)` guards in startWorkerThreads —
+// MEASURED, not assumed. It is named for what it actually covers so that a future reader
+// cannot mistake a green here for coverage of the null spawn.
+//
+// The defect the guards fix is real and provable by reading: closeResources() nulls
+// playbackStream_/rxBuffer_ under runMutex_ (src/net/AudioStreamClient.cpp:943-952),
+// startWorkerThreads snapshots them under that same lock, and playbackLoop dereferences before
+// testing anything — playback->actualFormat() is its first statement, rxBuffer-> its second. On
+// a DETACHED thread that is process death with no on_error, reachable through the C ABI as
+// na_client_disconnect racing a na_client_connect that is completing.
+//
+// WHY NO DETERMINISTIC ARM EXISTS. The window is between runConnect releasing runMutex_ after
+// committing connected_ and startWorkerThreads re-taking it, and NOTHING synchronous runs in
+// between: the one call that looks like a seam, notifyClientConnected, is asynchronous (see the
+// listener above). Staging it would need a test-only seam in production code, which is a bigger
+// change than the fix. The guards therefore rest on the read, not on a red test — recorded here
+// rather than left for a reader to infer from a green suite.
+TEST(Client, DisconnectConcurrentWithAConnectCommitTearsDownCleanly) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+
+    ConnectBlockingListener listener;
+    client.addStreamListener(&listener);
+
+    auto conn = std::make_shared<naudio::test::ScriptedClientConnection>("scripted-peer");
+    conn->pushConnectAccept();
+    auto transport = std::make_shared<naudio::test::ScriptedClientTransport>(conn);
+    client.setTransportFactory([transport]() { return transport; });
+
+    std::string err;
+    std::atomic<bool> connectResult{false};
+    std::thread connector([&]() { connectResult.store(client.connect(&err)); });
+
+    // The connect thread is now parked with connected_ already true and no workers started.
+    ASSERT_TRUE(listener.waitUntilEntered(3000))
+        << "runConnect never reached notifyClientConnected — the window was not staged, so a "
+           "green result here would be vacuous";
+
+    // Tear the client down underneath it. This is the public call the C ABI exposes.
+    client.disconnect();
+    listener.release();
+    connector.join();
+
+    // MUST OUTLIVE THE SPAWN. Whatever startWorkerThreads() launched is DETACHED, so without
+    // this the process can reach the end of the test — and, under a --gtest_filter that selects
+    // only this arm, exit — before the playback worker is ever scheduled. That is not a
+    // hypothetical: it is why the first version of this arm passed against the unguarded code.
+    // A crash that happens after the last assertion is still a crash, but a test that exits
+    // first cannot see it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    // connect() reports failure: runConnect returned true, but connect()'s own doClose path and
+    // the disconnect have left the handle closed. What matters is that we got here at all.
+    EXPECT_FALSE(client.isConnected());
+}
 
 // THE POSITIVE CONTROL for the arm below, and the proof the salvo's second copy is reachable
 // at all -- without it, "exactly one copy" cannot tell a working short-circuit from a salvo
