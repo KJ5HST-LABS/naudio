@@ -141,6 +141,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **`na_client_disconnect` / `AudioStreamClient::disconnect()` no longer wait out a heartbeat
+  interval after the connection is lost** (issue #76). `closed_` is the predicate every internal
+  interruptible sleep waits on, so setting it is only half the terminal transition: the three sites
+  that claim it on a connection loss — reconnect exhaustion, the "connection unstable" cutoff, and
+  the auto-reconnect-off path — set it without notifying the condition variable. A worker already
+  parked in that sleep was therefore never woken; it slept out the remainder of **its own** interval
+  while the join barrier blocked behind it. The longest such interval is the heartbeat check's
+  3000 ms, so a consumer calling `na_client_disconnect` after a peer went away paid up to ~3 s of
+  teardown, with no way to opt out — a cost coupled by accident to a constant chosen for heartbeat
+  cadence rather than for teardown latency.
+
+  Measured on all three paths: **2787 ms** after reconnect exhaustion, **2942 ms** on the
+  unstable-connection cutoff, **2937 ms** with auto-reconnect disabled — the last being the path an
+  embedder that turns reconnection off pays on every loss. All three now return promptly. The claim
+  and the wake are a single operation internally, so the two cannot be separated again.
+
+  **No C ABI change, no wire change, and no change to which events fire or in what order** — this is
+  teardown latency only. Note the cost was intermittent, not constant: the stall requires the parked
+  worker to already be asleep when the transition lands, which is why it read as ordinary variance.
+
 - **`na_client_disconnect` / `AudioStreamClient::disconnect()` no longer wait on a wedged TCP writer
   before sending their courtesy DISCONNECT** (issue #77). Every TCP send on a connection funnels
   through one `sendMutex_` held across the whole `Socket::sendAll`, so a peer that had stopped
