@@ -447,9 +447,14 @@ NA_EXPORT void na_client_destroy(na_stream_client* client);
 /* --- Configuration (set BEFORE na_client_connect; each returns NA_ERR_INVALID on a NULL client) --- */
 
 /* The local playback device id (REQUIRED for RX — connect fails without it). The NULL backend
- * accepts any id. */
+ * accepts any id. Call before connect: the reconnect worker re-reads this on every attempt, so
+ * NA_ERR_INVALID once connect has been attempted. */
 NA_EXPORT na_error_t na_client_set_playback_device(na_stream_client* client, int backend_id);
-/* The local capture device id (OPTIONAL — only needed for TX). Unsupported on the NULL backend. */
+/* The local capture device id (OPTIONAL — only needed for TX). Call before connect
+ * (NA_ERR_INVALID afterwards), for the same reason as the playback device.
+ *
+ * NA_ERR_UNSUPPORTED on a NULL-backend client, refused HERE rather than deferred to connect —
+ * that backend cannot capture. Use na_client_set_tx_inject for TX from a NULL-backend client. */
 NA_EXPORT na_error_t na_client_set_capture_device(na_stream_client* client, int backend_id);
 /* Enable TX audio from na_client_inject_tx_audio instead of (or alongside) a capture device — the
  * headless TX path, and the ONLY way for a NULL-backend client to transmit, since that backend
@@ -476,7 +481,9 @@ NA_EXPORT na_error_t na_client_set_transport(na_stream_client* client, na_transp
  * config as it stands then. NA_ERR_INVALID on a NULL client, an unknown profile, or once connected. */
 NA_EXPORT na_error_t na_client_set_reliability_profile(na_stream_client* client,
                                                        na_reliability_profile profile);
-/* Identify to the server's roster. Any argument may be NULL to leave that field unset. */
+/* Identify to the server's roster. Any argument may be NULL to leave that field unset.
+ * Call before connect — the reconnect worker re-sends these on every attempt, so changing them
+ * afterwards would race that read. NA_ERR_INVALID once connect has been attempted. */
 NA_EXPORT na_error_t na_client_set_identity(na_stream_client* client, const char* callsign,
                                             const char* operator_name, const char* location);
 /* Register lifecycle/roster/TX callbacks (the struct is COPIED). `user` is passed back to each.

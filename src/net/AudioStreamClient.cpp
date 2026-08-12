@@ -1016,6 +1016,14 @@ ClientStats AudioStreamClient::stats() const {
     const std::shared_ptr<ClientConnection> conn = currentConnection();
     if (!conn) return s;  // no live connection: defaults, connected == false
 
+    // Gate on connected_, not merely on the connection OBJECT existing (issue #58 facet 5). The
+    // object is installed by connect() BEFORE performHandshake runs, so keying on it alone made
+    // `connected` read 1 for the whole up-to-10 s window of a connect that would go on to FAIL —
+    // while na_client_is_connected returned 0 at the same instant. naudio.h defines this field as
+    // "1 if a live connection supplied these numbers", so the counters below were being labelled
+    // as readings from a connection that did not exist yet.
+    if (!connected_.load() || closed_.load()) return s;
+
     s.connected = true;
     s.packetsSent = conn->packetsSent();
     s.packetsReceived = conn->packetsReceived();

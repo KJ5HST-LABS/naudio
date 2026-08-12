@@ -262,9 +262,134 @@ static int client_fail_fast_arm(void) {
     return 0;
 }
 
+/* ---- (3) setters refuse AFTER connect, and answer for themselves BEFORE it (#58 facets 3+4) ----
+ *
+ * The identity and device setters were bare member writes with no gate, while the reconnect
+ * worker re-runs performHandshake and reads exactly those members — a concurrent std::string
+ * assignment against that read is UB, and naudio.h licenses the trigger by saying any client
+ * method may be called from inside an event callback (on_reconnecting, say). The callback
+ * setters already carried this gate; these did not.
+ *
+ * Facet 4 rides along because it is the same call: na_client_set_capture_device answered NA_OK
+ * on a NULL-backend client and deferred the failure to connect, where it arrived after a live
+ * handshake and left the handle spent — while the SERVER sibling had always returned
+ * NA_ERR_UNSUPPORTED at the setter.
+ */
+static int setter_gate_arm(void) {
+    na_audio_server* srv = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+    if (srv == NULL) return fail("could not create the setter-arm server");
+    if (na_server_start(srv, NULL, 0) != NA_OK) {
+        na_server_destroy(srv);
+        return fail("setter-arm server did not start");
+    }
+    const int port = na_server_port(srv);
+
+    na_stream_client* c = make_client(port, "setter");
+    if (c == NULL) {
+        na_server_destroy(srv);
+        return fail("could not create the setter-arm client");
+    }
+
+    /* BEFORE connect: the gate is open. This is the control — without it, an arm showing the
+     * setters refuse afterwards cannot tell a gate from a setter that never works. */
+    if (na_client_set_identity(c, "KJ5HST", "op", "grid") != NA_OK) {
+        na_client_destroy(c);
+        na_server_destroy(srv);
+        return fail("set_identity refused BEFORE connect — that is not a gate, that is a break");
+    }
+    if (na_client_set_playback_device(c, 0) != NA_OK) {
+        na_client_destroy(c);
+        na_server_destroy(srv);
+        return fail("set_playback_device refused BEFORE connect");
+    }
+
+    /* Facet 4: the NULL backend cannot capture, and the setter says so ITSELF rather than
+     * letting connect discover it after a full handshake. Checked before connect precisely
+     * because the point is that it does not need one. */
+    na_error_t rc = na_client_set_capture_device(c, 0);
+    if (rc != NA_ERR_UNSUPPORTED) {
+        fprintf(stderr, "  (NULL-backend set_capture_device returned %d, wanted "
+                        "NA_ERR_UNSUPPORTED)\n", (int)rc);
+        na_client_destroy(c);
+        na_server_destroy(srv);
+        return fail("the client capture setter must match its server sibling on the NULL backend");
+    }
+
+    if (na_client_connect(c, NULL, 0) != NA_OK) {
+        na_client_destroy(c);
+        na_server_destroy(srv);
+        return fail("the setter-arm client could not connect");
+    }
+
+    /* AFTER connect: closed to the racing writes. */
+    if (na_client_set_identity(c, "W1AW", NULL, NULL) != NA_ERR_INVALID) {
+        na_client_disconnect(c);
+        na_client_destroy(c);
+        na_server_destroy(srv);
+        return fail("set_identity still wrote strings the reconnect worker reads");
+    }
+    if (na_client_set_playback_device(c, 1) != NA_ERR_INVALID) {
+        na_client_disconnect(c);
+        na_client_destroy(c);
+        na_server_destroy(srv);
+        return fail("set_playback_device still wrote a member the reconnect worker reads");
+    }
+
+    /* ---- (4) na_client_stats.connected agrees with na_client_is_connected (#58 facet 5) ----
+     *
+     * ⚠ A CONSISTENCY CHECK, NOT A DETECTOR — measured: both readings below pass with the fix
+     * REMOVED. The defect is a mid-handshake window, and neither end of it is reachable here:
+     * before connect there is no connection object, and after disconnect closeResources() has
+     * nulled it, so stats() returns its defaults early in both cases regardless of the gate.
+     * The detector for this facet is the C++ arm
+     * Client.StatsDoesNotClaimConnectedWhileTheHandshakeIsStillOutstanding, which holds the
+     * handshake open with a scripted connection that is never given a ConnectAccept — the one
+     * place the window can actually be staged. Kept here because the two fields agreeing across
+     * a real connect/disconnect is worth pinning; do not read it as coverage of the fix. */
+    {
+        na_client_stats st;
+        memset(&st, 0, sizeof st);
+        if (na_client_get_stats(c, &st, sizeof st) != NA_OK) {
+            na_client_disconnect(c);
+            na_client_destroy(c);
+            na_server_destroy(srv);
+            return fail("could not read client stats");
+        }
+        if (st.connected != 1 || na_client_is_connected(c) != 1) {
+            na_client_disconnect(c);
+            na_client_destroy(c);
+            na_server_destroy(srv);
+            return fail("stats.connected and is_connected disagree on a LIVE connection");
+        }
+    }
+
+    na_client_disconnect(c);
+
+    /* After disconnect the two must STILL agree — the direction that was broken. */
+    {
+        na_client_stats st;
+        memset(&st, 0, sizeof st);
+        na_client_get_stats(c, &st, sizeof st);
+        if (st.connected != 0 || na_client_is_connected(c) != 0) {
+            fprintf(stderr, "  (post-disconnect stats.connected=%d is_connected=%d)\n",
+                    st.connected, na_client_is_connected(c));
+            na_client_destroy(c);
+            na_server_destroy(srv);
+            return fail("stats.connected still claims a live connection after disconnect");
+        }
+    }
+
+    na_client_destroy(c);
+    na_server_destroy(srv);
+    printf("  setters: gated after connect, open before it; NULL-backend capture refused at the "
+           "setter; stats.connected tracks is_connected\n");
+    return 0;
+}
+
 int main(void) {
     if (server_start_retry_arm() != 0) return 1;
     if (client_fail_fast_arm() != 0) return 1;
+    if (setter_gate_arm() != 0) return 1;
     printf("c_lifecycle_contract OK\n");
     return 0;
 }

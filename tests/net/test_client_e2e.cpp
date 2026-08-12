@@ -748,6 +748,49 @@ TEST(Client, DisconnectConcurrentWithAConnectCommitTearsDownCleanly) {
     EXPECT_FALSE(client.isConnected());
 }
 
+// #58 facet 5 — na_client_stats.connected must not read 1 during a handshake that has not
+// completed. naudio.h defines the field as "1 if a live connection supplied these numbers".
+//
+// stats() keyed on the connection OBJECT, which connect() installs BEFORE performHandshake runs.
+// So for the whole up-to-10 s window of a connect that will fail, stats().connected read 1 while
+// isConnected() returned 0 at the same instant — every counter beside it labelled as a reading
+// from a connection that did not exist yet.
+//
+// THIS is the arm that pins the fix. The C-ABI arm in c_lifecycle_contract.c checks the same
+// field only before and after a completed connect, and passes either way (after disconnect,
+// closeResources has nulled connection_, so stats() returns early regardless) — measured, and
+// labelled there as a consistency check rather than a detector. The window is only reachable
+// where the handshake can be held open, which is here: a scripted connection that is never given
+// a ConnectAccept parks performHandshake in receivePacket.
+TEST(Client, StatsDoesNotClaimConnectedWhileTheHandshakeIsStillOutstanding) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+
+    // Deliberately NO pushConnectAccept: the handshake will block waiting for a reply.
+    auto conn = std::make_shared<naudio::test::ScriptedClientConnection>("silent-peer");
+    auto transport = std::make_shared<naudio::test::ScriptedClientTransport>(conn);
+    client.setTransportFactory([transport]() { return transport; });
+
+    std::string err;
+    std::thread connector([&]() { client.connect(&err); });
+
+    // Wait until the connection object is installed and the handshake is outstanding. Reading
+    // stats() until it reports non-default would be the wrong probe — that is the bug itself —
+    // so key on the ConnectRequest performHandshake sends immediately before it blocks.
+    ASSERT_TRUE(waitFor([&]() { return conn->countSent(ControlType::ConnectRequest) > 0; }, 3000))
+        << "the handshake never sent its ConnectRequest — the window was not staged, so a green "
+           "result here would be vacuous";
+
+    EXPECT_FALSE(client.isConnected()) << "precondition: the connect has not completed";
+    EXPECT_FALSE(client.stats().connected)
+        << "stats claimed a live connection while the handshake was still outstanding";
+
+    client.disconnect();
+    connector.join();
+}
+
 // THE POSITIVE CONTROL for the arm below, and the proof the salvo's second copy is reachable
 // at all -- without it, "exactly one copy" cannot tell a working short-circuit from a salvo
 // that never had two copies to begin with.

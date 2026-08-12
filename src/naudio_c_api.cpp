@@ -469,6 +469,11 @@ struct na_stream_client {
     // / na_client_set_audio_cb reject with NA_ERR_INVALID instead of racing a reader. Atomic so a
     // setter on one thread sees a connect() on another.
     std::atomic<bool> connectStarted{false};
+    // Which backend na_client_create built, kept for the same reason the server handle keeps its
+    // own: a setter has to be able to refuse a request the backend cannot serve AT THE SETTER
+    // rather than deferring the failure to connect (issue #58 facet 4). Set once in
+    // na_client_create and never written again.
+    na_client_backend backendKind = NA_CLIENT_BACKEND_SYSTEM;
     std::unique_ptr<naudio::net::AudioStreamClient> client;
 };
 
@@ -560,6 +565,7 @@ extern "C" na_stream_client* na_client_create(na_client_backend backend, const c
                 setError(NA_ERR_INVALID);
                 return nullptr;
         }
+        c->backendKind = backend;
 
         c->client = std::make_unique<naudio::net::AudioStreamClient>(
             std::string(host), static_cast<std::uint16_t>(port),
@@ -608,6 +614,13 @@ extern "C" void na_client_destroy(na_stream_client* client) {
 extern "C" na_error_t na_client_set_playback_device(na_stream_client* client, int backend_id) {
     NA_GUARD(NA_ERR_BACKEND, {
         if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        // Extends the A3 gate to the device/identity setters (issue #58 facet 3). These are bare
+        // member writes — std::string and std::optional<int>, no lock — and the RECONNECT worker
+        // re-runs performHandshake, which reads exactly those members. A concurrent std::string
+        // assignment against that read is UB, and naudio.h explicitly licenses the trigger: "You
+        // MAY call any client method from inside an event callback", e.g. from on_reconnecting.
+        // The callback setters were given this same gate for this same reason.
+        if (client->connectStarted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
         client->client->setPlaybackDevice(backend_id);
         return NA_OK;
     });
@@ -616,6 +629,19 @@ extern "C" na_error_t na_client_set_playback_device(na_stream_client* client, in
 extern "C" na_error_t na_client_set_capture_device(na_stream_client* client, int backend_id) {
     NA_GUARD(NA_ERR_BACKEND, {
         if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        if (client->connectStarted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        // Match the server sibling (issue #58 facet 4). na_server_set_capture_device has always
+        // rejected the NULL backend with NA_ERR_UNSUPPORTED; the client forwarded unconditionally
+        // and returned NA_OK, so the failure was DEFERRED to connect — which by then had run a
+        // live handshake before dying with "NULL backend: capture (TX) is unsupported", and under
+        // the one-shot rule left the handle spent. Two public setters, the same impossible
+        // request, one NA_OK and one NA_ERR_UNSUPPORTED; that asymmetry was the defect. TX from a
+        // NULL-backend client goes through na_client_set_tx_inject, which is what naudio.h
+        // already points a caller at.
+        if (client->backendKind == NA_CLIENT_BACKEND_NULL) {
+            setError(NA_ERR_UNSUPPORTED);
+            return NA_ERR_UNSUPPORTED;
+        }
         client->client->setCaptureDevice(backend_id);
         return NA_OK;
     });
@@ -684,6 +710,10 @@ extern "C" na_error_t na_client_set_identity(na_stream_client* client, const cha
                                              const char* operator_name, const char* location) {
     NA_GUARD(NA_ERR_BACKEND, {
         if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        // #58 facet 3 — see na_client_set_playback_device. These three are the std::string
+        // members performHandshake reads on every reconnect attempt, so this is the setter the
+        // data race was actually about.
+        if (client->connectStarted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
         if (callsign != nullptr) client->client->setCallsign(callsign);
         if (operator_name != nullptr) client->client->setOperatorName(operator_name);
         if (location != nullptr) client->client->setLocation(location);
