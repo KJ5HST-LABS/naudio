@@ -175,6 +175,28 @@ public:
     bool setSendBufferAtLeast(int bytes);
     bool setRecvBufferAtLeast(int bytes);
 
+    // Sets SO_SNDBUF / SO_RCVBUF toward `bytes` and, unlike the two above, will SHRINK a buffer
+    // that is already larger. Returns the size the kernel actually settled on, or 0 if the
+    // socket is invalid or the option could not be read back.
+    //
+    // THE RETURN VALUE IS THE CONTRACT, not the argument. No kernel is obliged to honour the
+    // request, and the ways they decline differ enough that "did it work" is only answerable by
+    // reading it back — which is why this returns the effective size rather than a bool.
+    // MEASURED on macOS/arm64 over loopback TCP: a request of 65536 AFTER connect is honoured
+    // exactly (65536), while the SAME request made BEFORE connect is clamped up to a floor
+    // (8192 -> 65328 SO_SNDBUF, 8192 -> 326640 SO_RCVBUF) because auto-sizing has not yet been
+    // pinned. Linux commonly reports back double what was asked. So callers that depend on the
+    // size — as the send-budget arm in tests/net/test_socket.cpp does — must assert on this
+    // return, never on the request (issue #74).
+    //
+    // Shrinking a TCP receive buffer bounds the peer's advertised window, which is what makes a
+    // "stalled peer" wedge cheap and, more importantly, PLATFORM-INDEPENDENT: without it the
+    // wedge costs whatever the platform's loopback happens to absorb, MEASURED at ~540 KB on
+    // macOS but at more than 8 MB on Winsock, which is what forced the budget arm to be
+    // POSIX-only in the first place.
+    int setSendBufferSize(int bytes);
+    int setRecvBufferSize(int bytes);
+
     // The bound local port, or 0 if unbound/unknown.
     std::uint16_t localPort() const;
 

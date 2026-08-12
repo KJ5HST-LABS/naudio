@@ -28,10 +28,19 @@ namespace {
 // Establishes a connected TCP triple over loopback: a listening server, the
 // client end, and the server-accepted end. Single-threaded — on loopback the
 // connect completes into the listen backlog, then accept() dequeues it.
-bool makeTcpPair(Socket& server, Socket& client, Socket& accepted) {
+//
+// listenerRecvBuf, when nonzero, shrinks the LISTENER's receive buffer before the peer
+// connects, so the accepted socket inherits a bounded receive window. That ordering is the
+// whole point of the parameter and cannot be replaced by setting the accepted socket
+// afterwards: a TCP receive window is negotiated during the handshake, and MEASURED on
+// windows-latest a post-connect SO_RCVBUF is reported back by getsockopt while the connection
+// goes on absorbing 8 MB in 39 ms (issue #74). Only SendAllStopsAtItsBudgetWhenThePeerOnly-
+// Trickles passes it; every other caller keeps the kernel's defaults.
+bool makeTcpPair(Socket& server, Socket& client, Socket& accepted, int listenerRecvBuf = 0) {
     std::string err;
     server = Socket::listenTcp("", 0, true, &err);
     if (!server.valid()) return false;
+    if (listenerRecvBuf > 0) server.setRecvBufferSize(listenerRecvBuf);
     std::uint16_t port = server.localPort();
     if (port == 0) return false;
     client = Socket::connectTcp("127.0.0.1", port, 2000, &err);
@@ -176,12 +185,6 @@ TEST(Socket, SendTimesOutWhenPeerStopsReading) {
 // rather than the bound. MEASURED before this arm existed: 9 partial writes and 3263 ms
 // against a 200 ms deadline (16.3x) for a peer draining 32 KB every 40 ms.
 //
-// THE PEER BURSTS AND THEN GOES IDLE FOR LONGER THAN THE DEADLINE, deliberately. In that
-// same measurement the partial writes arose from scheduling JITTER — the drainer's sleep
-// occasionally overrunning the deadline — which is not something to build an assertion on.
-// Here the idle window (kBurstIdleMs) is longer than the deadline by construction, so every
-// ::send is guaranteed to hand back a partial count and the re-arm is not left to chance.
-//
 // WHAT PROVES THE FAULT FIRED, as opposed to the setup merely running. A dead peer also
 // makes this call return false at about one deadline, so the elapsed time alone cannot tell
 // "the budget stopped a call that was making progress" from "nothing ever moved" — the arm
@@ -190,70 +193,112 @@ TEST(Socket, SendTimesOutWhenPeerStopsReading) {
 // peer frees is room the kernel immediately fills from our buffer, and a nonzero drain
 // during the call is therefore forward progress that was interrupted.
 //
-// NOT REGISTERED ON WINDOWS, and this is a real coverage gap rather than a tidy-up. MEASURED
-// on windows-latest (run 31448166393, the first CI trip of this arm): the timed 8 MB send
-// SUCCEEDED in 545 ms with the peer draining 0 bytes, so the fill never wedged the socket at
-// all. The mechanism is that the fill runs with kDeadlineMs already armed and Winsock
-// loopback absorbs steadily but slowly enough that one 64 KB chunk crosses 200 ms with a
-// partial write — so THE BUDGET UNDER TEST TERMINATES ITS OWN SETUP, the fill stops early
-// with the buffer not full, and the timed call sails into the remaining capacity.
+// THE WEDGE IS BUILT BY SHRINKING THE SOCKET BUFFERS, NOT BY FILLING THEM (issue #74). The
+// arm used to push 64 KB chunks until sendAll returned false, which staged the premise using
+// THE VERY PRIMITIVE UNDER TEST — so on Winsock the budget terminated its own setup: MEASURED
+// on windows-latest (run 31448166393) the fill stopped early with the buffer not full and the
+// timed 8 MB send then SUCCEEDED in 545 ms with the peer draining 0 bytes. Re-tuning the fill
+// cannot fix that shape, only move it. Shrinking SO_SNDBUF/SO_RCVBUF instead makes the
+// capacity small and KNOWN, so a payload many times larger than it arrives already wedged
+// after the first instant absorption, and there is no setup for the budget to terminate.
 //
-// The obvious repair — fill under a long deadline, then arm the short one — was tried and
-// REJECTED ON MEASUREMENT, not on taste: it wedges the buffer properly but then the
-// un-budgeted control passes too (M1 re-run: mutant GREEN, call ended at ~1 s instead of
-// running to the ceiling), because a fully wedged buffer produces a zero-progress window
-// that ends the call on its own. The configuration below is the one mutation actually proved
-// discriminating, and it is proved on macOS only. Both facts are stated because a
-// tuned-on-one-platform arm that silently stops discriminating elsewhere is worse than an
-// arm that says where it works. Issue #74 carries both measurements and three candidate
-// designs for a detector that works on every platform.
-#ifndef _WIN32
+// THE RECEIVE WINDOW IS BOUNDED BEFORE THE HANDSHAKE, AND THAT IS NOT INTERCHANGEABLE WITH
+// AFTER. This arm shrinks the same buffer twice, on purpose, because the two platforms need
+// opposite things and each ignores the other's:
+//
+//   * on the LISTENER, before the client connects (inherited by the accepted socket).
+//     MEASURED on windows-latest: without this, a post-connect SO_RCVBUF is reported back by
+//     getsockopt as 65536 while the connection absorbs the whole 8 MB payload in 39 ms with
+//     the peer reading nothing — a TCP receive window is negotiated during the handshake, so
+//     setting it afterwards is simply too late there.
+//   * on the endpoints, after connect. MEASURED on macOS/arm64: a post-connect request is
+//     honoured exactly (65536 -> 65536) while a pre-connect one is clamped up to a floor
+//     (8192 -> 65328 / 326640) because auto-sizing has not been pinned yet, so the listener
+//     set alone leaves the receiver at 326640 and the arm runs 2654..3312 ms.
+//
+// THE CLIENT SENDS AND THE ACCEPTED SOCKET RECEIVES, which is the reverse of the other arms
+// here and is forced by the above: the receiver has to be the socket that can inherit a
+// pre-handshake window, and only the accepted socket can.
+//
+// THE PEER DRAINS OFTEN AND IN SMALL PIECES — kDrainIdleMs is far SHORTER than the deadline,
+// which is the opposite of what this arm used to do and is the change that made it work
+// everywhere. #74 recorded the surviving band as D < I < 2D, and that is the constraint for a
+// LARGE, RARE drain: a deadline window can then fall entirely between two bursts, the ::send
+// returns zero progress, and sendAll fails on its own limb with the budget never consulted —
+// which is exactly how the un-budgeted control used to pass. With I << D every window contains
+// several bursts, so a zero-progress window is impossible by construction and only the budget
+// can end the call.
+//
+// MEASURED, 4 shipped + 4 mutant runs per configuration, mutation = the budget check deleted:
+//
+//   buffers      shipped call ms    mutant caught
+//   default      202..303           2 of 4      <- what this arm used to be
+//   64 KiB       206..207           4 of 4      <- shipped below
+//
+// The old configuration was a COIN FLIP, not a detector, and that is the finding this rewrite
+// rests on rather than the Windows gate alone: re-running the documented M1 mutation against
+// the shipped arm on macOS/arm64 caught it in 1 of 3 runs, failing on `callMs 1631 vs 1600` —
+// a 31 ms margin on a tuned wall-clock threshold. The configuration below fails the mutant
+// through the RESCUE PATH at the 5 s ceiling instead, a ~20x margin that needs no threshold.
+//
+// A NEGATIVE CONTROL, so the drain rate is not read as arbitrary: doubling it to 64 KB every
+// 40 ms takes BOTH the shipped arm and the mutant green — the peer then consumes the payload
+// inside the ceiling and there is nothing left to interrupt. The payload must outrun the
+// drain over the whole ceiling (8 MiB vs ~800 KB/s x 5 s), and that relation, not the literal
+// 8 MiB, is what the arm depends on.
 TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
-    Socket server, client, accepted;
-    ASSERT_TRUE(makeTcpPair(server, client, accepted));
-
     constexpr int kDeadlineMs = 200;
-    constexpr std::size_t kBurstBytes = 256 * 1024;
-    constexpr int kBurstIdleMs = 300;  // > kDeadlineMs, so the next send always re-arms
-    ASSERT_TRUE(accepted.setSendTimeout(kDeadlineMs));
-    client.setRecvTimeout(50);
+    constexpr int kBufferBytes = 64 * 1024;
+    constexpr std::size_t kDrainChunk = 32 * 1024;
+    constexpr int kDrainIdleMs = 40;  // << kDeadlineMs — see the note above
+    constexpr std::size_t kPayloadBytes = 8 * 1024 * 1024;
 
-    // Fill to real backpressure first, so the timed call below starts wedged rather than
-    // streaming into an empty buffer.
-    const std::vector<std::uint8_t> chunk(64 * 1024, 0xAB);
-    constexpr long kFillCeilingBytes = 64L * 1024 * 1024;
-    long filled = 0;
-    while (filled < kFillCeilingBytes && accepted.sendAll(chunk.data(), chunk.size()))
-        filled += static_cast<long>(chunk.size());
-    ASSERT_LT(filled, kFillCeilingBytes)
-        << "the fill reached its ceiling without ever blocking, so no wedge existed and this "
-           "arm proves nothing";
+    Socket server, client, accepted;
+    ASSERT_TRUE(makeTcpPair(server, client, accepted, kBufferBytes));
+
+    const int effSnd = client.setSendBufferSize(kBufferBytes);
+    const int effRcv = accepted.setRecvBufferSize(kBufferBytes);
+    ASSERT_TRUE(client.setSendTimeout(kDeadlineMs));
+    accepted.setRecvTimeout(50);
+
+    // THE KERNEL ACCEPTED THE REQUEST — which is a weaker statement than it looks, and is
+    // deliberately not called the premise. MEASURED on windows-latest: getsockopt reported
+    // 65536 back on a connection that then absorbed 8 MB in 39 ms, so A READBACK IS NOT
+    // EVIDENCE THE WINDOW SHRANK ON THE WIRE. What this pair of assertions actually catches is
+    // a setter that does nothing at all (proved: a resizeSocketBuffer stubbed to skip its
+    // setsockopt reddens here 2 of 2 in 0 ms). The BEHAVIOURAL premise — that the socket really
+    // wedged — is carried by EXPECT_FALSE(sendOk) and the drain check below, and their failure
+    // messages say so. 4x leaves room for the rounding conventions (Linux commonly reports back
+    // double) without leaving room for a platform that ignored the call.
+    ASSERT_GT(effSnd, 0) << "SO_SNDBUF could not be read back";
+    ASSERT_GT(effRcv, 0) << "SO_RCVBUF could not be read back";
+    ASSERT_LE(effSnd, 4 * kBufferBytes)
+        << "this platform declined the send-buffer shrink (asked " << kBufferBytes << ", got "
+        << effSnd << ")";
+    ASSERT_LE(effRcv, 4 * kBufferBytes)
+        << "this platform declined the receive-buffer shrink (asked " << kBufferBytes << ", got "
+        << effRcv << ")";
 
     std::atomic<bool> stop{false};
     std::atomic<bool> sending{false};
     std::atomic<long> drainedDuringCall{0};
     std::thread burster([&]() {
-        std::vector<std::uint8_t> sink(kBurstBytes);
-        // Hold the first burst until the timed call is in flight. MEASURED without this:
-        // the burst that opens the window lands BEFORE the send starts, the budget then
-        // ends the call at ~200 ms, and the next burst is not due until 300 ms — so the
-        // call is bracketed by two bursts and drainedDuringCall reads 0, tripping the
-        // precondition below. The window still opens for the send either way; what this
-        // fixes is that the evidence lands inside the interval being measured.
+        std::vector<std::uint8_t> sink(kDrainChunk);
+        // Hold the first drain until the timed call is in flight, so the evidence the
+        // precondition below reads lands INSIDE the interval being measured.
         while (!sending.load() && !stop.load())
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         while (!stop.load()) {
-            RecvResult r = client.recv(sink.data(), sink.size());
+            RecvResult r = accepted.recv(sink.data(), sink.size());
             if (r.status == IoStatus::Ok && sending.load())
                 drainedDuringCall.fetch_add(static_cast<long>(r.bytes));
-            std::this_thread::sleep_for(std::chrono::milliseconds(kBurstIdleMs));
+            std::this_thread::sleep_for(std::chrono::milliseconds(kDrainIdleMs));
         }
     });
 
-    // 8 MB at one burst per kBurstIdleMs is ~9.6 s of drip-feeding, so without the budget
-    // this call cannot finish inside the ceiling below — it reddens through the rescue path
-    // rather than through a tight wall-clock threshold.
-    const std::vector<std::uint8_t> big(8 * 1024 * 1024, 0xCD);
+    // Larger than the peer can take inside the ceiling, so without the budget this call
+    // reddens through the rescue path rather than through a tight wall-clock threshold.
+    const std::vector<std::uint8_t> big(kPayloadBytes, 0xCD);
     std::atomic<bool> finished{false};
     std::atomic<bool> sendOk{true};
     std::atomic<long> callMs{-1};
@@ -261,7 +306,7 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
     std::thread sender([&]() {
         sending.store(true);
         const auto t0 = std::chrono::steady_clock::now();
-        sendOk.store(accepted.sendAll(big.data(), big.size()));
+        sendOk.store(client.sendAll(big.data(), big.size()));
         callMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now() - t0)
                          .count());
@@ -277,12 +322,11 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
     if (!finished.load()) {
         stop.store(true);
         std::vector<std::uint8_t> sink(1 << 20);  // rescue: drain hard so the send can finish
-        while (!finished.load()) client.recv(sink.data(), sink.size());
+        while (!finished.load()) accepted.recv(sink.data(), sink.size());
         burster.join();
         sender.join();
-        FAIL() << "sendAll ran past " << kDeadlineMs * 25
-               << " ms against a peer draining " << kBurstBytes << " bytes every "
-               << kBurstIdleMs
+        FAIL() << "sendAll ran past " << kDeadlineMs * 25 << " ms against a peer draining "
+               << kDrainChunk << " bytes every " << kDrainIdleMs
                << " ms — the whole-call budget is not in effect, so each partial write is "
                   "re-arming the per-send deadline (issue #70)";
     }
@@ -290,9 +334,17 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
     burster.join();
     sender.join();
 
+    // THIS IS THE BEHAVIOURAL PREMISE, not just an outcome: a call that succeeded never
+    // wedged, and the readback assertions above cannot tell you that (windows-latest reported
+    // 65536 while absorbing 8 MB in 39 ms). So the message names the likely cause rather than
+    // only the symptom — the next reader's first question is "did the shrink reach the wire".
     EXPECT_FALSE(sendOk.load())
-        << "the peer never took 8 MB at one burst per " << kBurstIdleMs
-        << " ms, so this call did not end at the budget";
+        << "the peer took the whole " << kPayloadBytes << " byte payload at " << kDrainChunk
+        << " bytes every " << kDrainIdleMs << " ms (SO_SNDBUF " << effSnd << ", SO_RCVBUF "
+        << effRcv
+        << " as reported by getsockopt) — the socket never wedged, so either this platform's "
+           "receive window is not bounded by the listener's SO_RCVBUF or the drain outran the "
+           "payload; this call did not end at the budget";
     ASSERT_GT(drainedDuringCall.load(), 64 * 1024)
         << "the peer drained nothing while the send was running, so this arm measured a "
            "DEAD peer — the same thing SendTimesOutWhenPeerStopsReading already covers, and "
@@ -300,10 +352,11 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
 
     // It waited (so the budget is doing the work, not an instant refusal) and it stopped
     // well inside the drip-feed's own timescale. Both bounds derive from kDeadlineMs.
+    // MEASURED at 206..207 ms shipped, so the upper bound carries ~7x headroom for a loaded
+    // runner while still sitting 3x below the ceiling the mutant runs to.
     EXPECT_GE(callMs.load(), kDeadlineMs / 2);
     EXPECT_LT(callMs.load(), kDeadlineMs * 8);
 }
-#endif  // !_WIN32 — see the measured Winsock note above
 
 // The control for the arms above: with the same deadline armed, a peer that DRAINS must
 // still take everything. Without it, "sendAll returned false" could not distinguish a

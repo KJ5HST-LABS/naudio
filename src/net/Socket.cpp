@@ -444,6 +444,24 @@ bool raiseSocketBuffer(socket_t h, int optname, int bytes) {
     }
     return current >= bytes;
 }
+
+// Set one SO_*BUF option to `bytes`, allowing a SHRINK, and report what the kernel settled on.
+//
+// Deliberately a SEPARATE function rather than a flag on raiseSocketBuffer above. That one's
+// "never shrink" clause is load-bearing for UDP — macOS refuses a sendto() larger than SO_SNDBUF
+// — so a caller wanting a smaller buffer must not be able to reach it by passing a smaller
+// number to the primitive whose whole contract is that it cannot lower one.
+int resizeSocketBuffer(socket_t h, int optname, int bytes) {
+    if (h == kInvalidSocket || bytes <= 0) return 0;
+    int want = bytes;
+    ::setsockopt(h, SOL_SOCKET, optname, reinterpret_cast<char*>(&want), sizeof(want));
+    int current = 0;
+    socklen_t len = sizeof(current);
+    if (::getsockopt(h, SOL_SOCKET, optname, reinterpret_cast<char*>(&current), &len) != 0) {
+        return 0;
+    }
+    return current;
+}
 }  // namespace
 
 bool Socket::setSendBufferAtLeast(int bytes) {
@@ -452,6 +470,14 @@ bool Socket::setSendBufferAtLeast(int bytes) {
 
 bool Socket::setRecvBufferAtLeast(int bytes) {
     return raiseSocketBuffer(handle_.load(), SO_RCVBUF, bytes);
+}
+
+int Socket::setSendBufferSize(int bytes) {
+    return resizeSocketBuffer(handle_.load(), SO_SNDBUF, bytes);
+}
+
+int Socket::setRecvBufferSize(int bytes) {
+    return resizeSocketBuffer(handle_.load(), SO_RCVBUF, bytes);
 }
 
 bool Socket::setRecvTimeout(int ms) {
