@@ -125,7 +125,7 @@ AudioMixer::TxResult AudioMixer::submitTxAudio(const std::string& clientId,
             if (canPreempt(ourPriority, txOwnership_->priority)) {
                 // Someone else holds it and we outrank them. Unreachable in the shipping
                 // server — every session is hard-wired Normal and canPreempt is strict-
-                // greater, and the frozen spec pins that (audio-streaming-protocol-v1.md:326)
+                // greater, and the frozen spec pins that (audio-streaming-protocol-v1.md:328)
                 // — but specified so the proposed §13.3 priority feature cannot inherit the bug.
                 if (recovered) {
                     result = TxResult::DeclinedRecovered;

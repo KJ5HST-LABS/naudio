@@ -165,7 +165,7 @@ private:
     // CONNECTION_TIMEOUT_MS of not SENDING (AudioProtocolHandler::isConnectionTimedOut);
     // this applies the same window to a peer that will not DRAIN. The coupling is
     // deliberate and is a real coupling: CONNECTION_TIMEOUT_MS is frozen by the wire spec
-    // (docs/audio-streaming-protocol-v1.md:289-290 and the constants table at :550-551), so
+    // (docs/audio-streaming-protocol-v1.md:291-292 and the constants table at :552-553), so
     // moving it there moves this cap with it. That is the intended behaviour, not a
     // side effect — but it means this line is not free to retune locally.
     //
