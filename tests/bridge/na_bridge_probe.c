@@ -136,7 +136,11 @@ static void sleep_ms(int ms) {
  * na_client_inject_tx_audio. No capture device is involved — the NULL backend cannot capture, and
  * this is the reason na_client_set_tx_inject exists. */
 #define TX_FRAME_SAMPLES 480    /* 10 ms at 48 kHz mono S16 — the format the bridge negotiates */
-#define TX_TONE_PEAK     16383  /* matches the Hamlib dummy's tone amplitude and SELFTEST_TONE_PEAK */
+/* Naudio-internal injection only: this tone is generated here and consumed by this probe, and
+ * never crosses Hamlib. It therefore does NOT have to match the dummy backend, and no longer
+ * does — since PR #2116 commit 961093f2 the dummy's tone reaches the bridge through an F32->S16
+ * conversion and arrives at 16384. Keep this equal to SELFTEST_TONE_PEAK, not to the dummy. */
+#define TX_TONE_PEAK     16383
 
 /* A square wave, so |sample| is exactly `peak` on every sample and the expected value downstream is
  * a derived constant rather than something to approximate. */
@@ -259,7 +263,11 @@ static void report(const char* label, double secs) {
  * cheap here precisely because a server can be told to inject zeros. */
 #define SELFTEST_FRAME_SAMPLES 480              /* 10 ms of 48 kHz mono S16 */
 #define SELFTEST_FRAMES        60
-#define SELFTEST_TONE_PEAK     16383            /* matches the Hamlib dummy's tone amplitude */
+/* Self-injected and self-checked; never crosses Hamlib, so this is not the dummy backend's
+ * amplitude and must not be "corrected" to it. Through the bridge the dummy now arrives at
+ * 16384 (F32->S16 conversion, PR #2116 commit 961093f2) — which is exactly why --expect content
+ * asserts peak > 0 rather than an exact value. */
+#define SELFTEST_TONE_PEAK     16383
 
 static int selftest_arm(na_audio_server* srv, na_stream_client* cli, int tone, const char* label) {
     unsigned char frame[SELFTEST_FRAME_SAMPLES * 2];

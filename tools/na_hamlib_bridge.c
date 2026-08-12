@@ -12,9 +12,21 @@
  * FEC only protects the link it runs on, so placing this box on the far side of the
  * Internet from the rig would defeat the point.
  *
- * DATA PATH (both directions are straight S16LE byte copies — no resample, no convert):
+ * DATA PATH (both directions are straight S16LE byte copies ON THIS SIDE — this file never
+ * resamples and never converts a sample format):
  *   RX: rig_stream_read(AUDIO_RX, S16@48k) ---> na_server_inject_audio()  [fan-out + FEC]
  *   TX: na_server_tx_audio_cb() --ring--> rig_stream_write(AUDIO_TX, S16@48k)
+ *
+ * That is a claim about THIS PROCESS, not about the whole path. Since Hamlib PR #2116 commit
+ * 961093f2, libhamlib itself may convert underneath these calls: backends now advertise only
+ * their hardware-native capability, and the streaming core serves anything else through a
+ * frontend conversion pipeline. S16@48k is not native on every backend — the dummy now
+ * advertises PCM_F32|OPUS natively — so the request above is commonly served through an
+ * F32->S16 conversion, and on hardware whose native rate is not 48 kHz it adds libsamplerate
+ * resampling inside the very hop this bridge exists to keep short. That is a deliberate
+ * trade: converting reaches far more hardware than demanding native would, and demanding it
+ * (rig_stream_config.require_native = 1) would fail outright against the dummy backend. What
+ * is NOT acceptable is doing it silently, so open_stream() reports the active stages at open.
  *
  * Pure C: links the naudio C ABI (naudio.h) + libhamlib (<hamlib/rig.h>). The C ABI's
  * na_server_set_reliability_profile()/_set_audio_format() expose the FEC profile + mono
@@ -325,8 +337,53 @@ static na_reliability_profile parse_profile(const char *s) {
     return NA_RELIABILITY_UDP_WAN;   /* default */
 }
 
-/* Open one stream of `type` as S16 @ 48k / `channels`. On failure, dump the backend's caps
- * so the user can see what it actually offers. Returns RIG_OK / negative. */
+/* Print a 0-terminated rate list from struct rig_stream_caps, bounded by the array size so a
+ * caps block that fills every slot without a terminator cannot run off the end. */
+static void print_rates(FILE *f, const int *rates) {
+    for (int i = 0; i < HAMLIB_MAX_STREAM_RATES && rates[i]; i++)
+        fprintf(f, "%s%d", i ? "," : "", rates[i]);
+}
+
+/* Name the conversion stages libhamlib is running between the hardware and an open stream.
+ *
+ * The bridge asks for S16@48k because that is what naudio carries. Since PR #2116 commit
+ * 961093f2 that request is served whether or not the hardware speaks it, so silence here is
+ * ambiguous — it could mean a native stream or an undisclosed resample sitting in the local
+ * hop. One line at open removes the ambiguity. Reported, never enforced: require_native is
+ * left at 0 deliberately (see the DATA PATH note in this file's header).
+ *
+ * Compiled out against a streaming libhamlib built before 961093f2, which has no such call. */
+static void report_conversions(rig_stream_t *stream, rig_stream_type_t type) {
+#ifdef NAUDIO_HAMLIB_HAS_STREAM_CONV
+    int conv = rig_stream_get_conversions(stream);
+    if (conv < 0) {
+        fprintf(stderr, "na_hamlib_bridge: stream type=%d: cannot read conversion state: %s\n",
+                (int)type, rigerror(conv));
+        return;
+    }
+    if (conv == RIG_STREAM_CONV_NONE) {
+        printf("na_hamlib_bridge: stream type=%d S16@48k is NATIVE (libhamlib converts nothing)\n",
+               (int)type);
+    } else {
+        /* Rate conversion is called out first and by name: it is the one stage that adds
+         * latency and libsamplerate cost to the hop this bridge exists to keep short. */
+        printf("na_hamlib_bridge: stream type=%d S16@48k is CONVERTED by libhamlib:%s%s%s "
+               "(conv=0x%x)\n",
+               (int)type,
+               (conv & RIG_STREAM_CONV_RATE)     ? " resample" : "",
+               (conv & RIG_STREAM_CONV_FORMAT)   ? " sample-format" : "",
+               (conv & RIG_STREAM_CONV_CHANNELS) ? " channel-map" : "",
+               (unsigned)conv);
+    }
+    fflush(stdout);
+#else
+    (void)stream; (void)type;
+#endif
+}
+
+/* Open one stream of `type` as S16 @ 48k / `channels`. On success, report what libhamlib is
+ * converting. On failure, dump the backend's caps so the user can see what it actually offers.
+ * Returns RIG_OK / negative. */
 static int open_stream(RIG *rig, rig_stream_type_t type, int channels, rig_stream_t **out) {
     struct rig_stream_config *cfg = rig_stream_config_alloc();
     if (!cfg) return -RIG_ENOMEM;
@@ -336,15 +393,28 @@ static int open_stream(RIG *rig, rig_stream_type_t type, int channels, rig_strea
     cfg->channels = channels;
     int r = rig_stream_open(rig, cfg, out);
     rig_stream_config_free(cfg);
-    if (r != RIG_OK) {
-        fprintf(stderr, "na_hamlib_bridge: rig_stream_open(type=%d, S16@48k/%dch): %s\n",
-                (int)type, channels, rigerror(r));
-        int n = rig_stream_caps_count(rig);
-        for (int i = 0; i < n; i++) {
-            const struct rig_stream_caps *c = rig_stream_caps_at(rig, i);
-            if (c) fprintf(stderr, "  caps[%d]: type=%d formats=0x%x channels=%d..%d\n",
-                           i, (int)c->type, (unsigned)c->formats, c->channels_min, c->channels_max);
-        }
+    if (r == RIG_OK) {
+        report_conversions(*out, type);
+        return r;
+    }
+    fprintf(stderr, "na_hamlib_bridge: rig_stream_open(type=%d, S16@48k/%dch): %s\n",
+            (int)type, channels, rigerror(r));
+    int n = rig_stream_caps_count(rig);
+    for (int i = 0; i < n; i++) {
+        const struct rig_stream_caps *c = rig_stream_caps_at(rig, i);
+        if (!c) continue;
+        /* Both views. The classic fields are the EFFECTIVE set — everything rig_stream_open
+         * would accept, conversions included — so on their own they no longer tell a reader
+         * what the hardware does, which is the question a failed open raises. */
+        fprintf(stderr, "  caps[%d]: type=%d formats=0x%x channels=%d..%d rates=",
+                i, (int)c->type, (unsigned)c->formats, c->channels_min, c->channels_max);
+        print_rates(stderr, c->sample_rates);
+#ifdef NAUDIO_HAMLIB_HAS_STREAM_CONV
+        fprintf(stderr, "\n            native: formats=0x%x channels=%d..%d rates=",
+                (unsigned)c->native_formats, c->native_channels_min, c->native_channels_max);
+        print_rates(stderr, c->native_sample_rates);
+#endif
+        fputc('\n', stderr);
     }
     return r;
 }

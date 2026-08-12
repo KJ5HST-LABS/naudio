@@ -54,6 +54,13 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE)
             set(CMAKE_REQUIRED_INCLUDES ${HAMLIB_INCLUDE_DIRS})
             set(CMAKE_REQUIRED_LIBRARIES ${HAMLIB_LINK_LIBRARIES})
             check_symbol_exists(rig_stream_open "hamlib/rig.h" NAUDIO_HAMLIB_HAS_STREAM)
+            # Hamlib PR #2116 commit 961093f2 moved sample-format/rate/channel conversion out of
+            # the backends and into the streaming core, and added rig_stream_get_conversions() to
+            # report which stages are running. The gate above is a PRESENCE check on the streaming
+            # API as a whole, so a prefix built before that commit satisfies it and still lacks
+            # this call. Detect it separately rather than assuming the two arrived together.
+            check_symbol_exists(rig_stream_get_conversions "hamlib/rig.h"
+                                NAUDIO_HAMLIB_HAS_STREAM_CONV)
             unset(CMAKE_REQUIRED_INCLUDES)
             unset(CMAKE_REQUIRED_LIBRARIES)
             if(NOT NAUDIO_HAMLIB_HAS_STREAM)
@@ -66,7 +73,17 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE)
                 target_link_directories(na_hamlib_bridge PRIVATE ${HAMLIB_LIBRARY_DIRS})
                 target_link_libraries(na_hamlib_bridge
                                       PRIVATE naudio ${HAMLIB_LINK_LIBRARIES} Threads::Threads)
-                message(STATUS "naudio: na_hamlib_bridge enabled (hamlib ${HAMLIB_VERSION})")
+                if(NAUDIO_HAMLIB_HAS_STREAM_CONV)
+                    target_compile_definitions(na_hamlib_bridge PRIVATE NAUDIO_HAMLIB_HAS_STREAM_CONV)
+                    message(STATUS "naudio: na_hamlib_bridge enabled (hamlib ${HAMLIB_VERSION}, "
+                                   "conversion reporting available)")
+                else()
+                    # Not a warning: the bridge is fully functional here, it just cannot say
+                    # whether libhamlib is converting for it. Worth one STATUS line so an operator
+                    # who never sees a conversion report knows which of the two reasons applies.
+                    message(STATUS "naudio: na_hamlib_bridge enabled (hamlib ${HAMLIB_VERSION}, "
+                                   "pre-961093f2 — cannot report conversions)")
+                endif()
             endif()
         endif()
     endif()
