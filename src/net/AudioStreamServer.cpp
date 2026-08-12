@@ -597,9 +597,7 @@ bool AudioStreamServer::start(std::string* err) {
     return true;
 }
 
-void AudioStreamServer::stop() {
-    if (!running_.exchange(false)) return;
-
+void AudioStreamServer::teardownSessions() {
     // Close all sessions (each signals its threads to exit).
     std::vector<std::shared_ptr<ClientSession>> snapshot;
     {
@@ -617,7 +615,12 @@ void AudioStreamServer::stop() {
         std::lock_guard<std::mutex> lock(sessionsMutex_);
         sessions_.clear();
     }
+}
 
+void AudioStreamServer::stop() {
+    if (!running_.exchange(false)) return;
+
+    teardownSessions();
     stopSharedAudio();
 
     // Close the transport to unblock the accept thread, then join it.
@@ -628,6 +631,27 @@ void AudioStreamServer::stop() {
     }
     if (transport) transport->close();
     if (acceptThread_.joinable()) acceptThread_.join();
+
+    // SECOND PASS — issue #57. The first pass above is NOT final: the accept thread can be part
+    // way through handleNewClient when it runs. handleNewClient samples running_ at entry, so a
+    // connection popped just before stop() proceeds to insert a session and call startRunThread()
+    // — and the barrier above passes precisely because threadStarted() has not run yet. Worse,
+    // the join we just did GUARANTEES it: acceptLoop cannot return until handleNewClient does, so
+    // stop() waits for the very thread that is creating the straggler. The old code then returned
+    // with activeThreads_ == 1 and a live detached runLoop; the destructor's stop() is a no-op
+    // (running_.exchange(false) already returned false), so nothing ever waited for that thread
+    // and ~AudioStreamServer destroyed runMutex_/sessionsMutex_/dispatcher_ underneath it.
+    //
+    // The same window lets handleNewClient's openSharedAudioLines() reopen captureStream_ after
+    // stopSharedAudio() moved it out, leaving a capture device open on a stopped server.
+    //
+    // Now that acceptThread_ is joined, no new client can be admitted, so this pass IS final —
+    // that ordering is the whole argument, which is why the repeat lives after the join and not
+    // before it. Both calls are idempotent: with no straggler this is a mutex acquire, an
+    // already-satisfied barrier predicate, and a set of null resets.
+    teardownSessions();
+    stopSharedAudio();
+
     {
         std::lock_guard<std::mutex> lock(runMutex_);
         transport_.reset();
@@ -782,6 +806,18 @@ void AudioStreamServer::handleNewClient(const std::shared_ptr<ClientConnection>&
     auto session = std::make_shared<ClientSession>(this, clientId, connection);
     {
         std::lock_guard<std::mutex> lock(sessionsMutex_);
+        // Re-check under the lock (issue #57). The running_ sample at entry is stale by now — the
+        // handshake-stage work above (device check, roster check, openSharedAudioLines) all takes
+        // time a stop() can land in. This does not by itself close the race (stop() can still pass
+        // its first barrier between this insert and startRunThread() below), which is why stop()
+        // repeats the whole teardown after joining the accept thread. What it buys is that the
+        // COMMON case never admits a client onto a stopping server: no session in a map that is
+        // about to be cleared, and no notifyClientConnected for a client that never really
+        // connected — an event a listener would otherwise have to un-see.
+        if (!running_.load()) {
+            connection->close();
+            return;
+        }
         sessions_[clientId] = session;
     }
     notifyClientConnected(clientId, address);

@@ -13,10 +13,13 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -1053,6 +1056,139 @@ TEST(Server, AScriptedTransportFactoryDrivesARealClientSession) {
     EXPECT_EQ(conn->countSent(ControlType::ConnectAccept), 1) << conn->diagnostics();
     EXPECT_EQ(fx.server.connectedClientIds(), std::vector<std::string>{"audio-1"});
     EXPECT_GT(fx.transport->acceptCalls(), 0);
+}
+
+// --- issue #57.1 — stop() vs a client already inside handleNewClient -----------------------
+//
+// A connection that PARKS the accept thread inside handleNewClient, holding no lock, in the
+// window between handleNewClient's entry running_ check and the session insert.
+//
+// remoteAddress() is the hook because of what it does NOT do: it is called at the top of
+// handleNewClient (src/net/AudioStreamServer.cpp:753) and takes no lock. The obvious
+// alternative — blocking the backend's openCaptureStream — is WRONG here: that runs under
+// runMutex_ (openSharedAudioLines takes it), so stop() would block in stopSharedAudio() before
+// reaching the barrier and the race would never be staged. The whole point is to let stop()
+// run its ENTIRE teardown while the accept thread sits in the window.
+class LatchedAddressConnection : public naudio::test::ScriptedClientConnection {
+public:
+    using ScriptedClientConnection::ScriptedClientConnection;
+
+    std::string remoteAddress() const override {
+        entered_.store(true);
+        std::unique_lock<std::mutex> lock(latchMutex_);
+        latchCv_.wait(lock, [this]() { return released_; });
+        return ScriptedClientConnection::remoteAddress();
+    }
+
+    bool waitUntilEntered(int timeoutMs) const {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (entered_.load()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return entered_.load();
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(latchMutex_);
+            released_ = true;
+        }
+        latchCv_.notify_all();
+    }
+
+private:
+    mutable std::atomic<bool> entered_{false};
+    mutable std::mutex latchMutex_;
+    mutable std::condition_variable latchCv_;
+    bool released_ = false;
+};
+
+// Counts the connect events a listener is told about.
+class ConnectCountingListener : public AudioStreamListener {
+public:
+    void onClientConnected(const std::string&, const std::string&) override {
+        connects_.fetch_add(1);
+    }
+    int connects() const { return connects_.load(); }
+
+private:
+    std::atomic<int> connects_{0};
+};
+
+// #57.1 — stop() must not return while a session admitted during its teardown is still live.
+//
+// Staged, not raced: the accept thread is held in handleNewClient's window while stop() runs its
+// close-all / barrier / clear pass, so the interleaving is deterministic rather than a timing
+// loop that may never hit it.
+//
+// PRE-FIX this reads clientCount() == 1. stop() passed the activeThreads_ == 0 barrier precisely
+// BECAUSE startRunThread() had not run yet, cleared sessions_, and then blocked in
+// acceptThread_.join() — which guarantees the straggler is inserted and its detached runLoop
+// spawned before stop() returns. Nothing ever joined that thread: the destructor's stop() is a
+// no-op once running_ is already false, so ~AudioStreamServer freed runMutex_/sessionsMutex_
+// under a running thread.
+//
+// WHAT THIS ARM DETECTS — MEASURED, three builds, not reasoned:
+//   - both fixes removed (original code): RED on connects(), which reads 1.
+//   - second teardown pass removed, re-check kept: GREEN.
+//   - both fixes in place: GREEN.
+//
+// So the detector is connects(), and it pins the running_ RE-CHECK at insert. Its observable is
+// the one thing no later cleanup can undo: a listener was told a client connected to a server
+// that had already stopped.
+//
+// clientCount() IS NOT A DETECTOR — it reads 0 in all three builds above. ClientSession::close()
+// erases the session from sessions_ itself (src/net/AudioStreamServer.cpp:487-489), so the
+// straggler removes its own evidence before the assertion runs. It is kept only as a plain
+// post-condition (a stopped server has an empty roster); do not read a green here as coverage.
+//
+// THE SECOND TEARDOWN PASS HAS NO DETECTOR IN THIS ARM, and that is a known gap rather than an
+// oversight. The interleaving it defends is: handleNewClient passes the re-check while running_
+// is still true, releases sessionsMutex_, and is descheduled BEFORE startRunThread(); stop()
+// then runs its whole first pass (the barrier passes because threadStarted() has not run) and
+// blocks in the join, and the spawn happens after. Staging that needs a latch between the insert
+// and startRunThread() — notifyClientConnected() at :787 sits exactly there and would be the
+// hook. The pass is justified by that argument and by being idempotent, NOT by a red test.
+TEST(Server, StopDoesNotStrandASessionAdmittedWhileItWasTearingDown) {
+    auto transport = std::make_shared<naudio::test::ScriptedServerTransport>();
+
+    // Declared BEFORE the server so it outlives it: the server holds a raw listener pointer and
+    // there is no removeStreamListener to hand it back.
+    ConnectCountingListener listener;
+
+    AudioStreamServer server{0};
+    server.setInjectOnlyMode(true);
+    server.setTransportFactory([transport]() { return transport; });
+    server.addStreamListener(&listener);
+
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    auto conn = std::make_shared<LatchedAddressConnection>("racer");
+    conn->pushConnectRequest();
+    transport->offer(conn);
+
+    // Park the accept thread in the window before touching stop().
+    ASSERT_TRUE(conn->waitUntilEntered(3000))
+        << "the accept thread never reached handleNewClient — the window was not staged, so a "
+           "green result here would be vacuous";
+
+    // stop() ends up blocked in acceptThread_.join() waiting for the thread the latch holds, so
+    // the release has to come from a third thread or this deadlocks.
+    std::thread releaser([conn]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        conn->release();
+    });
+    server.stop();
+    releaser.join();
+
+    EXPECT_EQ(server.clientCount(), 0)
+        << "stop() returned with a session in the map it had already cleared";
+    EXPECT_EQ(listener.connects(), 0)
+        << "a listener was told a client connected to a server that had already stopped";
+    EXPECT_FALSE(server.isRunning());
 }
 
 // The third state the transport-factory branch creates (L131): set, and returning nothing.

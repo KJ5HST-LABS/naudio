@@ -205,6 +205,11 @@ private:
     bool initializeSharedAudio(std::string* err);
     bool openSharedAudioLines(std::string* err);
     void stopSharedAudio();
+    // Close every live session, wait out the activeThreads_ barrier, and drop the map. Factored
+    // out of stop() because it must run TWICE (issue #57): the accept thread can be inside
+    // handleNewClient when the first pass runs, and only a pass made after acceptThread_ is
+    // joined is final.
+    void teardownSessions();
     void acceptLoop();
     void handleNewClient(const std::shared_ptr<ClientConnection>& connection);
     void rejectClient(const std::shared_ptr<ClientConnection>& connection, RejectReason reason,
