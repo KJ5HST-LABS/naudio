@@ -103,14 +103,120 @@ run_arm () {
     return $prc
 }
 
+# ------------------------------------------------- arm: a failed startup must NOT exit 0 (issue #16)
+#
+# The two arms above assert what a HEALTHY bridge delivers. This one asserts what a bridge that
+# never came up reports, which is the other half of the same supervisor contract: three failures
+# after the naudio server object exists reached the shared teardown by goto and fell through to
+# `return g_failed ? 1 : 0` with g_failed == 0 — g_failed is set only by a dead WORKER. So the
+# bridge printed its diagnostic to stderr and exited 0, and a supervisor (systemd, launchd, a
+# container restart policy) reads 0 as "completed its work and shut down cleanly" and does not
+# restart it. The bridge never comes up and its exit status actively argues against intervention.
+#
+# na_server_start failing on an already-taken port is staged here because it is the likeliest of the
+# three in real deployment — usually a previous instance that has not fully exited.
+#
+# THIS ARM'S PREMISE IS PLATFORM-DEPENDENT AND IT SAYS SO RATHER THAN ASSUMING IT. naudio's UDP
+# server binds with SO_REUSEADDR (src/net/UdpServerTransport.cpp:43), and the platforms disagree
+# about what that means for UDP. Measured 2026-08-12 with two controls, so the result is not one
+# implementation's opinion (Learning 183):
+#
+#                     UDP, reuse on BOTH      UDP, reuse on 2nd only     TCP, reuse on BOTH
+#     macOS           bind FAILS              bind fails                 bind fails
+#     Linux           bind SUCCEEDS           bind fails                 bind fails
+#
+# So on Linux the second bridge BINDS THE SAME PORT and starts, there is no failed startup, and
+# there is no exit code to assert. The arm reports that in so many words instead of passing quietly:
+# a skip that reads as a pass is exactly the failure the rest of this harness exists to prevent
+# (Learning 63). That Linux double-bind is a naudio-side defect in its own right, tracked separately
+# — this arm is a real detector on macOS and a declared no-op on Linux until it is fixed.
+run_exit_code_arm () {
+    alog="$workdir/exitcode.holder.log"
+    blog="$workdir/exitcode.second.log"
+
+    "$BRIDGE" -m 1 -S silence -p "$PORT" >"$alog" 2>&1 &
+    apid=$!
+    ready=0
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$apid" 2>/dev/null; then break; fi
+        if grep -q -- '-> naudio :' "$alog" 2>/dev/null; then ready=1; break; fi
+        sleep 0.1
+    done
+    if [ "$ready" -eq 0 ]; then
+        echo "FAIL bridge_arm/exit-code: the port-holding bridge never reported itself listening" >&2
+        sed 's/^/    | /' "$alog" >&2
+        kill -INT "$apid" 2>/dev/null
+        wait "$apid" 2>/dev/null
+        return 2
+    fi
+
+    # Deadline rather than a bare `wait`: on a platform where the premise does not hold the second
+    # bridge runs forever, and an unbounded wait here would hang ctest instead of reporting.
+    "$BRIDGE" -m 1 -S silence -p "$PORT" >"$blog" 2>&1 &
+    bpid=$!
+    exited=0
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$bpid" 2>/dev/null; then exited=1; break; fi
+        sleep 0.1
+    done
+    if [ "$exited" -eq 1 ]; then
+        wait "$bpid" 2>/dev/null
+        bexit=$?
+    else
+        kill -INT "$bpid" 2>/dev/null
+        wait "$bpid" 2>/dev/null
+        bexit=-1
+    fi
+
+    kill -INT "$apid" 2>/dev/null
+    wait "$apid" 2>/dev/null
+    aexit=$?
+
+    # The holder is also the SIGINT control: an orderly shutdown must still be 0, or the fix for
+    # this arm has been made by failing everything (issue #16's third acceptance item).
+    if [ "$aexit" -ne 0 ]; then
+        echo "FAIL bridge_arm/exit-code: the port-holding bridge exited $aexit on SIGINT," >&2
+        echo "  expected 0 — a clean operator shutdown must not report failure" >&2
+        sed 's/^/    | /' "$alog" >&2
+        return 1
+    fi
+
+    if grep -q -- '-> naudio :' "$blog" 2>/dev/null; then
+        echo "  bridge_arm/exit-code: PREMISE NOT MET on $(uname -s) — the second bridge bound the"
+        echo "    same UDP port and started, so no startup failure happened and this arm asserted"
+        echo "    NOTHING about issue #16. Not a bridge regression; see the SO_REUSEADDR table in"
+        echo "    this file. The arm is a live detector only where the second bind fails."
+        return 0
+    fi
+    if ! grep -q 'na_server_start' "$blog" 2>/dev/null; then
+        echo "FAIL bridge_arm/exit-code: the second bridge neither started nor failed in" >&2
+        echo "  na_server_start, so this arm cannot tell what it measured (harness fault)" >&2
+        sed 's/^/    | /' "$blog" >&2
+        return 2
+    fi
+    if [ "$bexit" -eq 0 ]; then
+        echo "FAIL bridge_arm/exit-code: na_server_start failed and the bridge still exited 0." >&2
+        echo "  This is issue #16: a supervisor reads 0 as a clean shutdown and will not restart," >&2
+        echo "  so the bridge never comes up and its exit status argues against intervention." >&2
+        sed 's/^/    | /' "$blog" >&2
+        return 1
+    fi
+    echo "  bridge_arm/exit-code: OK (a failed na_server_start exits $bexit, and SIGINT still 0)"
+    return 0
+}
+
 echo "bridge_arm: $BRIDGE on :$PORT, ${SECS}s per arm"
 
 run_arm tone content   || rc=$?
 # The negative control runs even if the first arm failed, because "both arms report content" and
 # "both arms report silence" are different diagnoses and the second arm is what tells them apart.
 run_arm silence silence || { arc=$?; [ "$rc" -eq 0 ] && rc=$arc; }
+# Runs even if the content arms failed, for the same reason they run independently of each other:
+# "the bridge delivers nothing" and "the bridge misreports a failed startup" are different
+# diagnoses, and only running both tells them apart.
+run_exit_code_arm       || { arc=$?; [ "$rc" -eq 0 ] && rc=$arc; }
 
 if [ "$rc" -eq 0 ]; then
-    echo "bridge_arm: OK — the bridge delivers content on tone and silence on silence"
+    echo "bridge_arm: OK — content on tone, silence on silence, and a failed startup exits non-zero"
 fi
 exit "$rc"

@@ -526,21 +526,38 @@ int main(int argc, char **argv) {
     }
 
     /* ---- naudio sink (fan-out + FEC) ---- */
+    /* Every failure from here down reaches the shared teardown by goto and then falls through to
+     * the single return at the bottom of main(). That return reports g_failed, which ONLY a dead
+     * worker sets (worker_failed) — so these three startup failures each printed a diagnostic to
+     * stderr and then exited 0. That is invisible interactively and not at all invisible to a
+     * supervisor: systemd, launchd, a wrapper script or a container restart policy reads 0 as "the
+     * process completed its work and shut down cleanly" and so does NOT restart. The bridge never
+     * comes up, and its exit status actively argues against intervention.
+     *
+     * Tracked separately from g_failed rather than folded into it: g_failed means "a worker died
+     * mid-run", this means "we never started", and the two reach the same teardown from opposite
+     * ends of the process lifetime. */
+    int startup_failed = 0;
     b.srv = na_server_create(NA_SERVER_BACKEND_NULL, na_port);
     if (!b.srv) {
         fprintf(stderr, "na_hamlib_bridge: na_server_create: %s\n", na_strerror(na_last_error()));
+        startup_failed = 1;
         goto teardown_rig;
     }
     if (na_server_set_reliability_profile(b.srv, profile) != NA_OK ||
         na_server_set_audio_format(b.srv, 48000, 16, channels) != NA_OK) {
         fprintf(stderr, "na_hamlib_bridge: server config: %s\n", na_strerror(na_last_error()));
+        startup_failed = 1;
         goto teardown_all;
     }
     if (b.tx) na_server_set_tx_audio_cb(b.srv, on_tx_frame, &b);
 
     char err[256];
+    /* The likeliest of the three in real deployment: the port is already taken, usually by a
+     * previous instance of this bridge that has not fully exited. */
     if (na_server_start(b.srv, err, (int)sizeof err) != NA_OK) {
         fprintf(stderr, "na_hamlib_bridge: na_server_start: %s\n", err);
+        startup_failed = 1;
         goto teardown_all;
     }
 
@@ -646,5 +663,7 @@ teardown_rig:
     rig_cleanup(b.rig);
     ring_free(&b.txring);
     rx_meter_free(&b.rxm);
-    return g_failed ? 1 : 0;
+    /* Two independent reasons to report failure: a worker that died mid-run, and a startup that
+     * never completed. An operator-requested SIGINT/SIGTERM sets neither and still exits 0. */
+    return (g_failed || startup_failed) ? 1 : 0;
 }
