@@ -129,6 +129,33 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `project(VERSION)`, since a version that answers *wrongly* is worse than one that does not answer.
 
 ### Changed
+- **BREAKING (C ABI): the client identity and device setters now refuse to run after connect has
+  been attempted, and `na_client_set_capture_device` refuses the NULL backend outright.**
+  `na_client_set_identity`, `na_client_set_playback_device` and `na_client_set_capture_device` were
+  unguarded plain-member writes, while the reconnect worker re-runs the handshake and reads exactly
+  those members — a concurrent `std::string` assignment against that read is undefined behaviour,
+  and the header explicitly permits the trigger by stating any client method may be called from
+  inside an event callback (`on_reconnecting` among them). They now return `NA_ERR_INVALID` once
+  `na_client_connect` has been attempted, which is the gate `na_client_set_callbacks` and
+  `na_client_set_audio_cb` already carried for this same reason. Set them before connecting.
+
+  Separately, `na_client_set_capture_device` now returns **`NA_ERR_UNSUPPORTED`** on a
+  NULL-backend client instead of `NA_OK`. That backend cannot capture, so the call could never
+  succeed; the failure was merely *deferred* to `na_client_connect`, where it surfaced only after a
+  live server handshake and left the handle spent. `na_server_set_capture_device` has always
+  refused it at the setter — the two siblings now agree. TX from a NULL-backend client goes through
+  `na_client_set_tx_inject`.
+
+  **No wire change.** No callers exist outside the test suite for the capture setter.
+
+- **The failure-path lifecycle contract is now specified, and the return code — not the errbuf
+  text — is what tells a caller whether to retry.** `NA_ERR_BACKEND` means the *attempt* failed and
+  the handle is still usable; `NA_ERR_INVALID` means the *handle* is spent and no retry on it can
+  succeed. A client becomes terminal at the first `na_client_disconnect`, or at a connect failure
+  past the start of the handshake; a transport-level failure such as a refused socket does not. A
+  **failed** `na_server_start` no longer consumes the server handle — only a successful start is
+  one-shot, which is what the header already said.
+
 - **BREAKING (C ABI): all four caller-allocated structs now carry their own size, so an
   appended field stops being an out-of-bounds access against an already-compiled consumer.** None
   of them recorded how large the caller believed them to be, so adding any field to a future
@@ -165,6 +192,37 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **Two lifecycle races reachable from the public C ABI** (issue #57). `na_server_stop` could
+  return while a client admitted *during* its teardown was still starting: `handleNewClient`
+  sampled the running flag once at entry, so `stop()` passed its thread barrier precisely because
+  the session's thread had not been counted yet, cleared the roster, and then blocked joining the
+  accept thread — which *guarantees* the straggler's detached run loop is spawned before `stop()`
+  returns. Nothing joined it, so the destructor tore the server's mutexes down underneath a live
+  thread; `na_server_destroy`'s documented stop-then-delete contract was the reachable path. The
+  same window let the session reopen the shared capture device after teardown had closed it.
+  Separately, `na_client_disconnect` racing a completing `na_client_connect` spawned the playback
+  worker on an already-nulled stream, which dereferences before testing anything — process death
+  on a detached thread, with `on_error` never firing.
+
+- **`na_client_connect` on a spent handle no longer completes a full server handshake before
+  failing** (issue #58). The closed check ran *inside* the connect path, after the handshake and
+  audio-line opening, so a retry opened a socket, handshook, and was accepted into the server's
+  roster before aborting. The cost landed on the server: with `max_clients=1` the phantom session
+  held the only slot for the full 10 s connection timeout, rejecting legitimate clients as busy,
+  while `na_client_is_connected` reported 0 throughout. That retry also leaked its socket and
+  freshly opened audio lines, because the teardown early-returned on the already-set flag.
+
+- **A failed `na_server_start` no longer bricks the server handle** (issue #58). The one-shot flag
+  fired on *attempt* with no reset on any failure path, so a bind collision left a handle that
+  could neither be started nor reconfigured — the retry returned `NA_ERR_INVALID` with the errbuf
+  untouched. Retrying a momentarily busy port is the Hamlib bridge's normal startup case.
+
+- **`na_client_stats.connected` no longer reads 1 during an incomplete handshake** (issue #58). It
+  keyed on the connection object, which is installed before the handshake runs, so for the whole
+  up-to-10 s window of a connect that would fail it claimed a live connection — and labelled every
+  counter beside it as a reading from one — while `na_client_is_connected` returned 0 at the same
+  instant.
+
 - **`na_server_start` on a UDP transport no longer reports success for a port another process is
   already serving** (issue #83). The UDP server socket was bound with `SO_REUSEADDR`. On TCP that
   flag is the standard restart-after-`TIME_WAIT` accommodation and never permits two live listeners;
