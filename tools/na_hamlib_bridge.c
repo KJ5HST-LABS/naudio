@@ -73,9 +73,16 @@ static void sleep_ms(int ms) {
     nanosleep(&ts, NULL);
 }
 
-/* A mutex-only byte FIFO for TX frames: the na_server_tx_audio_cb (mixer thread, MUST NOT
- * block) pushes; the TX drain thread pops. Non-blocking both ways — push drops the oldest
- * bytes on overflow so a stalled radio write can never wedge the naudio mixer.
+/* A mutex-only byte FIFO for TX frames: the na_server_tx_audio_cb (mixer thread, which must not
+ * stall) pushes; the TX drain thread pops. Neither side ever waits on the radio — push drops the
+ * oldest bytes on overflow, so a stalled rig_stream_write can never wedge the naudio mixer.
+ *
+ * Both sides DO take r->m, so this is not lock-free and the comment used to overclaim by calling
+ * it "non-blocking both ways" (issue #8 item 4). The guarantee it actually gives: a push never
+ * waits on I/O, and contends only with the drain thread's bounded memcpy — never for the duration
+ * of a radio write, which is the stall that would matter. The mutex is the right call at this
+ * contention window; a lock-free SPSC ring would make the stronger claim literally true and is a
+ * bigger change than this warrants.
  *
  * Every way this bridge can lose TX audio passes through a ring operation, so the loss
  * counters live here under the ring's own mutex rather than in free-standing globals that
@@ -98,7 +105,12 @@ static int ring_init(byte_ring *r, size_t cap) {
     r->buf = (unsigned char *)malloc(cap);
     if (!r->buf) return -1;
     r->cap = cap; r->head = r->count = 0;
-    return pthread_mutex_init(&r->m, NULL);
+    /* Free the buffer if the mutex will not init: main treats a non-zero return as fatal and
+     * returns WITHOUT calling ring_free, so nothing else would ever release it (issue #8 item 1).
+     * NULLing it keeps ring_free idempotent for any future caller that does clean up. */
+    int rc = pthread_mutex_init(&r->m, NULL);
+    if (rc != 0) { free(r->buf); r->buf = NULL; }
+    return rc;
 }
 static void ring_free(byte_ring *r) {
     if (r->buf) { free(r->buf); r->buf = NULL; }
@@ -234,7 +246,9 @@ typedef struct {
 
 static void on_tx_frame(const unsigned char *pcm, size_t n_bytes, void *user) {
     bridge *b = (bridge *)user;
-    ring_push(&b->txring, pcm, n_bytes);   /* non-blocking; mixer thread must not stall */
+    /* Never waits on I/O; contends only with the drain thread's bounded memcpy. See the byte_ring
+     * comment — this is not lock-free, and the mixer thread must not stall on the radio. */
+    ring_push(&b->txring, pcm, n_bytes);
 }
 
 /* ------------------------------------------------------------------ RX feeder thread */
@@ -283,7 +297,14 @@ static void *tx_thread(void *arg) {
     for (;;) {
         if (g_stop) break;
         size_t n = ring_pop(&b->txring, tmp, chunk);
-        /* Is a client actually transmitting? (len-return convention: 0 == no owner). */
+        /* Is a client actually transmitting? The len-return convention makes 0 mean "no owner"
+         * (naudio.h: `"" (length 0) if no owner`), so this tests the owner STRING's length rather
+         * than an explicit has-owner flag. That is only correct while the server cannot report an
+         * owner whose id is empty — checked in the tree rather than assumed (issue #8 item 3):
+         * session ids are minted as "audio-" + a counter at AudioStreamServer.cpp's handleNewClient,
+         * the only site that builds one, and AudioMixer::submitTxAudio rejects an id with no
+         * matching session before any claim can be recorded. An empty-string owner is therefore
+         * unrepresentable and "length 0 == nobody is transmitting" holds. */
         int has_owner = na_server_tx_owner(b->srv, NULL, 0) > 0;
         if (b->use_ptt) {
             if (has_owner && !ptt_on) { rig_set_ptt(b->rig, RIG_VFO_CURR, RIG_PTT_ON);  ptt_on = 1; }
@@ -465,6 +486,16 @@ int main(int argc, char **argv) {
     }
     if (channels != 1 && channels != 2) {
         fprintf(stderr, "na_hamlib_bridge: channels must be 1 or 2\n");
+        return 2;
+    }
+    /* -p goes through atoi like -c, and without this check an out-of-range or non-numeric value
+     * reached na_server_create with a less specific complaint than the tool can give (issue #8
+     * item 2). Port 0 is the case worth naming: atoi("abc") yields it, and 0 means "bind any free
+     * port" to the socket layer — so a typo would silently bring the bridge up somewhere the
+     * operator never asked for, and every client pointed at the intended port would simply fail
+     * to find it. Rejecting it costs one comparison. */
+    if (na_port < 1 || na_port > 65535) {
+        fprintf(stderr, "na_hamlib_bridge: port must be 1..65535\n");
         return 2;
     }
 
