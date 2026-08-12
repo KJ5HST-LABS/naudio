@@ -733,24 +733,113 @@ TEST(Client, ReconnectAttemptSurvivesATransportFactoryThatStartsReturningNothing
 
     // Explicit teardown rather than relying on the destructor.
     //
-    // THIS ARM'S DURATION IS BIMODAL — ~3 s or ~0.16 s — and only ~158 ms of it is ever the
-    // subject. Do not "fix" the slow mode here; it is #76.
+    // THIS ARM'S DURATION USED TO BE BIMODAL — ~3 s or ~0.16 s — and #76 is why. It is now
+    // uniformly fast (0.16 s locally, and the fix removed the only mechanism that made it
+    // otherwise), so a slow run here is a REGRESSION SIGNAL rather than the variance it used
+    // to be. It is still not the detector: assert nothing on this duration. The arm that does
+    // discriminate is ReconnectExhaustionWakesAWorkerParkedInAnInterruptibleSleep below, which
+    // forces the race instead of running it.
     //
-    // The subject is the two reconnect attempts (50 ms + 100 ms backoff). What follows is
-    // waitForWorkers(), and reconnectLoop's exhaustion tail sets closed_ WITHOUT notifying
-    // shutdownCv_ — so if heartbeatLoop is already parked in interruptibleSleepMs it sleeps out
+    // The subject is the two reconnect attempts (50 ms + 100 ms backoff). What followed was
+    // waitForWorkers(), and reconnectLoop's exhaustion tail set closed_ WITHOUT notifying
+    // shutdownCv_ — so if heartbeatLoop was already parked in interruptibleSleepMs it slept out
     // its full kHeartbeatCheckIntervalMs (3000 ms, AudioStreamClient.cpp:30) before noticing.
-    // If that thread has not reached its sleep yet when closed_ flips, it returns immediately
-    // and the arm is fast. Which way it goes is a RACE, not a platform property.
+    // If that thread had not reached its sleep yet when closed_ flipped, it returned immediately
+    // and the arm was fast. Which way it went was a RACE, not a platform property — which is
+    // exactly why this arm's wall clock was never a sound detector for the defect.
     //
-    // MEASURED on one CI run of one commit: macos-latest 3.07 s, ubuntu-latest 3.00 s, the two
-    // lib-only jobs 0.16 s and 0.20 s; locally (macOS) four consecutive runs were all ~3.00 s,
-    // and a one-line notify_all probe on the tail took it to 155 ms. Both modes PASS -- the
-    // assertion has a 5000 ms budget against a 158 ms subject, a 31x margin either way.
-    //
-    // Corollary for whoever fixes #76: this duration is a WEAK detector, not a free one. It
-    // only witnesses the stall in the slow mode, so a fast run proves nothing.
+    // MEASURED on one CI run of one pre-fix commit: macos-latest 3.07 s, ubuntu-latest 3.00 s,
+    // the two lib-only jobs 0.16 s and 0.20 s; locally (macOS) four consecutive runs were all
+    // ~3.00 s. Both modes PASSED — the assertion has a 5000 ms budget against a 158 ms subject,
+    // a 31x margin either way, which is what let the stall sit here unnoticed.
     client.disconnect();
+}
+
+// #76's DETECTOR. `closed_` is the predicate every interruptibleSleepMs waits on, and
+// reconnectLoop's exhaustion tail used to flip it WITHOUT notifying shutdownCv_ — so a worker
+// already parked there was never woken. It slept out the remainder of its own interval, and
+// waitForWorkers() (reached from disconnect(), from ~AudioStreamClient, and from disconnect()'s
+// already-closing branch) blocked behind it for up to kHeartbeatCheckIntervalMs.
+//
+// WHY THIS ARM EXISTS WHEN THE ARM ABOVE ALREADY MEASURES THE STALL. #76 proposed reading that
+// arm's wall clock instead — "no new detector is needed" — and its own later comment refutes
+// that: the duration is BIMODAL (one CI run: macos 3.07 s, ubuntu 3.00 s, both lib-only jobs
+// ~0.2 s) because the stall requires heartbeatLoop to be ALREADY PARKED when the tail runs, and
+// the tail arrives ~158 ms after the loss. A fast run witnesses nothing. So that arm detects the
+// regression roughly half the time, which is not a detector.
+//
+// THIS ARM REMOVES THE RACE RATHER THAN RUNNING IT. timeoutChecks() can only rise after
+// heartbeatLoop's interruptibleSleepMs has RETURNED, so waiting for it proves the worker
+// completed a full cycle and re-entered a fresh 3000 ms park — measured, not assumed. The two
+// outcomes are then separated by a documented constant (kHeartbeatCheckIntervalMs,
+// AudioStreamClient.cpp:30) instead of by two thread edges that have to coincide (L172).
+TEST(Client, ReconnectExhaustionWakesAWorkerParkedInAnInterruptibleSleep) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setAutoReconnect(true);
+    // 2 for the same load-bearing reason as the arm above: at max=1 handleConnectionLost's
+    // short-lived branch reports "Connection unstable" and returns without ever calling
+    // startReconnection, so reconnectLoop — and the tail under test — is never reached.
+    client.setMaxReconnectAttempts(2);
+    client.setReconnectDelayMs(50);
+
+    RecordingListener listener;
+    client.addStreamListener(&listener);
+
+    std::string err;
+    auto conn = connectOverScriptedTransport(client, &err);
+    ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
+    ASSERT_TRUE(client.isConnected());
+
+    // THE PREMISE, MEASURED. heartbeatLoop's only calls to isConnectionTimedOut() sit AFTER its
+    // interruptibleSleepMs returns, so timeoutChecks()>=2 proves the worker woke from its first
+    // sleep, ran a whole cycle, and is on its way back into the next one. Without this the arm
+    // would race the worker to its very first park and pass vacuously every time it won — which
+    // is exactly the defect that makes the arm above a half-time detector.
+    ASSERT_TRUE(waitFor([&]() { return conn->timeoutChecks() >= 2; }, 8000))
+        << "heartbeatLoop never completed a sleep cycle, so no worker was parked to be woken "
+           "and this arm would prove nothing; "
+        << conn->diagnostics();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // let it re-enter the sleep
+
+    // From here the factory yields nothing, so every reconnect attempt fails and the loop runs
+    // out — reaching the exhaustion tail rather than recovering.
+    client.setTransportFactory([]() { return std::shared_ptr<ClientTransport>{}; });
+    conn->close();
+
+    // This error is emitted INSIDE the tail's `if (!closed_.exchange(true))`, so observing it
+    // proves the tail is what claimed the terminal transition — the precise event whose missing
+    // notify is the bug.
+    ASSERT_TRUE(waitFor([&]() { return listener.sawError("Failed to reconnect"); }, 5000))
+        << "the exhaustion tail never ran, so nothing flipped closed_ here; "
+        << conn->diagnostics();
+
+    // THE DISCRIMINATOR. closed_ is already true, so disconnect() takes its already-closing
+    // branch and IS waitForWorkers() — the join barrier the parked heartbeat worker holds.
+    // Unfixed, that worker sleeps out the ~2.7 s left of its interval; fixed, the tail's
+    // notify_all already woke it before this line is reached. MEASURED under a pinned-artifact
+    // mutation harness: 2781-2788 ms with the notify removed (whether or not the empty lock
+    // scope is left behind), against 3226 ms for the WHOLE arm once fixed.
+    //
+    // WHAT THIS ARM DOES NOT COVER, measured rather than assumed. Moving the notify to BEFORE
+    // the exchange — the ineffective shape closeResources() already has, where the predicate is
+    // still false when the waiter re-evaluates it — leaves this arm GREEN. The woken thread has
+    // to reacquire shutdownMutex_ before it can re-read closed_, and the exchange is two
+    // instructions away, so it loses that race essentially always. This arm discriminates on
+    // the PRESENCE of a notify on this path, not on its ordering, and no arm should try for the
+    // latter: detecting it would mean asserting on two thread edges coinciding (L172).
+    const auto t0 = std::chrono::steady_clock::now();
+    client.disconnect();
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+
+    EXPECT_LT(elapsedMs, 1000)
+        << "teardown waited out the heartbeat interval instead of being woken by the exhaustion "
+           "tail: "
+        << elapsedMs << " ms (#76). " << conn->diagnostics();
 }
 
 // ===========================================================================

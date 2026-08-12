@@ -741,6 +741,19 @@ void AudioStreamClient::reconnectLoop() {
     // reconnect exhaustion) racing this tail must not yield a second terminal
     // disconnected event.
     if (!closed_.exchange(true)) {
+        // WAKE THE SLEEPERS BEFORE THE CALLBACKS (#76). closed_ is shutdownCv_'s predicate, so
+        // setting it is only half the transition — a worker already parked in
+        // interruptibleSleepMs is not woken by the store and sleeps out the rest of its own
+        // interval, up to kHeartbeatCheckIntervalMs. waitForWorkers() then blocks behind it, so
+        // a consumer calling disconnect() after reconnect exhaustion paid up to 3 s of teardown
+        // with no way to opt out. Every other site that flips closed_ (disconnect(), doClose())
+        // already does this; the exhaustion tail was the one that did not. Empty lock scope, as
+        // there: it exists to close the window between a waiter evaluating the predicate and
+        // entering the wait, not to protect any state.
+        {
+            std::lock_guard<std::mutex> lock(shutdownMutex_);
+        }
+        shutdownCv_.notify_all();
         notifyError("local", "Failed to reconnect after " +
                                  std::to_string(reconnectAttempt_.load()) + " attempts");
         notifyClientDisconnected("local");
