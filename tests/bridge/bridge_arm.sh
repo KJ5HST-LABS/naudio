@@ -128,8 +128,11 @@ run_arm () {
 # So on Linux the second bridge BINDS THE SAME PORT and starts, there is no failed startup, and
 # there is no exit code to assert. The arm reports that in so many words instead of passing quietly:
 # a skip that reads as a pass is exactly the failure the rest of this harness exists to prevent
-# (Learning 63). That Linux double-bind is a naudio-side defect in its own right, tracked separately
-# — this arm is a real detector on macOS and a declared no-op on Linux until it is fixed.
+# (Learning 63). That Linux double-bind is a naudio-side defect in its own right — issue #83 — so
+# this arm is a real detector on macOS and a DECLARED NO-OP on the Linux CI job until #83 is fixed.
+# Do not read a green Linux run as evidence issue #16 is guarded. Fixing #83 by dropping reuseAddr
+# on the UDP server bind makes this arm live everywhere and turns the PREMISE NOT MET branch below
+# into dead code worth deleting.
 run_exit_code_arm () {
     alog="$workdir/exitcode.holder.log"
     blog="$workdir/exitcode.second.log"
