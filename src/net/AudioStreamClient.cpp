@@ -819,9 +819,24 @@ void AudioStreamClient::disconnect() {
             // disconnect(), on a peer already known to be gone. It changes nothing on UDP,
             // which is what the salvo is for: there the first sendto succeeds, so both copies
             // still go out with their yields.
-            if (conn->sendControl(ControlMessage::disconnect())) {
+            //
+            // NON-BLOCKING, and this is the earlier half of the same defect (#77). On TCP every
+            // send funnels through one sendMutex_ held across the whole Socket::sendAll, so a
+            // wedged TX writer blocked the salvo before it could ATTEMPT a send — the wait was
+            // for the lock, not for the wire, and closeResources() below (which is what breaks
+            // the wedge) sits after this point. Measured on the unfixed path: disconnect() had
+            // not returned at 4 s with no DISCONNECT ever attempted.
+            //
+            // Declining when the lock is held is not the same as skipping the salvo, which #71
+            // established would be wrong: ClientSession::receiveLoop guards its error on
+            // !closed_, so this control is what runs the server's close() before the FIN and
+            // stops every clean TCP disconnect reporting a receive error to on_error. We
+            // decline only when the socket is ALREADY backed up — in which case the courtesy
+            // frame could not have arrived promptly anyway. UDP has no such lock and forwards,
+            // so the salvo there is unchanged in both copies and timing.
+            if (conn->trySendControl(ControlMessage::disconnect())) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                conn->sendControl(ControlMessage::disconnect());
+                conn->trySendControl(ControlMessage::disconnect());
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         }

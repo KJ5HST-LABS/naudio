@@ -141,6 +141,30 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **`na_client_disconnect` / `AudioStreamClient::disconnect()` no longer wait on a wedged TCP writer
+  before sending their courtesy DISCONNECT** (issue #77). Every TCP send on a connection funnels
+  through one `sendMutex_` held across the whole `Socket::sendAll`, so a peer that had stopped
+  reading parked the audio writer *holding that lock* — and `disconnect()`'s courtesy control queued
+  behind it, before it could attempt a send at all. `closeResources()`, which is what breaks the
+  wedge, runs **after** the salvo. Measured through the test seam: `disconnect()` had not returned at
+  4 s and no DISCONNECT was ever attempted.
+
+  The salvo now uses a **non-blocking** send (`ClientConnection::trySendControl`, `std::try_to_lock`)
+  that declines when another sender already holds the lock, on the reasoning that a held lock means
+  the socket is backed up and the courtesy frame could not have arrived promptly anyway. The salvo is
+  **not** skipped otherwise: on a free lock both copies still go out with their yields, which is what
+  keeps a clean TCP disconnect from reporting a receive error to `on_error`. UDP has no such lock and
+  forwards unchanged — same two copies, same timing.
+
+  **What this does and does not bound.** It removes the wait *for the lock*, which was the term that
+  could be paid before any send was attempted. Once the lock is won, `sendAll` still spends up to its
+  whole-call budget (`CONNECTION_TIMEOUT_MS / 2`); that budget is deliberate and unchanged, so a
+  disconnect against a wedged peer is prompt rather than instantaneous.
+
+  **C++ API change, no C ABI change and no wire change.** `ClientConnection` gains a pure-virtual
+  `trySendControl`; any out-of-tree implementer of that interface must add it. The C ABI, the
+  `0xAF01` frame format, and the DISCONNECT control itself are untouched.
+
 - **A DUAL server bound to port 0 no longer fails when the OS reserves the port its own allocator
   just handed out** (issue #73). `DualServerTransport::bind` binds TCP, reads back the assigned port,
   then binds UDP to that same number — TCP and UDP port spaces are independent, which is what lets one

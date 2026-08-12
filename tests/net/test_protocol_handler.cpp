@@ -251,3 +251,42 @@ TEST(ProtocolHandler, GoodFrameResetsConsecutiveErrorCounter) {
     EXPECT_FALSE(died);
     EXPECT_FALSE(h.isClosed());
 }
+
+// #77's PRODUCTION half, and the reason it needs its own arm at all: the client-side arms in
+// test_client_e2e.cpp drive the SCRIPTED connection, which carries its own trySendControl, so
+// none of them reaches this implementation. MEASURED — with this method stubbed to a bare
+// `return false`, the entire suite stayed green at 370/370. This arm is what makes that
+// mutation red.
+//
+// It covers the two portable outcomes: a free lock transmits, and a closed connection does
+// not. THE DECLINE ITSELF IS NOT COVERED HERE, and deliberately so rather than by oversight —
+// staging it needs a real peer wedged with its receive window shut, which is what the send
+// budget (CONNECTION_TIMEOUT_MS / 2) and Winsock's loopback absorption make impractical and
+// non-portable; that is the same wall #74 documents, and the reason the scripted seam exists.
+// The decline is modelled in ScriptedClientConnection and asserted by
+// Client.DisconnectDeclinesTheSalvoWhileTheTxWriterHoldsTheSendLock.
+TEST(ProtocolHandler, TrySendControlTransmitsOnAFreeLockAndDeclinesOnceClosed) {
+    Link link;
+    ASSERT_TRUE(makeLink(link));
+    auto& h = *link.handler;
+
+    // Wrap the far end so the frame can be decoded rather than merely counted — a counter
+    // alone would still pass if the bytes never left.
+    AudioProtocolHandler peer{std::move(link.writer)};
+
+    ASSERT_TRUE(h.trySendControl(ControlMessage::disconnect()));
+    EXPECT_EQ(h.packetsSent(), 1);
+
+    auto got = recvFrame(peer);
+    ASSERT_TRUE(got.has_value()) << "trySendControl reported success but nothing reached the peer";
+    EXPECT_EQ(got->packetType(), PacketType::Control);
+    auto msg = ControlMessage::deserialize(got->payload());
+    ASSERT_TRUE(msg.has_value());
+    EXPECT_EQ(msg->messageType(), ControlType::Disconnect);
+
+    // The other side of the contract: it is not unconditionally true. A closed connection
+    // declines through the same sendPacketLocked guard sendPacket uses.
+    h.close();
+    EXPECT_FALSE(h.trySendControl(ControlMessage::disconnect()));
+    EXPECT_EQ(h.packetsSent(), 1) << "a send was counted on a closed connection";
+}

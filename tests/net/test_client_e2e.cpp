@@ -894,3 +894,96 @@ TEST(Client, HeartbeatWatchdogSkipsTheLatencyProbeOnceThePeerIsDeclaredDead) {
 
     client.disconnect();
 }
+
+// ===========================================================================
+// disconnect() under a held send lock (#77).
+// ===========================================================================
+//
+// #71 fixed the salvo's SECOND copy. This is its first, and one hop earlier than #71 thought:
+// the salvo blocks on ACQUIRING sendMutex_, before it can attempt a send at all.
+// AudioProtocolHandler::sendPacket holds that one lock across the whole Socket::sendAll, so a
+// wedged TX writer queues the courtesy DISCONNECT behind it — and closeResources(), which is
+// what would break the wedge, sits AFTER the salvo in disconnect().
+//
+// #71's own cost breakdown blamed waitForWorkers() for this time and was wrong. MEASURED on
+// macOS/arm64: a bare ::close(fd) breaks a thread already parked in ::send() in ~5 ms (505 /
+// 508 / 505 ms against a close called at 500 ms, errno 9), so every path that REACHES
+// waitForWorkers() is already prompt and adding shutdown() would buy nothing. The cost is
+// upstream of it. Measured through this same seam on the unfixed path: disconnect() had not
+// returned at 4 s and the ledger read { CONNECT_REQUEST x1 } — no DISCONNECT ever attempted.
+//
+// In production the wait is bounded rather than unbounded (one send budget for the lock plus
+// one for the salvo's own send, CONNECTION_TIMEOUT_MS / 2 each). Bounded is not prompt.
+
+// THE SUBJECT: disconnect() must return while another sender holds the send lock.
+//
+// The salvo is NOT skipped on TCP, and this arm must not be read as licensing that. #71
+// established why: ClientSession::receiveLoop guards its error with if (!closed_.load()), so
+// the DISCONNECT's real job is to run the server's close() before the FIN arrives — skip it
+// and every clean TCP disconnect reports a receive error across the C ABI. The fix declines
+// only when the lock is already held, on the reasoning that a held lock means the socket is
+// backed up and the courtesy frame could not arrive promptly anyway.
+//
+// disconnect() runs on a WORKER THREAD, and that is not stylistic. A regression here BLOCKS,
+// and a blocked disconnect() called from the test thread is a ctest timeout — a hang with no
+// message — rather than a failure that names its own cause.
+TEST(Client, DisconnectDeclinesTheSalvoWhileTheTxWriterHoldsTheSendLock) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 4533};
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setTxInjectEnabled(true);  // must precede connect(): it is what starts sendLoop
+    client.setAutoReconnect(false);   // defaults TRUE; a reconnect worker would perturb the ledger
+
+    std::string err;
+    auto conn = connectOverScriptedTransport(client, &err);
+    ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
+    ASSERT_TRUE(client.isConnected());
+    client.setPTT(true);  // captureMuted_ defaults TRUE (RX mode), and gates injectTxAudio
+
+    // Wedge the TX writer so it parks HOLDING the send lock, exactly as a real writer parks
+    // inside Socket::sendAll under sendPacket's mutex.
+    conn->stallTxAudioSends();
+    std::vector<std::uint8_t> pcm(1920, 0);
+    for (int i = 0; i < 100 && conn->sendsParked() == 0; ++i) {
+        client.injectTxAudio(pcm.data(), pcm.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // THE L136 GUARD. Everything below is a claim about what disconnect() does WHILE a send
+    // holds the lock; with no wedge it would return promptly having tested nothing.
+    ASSERT_GE(conn->sendsParked(), 1) << "the TX writer never wedged, so the arm's premise "
+                                         "never held; " << conn->diagnostics();
+    ASSERT_GE(conn->txAudioCalls(), 1) << conn->diagnostics();
+
+    std::atomic<bool> returned{false};
+    std::thread worker([&]() {
+        client.disconnect();
+        returned.store(true);
+    });
+
+    // 2 s against a subject that should complete in microseconds. Nothing releases the stall
+    // before this budget elapses, so a pass cannot come from the wedge having ended early —
+    // on the fixed path the wedge ends because disconnect() ITSELF reaches closeResources().
+    const bool prompt = waitFor([&]() { return returned.load(); }, 2000);
+
+    // Release BEFORE asserting. A red arm must still join and exit; asserting first would
+    // strand the worker in the wedge and turn a failure into a ctest hang.
+    conn->releaseSends();
+    worker.join();
+
+    EXPECT_TRUE(prompt) << "disconnect() blocked acquiring the send lock; " << conn->diagnostics();
+
+    // THE MECHANISM, not the clock (L84). The two counts below are a PAIR, and neither alone
+    // discriminates: zero DISCONNECTs is also what a salvo that never ran at all would produce
+    // (connected_ false, a factory that handed back nothing), while a decline with the frame
+    // still sent would mean something else declined.
+    EXPECT_EQ(conn->countSent(ControlType::Disconnect), 0)
+        << "the salvo queued behind the wedged writer instead of declining; "
+        << conn->diagnostics();
+
+    // EXACTLY one, which makes this a #71 regression guard as well: the second copy is gated
+    // on the first succeeding, so a 2 here would mean that gate came undone.
+    EXPECT_EQ(conn->controlSendsDeclined(), 1)
+        << "the salvo never reached the non-blocking send; " << conn->diagnostics();
+}
