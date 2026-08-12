@@ -72,6 +72,23 @@ public:
 
     // --- Send (return false on I/O failure) ---
     virtual bool sendControl(const ControlMessage& message) = 0;
+
+    // A courtesy control send for TEARDOWN paths that must not block: sends only if this
+    // connection's send path is free at the instant of the call, and returns false
+    // immediately rather than waiting behind a sender that already holds it (issue #77).
+    //
+    // Returns true ONLY if the message was actually handed to the socket. false covers both
+    // "declined — a send was already in flight" and "the send failed"; no caller separates
+    // them, because both mean the frame will not arrive promptly and a retry would only wait
+    // on the same wedge.
+    //
+    // PURE VIRTUAL, not a defaulted forward to sendControl, for the reason
+    // ServerTransport::controlRetransmits below gives: all three implementations are in-tree,
+    // and the plausible-looking default here — "just call sendControl" — silently reinstates
+    // the exact block this method exists to avoid. A forgotten override would be
+    // indistinguishable from a correct one until a peer wedged in production. Implement it in
+    // the new connection type; do not default it here.
+    virtual bool trySendControl(const ControlMessage& message) = 0;
     virtual bool sendRxAudio(const std::uint8_t* data, std::size_t offset,
                              std::size_t length) = 0;
     virtual bool sendTxAudio(const std::uint8_t* data, std::size_t length) = 0;

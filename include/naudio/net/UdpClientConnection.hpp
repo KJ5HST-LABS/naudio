@@ -217,6 +217,8 @@ public:
 
     // --- Send (false on I/O failure / closed) ---
     bool sendControl(const ControlMessage& message) override;
+    // Forwards to sendControl — see the definition for why UDP has nothing to decline on.
+    bool trySendControl(const ControlMessage& message) override;
     bool sendRxAudio(const std::uint8_t* data, std::size_t offset, std::size_t length) override;
     bool sendTxAudio(const std::uint8_t* data, std::size_t length) override;
     bool sendHeartbeat() override;

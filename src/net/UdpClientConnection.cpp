@@ -172,6 +172,16 @@ bool UdpClientConnection::sendControl(const ControlMessage& message) {
     return ok;
 }
 
+// UDP HAS NO SEND LOCK TO DECLINE ON, so the honest implementation is a forward, not a
+// shortcut. sendPacket takes no mutex at all, and Socket::sendTo on a connectionless socket
+// does not block on a peer that has stopped reading — there is no receive window to fill. The
+// pipe_ lock sendControl takes for control-ARQ bookkeeping is acquired AFTER the datagram is
+// away and is never held across a send, so it cannot stage the wedge #77 is about. On UDP the
+// courtesy DISCONNECT is therefore exactly as prompt, and as reliable, as it has always been.
+bool UdpClientConnection::trySendControl(const ControlMessage& message) {
+    return sendControl(message);
+}
+
 bool UdpClientConnection::sendRxAudio(const std::uint8_t* data, std::size_t offset,
                                       std::size_t length) {
     std::vector<std::uint8_t> audioData(data + offset, data + offset + length);

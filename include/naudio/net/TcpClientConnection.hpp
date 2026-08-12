@@ -33,6 +33,9 @@ public:
     bool sendControl(const ControlMessage& message) override {
         return protocol_.sendControl(message);
     }
+    bool trySendControl(const ControlMessage& message) override {
+        return protocol_.trySendControl(message);
+    }
     bool sendRxAudio(const std::uint8_t* data, std::size_t offset,
                      std::size_t length) override {
         return protocol_.sendRxAudio(data, offset, length);

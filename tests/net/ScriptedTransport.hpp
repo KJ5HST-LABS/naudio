@@ -213,6 +213,7 @@ public:
                         ", rxAudioCalls=" + std::to_string(rxAudioCalls_) +
                         ", stallRx=" + (stallRx_ ? "armed" : "off") +
                         ", failControls=" + (failControls_ ? "armed" : "off") +
+                        ", controlSendsDeclined=" + std::to_string(controlSendsDeclined_) +
                         ", stallMask=" + std::to_string(stallMask_) +
                         ", sendsEntered=" + std::to_string(sendsEntered_) +
                         ", sendsParked=" + std::to_string(sendsParked_) +
@@ -337,15 +338,39 @@ public:
     // reason. Those arms never arm the latch, so they still see an unconditional true.
     bool sendControl(const ControlMessage& message) override {
         std::lock_guard<std::mutex> serialize(sendMutex_);
-        bool fail;
-        {
+        return sendControlLocked(message);
+    }
+
+    // The non-blocking counterpart (#77), modelled the only way that is faithful: a real
+    // try-send declines on the LOCK, so this one does too. A double that decided by looking at
+    // stallMask_ would answer from the script rather than from contention, and would still
+    // decline for an arm whose wedge is not actually holding the lock.
+    //
+    // A DECLINE IS NOT RECORDED IN sentControls_, and that asymmetry with failControlSends is
+    // deliberate. A failed send is an ATTEMPT and the #71 arm counts attempts; a decline never
+    // reached the socket, so recording it would make "no DISCONNECT was ever attempted"
+    // unassertable — which is the whole claim of the arm this exists for. controlSendsDeclined
+    // below is where the decline is observable, so the path still proves it ran rather than
+    // being inferred from an absence.
+    bool trySendControl(const ControlMessage& message) override {
+        std::unique_lock<std::mutex> serialize(sendMutex_, std::try_to_lock);
+        if (!serialize.owns_lock()) {
             std::lock_guard<std::mutex> lock(mutex_);
-            ++sentControls_[message.messageType()];
-            fail = failControls_;
+            ++controlSendsDeclined_;
+            cv_.notify_all();
+            return false;
         }
-        cv_.notify_all();
-        if (!enterSend(kControl)) return false;
-        return !fail;
+        return sendControlLocked(message);
+    }
+
+    // How many trySendControl calls DECLINED because another sender held the lock. The
+    // positive half of the #77 arm's guard: "no DISCONNECT was sent" alone is also what a
+    // salvo that never ran at all would produce (a connected_ that was false, a factory that
+    // handed back nothing), so the arm asserts the decline happened, not merely that the send
+    // did not.
+    int controlSendsDeclined() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return controlSendsDeclined_;
     }
 
     // NOT SERIALISED ON sendMutex_, and that exclusion is load-bearing rather than an
@@ -432,6 +457,21 @@ private:
     // LOCK ORDER, and it is one-way everywhere in this class: sendMutex_ THEN mutex_. Never
     // the reverse. The cv wait below releases mutex_ while parked, so close() and the ledger
     // readers stay live against a wedged sender.
+    // The shared body of sendControl and trySendControl, with sendMutex_ ALREADY HELD — the
+    // two differ only in how they acquire it, exactly as AudioProtocolHandler's sendPacket and
+    // trySendControl do. Lock order is unchanged: sendMutex_ THEN mutex_, never the reverse.
+    bool sendControlLocked(const ControlMessage& message) {
+        bool fail;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++sentControls_[message.messageType()];
+            fail = failControls_;
+        }
+        cv_.notify_all();
+        if (!enterSend(kControl)) return false;
+        return !fail;
+    }
+
     bool enterSend(unsigned kind) const {
         std::unique_lock<std::mutex> lock(mutex_);
         ++sendsEntered_;
@@ -463,6 +503,7 @@ private:
     bool failControls_ = false;
     bool stallRx_ = false;
     int rxAudioCalls_ = 0;
+    int controlSendsDeclined_ = 0;
     bool closed_ = false;
     mutable unsigned stallMask_ = 0;
     mutable int sendsParked_ = 0;
