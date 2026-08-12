@@ -354,7 +354,15 @@ TEST(ProtocolHandler, TrySendControlDeclinesWhileAnotherSenderHoldsTheSendLock) 
     // buffer, a loopback send of one frame completes in microseconds. This samples the flag,
     // not the clock, so what it detects is the WRITER HOLDING THE LOCK rather than a slow machine.
     constexpr int kParkDwellMs = 150;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    // 30 s, and the margin is the point rather than the number. How much a peer must ignore
+    // before its window shuts is a PLATFORM property, not a property of this arm: MEASURED at
+    // ~2 ms on macOS/arm64 but ~4.9 s on ubuntu-latest CI (whole arm 154 ms vs 5.08 s), where
+    // loopback buffers autotune far larger. A deadline sized from the macOS figure would sit
+    // ~2x above the slowest platform that actually runs this, and the failure mode of being
+    // wrong is a RED main via the premise guard below — so this is deliberately ~6x the worst
+    // measurement rather than a round number near the best one. It is bounded well under the
+    // suite's ctest --timeout 300 either way.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     bool parked = false;
     while (!parked && !writerDone.load() && std::chrono::steady_clock::now() < deadline) {
         if (!inSend.load()) {
