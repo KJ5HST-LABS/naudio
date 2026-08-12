@@ -116,23 +116,17 @@ run_arm () {
 # na_server_start failing on an already-taken port is staged here because it is the likeliest of the
 # three in real deployment — usually a previous instance that has not fully exited.
 #
-# THIS ARM'S PREMISE IS PLATFORM-DEPENDENT AND IT SAYS SO RATHER THAN ASSUMING IT. naudio's UDP
-# server binds with SO_REUSEADDR (src/net/UdpServerTransport.cpp:43), and the platforms disagree
-# about what that means for UDP. Measured 2026-08-12 with two controls, so the result is not one
-# implementation's opinion (Learning 183):
+# THIS ARM WAS A NO-OP ON LINUX UNTIL #83 WAS FIXED, AND THE HISTORY IS WORTH KEEPING. naudio's UDP
+# server used to bind with SO_REUSEADDR, and the platforms disagree about what that means for UDP:
+# two sockets that BOTH set it share an addr:port on Linux and are refused on macOS. So the second
+# bridge here used to start normally on Linux, leaving no failed startup to assert an exit code on —
+# a green arm that had tested nothing, on the one platform CI runs it. It said so at the point of
+# skip rather than passing quietly, and #83 has since dropped the flag (UdpServerTransport.cpp), so
+# the collision below now fails to bind on every platform and this arm is live everywhere.
 #
-#                     UDP, reuse on BOTH      UDP, reuse on 2nd only     TCP, reuse on BOTH
-#     macOS           bind FAILS              bind fails                 bind fails
-#     Linux           bind SUCCEEDS           bind fails                 bind fails
-#
-# So on Linux the second bridge BINDS THE SAME PORT and starts, there is no failed startup, and
-# there is no exit code to assert. The arm reports that in so many words instead of passing quietly:
-# a skip that reads as a pass is exactly the failure the rest of this harness exists to prevent
-# (Learning 63). That Linux double-bind is a naudio-side defect in its own right — issue #83 — so
-# this arm is a real detector on macOS and a DECLARED NO-OP on the Linux CI job until #83 is fixed.
-# Do not read a green Linux run as evidence issue #16 is guarded. Fixing #83 by dropping reuseAddr
-# on the UDP server bind makes this arm live everywhere and turns the PREMISE NOT MET branch below
-# into dead code worth deleting.
+# Keep the collision as the staging mechanism: it is the real deployment case, and it now doubles as
+# an end-to-end check that #83 has not regressed — a return of SO_REUSEADDR would show up here as
+# this arm quietly costing ~10 s more (the deadline below expiring) instead of ~1 s.
 run_exit_code_arm () {
     alog="$workdir/exitcode.holder.log"
     blog="$workdir/exitcode.second.log"
@@ -184,12 +178,17 @@ run_exit_code_arm () {
         return 1
     fi
 
+    # The second bridge coming UP is now a naudio regression, not a platform quirk to tolerate:
+    # since #83 the UDP server no longer sets SO_REUSEADDR, so a port that is already being served
+    # must be refused everywhere. Treating this as a failure rather than a skip is the whole point
+    # of fixing #83 — while it was a skip, this arm was green on Linux having asserted nothing.
     if grep -q -- '-> naudio :' "$blog" 2>/dev/null; then
-        echo "  bridge_arm/exit-code: PREMISE NOT MET on $(uname -s) — the second bridge bound the"
-        echo "    same UDP port and started, so no startup failure happened and this arm asserted"
-        echo "    NOTHING about issue #16. Not a bridge regression; see the SO_REUSEADDR table in"
-        echo "    this file. The arm is a live detector only where the second bind fails."
-        return 0
+        echo "FAIL bridge_arm/exit-code: a second bridge BOUND a port the first was already" >&2
+        echo "  serving and came up. na_server_start reported success for a port it does not" >&2
+        echo "  have, so two bridges are live and the datagrams reach only one of them. This is" >&2
+        echo "  issue #83 regressing — check that UdpServerTransport still passes reuseAddr=false." >&2
+        sed 's/^/    | /' "$blog" >&2
+        return 1
     fi
     if ! grep -q 'na_server_start' "$blog" 2>/dev/null; then
         echo "FAIL bridge_arm/exit-code: the second bridge neither started nor failed in" >&2

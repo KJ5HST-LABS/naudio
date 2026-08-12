@@ -53,6 +53,59 @@ TEST(UdpTransport, PortBeforeBindIsMinusOne) {
     EXPECT_FALSE(server.isBound());
 }
 
+// Issue #83. A second server must NOT be able to bind a port another server is already serving.
+//
+// This reads as an OS-level truism and is not one: it held only because of a flag naudio chose.
+// While UdpServerTransport passed reuseAddr=true, Linux let both sockets bind — two servers up,
+// neither told, datagrams delivered to one of them — and na_server_start() reported NA_OK for a
+// port it did not have. macOS refused it regardless, which is exactly what made the bug survive:
+// the platform most bridge development happens on could not reproduce it.
+//
+// THE PLATFORM ASYMMETRY IS ALSO THIS TEST'S HONEST LIMIT. Against the pre-fix code it is RED on
+// Linux and GREEN on macOS, because macOS never permitted the double bind in the first place. Its
+// regression value is therefore Linux-side, and a green macOS run is not evidence the flag is
+// still off. Stated rather than left for a reader to discover (Learning 63).
+//
+// Binds the first server to port 0 so the OS picks a free one: a hard-coded port would make this
+// fail for the unrelated reason that something else on the machine already holds it.
+TEST(UdpTransport, ASecondServerCannotBindAPortAlreadyBeingServed) {
+    UdpServerTransport first;
+    std::string err;
+    ASSERT_TRUE(first.bind(0, &err)) << err;
+    ASSERT_GT(first.port(), 0);
+    const std::uint16_t served = static_cast<std::uint16_t>(first.port());
+
+    UdpServerTransport second;
+    std::string secondErr;
+    EXPECT_FALSE(second.bind(served, &secondErr))
+        << "a second server bound port " << served << " while the first was serving it — "
+        << "na_server_start would report success for a port it does not have (issue #83)";
+    EXPECT_FALSE(second.isBound());
+    EXPECT_EQ(second.port(), -1);
+    EXPECT_FALSE(secondErr.empty()) << "a refused bind must say why";
+}
+
+// The other half of the contract, and the control for the test above: refusing the second bind
+// must not come from having made binding harder in general. Once the first server releases the
+// port, the next one must get it — with no TIME_WAIT wait, which is precisely why UDP does not
+// need the SO_REUSEADDR that caused #83. A fix that traded the double-bind for a port that
+// cannot be reclaimed after restart would pass the test above and break every supervised restart.
+TEST(UdpTransport, APortIsImmediatelyRebindableOnceItsServerIsGone) {
+    std::uint16_t served = 0;
+    {
+        UdpServerTransport first;
+        std::string err;
+        ASSERT_TRUE(first.bind(0, &err)) << err;
+        served = static_cast<std::uint16_t>(first.port());
+    }  // destroyed: socket closed
+
+    UdpServerTransport second;
+    std::string err;
+    EXPECT_TRUE(second.bind(served, &err))
+        << "port " << served << " was not immediately rebindable after its server went away: "
+        << err;
+}
+
 TEST(UdpTransport, BindAssignsEphemeralPort) {
     UdpServerTransport server;
     std::string err;

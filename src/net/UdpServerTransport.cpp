@@ -40,7 +40,21 @@ bool UdpServerTransport::bind(std::uint16_t port, std::string* err) {
         if (err) *err = "Already bound";
         return false;
     }
-    socket_ = Socket::bindUdp(bindHost_, port, /*reuseAddr=*/true, err);
+    // NO SO_REUSEADDR, deliberately, and NOT by symmetry with the TCP listener (issue #83).
+    //
+    // On TCP the flag is the standard restart-after-TIME_WAIT accommodation and it never permits
+    // two live listeners on any platform. UDP has no TIME_WAIT — a closed socket's port is
+    // immediately rebindable without it — so the flag buys a UDP server nothing, and what it costs
+    // is platform-dependent. Measured 2026-08-12 with controls: two UDP sockets that BOTH set it
+    // bind the same addr:port successfully on Linux, and are refused on macOS; with the first
+    // socket not setting it, the second is refused on both.
+    //
+    // So while this was true, na_server_start() returned NA_OK on Linux for a port another process
+    // was already serving. Two servers came up, neither was told, and the datagrams went to one of
+    // them. Reporting a successful bind for a port we do not have is the defect; refusing to start
+    // is the contract. The UDP CLIENT socket has always passed false here (UdpClientTransport.hpp)
+    // — it binds an ephemeral port, where the flag is meaningless either way.
+    socket_ = Socket::bindUdp(bindHost_, port, /*reuseAddr=*/false, err);
     if (!socket_.valid()) return false;
     // A maximum-payload audio packet must be sendable, or the writer loop tears the whole
     // session down on the first oversized RX frame (see Socket::setSendBufferAtLeast). The

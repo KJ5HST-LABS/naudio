@@ -165,6 +165,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **`na_server_start` on a UDP transport no longer reports success for a port another process is
+  already serving** (issue #83). The UDP server socket was bound with `SO_REUSEADDR`. On TCP that
+  flag is the standard restart-after-`TIME_WAIT` accommodation and never permits two live listeners;
+  UDP has no `TIME_WAIT`, so it bought the server nothing — and what it cost was platform-dependent.
+  Measured with controls: two UDP sockets that *both* set it bind the same `addr:port` successfully
+  on **Linux** and are refused on **macOS**. So on Linux a second server started cleanly on a port
+  already in use, `na_server_start` returned `NA_OK` for a port it did not have, neither process was
+  told, and datagrams reached only one of them.
+
+  **This is a behaviour change on Linux**, and the only callers it can affect are ones that were
+  previously getting silent success: a start that used to return `NA_OK` on an occupied UDP port now
+  fails with a bind error. A port is still immediately rebindable once its server closes — verified
+  as an explicit control, since UDP has no `TIME_WAIT` for the flag to have been accommodating.
+  macOS and Windows behaviour is unchanged; they already refused the second bind.
+
+  No C ABI change and no wire change — `na_server_start`'s signature and error convention are
+  untouched; it now reports failure where it previously reported success.
+
 - **`na_client_disconnect` / `AudioStreamClient::disconnect()` no longer wait out a heartbeat
   interval after the connection is lost** (issue #76). `closed_` is the predicate every internal
   interruptible sleep waits on, so setting it is only half the terminal transition: the three sites
