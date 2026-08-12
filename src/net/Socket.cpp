@@ -452,7 +452,9 @@ bool raiseSocketBuffer(socket_t h, int optname, int bytes) {
 // — so a caller wanting a smaller buffer must not be able to reach it by passing a smaller
 // number to the primitive whose whole contract is that it cannot lower one.
 int resizeSocketBuffer(socket_t h, int optname, int bytes) {
-    if (h == kInvalidSocket || bytes <= 0) return 0;
+    // bytes == 0 is passed through rather than rejected: on Winsock it is the documented way
+    // to disable buffering for that direction outright, which is not otherwise reachable.
+    if (h == kInvalidSocket || bytes < 0) return 0;
     int want = bytes;
     ::setsockopt(h, SOL_SOCKET, optname, reinterpret_cast<char*>(&want), sizeof(want));
     int current = 0;

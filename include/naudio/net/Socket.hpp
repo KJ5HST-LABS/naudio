@@ -189,11 +189,17 @@ public:
     // size — as the send-budget arm in tests/net/test_socket.cpp does — must assert on this
     // return, never on the request (issue #74).
     //
-    // Shrinking a TCP receive buffer bounds the peer's advertised window, which is what makes a
-    // "stalled peer" wedge cheap and, more importantly, PLATFORM-INDEPENDENT: without it the
-    // wedge costs whatever the platform's loopback happens to absorb, MEASURED at ~540 KB on
-    // macOS but at more than 8 MB on Winsock, which is what forced the budget arm to be
-    // POSIX-only in the first place.
+    // Shrinking a TCP receive buffer bounds the peer's advertised window on POSIX. It does NOT
+    // do so on Winsock: MEASURED on windows-latest, a 64 KiB receive buffer — set on the
+    // listener before the handshake AND on the accepted socket after it — still absorbed an
+    // 8 MB send in 30 ms with the peer reading nothing, while getsockopt reported 65536 back
+    // the whole time. Windows enables DYNAMIC SEND BUFFERING by default and auto-tunes
+    // SO_SNDBUF, so a nonzero request there is advisory.
+    //
+    // `bytes == 0` is legal and is the one way to defeat that: on Winsock it disables buffering
+    // for that direction outright, so ::send cannot return until the peer accepts the bytes.
+    // POSIX kernels clamp 0 up to their own minimum instead, so it is not portable — check the
+    // return value, and prefer a positive size everywhere else.
     int setSendBufferSize(int bytes);
     int setRecvBufferSize(int bytes);
 

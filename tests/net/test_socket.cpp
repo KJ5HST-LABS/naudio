@@ -256,7 +256,19 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
     Socket server, client, accepted;
     ASSERT_TRUE(makeTcpPair(server, client, accepted, kBufferBytes));
 
+    // WINDOWS NEEDS THE SEND BUFFER OFF, NOT SMALL, and this is the only platform-conditional
+    // line in the arm — it changes the setup, it does not skip the test. MEASURED on
+    // windows-latest across two arrangements: a 64 KiB receive window set on the listener
+    // pre-handshake AND on the accepted socket post-accept still absorbed the whole 8 MB
+    // payload in 30 ms with the peer reading nothing, with getsockopt reporting 65536
+    // throughout. Winsock enables dynamic send buffering by default and auto-tunes SO_SNDBUF,
+    // so a nonzero request there is advisory; 0 disables buffering outright, which is the one
+    // setting that forces ::send to wait on the peer's window.
+#ifdef _WIN32
+    const int effSnd = client.setSendBufferSize(0);
+#else
     const int effSnd = client.setSendBufferSize(kBufferBytes);
+#endif
     const int effRcv = accepted.setRecvBufferSize(kBufferBytes);
     ASSERT_TRUE(client.setSendTimeout(kDeadlineMs));
     accepted.setRecvTimeout(50);
@@ -270,7 +282,8 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
     // wedged — is carried by EXPECT_FALSE(sendOk) and the drain check below, and their failure
     // messages say so. 4x leaves room for the rounding conventions (Linux commonly reports back
     // double) without leaving room for a platform that ignored the call.
-    ASSERT_GT(effSnd, 0) << "SO_SNDBUF could not be read back";
+    // effSnd is deliberately NOT asserted positive: 0 is the requested value on Windows. The
+    // recv side carries the does-the-setter-do-anything check for both platforms.
     ASSERT_GT(effRcv, 0) << "SO_RCVBUF could not be read back";
     ASSERT_LE(effSnd, 4 * kBufferBytes)
         << "this platform declined the send-buffer shrink (asked " << kBufferBytes << ", got "
