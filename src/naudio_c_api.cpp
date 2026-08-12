@@ -805,6 +805,11 @@ extern "C" na_error_t na_client_set_playback_muted(na_stream_client* client, int
 extern "C" na_error_t na_client_connect(na_stream_client* client, char* errbuf, int errlen) {
     setError(NA_OK);
     if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+    // The TERMINAL-handle arm of the failure-path contract (issue #58). A spent handle is a
+    // caller error, not a backend failure, so it gets NA_ERR_INVALID — the code that tells a
+    // caller "stop retrying this handle" without parsing errbuf prose. Checked before
+    // connectStarted so a call that does nothing does not also freeze the callback config.
+    if (client->client->isClosed()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
     // A3: freeze the callback config — from here on the dispatch/receive workers may read it, so
     // na_client_set_callbacks / na_client_set_audio_cb refuse further changes. Set on ATTEMPT (not
     // success) because even a failed connect can post an onError the dispatcher reads.
@@ -1251,6 +1256,30 @@ extern "C" na_error_t na_server_set_tx_audio_cb(na_audio_server* server, na_serv
 
 // ---- Lifecycle -------------------------------------------------------------------------
 
+namespace {
+
+// Undo a FAILED na_server_start so the handle is reusable (issue #58).
+//
+// startAttempted fires on ATTEMPT, which is right for freezing config against the workers but
+// wrong as a one-shot gate: naudio.h scopes that rule to "a second call after a SUCCESSFUL
+// start", and the code bricked the handle on any attempt. Measured: start on a busy port ->
+// NA_ERR_BACKEND with errbuf "bind() failed (errno=48)"; free the port; start again ->
+// NA_ERR_INVALID with errbuf UNTOUCHED, and every config setter refusing too. A caller was left
+// with a handle that could neither start nor be reconfigured, and no way to tell why.
+//
+// Resetting is safe precisely because the start failed: no accept thread is running,
+// notifyServerStarted never fired, and no worker can be reading the config this releases. The
+// half-built AudioStreamServer is destroyed here rather than left for the next attempt, which
+// would otherwise construct a second one over it. This is also the behaviour the Hamlib bridge
+// wants — retrying a port that was momentarily busy is its normal startup case.
+void unwindFailedStart(na_audio_server* server) {
+    server->server.reset();
+    server->glue.reset();
+    server->startAttempted.store(false);
+}
+
+}  // namespace
+
 extern "C" na_error_t na_server_start(na_audio_server* server, char* errbuf, int errlen) {
     setError(NA_OK);
     if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
@@ -1289,14 +1318,17 @@ extern "C" na_error_t na_server_start(na_audio_server* server, char* errbuf, int
         if (!server->server->start(&err)) {
             if (errbuf != nullptr && errlen > 0)
                 copyStr(errbuf, static_cast<std::size_t>(errlen), err);
+            unwindFailedStart(server);
             setError(NA_ERR_BACKEND);
             return NA_ERR_BACKEND;
         }
         return NA_OK;
     } catch (const std::bad_alloc&) {
+        unwindFailedStart(server);
         setError(NA_ERR_NOMEM);
         return NA_ERR_NOMEM;
     } catch (...) {
+        unwindFailedStart(server);
         setError(NA_ERR_BACKEND);
         return NA_ERR_BACKEND;
     }

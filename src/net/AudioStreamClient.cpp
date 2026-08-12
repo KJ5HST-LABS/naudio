@@ -135,6 +135,21 @@ bool AudioStreamClient::connect(std::string* err) {
         setErr("Already connected");
         return false;
     }
+    // FAIL FAST ON A SPENT HANDLE (issue #58). closed_ is monotonic, so once any disconnect or
+    // failed handshake-stage connect has set it, this handle can never connect again. Without
+    // this check the retry ran the ENTIRE connect path — it opened a socket, completed a full
+    // handshake, and was accepted into the server's roster — before runConnect's own closed_
+    // re-check (after performHandshake and openAudioLines) turned it away with "Closed during
+    // connect". The cost landed on the SERVER: measured with maxClients=1, the rejected retry
+    // occupied the only slot for the full 10 s CONNECTION_TIMEOUT_MS, rejecting legitimate
+    // clients Busy, while na_client_is_connected reported 0 the whole time. Worse, that retry's
+    // doClose() early-returned on the already-true flag, so closeResources() never ran for the
+    // retry generation and its socket and freshly opened audio lines leaked inside the dead
+    // handle. Checking here costs one atomic load and reaches no network at all.
+    if (closed_.load()) {
+        setErr("Client is closed — create a new client to connect again");
+        return false;
+    }
     if (!playbackDeviceId_.has_value()) {
         setErr("Playback device not configured");
         return false;

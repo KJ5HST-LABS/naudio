@@ -185,6 +185,12 @@ public:
     void disconnect();
     bool isConnected() const { return connected_.load() && !closed_.load(); }
     bool isStreaming() const { return streaming_.load(); }
+    // TERMINAL, not "disconnected": closed_ is monotonic (see its declaration), so this is the
+    // "this handle can never connect again" predicate. It is what separates a connect attempt
+    // that merely failed — a refused socket, say — from one made on a handle that is already
+    // spent, which is the distinction the C ABI turns into NA_ERR_INVALID vs NA_ERR_BACKEND
+    // (issue #58).
+    bool isClosed() const { return closed_.load(); }
 
     // --- Server client info (from CLIENTS_UPDATE) ---
     int serverClientCount() const;

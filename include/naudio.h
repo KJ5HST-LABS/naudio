@@ -516,12 +516,35 @@ NA_EXPORT na_error_t na_client_set_playback_muted(na_stream_client* client, int 
 NA_EXPORT int na_client_inject_tx_audio(na_stream_client* client, const unsigned char* pcm,
                                         int n_bytes);
 
-/* --- Lifecycle --- */
+/* --- Lifecycle ---
+ *
+ * THE FAILURE-PATH CONTRACT, for both the client and the server (na_server_start below). Read
+ * the RETURN CODE, never the errbuf text, to decide whether to retry — errbuf is a human
+ * diagnostic whose wording is not part of this ABI.
+ *
+ *   NA_ERR_BACKEND  This ATTEMPT failed; the handle is still usable. Retry is meaningful —
+ *                   fix whatever the errbuf describes (a refused port, an absent device) and
+ *                   call again.
+ *   NA_ERR_INVALID  The HANDLE is unusable for this call, and no retry on it can ever succeed.
+ *                   Destroy it and create a new one. Reaches no network and no device.
+ *
+ * A client handle becomes terminal at the FIRST na_client_disconnect, and at any connect
+ * failure that occurred after the server handshake began (a transport-level failure — a refused
+ * or unreachable socket — does NOT make it terminal, so that case is a plain retry). Once
+ * terminal it stays terminal: na_client_connect returns NA_ERR_INVALID immediately, without
+ * contacting the server. A server handle is NOT made terminal by a failed na_server_start; only
+ * a SUCCESSFUL start is one-shot.
+ */
 /* Connect, handshake, open audio lines, start streaming. Returns NA_OK on success; on failure
  * returns a negative na_error_t and, if `errbuf`/`errlen` are provided, writes the reason
- * (truncated to errlen-1 chars, always NUL-terminated). */
+ * (truncated to errlen-1 chars, always NUL-terminated).
+ *
+ * NA_ERR_INVALID means this client has already been disconnected (or a previous connect failed
+ * past the handshake): it is spent, and this call did not touch the network. NA_ERR_BACKEND
+ * means the attempt failed and retrying this same handle is legitimate. */
 NA_EXPORT na_error_t na_client_connect(na_stream_client* client, char* errbuf, int errlen);
-/* Best-effort DISCONNECT to the server, stop reconnection, and join workers. Idempotent. */
+/* Best-effort DISCONNECT to the server, stop reconnection, and join workers. Idempotent.
+ * This is the terminal transition: after it, na_client_connect returns NA_ERR_INVALID forever. */
 NA_EXPORT void na_client_disconnect(na_stream_client* client);
 /* 1 if connected, else 0 (also 0 on NULL). */
 NA_EXPORT int na_client_is_connected(na_stream_client* client);
@@ -846,7 +869,11 @@ NA_EXPORT na_error_t na_server_set_tx_audio_cb(na_audio_server* server, na_serve
 /* Bind, init audio, and start accepting clients. Returns NA_OK on success; on failure returns a
  * negative na_error_t and, if `errbuf`/`errlen` are provided, writes the reason (truncated to
  * errlen-1 chars, always NUL-terminated). Call exactly once per server (a second call after a
- * successful start returns NA_ERR_INVALID). */
+ * successful start returns NA_ERR_INVALID).
+ *
+ * A FAILED start does NOT consume the handle — see the failure-path contract above the client
+ * lifecycle block. The config setters unfreeze, and you may fix the cause and call again; the
+ * common case is a port that was momentarily busy. Only a successful start is one-shot. */
 NA_EXPORT na_error_t na_server_start(na_audio_server* server, char* errbuf, int errlen);
 /* Stop accepting, close all sessions, join workers, tear down audio. Idempotent. */
 NA_EXPORT void na_server_stop(na_audio_server* server);

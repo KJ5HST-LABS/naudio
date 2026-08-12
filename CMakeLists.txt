@@ -413,6 +413,17 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
     set_target_properties(naudio_c_server_smoke PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME naudio_c_server_smoke COMMAND naudio_c_server_smoke)
 
+    # The FAILURE-path lifecycle contract (issue #58), which the smokes above do not reach: they
+    # drive the success path, and every defect this pins lived in what happens after a call
+    # FAILS. Asserts naudio.h's stated rule — NA_ERR_BACKEND means the attempt failed and the
+    # handle is still usable, NA_ERR_INVALID means the handle is spent — against a real bind
+    # collision and a real full-roster rejection, each with a control so a green cannot mean
+    # "nothing works any more". Public C ABI only; hardware-free.
+    add_executable(naudio_c_lifecycle_contract tests/c_lifecycle_contract.c)
+    target_link_libraries(naudio_c_lifecycle_contract PRIVATE naudio)
+    set_target_properties(naudio_c_lifecycle_contract PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME naudio_c_lifecycle_contract COMMAND naudio_c_lifecycle_contract)
+
     # Sustained-TX regression: the same two ends as c_server_smoke, but over UDP and asserting
     # TX audio is still flowing in the SECOND HALF of a multi-second run. c_net_smoke's TX
     # round-trip asserts arrival at all, which passed while TX died about a second in. Drives
