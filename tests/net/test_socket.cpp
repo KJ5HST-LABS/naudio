@@ -377,10 +377,33 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
         << " as reported by getsockopt) — the socket never wedged, so either this platform's "
            "receive window is not bounded by the listener's SO_RCVBUF or the drain outran the "
            "payload; this call did not end at the budget";
-    ASSERT_GT(drainedDuringCall.load(), 64 * 1024)
-        << "the peer drained nothing while the send was running, so this arm measured a "
-           "DEAD peer — the same thing SendTimesOutWhenPeerStopsReading already covers, and "
-           "the re-arm was never exercised";
+    // THE PEER WAS ALIVE. This is a LIVENESS premise and deliberately not a throughput one: a
+    // dead peer drains exactly 0, which would make this arm a duplicate of
+    // SendTimesOutWhenPeerStopsReading, and that confusion is the only thing this guard exists
+    // to prevent.
+    //
+    // THE BOUND IS 0 AND MUST STAY THERE — do not "sharpen" it back. It was `> 64 * 1024`, and
+    // that FALSE-REDDENED macos-latest on 2026-08-12 (run 31574019523, `actual: 65536 vs 65536`)
+    // on the same sha that had passed six minutes earlier. Two independent reasons, either one
+    // sufficient:
+    //   * drainedDuringCall accumulates in kDrainChunk units, so 64 KiB is EXACTLY 2 chunks —
+    //     a strict `>` sitting precisely on the lattice the counter lands on, i.e. the single
+    //     likeliest value to meet rather than the least.
+    //   * the count is scheduler THROUGHPUT — how many kDrainIdleMs cycles the burster wins
+    //     inside one call — so any bound above 0 is a bet on a shared runner's scheduling, not
+    //     a statement about sendAll.
+    // REPRODUCED deterministically rather than inferred: widening kDrainIdleMs to 130 puts only
+    // two drains inside the call and reddens the old bound 6 of 6 at exactly 65536, the CI
+    // value. At the shipped 40 ms it is 5 chunks, 20 of 20 — so the old bound had no margin
+    // below it at all, only above.
+    //
+    // Nothing is lost. The re-arm claim the old message made belongs to the rescue-path FAIL
+    // above (issue #70), which is what actually catches a per-send deadline re-arming; the
+    // timing claim belongs to the callMs bounds below.
+    ASSERT_GT(drainedDuringCall.load(), 0)
+        << "the peer drained NOTHING while the send was running, so this arm measured a DEAD "
+           "peer — the same thing SendTimesOutWhenPeerStopsReading already covers, and the "
+           "budget was never what ended this call";
 
     // It waited (so the budget is doing the work, not an instant refusal) and it stopped
     // well inside the drip-feed's own timescale. Both bounds derive from kDeadlineMs.
