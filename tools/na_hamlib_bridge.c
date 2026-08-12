@@ -482,6 +482,22 @@ int main(int argc, char **argv) {
     }
 
     /* ---- Hamlib source ---- */
+    /* Handlers go in BEFORE the first slow call, not after the server is up. Everything below —
+     * rig_init, rig_set_conf, rig_open, both rig_stream_open calls, na_server_create and
+     * na_server_start — is setup, and over -m 2 (netrigctl) several of those are real network
+     * round-trips against rigctld. Installing the handlers afterwards left that whole window
+     * unprotected, so a Ctrl-C anywhere in it took the DEFAULT action: the process died with the
+     * rig open and streams allocated, with no rig_close and no rig_stream_close (issue #7).
+     *
+     * Nothing in the setup path reads g_stop, so a signal arriving here is simply absorbed: setup
+     * runs to completion, both workers see g_stop on their first check and return at once, the
+     * main loop is skipped, and teardown runs normally — an orderly shutdown that exits 0.
+     * worker_failed() early-returns while g_stop is set, so that shutdown is not misreported as a
+     * worker death. If a signal does interrupt a setup call badly enough to fail it, the failure is
+     * reported and exits non-zero on its own path, which is still an orderly teardown. */
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
     b.rig = rig_init((rig_model_t)model);
     if (!b.rig) {
         fprintf(stderr, "na_hamlib_bridge: rig_init(%d) failed\n", model);
@@ -560,9 +576,6 @@ int main(int argc, char **argv) {
         startup_failed = 1;
         goto teardown_all;
     }
-
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
 
     printf("na_hamlib_bridge: model=%d %s -> naudio :%d  profile=%s  channels=%d  tx=%s\n",
            model, rig_file ? rig_file : "(local)", na_server_port(b.srv),
