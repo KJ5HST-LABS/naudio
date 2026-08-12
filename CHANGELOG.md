@@ -141,6 +141,32 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **A DUAL server bound to port 0 no longer fails when the OS reserves the port its own allocator
+  just handed out** (issue #73). `DualServerTransport::bind` binds TCP, reads back the assigned port,
+  then binds UDP to that same number — TCP and UDP port spaces are independent, which is what lets one
+  port number serve both. Independent is not the same as certain: a host may reserve blocks of UDP
+  ports the TCP allocator knows nothing about, and a bind into one is refused with a *permission*
+  error (Windows `WSAEACCES`/10013) rather than address-in-use. Whether it happens depends only on
+  which port the OS chose, so it surfaced as an intermittent — five arms failed together on a Windows
+  runner against a commit that changed `CHANGELOG.md` and nothing else.
+
+  A caller that requested **port 0** now has the pair rolled back and retried on a fresh OS-assigned
+  port, bounded at 32 attempts. That preserves the contract such a caller was given: it asked for any
+  port, and it still gets any port. A caller that **named** a port is unchanged — one attempt, that
+  port or nothing. Keeping the retry off that path is deliberate: a caller that named a number should
+  get that number rather than a silent substitute, and it is also the only path on which a genuine
+  privilege refusal is reachable, which a retry would otherwise mask. On exhaustion the underlying
+  refusal is reported rather than a summary of it, so the error stays diagnosable.
+
+  The bound is 32 rather than "a few" because ephemeral ports are issued sequentially (measured:
+  +1 per bind across 24 cycles, with a just-released port never re-issued), so each retry steps one
+  port further into a reserved range — a small budget would exhaust *inside* a typical 16-port block
+  and fix nothing.
+
+  **No C ABI change and no wire change**; `docs/audio-streaming-protocol-v1.md` §2.2 records the
+  retry as a bounded `SHOULD` for other implementations, since nothing about it is observable on the
+  wire.
+
 - **The client's connection-timeout watchdog is no longer evaluated downstream of a blocking send**
   (issue #71). `AudioStreamClient`'s heartbeat loop is the only thing that notices a peer which has
   stopped sending, and its `isConnectionTimedOut()` check sat *between* two blocking sends — the

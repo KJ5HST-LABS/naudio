@@ -149,3 +149,112 @@ TEST(DualTransport, AggregateStatsZeroWithNoClients) {
     EXPECT_EQ(server.crcErrors(), 0);
     server.close();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #73 — the paired UDP bind is retried when the caller named no port.
+//
+// WHY A DOUBLE. The fault is the OS refusing a UDP bind on the very port its own
+// allocator just handed out to TCP (WSAEACCES, from a WinNAT/Hyper-V reserved block).
+// No test can provoke that on demand — it depends on which port the OS chose, which is
+// exactly why it only ever surfaced as a Windows CI intermittent, on a commit that
+// touched documentation alone. So the refusal is injected through the bindUdpTo seam
+// and everything else in the bind path stays real: the TCP bind, the rollback, the
+// port resolution, the loop, the error text.
+//
+// THE ASSERTION IS A COUNT, NEVER A DURATION. bindAttempts() cannot pass vacuously in
+// either direction — a fix that stops retrying reads 1, and one that retries when it
+// must not reads >1. Timing could not separate those.
+namespace {
+
+// Refuses the first `failures` paired UDP binds, then behaves normally.
+class FlakyUdpBindTransport : public DualServerTransport {
+public:
+    explicit FlakyUdpBindTransport(int failures) : failures_(failures) {}
+    int udpBindCalls() const { return calls_; }
+
+protected:
+    bool bindUdpTo(std::uint16_t port, std::string* err) override {
+        if (++calls_ <= failures_) {
+            // The shape of the real refusal: Windows reports a reserved range as a
+            // permission denial, not as an address already in use.
+            if (err) *err = "bind() failed (errno=10013)";
+            return false;
+        }
+        return DualServerTransport::bindUdpTo(port, err);
+    }
+
+private:
+    int failures_;
+    int calls_{0};
+};
+
+}  // namespace
+
+// A port-0 caller survives a run of refusals and lands on a working pair.
+TEST(DualTransport, Port0BindRetriesPastRefusedUdpPorts) {
+    constexpr int kRefusals = 3;
+    FlakyUdpBindTransport server(kRefusals);
+    std::string err;
+
+    ASSERT_TRUE(server.bind(0, &err)) << err;
+    EXPECT_TRUE(server.isBound());
+    EXPECT_GT(server.port(), 0);
+    // It retried, and it retried exactly as far as it had to.
+    EXPECT_EQ(server.bindAttempts(), kRefusals + 1);
+    EXPECT_EQ(server.udpBindCalls(), kRefusals + 1);
+    server.close();
+}
+
+// A first-try success must not look like a retry — the negative control for the arm
+// above, without which bindAttempts() could be a constant and both would pass.
+TEST(DualTransport, Port0BindReportsOneAttemptWhenUdpNeverRefuses) {
+    FlakyUdpBindTransport server(0);
+    std::string err;
+    ASSERT_TRUE(server.bind(0, &err)) << err;
+    EXPECT_EQ(server.bindAttempts(), 1);
+    server.close();
+}
+
+// THE GUARD ON THE RETRY'S SCOPE. A caller that NAMED a port gets exactly one attempt.
+// Retrying there would either serve a different port than the one asked for, or paper
+// over a genuine privilege refusal — the cost that made this a decision rather than an
+// obvious fix. Confining the retry to port 0 is what removes it.
+TEST(DualTransport, NamedPortBindIsNeverRetried) {
+    // Take a real port first so the named bind below asks for something plausible.
+    DualServerTransport donor;
+    std::string err;
+    ASSERT_TRUE(donor.bind(0, &err)) << err;
+    const auto named = static_cast<std::uint16_t>(donor.port());
+    donor.close();
+
+    FlakyUdpBindTransport server(1);  // one refusal is enough to prove it does not retry
+    EXPECT_FALSE(server.bind(named, &err));
+    EXPECT_EQ(server.bindAttempts(), 1);
+    EXPECT_EQ(server.udpBindCalls(), 1);
+    EXPECT_FALSE(server.isBound());
+}
+
+// Exhaustion is bounded, reports the UNDERLYING refusal rather than a summary of it,
+// and strands no TCP listener.
+TEST(DualTransport, Port0BindGivesUpAfterBudgetAndPreservesTheRealError) {
+    FlakyUdpBindTransport server(DualServerTransport::kPort0BindAttempts + 1);  // never succeeds
+    std::string err;
+
+    EXPECT_FALSE(server.bind(0, &err));
+    EXPECT_EQ(server.bindAttempts(), DualServerTransport::kPort0BindAttempts);
+    EXPECT_EQ(server.udpBindCalls(), DualServerTransport::kPort0BindAttempts);
+    // The diagnosable part of the error survives the retry.
+    EXPECT_NE(err.find("10013"), std::string::npos) << err;
+    // Rollback held on every attempt, not just the first.
+    EXPECT_FALSE(server.isBound());
+    EXPECT_EQ(server.port(), -1);
+}
+
+// The budget must clear a CONTIGUOUS reserved block, not one unlucky port: ephemeral
+// ports are handed out sequentially (+1 per bind, measured), so each retry steps one
+// port further into a reserved range. A budget trimmed to "a few" would give up inside
+// a typical 16-port WinNAT block and fix nothing. This pins the reasoning, not the
+// number — the constant is free to move above the floor.
+TEST(DualTransport, Port0BindBudgetClearsAContiguousReservedBlock) {
+    EXPECT_GT(DualServerTransport::kPort0BindAttempts, 16);
+}
