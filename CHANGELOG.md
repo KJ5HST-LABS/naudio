@@ -261,6 +261,56 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **UDP audio frames are now sized from the MTU advisory instead of from the frame cadence, so no
+  preset emits a datagram that IP-fragments** (issue #86). `AudioPacket::UDP_MAX_PAYLOAD` (1400)
+  has always documented that a larger datagram fragments on a standard ~1500-byte path, and that
+  losing any one fragment discards the whole datagram — but the rule was addressed to *callers*
+  while naudio's own presets all broke it. One call to send audio became exactly one datagram,
+  whose size was however much audio `frameDurationMs` happened to name. Measured, with no oversized
+  inject involved and at each preset's own default settings:
+
+  | preset | audio frame | datagram before | datagram after | packets/frame |
+  |---|---|---|---|---|
+  | default / TCP shape (20 ms) | 3840 B | 3863 B | 1399 B | 1 → 3 |
+  | `udpLan` / `udpWan` / `udpFt8` (10 ms) | 1920 B | 1943 B | 1399 B | 1 → 2 |
+  | `udpIq` (192 kHz, 10 ms) | 7680 B | 7703 B | 1399 B | 1 → 6 |
+  | `lowBandwidth` | 960 B | 983 B | 983 B | 1 → 1 (unchanged) |
+
+  **`udpWan` is the only preset that enables FEC, and it was a preset whose own frames defeated it:**
+  a fragmented 1943-byte datagram loses everything if any fragment is dropped, including the parity
+  meant to cover that loss. None of this was visible in testing because loopback has no MTU.
+
+  `UdpClientConnection` now splits outgoing audio at
+  `AudioPacket::udpMaxAudioPayload(sampleFrameBytes)` — the advisory budget rounded **down to a
+  whole sample frame**, since a chunk boundary inside a sample decodes every later sample one
+  channel out of phase. **This is not app-layer fragmentation and not a wire change:** each chunk
+  is a complete, independently-sequenced 0xAF01 audio frame, and the receiver reassembles nothing,
+  because it appends payloads to a byte-stream ring in sequence order exactly as before. It is the
+  same property the RX fan-out already relied on for issue #20's oversized inject, applied one
+  layer down so that **both** audio producers are covered — the server's RX fan-out and the
+  client's TX capture loop reach this one point, and fixing either alone would have left the other
+  fully exposed. FEC parity needs no separate handling: it is the XOR of its block's payloads, so
+  it shrinks with them.
+
+  **The cost is more packets per second, in exchange for datagrams that survive a real path**: 100
+  → 200 pkt/s on the voice presets, 100 → 600 on `udpIq`. `lowBandwidth` was already compliant and
+  is byte-identical. Frame cadence, latency and `frameDurationMs`'s meaning are unchanged; the
+  reorder window (8 packets) and FEC block (5 packets) now span proportionally less time, which
+  widens the FEC decoder's derived hold bound rather than narrowing it.
+
+  **`UdpClientConnection::oversizedDatagrams()` finally means something.** It previously counted
+  ordinary audio at every UDP preset and was read by nothing anywhere — not by a test, not by the C
+  ABI, not by the bridge. It now stays 0 on every preset (asserted), and a non-zero value reports
+  only what nothing upstream can shrink: an outsized control message, or a format whose single
+  sample frame does not fit the advisory at all — a case where alignment is deliberately preferred
+  over MTU safety, because fragmentation costs loss resilience while misalignment corrupts.
+
+  **Added to the public C++ headers:** `AudioPacket::UDP_MAX_AUDIO_PAYLOAD`,
+  `AudioPacket::udpMaxAudioPayload()`, `AudioStreamConfig::sampleFrameBytes()`,
+  `AudioStreamConfig::udpMaxAudioPayload()`, and `UdpReliabilityConfig::maxAudioPayloadBytes`.
+  **No C ABI change and no wire change**; `docs/audio-streaming-protocol-v1.md` §2.4 gains a
+  non-normative note on which side of the connection owes the advisory.
+
 - **`Socket::close()` no longer frees a descriptor while a syscall is still running on it**
   (issue #90). Every transport's shutdown path closed a socket while another thread was parked in
   `recv()` / `accept()` on that same descriptor — `AudioStreamServer::stop()` →

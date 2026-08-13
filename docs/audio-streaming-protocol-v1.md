@@ -64,7 +64,7 @@ On UDP, a client is registered **only** upon receipt of a valid, deserializable 
 ### 2.4 Framing
 
 - **TCP:** frames are length-delimited by the header's 2-byte payload-length field. A reader consumes the fixed 19-byte header, then `payloadLength` payload bytes, then 4 CRC bytes. A robust reader maintains a resync state machine: on a bad magic it scans forward byte-by-byte for the next `0xAF01`; on an oversized payload-length it skips; on `MAX_CONSECUTIVE_CRC_ERRORS` (= 5) consecutive validation failures it MAY abort the connection. A successful decode resets the consecutive-error counter.
-- **UDP:** one frame per datagram. Payloads SHOULD be kept ≤ `UDP_MAX_PAYLOAD` (= 1400 bytes) to avoid IP fragmentation (advisory, not enforced by the codec).
+- **UDP:** one frame per datagram. Payloads SHOULD be kept ≤ `UDP_MAX_PAYLOAD` (= 1400 bytes) to avoid IP fragmentation (advisory, not enforced by the codec). The obligation falls on the **sender**, not on the application feeding it: a sender whose audio frame exceeds the budget SHOULD split it across several complete, independently-sequenced audio frames rather than emit one oversized datagram, since each is a whole frame and a receiver reassembles nothing. Splitting at a whole sample frame is required — a boundary inside a sample decodes every later sample one channel out of phase. This is not app-layer fragmentation and adds nothing to the wire format. *(Non-normative: the reference implementation does this for every preset, sample rate and channel count; see issue #86.)*
 
 ### 2.5 Ports
 
