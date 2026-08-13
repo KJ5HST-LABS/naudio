@@ -1860,7 +1860,23 @@ TEST(Server, GateRejectedClientsLeaveNoTraceInTheRosterGauge) {
 
         // The roster is still empty, so every aggregate over it must still be zero. Pre-fix each
         // rejected connection is still in the map and still counting its own reject message.
-        const ServerStats after = server.stats();
+        //
+        // THE GAUGE IS ALLOWED TO SETTLE, and the wait is not a flake-patch. Since #87 rejectClient
+        // drains the peer's unread CONNECT_REQUEST before closing (so the close emits a FIN and the
+        // reject is not lost to an RST), so the map entry is released up to the drain budget AFTER
+        // the client has already read its reject. The contract this arm pins is that a rejected
+        // client LEAVES the map — not that it leaves before an observer can look. Measured: without
+        // this wait the arm read packetsSent == 1, the final attempt still inside its 20 ms drain.
+        //
+        // It stays a real detector: a leak that never resolves still fails, because the budget is
+        // 100x the drain. Confirmed by re-running the M-A mutation after this wait was added.
+        ServerStats after = server.stats();
+        const auto settleBy = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+        while ((after.packetsSent != 0 || after.bytesSent != 0) &&
+               std::chrono::steady_clock::now() < settleBy) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            after = server.stats();
+        }
         EXPECT_EQ(after.clientsConnected, 0);
         EXPECT_EQ(after.packetsSent, 0) << "transport " << static_cast<int>(tt);
         EXPECT_EQ(after.bytesSent, 0) << "transport " << static_cast<int>(tt);
