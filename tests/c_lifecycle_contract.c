@@ -95,38 +95,16 @@ static int server_start_retry_arm(void) {
     berr[0] = '\0';
     na_error_t rc = na_server_start(b, berr, (int)sizeof berr);
 
-    /* PREMISE GUARD — issue #85, and NOT a convenience skip.
+    /* The #85 premise guard that stood here is DELETED, not adjusted, because the premise now
+     * holds everywhere. It skipped this arm on any platform that ALLOWED a second server to bind
+     * a served port — which was Windows, where the listener's port-ownership request had been
+     * implemented as a bare SO_REUSEADDR and Winsock reads that as permission to bind a port
+     * another socket is actively listening on. Socket::listenTcp now asks for
+     * SO_EXCLUSIVEADDRUSE there instead, so the collision below stages a real failed start on all
+     * four CI jobs and the #58 unwind assertions have Windows coverage for the first time.
      *
-     * This arm stages a failed start with a real bind collision, which assumes the platform
-     * REFUSES a second bind of a port already being served. Windows does not: the TCP listener
-     * sets SO_REUSEADDR (src/net/TcpServerTransport.cpp:40), and on Winsock that flag permits
-     * binding a port another socket is ACTIVELY LISTENING on — the behaviour SO_EXCLUSIVEADDRUSE
-     * exists to prevent. So na_server_start returns NA_OK there for a port it does not have.
-     *
-     * That is #83's defect on the other transport and platform, found BY this arm (CI run
-     * 31643720529 returned 0 here) and filed as #85. It is a separate defect needing a design
-     * call — TCP genuinely needs SO_REUSEADDR on POSIX for restart-after-TIME_WAIT, so #83's
-     * "the flag bought us nothing" reasoning does not transfer.
-     *
-     * Until #85 is fixed the collision cannot be staged on such a platform, so the unwind
-     * assertions below are unreachable there and the #58 facet-2 fix has NO Windows coverage.
-     * Said out loud rather than left to a green tick. The one-shot CONTROL still runs, so this
-     * branch is not vacuous. WHEN #85 LANDS, DELETE THIS GUARD — do not adjust it. */
-    if (rc == NA_OK) {
-        fprintf(stderr,
-                "  SKIP (issue #85): this platform ALLOWED a second server to bind a port "
-                "already being served, so a failed start cannot be staged here and the #58 "
-                "unwind is UNCOVERED on this platform. Running the one-shot control only.\n");
-        if (na_server_start(b, NULL, 0) != NA_ERR_INVALID) {
-            na_server_destroy(b);
-            na_server_destroy(a);
-            return fail("a second start after a SUCCESSFUL start must return NA_ERR_INVALID");
-        }
-        na_server_destroy(b);
-        na_server_destroy(a);
-        printf("  server: SKIPPED the unwind arm (#85); one-shot control passed\n");
-        return 0;
-    }
+     * If this arm ever reports NA_OK again, that is #85 regressing and it must fail here rather
+     * than skip — the skip existed only while the defect was known and open. */
     if (rc != NA_ERR_BACKEND) {
         fprintf(stderr, "  (start on a busy port returned %d, wanted NA_ERR_BACKEND)\n", (int)rc);
         na_server_destroy(b);
