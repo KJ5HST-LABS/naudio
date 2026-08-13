@@ -213,6 +213,32 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **On Linux, tearing down a session leaked its writer thread whenever the peer had stopped
+  reading** (issue #56). Closing a socket drops a *descriptor*; it does not by itself return a
+  thread already blocked in the kernel on that socket, because a blocked `send()` holds its own
+  reference to the open file description. naudio had no `::shutdown()` call anywhere, so teardown
+  depended on a behaviour that only some platforms provide. Measured against a peer whose receive
+  window had shut: on macOS a bare `close()` woke the parked sender immediately, while on Linux it
+  was **still parked five seconds later** — and `shutdown()` before `close()` woke it in **11 ms**.
+  Every connection close now half-closes both directions first. The platform that papered over this
+  is the one naudio was developed on; the one that did not is the one Hamlib mostly ships to.
+
+- **A client that stopped reading could wedge the server thread that handles its own traffic**
+  (issue #56). The session's receive loop answered a latency probe and a TX denial with a direct
+  send, and every send holds one mutex across the whole socket write — so while the writer thread
+  was blocked against a stalled peer, the receive thread blocked behind it. The thread that
+  processes that client's TX audio, its heartbeats and its DISCONNECT stopped, precisely because
+  the client had stopped reading. Both are now queued for the writer thread, which is what the
+  writer bridge exists for. A depth cap on that queue is part of the same fix rather than an extra:
+  control messages do not count toward the byte-based backlog cap, so with the receive thread no
+  longer blocking, a peer that spams latency probes while refusing to drain would have queued one
+  response per probe forever — the wedge had been doing that bounding.
+
+  **Consequence for a backlogged client:** a latency probe answered from the queue reports a larger
+  round-trip than one answered inline. That is the honest number — a client whose queue is deep
+  genuinely is that far behind — and it is preferable to stalling that client's TX audio to make
+  one measurement look better.
+
 - **On Windows, a rejected client received no reason at all — it saw a reset connection instead of
   "Maximum clients (N) reached"** (issue #87). The server decides a reject at *accept*, before
   reading a byte, so a client that behaved normally — connect, send `CONNECT_REQUEST`, then wait for
