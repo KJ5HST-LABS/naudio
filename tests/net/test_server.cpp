@@ -1081,11 +1081,13 @@ std::shared_ptr<naudio::test::ScriptedClientConnection> connectScripted(
 
 // Delivers one TX frame and returns when the session has FINISHED handling it.
 //
-// The probe is the barrier. handleControlMessage answers a LatencyProbe with a direct
-// connection_->sendControl on the receive thread (AudioStreamServer.cpp:378), and
-// receiveLoop is strictly sequential (:266-289) — so the response cannot be recorded until
-// the frame pushed before it has been through handleTxAudio and the mixer. This is a
-// happens-after edge in production code, not an observation of the double's own counters.
+// The probe is the barrier, and it survived #56 item 2 changing how the response is sent.
+// handleControlMessage now ENQUEUES the LatencyResponse (AudioStreamServer.cpp:568) instead of
+// sending it inline, so the writer thread transmits it — but the enqueue still happens on the
+// receive thread, strictly after handleTxAudio returned, and receiveLoop is strictly sequential
+// (AudioStreamServer.cpp:437-462). So "response observed" still implies "enqueued", which still
+// implies "the frame pushed before it has been through handleTxAudio and the mixer". The
+// happens-after edge is unchanged; only the thread that finally writes the bytes moved.
 bool deliverTx(naudio::test::ScriptedClientConnection& conn, Provenance provenance,
                int probeOrdinal) {
     conn.push(AudioPacket::createTxAudio(100 + probeOrdinal, kTxFrame), provenance);
@@ -1883,6 +1885,69 @@ TEST(Server, GateRejectedClientsLeaveNoTraceInTheRosterGauge) {
 
         server.stop();
     }
+}
+
+// #56 item 2 — a stalled writer must not wedge the session's RECEIVE thread.
+//
+// receiveLoop used to answer a LatencyProbe and a TX denial with a DIRECT connection_->sendControl.
+// Every send funnels through AudioProtocolHandler::sendPacket, which holds one sendMutex_ across
+// the whole Socket::sendAll — so while the writer thread was blocked sending to a peer whose
+// receive window had closed, the receive thread blocked behind it on that same mutex. The thread
+// that processes that client's TX audio, its heartbeats and its DISCONNECT stopped, because the
+// client had stopped reading. Bounded since the send deadline landed (#56/#70), but bounded is not
+// the same as absent, and the writer bridge exists precisely so that no other thread touches a
+// socket.
+//
+// WHY NO ARM CAUGHT THIS BEFORE, which is the part worth keeping: ScriptedClientConnection
+// deliberately did NOT serialise sendRxAudio on its sendMutex_, with a comment saying production
+// does but that serialising it here would deadlock the LatencyProbe barrier the server arms use.
+// That is true — and it is true BECAUSE of this defect. The double was bent to fit the bug, so the
+// one place the contention lived was the one place the harness refused to model it. The double is
+// faithful again now that the fix removed the reason for the exception.
+//
+// THE OBSERVABLE IS THE DISCONNECT, not the probe. A LatencyResponse would only prove the probe
+// was handled; the Disconnect pushed BEHIND it proves receiveLoop kept going past it, which is the
+// actual claim. It is also un-fakeable by later cleanup: the session leaves the roster only if
+// handleControlMessage ran.
+TEST(Server, ServerReceiveLoopIsNotWedgedByAStalledWriter) {
+    auto transport = std::make_shared<naudio::test::ScriptedServerTransport>();
+    AudioStreamServer server{0};
+    server.setInjectOnlyMode(true);
+    server.setTransportFactory([transport]() { return transport; });
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    auto conn = connectScripted(*transport, "stalled-reader");
+    ASSERT_TRUE(conn) << "the scripted session never reached the roster";
+
+    // Park the writer inside a send, holding sendMutex_ — a peer whose window has closed.
+    conn->stallRxAudio();
+    std::vector<std::uint8_t> frame(64, 0x5A);
+    server.injectAudio(frame);
+
+    // THE L136 GUARD. Asserting anything about the receive thread "while the writer is wedged" is
+    // vacuous unless the writer is actually wedged at that moment. rxAudioCalls saturates at 1
+    // with the latch armed, so this is the proof the fault was staged, not merely requested.
+    const auto parkedBy = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (conn->rxAudioCalls() < 1 && std::chrono::steady_clock::now() < parkedBy) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_GE(conn->rxAudioCalls(), 1) << "the writer never entered sendRxAudio, so nothing is "
+                                          "holding sendMutex_ and this arm proves nothing: "
+                                       << conn->diagnostics();
+
+    // Drive the receive thread: a probe (which used to block on the held mutex) and, behind it,
+    // a Disconnect whose handling is the observable.
+    conn->pushLatencyProbe();
+    conn->push(AudioPacket::createControl(0, ControlMessage::disconnect().serialize()),
+               Provenance::Live);
+
+    EXPECT_TRUE(waitForClientCount(server, 0, 3000))
+        << "receiveLoop never got past the LatencyProbe to the Disconnect behind it — it is "
+           "wedged behind the parked writer: "
+        << conn->diagnostics();
+
+    server.stop();
 }
 
 // #87 — a rejected client must actually RECEIVE its reason, when it behaves the way the real

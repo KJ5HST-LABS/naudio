@@ -394,15 +394,27 @@ public:
         return controlSendsDeclined_;
     }
 
-    // NOT SERIALISED ON sendMutex_, and that exclusion is load-bearing rather than an
-    // oversight. Production does serialise it — sendRxAudio funnels through the same
-    // AudioProtocolHandler::sendPacket — but this method's stall latch parks until close(),
-    // and the server arms that arm it rely on the session's RECEIVE thread still being able to
-    // answer a LatencyProbe with sendControl while the writer is parked (the BARRIER above).
-    // Put this under sendMutex_ and that barrier deadlocks, turning every one of those arms
-    // into a ctest hang rather than a failure. The client-side serialisation below models the
-    // wedge #71 is about; this one keeps the server-side arms working.
+    // SERIALISED ON sendMutex_ since #56 item 2, and the history is the point.
+    //
+    // This used to be deliberately EXCLUDED from sendMutex_, with a comment explaining that
+    // production does serialise it (sendRxAudio funnels through the same
+    // AudioProtocolHandler::sendPacket) but that the server arms relied on the session's RECEIVE
+    // thread still being able to answer a LatencyProbe with a direct sendControl while the writer
+    // was parked — so putting it under sendMutex_ would deadlock the barrier and turn those arms
+    // into ctest hangs.
+    //
+    // That exclusion was the double bending to fit the defect. The receive thread could only
+    // answer while the writer was parked BECAUSE production let it block on sendMutex_ — which is
+    // exactly #56's item 2, and it meant no arm in this file could ever detect it: the one place
+    // the contention lived was the one place the double refused to model.
+    //
+    // Since receiveLoop enqueues instead of sending inline (AudioStreamServer.cpp, handleTxAudio
+    // and handleControlMessage), the receive thread never takes this mutex, so the double can now
+    // be faithful — and being faithful is what makes ServerReceiveLoopIsNotWedgedByAStalledWriter
+    // a real detector. Reverting the production change reddens that arm; it does not hang, because
+    // close() releases the latch.
     bool sendRxAudio(const std::uint8_t*, std::size_t, std::size_t) override {
+        std::lock_guard<std::mutex> serialize(sendMutex_);
         std::unique_lock<std::mutex> lock(mutex_);
         ++rxAudioCalls_;
         cv_.notify_all();  // wake a test waiting to observe that the writer arrived

@@ -159,6 +159,17 @@ private:
     std::condition_variable outCv_;
     std::deque<Outgoing> outQueue_;
     bool outClosed_ = false;
+    // Total entries allowed in outQueue_, audio and control together. Sized to sit ABOVE any
+    // depth audio can legitimately reach so it never fires on the audio path: audio is capped by
+    // outQueueMaxBytes_ (CONNECTION_TIMEOUT_MS of stream, 1,920,000 B on the default preset), and
+    // since #20's fan-out frames to AudioPacket::MAX_PAYLOAD the entries are ~16 KB each — order
+    // 100s, not 1000s. The smallest-framed built-in preset still lands near 1000. 4096 leaves
+    // room above that while bounding a control flood at a few MB. It is a BACKSTOP, not a tuning
+    // knob: if this ever fires on audio, the byte cap is the thing that is wrong.
+    static constexpr std::size_t kOutQueueMaxDepth = 4096;
+    // One report per session, so a peer holding the queue at its cap cannot flood the operator's
+    // error callback with one message per dropped control.
+    bool controlDropReported_ = false;
     // Pending RX-audio bytes in outQueue_ (control messages count 0 — see enqueueControl).
     // Guarded by outMutex_.
     std::size_t outQueueBytes_ = 0;
@@ -195,6 +206,35 @@ private:
 void AudioStreamServer::ClientSession::enqueueControl(ControlMessage message) {
     std::lock_guard<std::mutex> lock(outMutex_);
     if (outClosed_) return;
+
+    // THE DEPTH CAP EXISTS FOR CONTROL MESSAGES SPECIFICALLY (issue #56, item 2). Audio is
+    // already bounded by outQueueMaxBytes_, but a control contributes ZERO to that counter by
+    // design — the byte counter measures the audio backlog exactly — so without a second bound
+    // controls would be the one thing that can grow this deque without limit.
+    //
+    // That became reachable the moment receiveLoop stopped sending inline: the receive thread
+    // now keeps reading while the writer is wedged, so a peer that is not draining and that
+    // spams LatencyProbes gets one queued LatencyResponse per probe, forever. Blocking the
+    // receive thread used to be what prevented that, which is to say the wedge was doing the
+    // bounding. Trading a liveness defect for a memory defect is not a fix.
+    //
+    // DROP rather than evict: a control is advisory, the drop is bounded and reported once, and
+    // a peer that is genuinely gone is already evicted by the heartbeat path (the #56 fix that
+    // landed in 8a9e692) within CONNECTION_TIMEOUT_MS. Evicting from here would also mean
+    // tearing down a session from inside a mixer callback, which is a re-entry this class
+    // deliberately avoids everywhere else.
+    if (outQueue_.size() >= kOutQueueMaxDepth) {
+        if (!controlDropReported_) {
+            controlDropReported_ = true;
+            server_->notifyError(clientId_,
+                                 "Outbound control queue at its depth cap (" +
+                                     std::to_string(kOutQueueMaxDepth) +
+                                     " messages): dropping control traffic for a client that is "
+                                     "not draining");
+        }
+        return;
+    }
+
     outQueue_.push_back(Outgoing{std::move(message), {}});
     outCv_.notify_one();
 }
@@ -499,7 +539,13 @@ void AudioStreamServer::ClientSession::handleTxAudio(const std::vector<std::uint
     } else if (result == AudioMixer::TxResult::Rejected) {
         const int denied = txDeniedCount_.fetch_add(1) + 1;
         if (denied == 1) {  // first denial only — avoid spam
-            connection_->sendControl(ControlMessage::txDenied(mixer->currentTxOwner()));
+            // ENQUEUED, not sent inline (issue #56, item 2). This runs on the RECEIVE thread, and
+            // a direct sendControl takes the same sendMutex_ the writer holds across its whole
+            // send — so a peer that has stopped draining used to wedge the one thread that
+            // processes its TX audio, its heartbeats and its DISCONNECT. Bounded since the send
+            // deadline landed, but bounded-and-wrong is still wrong: the writer bridge exists
+            // precisely so no other thread ever blocks on a socket.
+            enqueueControl(ControlMessage::txDenied(mixer->currentTxOwner()));
         }
     }
 }
@@ -510,7 +556,16 @@ void AudioStreamServer::ClientSession::handleControlMessage(const AudioPacket& p
 
     switch (msg->messageType()) {
         case ControlType::LatencyProbe:
-            connection_->sendControl(ControlMessage::latencyResponse(msg->parseLatencyTimestamp()));
+            // Enqueued for the same reason as txDenied above (issue #56, item 2): a LatencyProbe
+            // from a peer that has stopped draining must not wedge the receive thread.
+            //
+            // THE TRADE IS REAL AND IS THE RIGHT WAY ROUND. Queuing puts the response behind
+            // whatever audio is already pending, so a backlogged client measures a LARGER
+            // round-trip than it would have. That is not an error in the measurement — a client
+            // whose queue is deep genuinely is that far behind, and reporting it is the honest
+            // answer. Blocking the receive thread to make one number prettier costs that client
+            // its TX audio and its disconnect handling.
+            enqueueControl(ControlMessage::latencyResponse(msg->parseLatencyTimestamp()));
             break;
         case ControlType::LatencyResponse: {
             const std::int64_t sent = msg->parseLatencyTimestamp();
