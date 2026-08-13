@@ -6,6 +6,7 @@
 //
 #include "naudio/net/AudioStreamServer.hpp"
 
+#include <algorithm>  // std::remove, in removeStreamListener
 #include <chrono>
 #include <deque>
 #include <utility>
@@ -780,6 +781,10 @@ void AudioStreamServer::stop() {
         transport_.reset();
     }
 
+    // POSTS onServerStopped; it does not drain. Issue #89 asked whether it should, and the answer
+    // is recorded in full on AudioStreamServer::removeStreamListener() — the short version is that
+    // CallbackDispatcher is not restartable, so a drain here would leave a restarted server mute.
+    // A consumer that needs its listener destroyed before the server calls removeStreamListener().
     notifyServerStopped();
 }
 
@@ -1073,6 +1078,21 @@ void AudioStreamServer::addStreamListener(AudioStreamListener* listener) {
         if (l == listener) return;
     }
     listeners_.push_back(listener);
+}
+
+void AudioStreamServer::removeStreamListener(AudioStreamListener* listener) {
+    if (!listener) return;
+    {
+        std::lock_guard<std::mutex> lock(listenersMutex_);
+        listeners_.erase(std::remove(listeners_.begin(), listeners_.end(), listener),
+                         listeners_.end());
+    }
+    // OUTSIDE listenersMutex_, and that ordering is load-bearing twice over. The erase must land
+    // first, or a task posted between the two would name a listener this call is about to promise
+    // is detached. And the wait must not hold the lock: the task being waited on may re-enter the
+    // server from the dispatch thread, and every notify* takes listenersMutex_ to snapshot — so
+    // fencing under it would deadlock the two threads against each other.
+    dispatcher_.fence();
 }
 
 int AudioStreamServer::port() const {

@@ -174,16 +174,46 @@ public:
     // Injects PCM to broadcast to all clients (recordings / engine audio / tests).
     void injectAudio(const std::vector<std::uint8_t>& data);
 
-    // Borrowed, and must outlive the SERVER — not merely the last stop(). Callbacks are delivered
-    // on the dispatcher thread, and stop() only POSTS onServerStopped(); the drain and join happen
-    // in ~AudioStreamServer. So a listener destroyed between a returned stop() and the server's
-    // destruction is still reachable, and reading it there is a use-after-free.
+    // Borrowed, and must outlive the SERVER — not merely the last stop() — UNLESS it is handed
+    // back with removeStreamListener() below. Callbacks are delivered on the dispatcher thread,
+    // and stop() only POSTS onServerStopped(); the drain and join happen in ~AudioStreamServer. So
+    // a listener destroyed between a returned stop() and the server's destruction is still
+    // reachable, and reading it there is a use-after-free.
     //
     // Stated because it was NOT: the `backend` above carries the same borrowed-must-outlive rule
     // and says so, this one said nothing, and two of this project's own arms in
     // tests/net/test_server.cpp consequently declared their listener AFTER the server — destroying
     // it first. ASan found both (issue #28). Declare listeners before the server they attach to.
     void addStreamListener(AudioStreamListener* listener);
+
+    // Detaches a listener and WAITS for any callback already in flight to finish. After this
+    // returns, no callback for `listener` is running or will ever fire again, so destroying it is
+    // safe — including before the server. Idempotent; a listener never added is a no-op.
+    //
+    // The wait is the point, and it is why this is not a one-line erase. Each notify* snapshots
+    // the roster and captures the listener POINTERS by value, so a task queued before the erase
+    // still holds this one; erasing alone would return while that task was pending and hand the
+    // caller a detach that does not make destruction safe. See CallbackDispatcher::fence().
+    //
+    // Calling this from INSIDE a callback detaches, but cannot wait (a thread cannot wait for
+    // itself) — that is sound, because the only task that could hold the pointer is the one on
+    // your own stack, and you are not destroying yourself from within your own method.
+    //
+    // ISSUE #89 — WHY stop() DOES NOT DRAIN, AND WHY THIS EXISTS INSTEAD. The natural consumer
+    // sequence `server.stop();` followed by destroying the listener is unsafe above, and the
+    // obvious repair is to have stop() drain the dispatcher before returning. That was measured
+    // and rejected: start() after stop() is a supported, publicly documented state transition
+    // (naudio.h, na_server_stats.running — "0 means ... after na_server_stop"), and
+    // CallbackDispatcher is deliberately NOT restartable — stop() latches stop_ and joins, after
+    // which post() and start() both silently no-op forever. A drain inside stop() therefore leaves
+    // a restarted server RUNNING CORRECTLY AND PERMANENTLY MUTE, with start() still returning
+    // success: it trades a loud, sanitizer-detectable use-after-free for a silent event loss that
+    // no existing arm detects. The drain would also be conditional in a way nothing states — it is
+    // skipped whenever stop() is called from within a callback, which naudio.h explicitly permits
+    // ("You MAY call any server method from inside one, INCLUDING na_server_stop"). The strong
+    // "no callback can be in flight once it returns" guarantee is kept where it costs nothing and
+    // is already documented: na_server_destroy / ~AudioStreamServer.
+    void removeStreamListener(AudioStreamListener* listener);
 
     const AudioStreamConfig& config() const { return config_; }
     // The bound port (-1 if not bound).

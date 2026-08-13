@@ -35,6 +35,7 @@
 #include "naudio/FakeBackend.hpp"
 #include "naudio/Stream.hpp"
 #include "naudio/Types.hpp"
+#include "naudio/net/CallbackDispatcher.hpp"  // fence(), exercised directly at the end of this file
 #include "naudio/net/TcpClientTransport.hpp"
 #include "naudio/net/Transport.hpp"
 #include "naudio/net/UdpClientTransport.hpp"
@@ -2073,4 +2074,195 @@ TEST(Server, AFailedHandshakeLeavesNoUnpairedConnectEvent) {
     EXPECT_EQ(server.clientCount(), 0);
 
     server.stop();
+}
+
+// ===========================================================================
+// Issue #89 — the listener lifetime contract.
+//
+// Two arms, guarding the two halves of one decision. The first guards the decision NOT to drain
+// the dispatcher inside stop(); the second guards the mechanism that was shipped instead.
+// ===========================================================================
+
+namespace {
+
+// Counts the two lifecycle events across a restart. Deliberately counts rather than latches:
+// the defect this guards is a SECOND event going missing, which a bool cannot see.
+class RestartCountingListener : public AudioStreamListener {
+public:
+    void onServerStarted(int) override { ++starts_; }
+    void onServerStopped() override { ++stops_; }
+    int starts() const { return starts_.load(); }
+    int stops() const { return stops_.load(); }
+
+private:
+    std::atomic<int> starts_{0};
+    std::atomic<int> stops_{0};
+};
+
+// Parks the dispatch thread inside a callback so a removal can be staged while one is in flight,
+// then touches its own members AFTER the park — the read that is a use-after-free if the object
+// was destroyed during it.
+class ParkedCallbackListener : public AudioStreamListener {
+public:
+    void onServerStarted(int) override {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            entered_ = true;
+        }
+        cv_.notify_all();
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        std::lock_guard<std::mutex> lock(m_);
+        completed_ = true;  // a WRITE to this object, after the park
+    }
+
+    bool waitUntilEntered(int budgetMs) {
+        std::unique_lock<std::mutex> lock(m_);
+        return cv_.wait_for(lock, std::chrono::milliseconds(budgetMs), [this] { return entered_; });
+    }
+    bool completed() {
+        std::lock_guard<std::mutex> lock(m_);
+        return completed_;
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool entered_ = false;
+    bool completed_ = false;
+};
+
+}  // namespace
+
+// #89, half one: the decision NOT to drain in stop(), guarded by its consequence.
+//
+// This arm exists because the obvious repair for #89 — have stop() drain the dispatcher before
+// returning — is WRONG, and wrong in a way nothing else in this suite can see. start() after
+// stop() is a supported public transition (naudio.h, na_server_stats.running). CallbackDispatcher
+// is not restartable: stop() latches stop_ and joins, after which post() and start() both no-op
+// forever. So a drain inside stop() leaves a restarted server running correctly and PERMANENTLY
+// MUTE — with start() still returning success.
+//
+// MEASURED, not argued (S91): with `dispatcher_.stop()` appended to AudioStreamServer::stop(),
+// this arm reads starts()==1 stops()==1 against the 2/2 below — and the other 393 tests in the
+// tree stay green. It is the only detector for that regression, which is precisely why it is here.
+TEST(Server, RestartStillDeliversLifecycleCallbacksAfterAStop) {
+    RestartCountingListener listener;
+    AudioStreamServer server{0};
+    server.setInjectOnlyMode(true);
+    server.addStreamListener(&listener);
+
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+    server.stop();
+    ASSERT_TRUE(server.start(&err)) << err << " — start() after stop() is a supported transition";
+    server.stop();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while ((listener.starts() < 2 || listener.stops() < 2) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    EXPECT_EQ(listener.starts(), 2)
+        << "the SECOND onServerStarted never arrived: the dispatcher went mute across a restart. "
+           "If stop() was just changed to drain, THIS is the cost — see issue #89.";
+    EXPECT_EQ(listener.stops(), 2) << "the SECOND onServerStopped never arrived";
+}
+
+// #89, half two: removeStreamListener() must WAIT, not merely erase.
+//
+// The deterministic assertion is completed() — an erase-only removal returns while the parked
+// callback is still running, so it reads false on every platform with no sanitizer needed. The
+// destroy that follows is the second detector, and the one that speaks under ASan: without the
+// fence the parked callback writes to freed memory when it wakes.
+//
+// The waitUntilEntered gate is what stops a green here from being vacuous (L222): if the callback
+// never started, there was no in-flight window to close and the arm would pass without testing
+// anything.
+TEST(Server, RemoveStreamListenerWaitsForAnInFlightCallback) {
+    auto listener = std::make_unique<ParkedCallbackListener>();
+
+    AudioStreamServer server{0};
+    server.setInjectOnlyMode(true);
+    server.addStreamListener(listener.get());
+
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    ASSERT_TRUE(listener->waitUntilEntered(3000))
+        << "the dispatch thread never entered onServerStarted — the in-flight window was never "
+           "staged, so a green result here would be vacuous";
+
+    server.removeStreamListener(listener.get());
+
+    EXPECT_TRUE(listener->completed())
+        << "removeStreamListener() returned while a callback was still running on the listener — "
+           "destroying it here is a use-after-free, which is the whole defect in issue #89";
+
+    // The destroy the contract exists to make safe, and it happens BEFORE the server — the exact
+    // ordering addStreamListener's comment forbids without a hand-back.
+    listener.reset();
+
+    server.stop();
+}
+
+// #89, the primitive itself. removeStreamListener() on BOTH AudioStreamServer and
+// AudioStreamClient is an erase plus CallbackDispatcher::fence(), so fence()'s three no-wait
+// paths are shared by both classes and are the dangerous edges: each one is a case where the
+// caller CANNOT be made to wait, and getting any of them wrong is a hang or a self-deadlock
+// rather than a wrong answer. None of them is reachable through the two arms above.
+TEST(CallbackDispatcherFence, WaitsForQueuedWorkAndNeverHangsOnAPathThatCannotWait) {
+    // 1. The wait itself: a task queued before fence() has completed by the time it returns.
+    {
+        CallbackDispatcher d;
+        d.start();
+        std::atomic<bool> ran{false};
+        d.post([&ran] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            ran.store(true);
+        });
+        EXPECT_TRUE(d.fence()) << "fence() must report that it actually waited";
+        EXPECT_TRUE(ran.load()) << "fence() returned while a queued task was still running";
+        d.stop();
+    }
+
+    // 2. Never started: nothing was ever queued, so there is nothing to wait for. Must return
+    //    false immediately rather than block forever on a marker no thread will ever run.
+    {
+        CallbackDispatcher d;
+        EXPECT_FALSE(d.fence()) << "fence() on a never-started dispatcher must not wait";
+    }
+
+    // 3. Already stopped: post() no-ops from then on and stop() has drained what was queued, so
+    //    again there is nothing pending — and a marker posted here would never run. This is the
+    //    path that would HANG a removeStreamListener() called after teardown.
+    {
+        CallbackDispatcher d;
+        d.start();
+        d.stop();
+        EXPECT_FALSE(d.fence()) << "fence() on a stopped dispatcher must not wait";
+    }
+
+    // 4. Called ON the dispatch thread — a thread cannot wait for itself. This is the path a
+    //    consumer takes by calling removeStreamListener() from inside a callback; it must detach
+    //    without deadlocking. Asserted from within a dispatched task, which is the only place the
+    //    condition exists.
+    {
+        CallbackDispatcher d;
+        d.start();
+        std::atomic<bool> observed{false};
+        std::atomic<bool> waited{true};
+        d.post([&d, &observed, &waited] {
+            waited.store(d.fence());  // must be false, and must return rather than self-deadlock
+            observed.store(true);
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!observed.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        ASSERT_TRUE(observed.load())
+            << "the dispatched task never returned — fence() self-deadlocked on its own thread";
+        EXPECT_FALSE(waited.load()) << "fence() must not claim to have waited on its own thread";
+        d.stop();
+    }
 }

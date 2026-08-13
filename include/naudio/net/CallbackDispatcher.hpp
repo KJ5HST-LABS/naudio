@@ -9,6 +9,8 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -57,6 +59,46 @@ public:
             queue_.push_back(std::move(task));
         }
         cv_.notify_one();
+    }
+
+    // Blocks until every task queued BEFORE this call has finished running, by posting a marker
+    // and waiting for it. Returns true if it actually waited.
+    //
+    // This is the primitive behind removeStreamListener(): erasing a listener from the roster
+    // stops FUTURE posts from naming it, but every notify* snapshots the roster and captures the
+    // POINTERS by value, so a task already queued still holds it. A caller that erases and then
+    // destroys the listener races that task. fence() closes exactly that window — after it
+    // returns, no previously-queued task can still be holding the pointer.
+    //
+    // Deliberately NOT stop(): it never sets stop_ and never joins, so the dispatcher stays live
+    // and restartable. That distinction is the whole reason this exists rather than a drain —
+    // see the issue #89 decision recorded on AudioStreamServer::stop().
+    //
+    // Returns false WITHOUT waiting in the three cases where waiting is impossible or pointless,
+    // each of which is a genuine no-op rather than a silent failure:
+    //   - called ON the dispatch thread (a thread cannot wait for itself). The caller is inside a
+    //     callback, so the only task that could hold the pointer is the one on its own stack.
+    //   - never started, so nothing was ever queued.
+    //   - already stopped: post() no-ops from then on and stop() has already drained what was
+    //     queued, so no task can still be pending.
+    bool fence() {
+        // shared_ptr because std::function requires a CopyConstructible target and std::promise
+        // is move-only; the refcounted shared state also outlives whichever side finishes last,
+        // which a stack-local mutex/condvar pair would not.
+        auto reached = std::make_shared<std::promise<void>>();
+        std::future<void> ready = reached->get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!started_ || stop_) return false;
+            if (thread_.get_id() == std::this_thread::get_id()) return false;
+            queue_.push_back([reached] { reached->set_value(); });
+        }
+        cv_.notify_one();
+        // Safe against a concurrent stop(): the marker is queued under the same lock stop() takes,
+        // and run() returns only once the queue is EMPTY — so a queued marker is always executed,
+        // whether it is reached by the running loop or by stop()'s drain.
+        ready.wait();
+        return true;
     }
 
     // Requests stop, drains the remaining queue on the dispatch thread, then joins.
