@@ -45,18 +45,42 @@ a version number, so a wrong libhamlib can never break the rest of the build —
 produces no bridge. That is deliberate, and it is also why the failure looks like a broken flag
 instead of a missing dependency.
 
+Because the API is still in review it moves, so that presence gate is not enough on its own: two
+further checks detect *which* revision you have and compile the matching code, rather than assuming
+the newest shape. Both are capability checks, never version comparisons.
+
+| Check | Arrived in | What it selects |
+|---|---|---|
+| `rig_stream_get_conversions` | `961093f2` | whether the bridge can report the conversion stages libhamlib is running for it |
+| `struct rig_stream_caps.channels` | `b538567b` | whether openable channel counts are an exact 0-terminated **list** or a `channels_min`/`channels_max` **range** |
+
+The second is a struct-field change, so `check_symbol_exists` cannot see it — a prefix on either side
+of that commit exports identical symbols, and the mismatch would surface only as a compile error.
+`check_struct_has_member` is used instead.
+
 ### Provenance
 
 | | |
 |---|---|
 | Repository | `https://github.com/mikaelnousiainen/Hamlib.git` — the head repository of PR #2116 |
 | Branch | `streaming-subsystem-pr` |
-| Verified at | commit `2ef1e1d` ("Add data streaming subsystem for audio and I/Q") |
+| Verified at | commits `2ef1e1d`, `961093f2`, and `b538567b` — the bridge builds and runs against all three |
 | Reports as | `pkg-config --modversion hamlib` → `5.0.0~git` |
 
-PR #2116 is **open**, so the branch head moves as review continues. The script tracks the branch by
-default, which is what you want for a review or CI build. Pin it with `--ref <commit>` when you need
-a reproducible one — `2ef1e1d` is the commit naudio's bridge has actually been verified against.
+PR #2116 is **open**, so the branch head moves as review continues — and naudio tracks that head
+deliberately rather than pinning a commit. That is a decision, not an oversight (issue #81): the
+streaming API is new, naudio follows where upstream takes it, and noticing a move early is worth
+more than a build that cannot be surprised. The cost is accepted with it — an upstream rename can
+turn the `hamlib-bridge` CI job red without any naudio commit, and twice now it has.
+
+The countermeasure is not a pin, it is that nothing here assumes a shape: the capability checks
+above compile whichever revision you actually have, so a moving head produces a *diagnosed* build
+rather than a broken one. Pin with `--ref <commit>` if you need a reproducible build of your own.
+
+**When #2116 merges,** the streaming API lands in Hamlib proper and the fork branch may be deleted.
+At that point the defaults become `--repo https://github.com/Hamlib/Hamlib.git --ref master`, which
+keeps the tracking property and removes the deleted-branch risk. The script's fetch failure names
+this case explicitly, so a red run diagnoses itself.
 
 ---
 

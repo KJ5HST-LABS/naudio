@@ -122,8 +122,15 @@ else
 fi
 if ! git -C "$src" fetch --quiet --depth 1 origin "$ref"; then
   die "could not fetch '$ref' from $repo
-    A commit can only be fetched directly from a server that allows it (GitHub does).
-    If you are using a mirror, pass a branch name: --ref $default_ref"
+    This reads like a network blip and usually is not. The default ref is a live PR branch on a
+    FORK, so the likeliest causes are, in order:
+      1. PR #2116 merged and the fork branch was deleted. The streaming API is then in
+         Hamlib upstream: --repo https://github.com/Hamlib/Hamlib.git --ref master
+      2. The branch was force-pushed and the commit you pinned is gone. Pass a branch name,
+         or a commit that still exists: --ref $default_ref
+      3. A mirror that refuses to serve a bare commit (GitHub allows it; many mirrors do not).
+    Check which: git ls-remote --heads $repo $default_ref
+    An empty result means the branch is gone — case 1. See docs/hamlib-streaming-bridge.md."
 fi
 git -C "$src" checkout --quiet --detach FETCH_HEAD
 head_sha="$(git -C "$src" rev-parse --short HEAD)"

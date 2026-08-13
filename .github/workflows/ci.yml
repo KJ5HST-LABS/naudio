@@ -446,9 +446,17 @@ jobs:
         run: tools/build-streaming-hamlib.sh --prefix "${{ runner.temp }}/hamlib-streaming"
         # Tracks the PR branch HEAD rather than pinning a commit: #2116 is open, and noticing when
         # the streaming API moves out from under the bridge is exactly what this job is worth.
-        # docs/hamlib-streaming-bridge.md records that choice and how to pin instead (--ref).
+        # docs/hamlib-streaming-bridge.md records that choice and how to pin instead (--ref) — it
+        # owns the decision; this comment only restates it.
+        #
         # The cost of tracking a third-party branch is that an upstream force-push, a rename, or a
-        # deleted branch turns this job red for reasons outside naudio. Pin --ref if that bites.
+        # deleted branch turns this job red for reasons outside naudio. That cost has now been paid
+        # TWICE (961093f2 changed behaviour silently, b538567b broke the build), and the decision
+        # was re-taken deliberately in #81: keep tracking. naudio follows upstream while the
+        # streaming API is still forming, and a red run here is the loud, early notice that it
+        # moved. What absorbs the churn is that nothing assumes a shape — tools/CMakeLists.txt
+        # capability-checks each revision and compiles the matching code, so the usual outcome of
+        # a move is a diagnosed build, not a broken one.
         #
         # This step dominates the job's wall clock. Every figure here was measured by running these
         # steps verbatim in an ubuntu:24.04 amd64 container held to 4 CPUs, the runner's shape:
