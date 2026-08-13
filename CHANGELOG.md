@@ -129,6 +129,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `project(VERSION)`, since a version that answers *wrongly* is worse than one that does not answer.
 
 ### Changed
+- **`na_server_inject_audio` and `na_server_client_count` no longer both say "connected"** (issue
+  #48). They describe two different sets, and the header gave a consumer no way to tell: a client
+  joins the **roster** at accept, before its handshake, and becomes a **broadcast target** only once
+  that handshake completes. `na_server_client_count` reports the former. An inject in the window
+  between them is **discarded** — no queue, no retry — and still returns `NA_OK`, so the obvious
+  inject-as-soon-as-a-client-appears loop drops audio at every join, non-deterministically, with no
+  counter that reports it.
+
+  **No new symbol.** `on_stream_started` already fires after the session is registered as a
+  broadcast target, so the barrier a consumer needs is on the ABI today; the header now names it,
+  with a worked example, and states which set each call reports. Adding an accessor for the ready
+  count would widen a published surface to say what the callback already says. Documentation only —
+  no behavior changed here.
+
+  `tests/bridge/na_bridge_probe.c` was making exactly this mistake — its gate polled
+  `na_server_client_count` under a comment claiming the guarantee that call does not give — and now
+  gates on `on_stream_started`. Measured: the window is too narrow to lose a frame on this loopback
+  (60 of 60, five runs), but forced open with a 300 ms delay before target registration the old gate
+  delivered 36–37 frames of 60 **while the selftest still reported OK**, because it asserts
+  `calls > 0`; the new gate delivers 60 of 60 under the same delay.
+
 - **BREAKING (C ABI): the client identity and device setters now refuse to run after connect has
   been attempted, and `na_client_set_capture_device` refuses the NULL backend outright.**
   `na_client_set_identity`, `na_client_set_playback_device` and `na_client_set_capture_device` were
@@ -192,6 +213,34 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **A client the server rejected stayed in the transport's connection map for the life of the
+  server, inflating every `na_server_get_stats` counter** (issue #64). `rejectClient` sent the
+  CONNECT_REJECT and closed the socket, but closing is not leaving: only the transport's
+  `disconnectClient` removes the entry, and every `na_server_stats` aggregate is a **sum over the
+  entries currently in that map**. A rejected connection therefore kept contributing its own reject
+  message forever, so a server doing nothing but refusing clients — one sitting at `max_clients`
+  while a client retries, or one with no capture device — drifted upward on counters documented as
+  a *gauge over the live roster*, never a lifetime total. Measured across 8 rejects with an empty
+  roster: `packets_sent` 8 and `bytes_sent` 440 where both must read 0, identical on TCP and UDP.
+  All three reject paths share one `rejectClient`, which now evicts through the transport, exactly
+  as an admitted session already did when it closed.
+
+- **A peer that failed the handshake produced an `on_client_connected` with no matching
+  `on_client_disconnected`** (issue #64). The connect event fires when the session enters the
+  roster, which is at accept — before a word has been read — and the handshake-failure paths then
+  closed the session and returned without emitting anything. Any peer that connected and said the
+  wrong thing (a port scanner, a version-mismatched client, a half-open probe) left a connect event
+  that nothing ever closed, so a listener that pairs the two accumulated one phantom client per
+  probe. The server's own roster was never wrong — `na_server_client_count` was correct throughout —
+  which is why only an event-pairing listener could see it.
+
+  **The contract is now stated in `naudio.h`:** `on_client_connected` / `on_client_disconnected`
+  bracket roster membership and are always balanced, including for a session that never completes a
+  handshake; `on_stream_started` / `on_stream_stopped` nest inside that pair and bracket the window
+  in which the client is actually carrying audio. **Behavior change for consumers:** a failed
+  handshake now emits a disconnect event that it previously did not. Nothing about a *successful*
+  client's event order changed.
+
 - **`na_server_inject_audio` silently discarded everything past 16384 bytes and still reported
   success** (issue #20). `AudioPacket::serialize()` clamps its payload to `MAX_PAYLOAD` — correctly,
   because the wire's length field is a `u16` and the decoder rejects anything longer — but nothing
