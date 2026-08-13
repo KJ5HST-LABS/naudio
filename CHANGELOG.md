@@ -129,6 +129,35 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `project(VERSION)`, since a version that answers *wrongly* is worse than one that does not answer.
 
 ### Changed
+- **`na_hamlib_bridge` no longer tells operators that stereo over netrigctl is impossible** (issue
+  #21). It is possible, and has been since Hamlib PR #2116 commit `961093f2` (2026-08-11) put
+  `channels=` on the `\stream_open` wire. Until now the bridge printed *"`\stream_open` carries no
+  channels field … Use `-c 1` on that path"* at the moment an operator was debugging, and
+  `docs/hamlib-streaming-bridge.md` carried it as a standing **"Known limit"** — both false against
+  a current libhamlib, and both printed with no way to tell which case you were in.
+
+  **The advice is now selected at compile time** from `NAUDIO_HAMLIB_HAS_STREAM_CONV` — the existing
+  `rig_stream_get_conversions` probe, which detects the same commit — so a pre-fix build still names
+  the real limit and a post-fix build says the netrigctl channels limit is *not* the explanation.
+  The gap-signature diagnosis itself is unchanged; only the recommended action is. The build's
+  `pre-961093f2` STATUS line names the `-c 2` consequence too, since configure time is when the
+  choice of prefix is still in hand.
+
+  **The floor binds on the bridge's own libhamlib, not the peer's** — measured, not inferred, and it
+  is the half that was previously undocumented. `-c 2` over `-m 2`, one machine, same bridge source,
+  `rigctld -m 1 -C stream_mode=tone`: a pre-fix bridge (`9f412fe`) against a pre-fix `rigctld` gives
+  `gaps` 421 → 841, ~1 per RX read, 41% of nominal; a post-fix bridge (`2f076b5`) gives **0 gaps at
+  83% against a pre-fix `rigctld` as well as a post-fix one** — even though `rigctld` still hardcodes
+  `channels = 1` and opens its rig mono. A naudio client read **429112/430080 non-zero samples** off
+  that mixed run, so it is populated stereo, not mono padded with silence. Upgrading the remote
+  `rigctld` alone fixes nothing here.
+
+  Documented alongside it, because it is the failure an operator will actually mis-diagnose: a
+  **pre-fix bridge against a post-fix `rigctld` does not start at all** — the old client cannot parse
+  the new `\stream_caps` reply and rejects its own request with *"sample rate 48000 not in supported
+  list"*, a message naming a rate the caps dump appears to offer. Not channel-related; identical at
+  `-c 1`.
+
 - **`na_server_inject_audio` and `na_server_client_count` no longer both say "connected"** (issue
   #48). They describe two different sets, and the header gave a consumer no way to tell: a client
   joins the **roster** at accept, before its handshake, and becomes a **broadcast target** only once
