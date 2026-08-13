@@ -81,8 +81,16 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE)
                     # Not a warning: the bridge is fully functional here, it just cannot say
                     # whether libhamlib is converting for it. Worth one STATUS line so an operator
                     # who never sees a conversion report knows which of the two reasons applies.
+                    #
+                    # It also names the -c 2 floor, because that is the consequence an operator
+                    # actually hits: pre-961093f2 there is no channels field on the \stream_open
+                    # wire, so stereo over netrigctl (-m 2) is mis-framed rather than refused
+                    # (measured: ~1 gap per RX read at 41% of nominal). Said here rather than only
+                    # at runtime — this is the moment the choice of prefix is still in hand.
                     message(STATUS "naudio: na_hamlib_bridge enabled (hamlib ${HAMLIB_VERSION}, "
-                                   "pre-961093f2 — cannot report conversions)")
+                                   "pre-961093f2 — cannot report conversions, and -c 2 over "
+                                   "netrigctl is mis-framed; use -c 1 or build against a newer "
+                                   "libhamlib)")
                 endif()
             endif()
         endif()

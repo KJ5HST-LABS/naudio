@@ -531,6 +531,33 @@ static void usage(const char *argv0) {
         "Runs at the radio site, upstream of the lossy hop.\n", argv0);
 }
 
+/* What to tell an operator who is staring at the gap signature below. The diagnosis is the same
+ * either way — the two ends disagree about frame size — but the ACTION depends on which libhamlib
+ * this bridge is linked against, so it is chosen at compile time rather than guessed at runtime.
+ *
+ * NAUDIO_HAMLIB_HAS_STREAM_CONV is a proxy for "at or after Hamlib PR #2116 commit 961093f2": that
+ * commit added rig_stream_get_conversions() (which the gate detects) and, in the same change, made
+ * netrigctl_stream_open forward `channels=` on the wire (which is what fixes -c 2 over -m 2).
+ *
+ * The dependency binds on THIS side, not the peer's — measured, not assumed. With a bridge linked
+ * against 961093f2, -c 2 over -m 2 held 0 gaps at 83% of nominal against BOTH an old rigctld
+ * (9f412fe, which still opens its rig mono) and a new one, and a naudio client read 429112/430080
+ * non-zero samples off the old-peer run: fully populated stereo, not mono padded with silence.
+ * So the fix an operator needs is a newer libhamlib HERE; upgrading the remote rigctld alone does
+ * nothing for this, and an old bridge against a new rigctld fails to open the stream at all. */
+static const char rx_gap_advice[] =
+#ifndef NAUDIO_HAMLIB_HAS_STREAM_CONV
+    "  This bridge is linked against a libhamlib older than Hamlib 961093f2, whose \\stream_open\n"
+    "  carries no channels field — so over netrigctl (-m 2) rigctld opens the rig MONO however its\n"
+    "  caps advertise. Rebuild THIS bridge against a libhamlib at or after that commit (the remote\n"
+    "  rigctld's own version does not matter), or run -c 1 here.\n"
+#else
+    "  This bridge's libhamlib is at or after Hamlib 961093f2, which forwards channels= on\n"
+    "  \\stream_open — and -c 2 over netrigctl measures clean against that build, with an old peer\n"
+    "  as well as a new one. So the known netrigctl channels limit is NOT the explanation here.\n"
+#endif
+    "  See docs/hamlib-streaming-bridge.md.\n";
+
 /* ------------------------------------------------------------------ main */
 
 int main(int argc, char **argv) {
@@ -759,11 +786,8 @@ int main(int argc, char **argv) {
                     "na_hamlib_bridge: %u gaps over %llu RX reads with link_loss=0 — the peer is\n"
                     "  framing this stream differently than the channels=%d we opened, so naudio is\n"
                     "  re-framing its bytes wrongly and clients get mis-framed audio, not just less.\n"
-                    "  Over netrigctl (-m 2) this is expected at -c 2: \\stream_open carries no\n"
-                    "  channels field, so rigctld always opens the rig MONO even though its caps\n"
-                    "  advertise stereo, and the true count is stamped in every packet header but\n"
-                    "  never checked. Use -c 1 on that path. See docs/hamlib-streaming-bridge.md.\n",
-                    st.gaps, rx_reads, channels);
+                    "%s",
+                    st.gaps, rx_reads, channels, rx_gap_advice);
                 fflush(stderr);
             }
             if (b.tx) {

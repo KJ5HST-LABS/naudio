@@ -531,50 +531,91 @@ other than the deterministic 1-in-N used here (no bursts, no reordering, no dupl
 
 ---
 
-## Known limit: `-c 2` does not work over netrigctl (`-m 2`)
+## Version floor: `-c 2` over netrigctl (`-m 2`) needs libhamlib ≥ `961093f2`
 
-**Use `-c 1` when the source is a remote `rigctld`.** Stereo is silently wrong on that path, and the
-cause is upstream in Hamlib's streaming layer, not in naudio — there is nothing the bridge can do
-to obtain stereo over netrigctl today.
+**Stereo over a remote `rigctld` works — but only if *this bridge* is linked against a libhamlib at
+or after Hamlib PR [#2116](https://github.com/Hamlib/Hamlib/pull/2116) commit `961093f2`
+(2026-08-11).** Below that commit it is silently wrong, and `-c 1` is the workaround. naudio pins no
+libhamlib version, so which behaviour you get is a property of the prefix you built against.
 
-The `\stream_open` command carries only *type*, *format* and *sample rate*. There is **no channels
-field on the wire**, so (all paths below are in **libhamlib**, not naudio):
+The dependency binds on the **bridge's own** libhamlib, not the peer's. That is the surprising half,
+so it is the half that was measured rather than reasoned about:
 
-| Step | What happens |
+| Bridge's libhamlib | `rigctld` peer | `-c 2` result |
+|---|---|---|
+| `9f412fe` (pre-fix) | `9f412fe` | **broken** — `gaps` 421 → 841 (~1 per read), 41% of nominal rate |
+| `9f412fe` (pre-fix) | `2f076b5` (post-fix) | **`rig_stream_open` fails** — see the version-skew note below |
+| `2f076b5` (post-fix) | `9f412fe` | **correct** — 0 gaps, 83% of nominal |
+| `2f076b5` (post-fix) | `2f076b5` | **correct** — 0 gaps, 83% of nominal |
+
+Measured 2026-08-13, one machine, same bridge source, `rigctld -m 1 -C stream_mode=tone`, `-x`, two
+health ticks each; `-c 1` held 0 gaps on every combination that opened at all. Upgrading the remote
+`rigctld` alone does nothing for this — an old `rigctld` still opens its rig **mono**, and a post-fix
+bridge nevertheless delivers full, correctly-framed stereo from it (a naudio client read
+**429112/430080 non-zero samples** off that run: populated stereo, not mono padded with silence).
+
+### What was wrong before `961093f2`
+
+`\stream_open` carried only *type*, *format* and *sample rate* — there was **no channels field on
+the wire** (all paths below are in **libhamlib**, not naudio):
+
+| Step | What happened |
 |---|---|
-| Client asks | `netrigctl_stream_open` sends `\stream_open AUDIO_RX PCM_S16 48000` — the channel count is dropped (`rigs/dummy/netrigctl.c`) |
-| Server opens | `rigctld_stream_config_from_args` hardcodes `channels = 1`, so the rig is always opened **mono** (`tests/rigctld_stream.c`) |
+| Client asks | `netrigctl_stream_open` sent `\stream_open AUDIO_RX PCM_S16 48000` — the channel count was dropped (`rigs/dummy/netrigctl.c`) |
+| Server opens | `rigctld_stream_config_from_args` hardcodes `channels = 1`, so the rig is opened **mono** (`tests/rigctld_stream.c` — still true at `2f076b5`) |
 | Caps still say stereo | `\stream_caps` advertises `channels 1..2`, so the open succeeds and looks honoured |
 | Truth is on the wire | The server stamps the real `channels` into every packet header … |
-| … and is discarded | The client's receive path (`src/stream_net.c`) never compares that field against the stream it opened |
+| … and is discarded | The client's receive path (`src/stream_net.c`) never compared that field against the stream it opened |
 
-So a `-c 2` bridge over `-m 2` receives **mono** bytes, hands them to a naudio server configured
-for stereo, and naudio re-frames them as stereo — because the C ABI does not resample or convert
-(`include/naudio.h`, `na_server_set_audio_format`). The result is mis-framed audio at every client,
-not merely quieter or thinner audio.
+A `-c 2` bridge over `-m 2` therefore received **mono** bytes, handed them to a naudio server
+configured for stereo, and naudio re-framed them as stereo — because the C ABI does not resample or
+convert (`include/naudio.h`, `na_server_set_audio_format`). The result was mis-framed audio at every
+client, not merely quieter or thinner audio.
 
-The visible symptom is a gap counter climbing at roughly one gap per received read while
-`link_loss` stays `0`:
+`961093f2` added `channels=` to the `\stream_open` line (`+\stream_open <type> <format> <rate>
+channels=<n> [require_native=1]`). Note the server-side hardcode above is *unchanged* — which is why
+the floor is on the client side and why an old peer still works.
+
+### The symptom, if you hit it
+
+A gap counter climbing at roughly one gap per received read while `link_loss` stays `0`:
 
 ```
-  rx: clients=0 gaps=718 link_loss=0 overruns=0 underruns=0
-  rx: audio 66473 B/s of 192000 expected (35%)
+  rx: clients=0 gaps=421 link_loss=0 overruns=0 underruns=0
+  rx: audio 79662 B/s of 192000 expected (41%)
 ```
 
 That is not packet loss. The two ends disagree about how many bytes make a frame: the sender
 advances the wire timestamp by its own frame size, the receiver expects `payload_len` divided by
 *ours*, so every packet looks like a forward jump. The bridge detects exactly that combination and
-prints a one-time explanation pointing back here.
+prints a one-time explanation — naming which of the two cases applies, since it knows at compile
+time which libhamlib it holds.
 
-**A client sees nothing wrong.** Measured at `-c 2` over `-m 2`, a naudio UDP client receives the
-bridge's bytes at 100% parity, with a steady cadence and a full-scale non-silent signal — the
-delivery path is faultless and it is the *shape* of the audio that is wrong. So no client-side
+**A client sees nothing wrong.** Measured at `-c 2` over a pre-fix `-m 2`, a naudio UDP client
+receives the bridge's bytes at 100% parity, with a steady cadence and a full-scale non-silent signal
+— the delivery path is faultless and it is the *shape* of the audio that is wrong. So no client-side
 byte, rate, or loss check can detect this; the bridge's gap signature is the only local symptom.
 
 **Do not read the byte-rate line as the alarm.** It is reported because it is useful, but it
 reflects how fast the producer runs as much as whether the framing is right — a dummy in
 `stream_mode=loopback` with no TX peer paces itself off `nanosleep` and sits near 70% of nominal
 while being completely correct at `-c 1`. The gap-per-read signature is the discriminator.
+
+### Version skew is a separate, louder failure
+
+A **pre-fix bridge against a post-fix `rigctld`** does not degrade — it does not start. The old
+client cannot parse the new `\stream_caps` reply, so it reads no usable rate list and the open is
+rejected against caps it never understood:
+
+```
+rig_stream_net_parse_caps_line: missing required 'type' field
+validate_config_against_caps: sample rate 48000 not in supported list
+na_hamlib_bridge: rig_stream_open(type=0, S16@48k/2ch): Invalid parameter
+```
+
+This is **not** channel-related — it reproduces identically at `-c 1`. If you see a rate-rejection
+naming a rate the caps dump appears to offer, suspect skew between the bridge's libhamlib and the
+`rigctld` it is talking to, and upgrade the bridge.
 
 `-c 2` against a **local** backend (`-m 1`) is unaffected: no `\stream_open` round trip is involved,
 and the channel count reaches the backend directly.
