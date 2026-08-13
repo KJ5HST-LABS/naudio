@@ -61,6 +61,19 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE)
             # this call. Detect it separately rather than assuming the two arrived together.
             check_symbol_exists(rig_stream_get_conversions "hamlib/rig.h"
                                 NAUDIO_HAMLIB_HAS_STREAM_CONV)
+            # Commit b538567b then replaced rig_stream_caps' channels_min/channels_max RANGE with
+            # an exact 0-terminated channels[] LIST (openable counts need not be contiguous). That
+            # is a struct-field change, so check_symbol_exists cannot see it — a prefix on either
+            # side of the commit exports exactly the same symbols, and the mismatch surfaces only
+            # as a compile error in na_hamlib_bridge.c. naudio tracks the PR head deliberately
+            # rather than pinning a commit (#81, docs/hamlib-streaming-bridge.md), so BOTH shapes
+            # remain reachable from a locally built prefix and neither may be assumed.
+            #
+            # Verified to discriminate against three real prefixes: pre-961093f2 and 961093f2 both
+            # report FALSE, the b538567b head reports TRUE.
+            include(CheckStructHasMember)
+            check_struct_has_member("struct rig_stream_caps" channels "hamlib/rig.h"
+                                    NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST LANGUAGE C)
             unset(CMAKE_REQUIRED_INCLUDES)
             unset(CMAKE_REQUIRED_LIBRARIES)
             if(NOT NAUDIO_HAMLIB_HAS_STREAM)
@@ -73,6 +86,10 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE)
                 target_link_directories(na_hamlib_bridge PRIVATE ${HAMLIB_LIBRARY_DIRS})
                 target_link_libraries(na_hamlib_bridge
                                       PRIVATE naudio ${HAMLIB_LINK_LIBRARIES} Threads::Threads)
+                if(NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)
+                    target_compile_definitions(na_hamlib_bridge
+                                               PRIVATE NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)
+                endif()
                 if(NAUDIO_HAMLIB_HAS_STREAM_CONV)
                     target_compile_definitions(na_hamlib_bridge PRIVATE NAUDIO_HAMLIB_HAS_STREAM_CONV)
                     message(STATUS "naudio: na_hamlib_bridge enabled (hamlib ${HAMLIB_VERSION}, "

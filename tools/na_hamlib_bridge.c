@@ -433,12 +433,44 @@ static na_reliability_profile parse_profile(const char *s) {
     return NA_RELIABILITY_UDP_WAN;   /* default */
 }
 
-/* Print a 0-terminated rate list from struct rig_stream_caps, bounded by the array size so a
- * caps block that fills every slot without a terminator cannot run off the end. */
-static void print_rates(FILE *f, const int *rates) {
-    for (int i = 0; i < HAMLIB_MAX_STREAM_RATES && rates[i]; i++)
-        fprintf(f, "%s%d", i ? "," : "", rates[i]);
+/* Print a 0-terminated int list from struct rig_stream_caps. `cap` is the array's own bound, so a
+ * caps block that fills every slot without a terminator cannot run off the end — pass the bound
+ * belonging to the array being printed, not a shared constant: the rate and channel-count lists
+ * are sized independently upstream (32 vs 16). */
+static void print_int_list(FILE *f, const int *v, int cap) {
+    for (int i = 0; i < cap && v[i]; i++)
+        fprintf(f, "%s%d", i ? "," : "", v[i]);
 }
+
+/* Print a caps block's openable channel counts.
+ *
+ * Hamlib PR #2116 commit b538567b replaced the channels_min/channels_max RANGE with an exact
+ * 0-terminated LIST, because the openable counts need not be contiguous — a backend offering 1
+ * and 4 but neither 2 nor 3 cannot be described by a range, and the range form quietly implied
+ * openable counts that were not. naudio tracks the PR head deliberately rather than pinning
+ * (docs/hamlib-streaming-bridge.md), so a locally built prefix may predate that commit and both
+ * shapes stay reachable; tools/CMakeLists.txt detects which one this prefix has.
+ *
+ * Kept as two functions rather than one taking a `native` flag: the native_* fields do not exist
+ * at all before commit 961093f2, so a single body referencing them would fail to compile against
+ * the oldest prefix the bridge still supports. */
+static void print_channels(FILE *f, const struct rig_stream_caps *c) {
+#ifdef NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST
+    print_int_list(f, c->channels, HAMLIB_MAX_STREAM_CHANNEL_COUNTS);
+#else
+    fprintf(f, "%d..%d", c->channels_min, c->channels_max);
+#endif
+}
+
+#ifdef NAUDIO_HAMLIB_HAS_STREAM_CONV
+static void print_native_channels(FILE *f, const struct rig_stream_caps *c) {
+#  ifdef NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST
+    print_int_list(f, c->native_channels, HAMLIB_MAX_STREAM_CHANNEL_COUNTS);
+#  else
+    fprintf(f, "%d..%d", c->native_channels_min, c->native_channels_max);
+#  endif
+}
+#endif
 
 /* Name the conversion stages libhamlib is running between the hardware and an open stream.
  *
@@ -502,13 +534,17 @@ static int open_stream(RIG *rig, rig_stream_type_t type, int channels, rig_strea
         /* Both views. The classic fields are the EFFECTIVE set — everything rig_stream_open
          * would accept, conversions included — so on their own they no longer tell a reader
          * what the hardware does, which is the question a failed open raises. */
-        fprintf(stderr, "  caps[%d]: type=%d formats=0x%x channels=%d..%d rates=",
-                i, (int)c->type, (unsigned)c->formats, c->channels_min, c->channels_max);
-        print_rates(stderr, c->sample_rates);
+        fprintf(stderr, "  caps[%d]: type=%d formats=0x%x channels=",
+                i, (int)c->type, (unsigned)c->formats);
+        print_channels(stderr, c);
+        fprintf(stderr, " rates=");
+        print_int_list(stderr, c->sample_rates, HAMLIB_MAX_STREAM_RATES);
 #ifdef NAUDIO_HAMLIB_HAS_STREAM_CONV
-        fprintf(stderr, "\n            native: formats=0x%x channels=%d..%d rates=",
-                (unsigned)c->native_formats, c->native_channels_min, c->native_channels_max);
-        print_rates(stderr, c->native_sample_rates);
+        fprintf(stderr, "\n            native: formats=0x%x channels=",
+                (unsigned)c->native_formats);
+        print_native_channels(stderr, c);
+        fprintf(stderr, " rates=");
+        print_int_list(stderr, c->native_sample_rates, HAMLIB_MAX_STREAM_RATES);
 #endif
         fputc('\n', stderr);
     }
