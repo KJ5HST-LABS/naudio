@@ -213,6 +213,33 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **`na_hamlib_bridge` lost a client's TX channel without saying anything** (issue #17). The bridge
+  would carry an operator's transmit audio for about a second and then discard everything after it,
+  with a healthy-looking console, an open port and no error on either side.
+
+  The underlying fault was found and fixed earlier in the library: a legal maximum-payload RX packet
+  (16407 bytes) exceeded macOS's default `SO_SNDBUF` of 9216, `sendto()` refused it with EMSGSIZE,
+  and the writer loop responded by closing the session — which unregisters it from the mixer and so
+  releases any TX channel it held. The socket buffers were raised and the writer loop was given a
+  diagnostic naming the direction and size of the refused send.
+
+  **None of that reached the bridge.** `na_hamlib_bridge` registered no `na_server_callbacks` table,
+  and the C ABI forwards `onError` only when `cbs.on_error` is set, so every server-side fault was
+  constructed, posted to the dispatch thread, and dropped for want of a listener. The bridge now
+  registers `on_error`, `on_client_connected` and `on_client_disconnected` before `na_server_start`,
+  and separately logs each TX-ownership episode with its duration and the bytes that actually
+  reached the radio. A lost channel now reads:
+
+  ```
+  na_hamlib_bridge: tx owner acquired
+  na_hamlib_bridge: tx owner released after 4.45s, 304320 B to the rig
+  na_hamlib_bridge: server error [audio-1]: Connection timeout
+  na_hamlib_bridge: client audio-1 disconnected
+  ```
+
+  This is diagnostic output only — no C ABI change, no wire change, and no change to which audio the
+  bridge delivers.
+
 - **The installed package was unusable on MSVC and on any FetchContent-built install** (issue #61).
   `find_package(naudio)` failed two different ways, both on platforms whose CI build was green —
   and green precisely because those jobs built the library and never installed or consumed it.
