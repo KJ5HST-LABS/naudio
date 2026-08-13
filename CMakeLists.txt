@@ -119,6 +119,94 @@ set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
+# ----------------------------------------------------------------------------
+# NAUDIO_SANITIZE — opt-in compiler instrumentation (issue #28).
+#
+# Off by default and inert when off: everything below is inside the if(), so a normal build sees
+# no added flag. On, it instruments EVERY in-tree target -- which is why this block sits above the
+# first add_library(): add_compile_options/add_link_options apply only to targets created after
+# them, so moving it below any target silently un-instruments that target. That is the failure this
+# whole issue is about (an instrument that is present but not watching), so the position is
+# load-bearing, not stylistic.
+#
+# Accepts a comma list because ASan and UBSan compose and are meant to be run together; `thread` is
+# rejected alongside `address` because the two runtimes cannot coexist in one process.
+#
+# -fno-sanitize-recover=all is the non-obvious one, and it is MEASURED, not assumed. UBSan is
+# RECOVERABLE by default: it prints `runtime error: ...` and the process still exits 0. Measured on
+# Apple clang 21 with a runtime-valued `1 << 33` -- default build exits 0, the same binary with
+# -fno-sanitize-recover=all exits 134. ctest keys on the exit code, so without this flag a UBSan
+# job reports PASS on every run while printing findings into a log nobody reads. ASan and TSan
+# abort on their own (both measured at 134 here, since Darwin defaults abort_on_error=1), so the
+# flag exists for UBSan's sake and is harmless to the others.
+#
+# Leaks are deliberately NOT part of this option: LSan rides along with ASan on Linux only.
+# Measured here -- `ASAN_OPTIONS=detect_leaks=1` on arm64 Darwin prints "detect_leaks is not
+# supported on this platform". So the leak half of this issue is reachable only in CI, and no
+# local ASan run should ever be reported as leak coverage.
+# ----------------------------------------------------------------------------
+set(NAUDIO_SANITIZE "" CACHE STRING
+    "Sanitizers to instrument the build with: address, undefined, thread, or a comma list \
+(e.g. address,undefined). Empty (the default) builds with no instrumentation.")
+set_property(CACHE NAUDIO_SANITIZE PROPERTY STRINGS "" address undefined thread address,undefined)
+
+if(NAUDIO_SANITIZE)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        # A FATAL_ERROR rather than a warning-and-continue: MSVC spells this /fsanitize=address and
+        # supports neither thread nor undefined, so accepting the option there would produce an
+        # uninstrumented build that reports itself as sanitized -- issue #28's own failure mode.
+        message(FATAL_ERROR
+            "NAUDIO_SANITIZE=${NAUDIO_SANITIZE} is not supported for ${CMAKE_CXX_COMPILER_ID}. "
+            "-fsanitize= is a Clang/GCC spelling; configure without NAUDIO_SANITIZE on this "
+            "toolchain.")
+    endif()
+
+    string(REPLACE "," ";" _na_san_list "${NAUDIO_SANITIZE}")
+    foreach(_na_san IN LISTS _na_san_list)
+        if(NOT _na_san MATCHES "^(address|undefined|thread)$")
+            message(FATAL_ERROR
+                "NAUDIO_SANITIZE: unknown sanitizer '${_na_san}'. Accepted: address, undefined, "
+                "thread, or a comma list of them.")
+        endif()
+    endforeach()
+    if("thread" IN_LIST _na_san_list AND "address" IN_LIST _na_san_list)
+        message(FATAL_ERROR
+            "NAUDIO_SANITIZE: 'address' and 'thread' cannot be combined -- the two runtimes are "
+            "mutually exclusive in one process. Configure two build dirs and run them separately, "
+            "as .github/workflows/ci.yml does.")
+    endif()
+
+    # -fno-omit-frame-pointer and -g are what make a report name a naudio frame instead of an
+    # address: without them a use-after-free in a detached thread points at nothing actionable.
+    set(_na_san_flags -fsanitize=${NAUDIO_SANITIZE} -fno-omit-frame-pointer -g)
+    if("undefined" IN_LIST _na_san_list)
+        list(APPEND _na_san_flags -fno-sanitize-recover=all)
+        # SUPPRESSION 1 of 1, and the justification is required to stay attached to it (issue #28).
+        #
+        # -fsanitize=enum flags a load of an enum object holding a value outside its enumerator
+        # range. Three sites hit it, and all three are the C ABI VALIDATING UNTRUSTED INPUT: a C
+        # caller may legally pass any integer, so na_strerror() (naudio_c_api.cpp:142),
+        # na_client_set_reliability_profile() (:684) and na_server_set_reliability_profile()
+        # (:1191) switch on the parameter and reject the unknown value in `default:`. The check
+        # therefore fires on precisely the code that is being defensive, and the tests that trip it
+        # exist to prove that defence works — c_abi_smoke.c:133 passes (na_error_t)(-999), and
+        # c_client_profile.c:163 passes (na_reliability_profile)99 to each of the two setters.
+        #
+        # MEASURED, not assumed: both arms PASS in the normal optimized build, so the `default:`
+        # branches do execute on today's toolchains and the ABI really does reject these values.
+        # The exposure is latent — a compiler is permitted to assume the parameter is in range and
+        # elide the branch — so this is a real standards defect and not noise. It is recorded HERE
+        # and in CHANGELOG.md rather than tracked as an issue, because this comment is the thing a
+        # future reader will actually meet. Deleting this one flag is how you get the finding back;
+        # if a toolchain ever does elide one of those branches, that is the moment it earns an
+        # issue and a laundered-through-an-integer read at the three sites named above.
+        list(APPEND _na_san_flags -fno-sanitize=enum)
+    endif()
+    add_compile_options(${_na_san_flags})
+    add_link_options(${_na_san_flags})
+    message(STATUS "naudio: sanitizers ENABLED -- ${_na_san_flags}")
+endif()
+
 # Threads — needed by AudioRingBuffer's passive std::mutex/std::condition_variable
 # (linked into naudio_core below). Resolved once here; the later naudio_net block
 # re-requests it idempotently.
@@ -532,7 +620,16 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
     # executable, but the na_* allocations happen inside naudio.dll, which resolved
     # its own operator new at link time — the interposition never fires across a DLL
     # boundary (it does on Linux/macOS via ELF preemption / weak-def coalescing).
-    if(NOT WIN32)
+    #
+    # Not under TSan either, for the SAME reason one layer down: the ThreadSanitizer runtime
+    # supplies its own operator new, which wins over this TU's definition, so g_failAlloc stops
+    # having any effect and the arm fails with "A1 setter under OOM: ret=0 ... (want NA_ERR_NOMEM)"
+    # — a report about the instrument, not about naudio. MEASURED per sanitizer rather than assumed
+    # for all of them: the same arm PASSES under address,undefined (the ASan runtime does not
+    # displace the override), so the exclusion is deliberately narrowed to thread and ASan keeps
+    # its OOM coverage. Excluded at REGISTRATION, matching how WIN32 is handled above, so the arm
+    # never reports a pass it did not earn.
+    if(NOT WIN32 AND NOT "thread" IN_LIST _na_san_list)
         add_executable(naudio_c_abi_fault tests/c_abi_fault.cpp)
         target_link_libraries(naudio_c_abi_fault PRIVATE naudio)
         add_test(NAME naudio_c_abi_fault COMMAND naudio_c_abi_fault)
