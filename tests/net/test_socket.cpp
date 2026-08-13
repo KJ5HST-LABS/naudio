@@ -575,11 +575,16 @@ TEST(Socket, MoveLeavesSourceInvalid) {
 }
 
 // C4: close() may land while another thread is in recv() reading the same socket
-// handle (the receive-worker-vs-close race S630's TSan flagged). With the handle
-// now atomic, the concurrent close()-store and recv()-load are data-race-free and
-// the reader returns cleanly instead of crashing. (The teardown value is proven
-// under TSan; this also guards against a hang/crash on every platform.)
-TEST(Socket, CloseDuringRecvIsRaceFree) {
+// handle. With the handle atomic, the concurrent close()-store and recv()-load are
+// data-race-free and the reader returns cleanly instead of crashing.
+//
+// RENAMED IN #90 FOR WHAT IT ACTUALLY DEMONSTRATES. It was called
+// `CloseDuringRecvIsRaceFree`, and that name was the strongest evidence in this file that the
+// descriptor boundary had been established — which is exactly why nobody re-checked it while
+// TSan reported the same close()/recv() pair 17 times. What this arm proves is that the reader
+// comes back and the process survives; it says nothing about whether the DESCRIPTOR was still
+// ours when ::recv ran. That claim is the next arm's, and it needed a code change to become true.
+TEST(Socket, CloseDuringRecvUnblocksTheReaderWithoutCrashing) {
     Socket server, client, accepted;
     ASSERT_TRUE(makeTcpPair(server, client, accepted));
     accepted.setRecvTimeout(100);  // poll-recv, like the real receive worker (SO_RCVTIMEO)
@@ -599,6 +604,87 @@ TEST(Socket, CloseDuringRecvIsRaceFree) {
     reader.join();
     EXPECT_TRUE(done.load());
     EXPECT_FALSE(accepted.valid());
+}
+
+// Issue #90: close() must not free the descriptor while a syscall is still running on it.
+//
+// THE ONE ARM THAT ASSERTS THE DEFECT ITSELF, and it exists because the instrument that found
+// #90 cannot be run here: MEASURED 2026-08-13, Apple clang 21's TSan reports NOTHING for a
+// close()/recv() fd race even in a 20-line program, while the same program with a plain data
+// race added reports and exits 134. So macOS is structurally unable to verify the fix, and an
+// arm that keys on TSan would silently test nothing on half the CI matrix.
+//
+// This keys on the invariant directly instead, with no sanitizer involved. `inRecv` is true for
+// exactly as long as the reader is inside ::recv. If close() returns while it is still true, the
+// descriptor was handed back to the OS with a live syscall on it — free for the next socket() in
+// any thread to be assigned the same number. That is the whole defect, and it is observable
+// without an instrument.
+//
+// Issue #90: close() waits for an in-flight syscall to leave before it frees the descriptor, and
+// that wait must stay SHORT — otherwise the race is traded for a teardown stall.
+//
+// WHAT THIS ARM CAN AND CANNOT PROVE, stated plainly because the obvious reading is too generous.
+// It does NOT prove the ordering (that ::close runs after the syscall returns): MEASURED on macOS
+// 2026-08-13, a bare ::close ends a parked recvfrom / select / recv in ~204 ms each, so on this
+// platform the syscall is out of the kernel either way and no assertion through this API can tell
+// the two orderings apart. The first version of this arm was written that way, passed against
+// deliberately unfixed code, and was thrown out — SESSION_RUNNER Learning #12's vacuous test.
+// The ORDERING is proved by the ubuntu TSan job with tests/tsan-suppressions.txt' race:closeNative
+// entry deleted; 17 arms there redden if this regresses, and no local run can substitute.
+//
+// What it DOES prove, on every platform, is the promptness half — and that half is falsifiable
+// here. ::shutdown does not wake a select on a listener (measured: parked the full 5000 ms), so
+// with the poll-slice check removed from acceptTcp the drain sits out this accept's whole 3000 ms
+// deadline before ::close runs. DRIVEN RED THAT WAY BEFORE BEING TRUSTED: close() took 3006 ms
+// against the 500 ms bound below. On Linux the same mutation is worse still, because close() does
+// not wake a blocked select there at all.
+TEST(Socket, CloseIsPromptWhileAnAcceptIsParkedOnTheSocket) {
+    std::string err;
+    Socket listener = Socket::listenTcp("", 0, true, &err);
+    ASSERT_TRUE(listener.valid()) << err;
+
+    const std::uint64_t forcedBefore = Socket::drainTimeouts();
+
+    // Long enough that the accept's own deadline cannot be what ends the wait, and comfortably
+    // under kDrainTimeoutMs (5000) so a COMPLETED drain rather than an expired one is what does.
+    constexpr int kAcceptTimeoutMs = 3000;
+    constexpr int kPromptBoundMs = 500;
+
+    std::atomic<bool> enteredAccept{false};
+    std::atomic<bool> acceptReturned{false};
+    std::thread acceptor([&]() {
+        Socket out;
+        std::string aerr;
+        enteredAccept.store(true);
+        listener.acceptTcp(kAcceptTimeoutMs, out, &aerr);
+        acceptReturned.store(true);
+    });
+
+    while (!enteredAccept.load()) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // settle inside the syscall
+    ASSERT_FALSE(acceptReturned.load()) << "accept left early — the arm would prove nothing";
+
+    const auto t0 = std::chrono::steady_clock::now();
+    listener.close();
+    const auto closeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+
+    EXPECT_LT(closeMs, kPromptBoundMs)
+        << "close() sat on the parked accept for " << closeMs << " ms — the drain is waiting out "
+        << "the caller's whole poll instead of the slice";
+
+    // The negative control for the bound above, and the reason it is not just a stopwatch. A fast
+    // close() would ALSO be produced by the drain being absent altogether; what separates "waited
+    // and the syscall left" from "never waited" is that the first bumps no counter and the second
+    // could not bump one either — so the counter is checked for the REMAINING failure: a drain
+    // that ran, expired, and freed the descriptor the old racy way regardless.
+    EXPECT_EQ(Socket::drainTimeouts(), forcedBefore)
+        << "close() hit its drain deadline instead of waiting the syscall out";
+
+    acceptor.join();
+    EXPECT_TRUE(acceptReturned.load());
+    EXPECT_FALSE(listener.valid());
 }
 
 // C8: recvFrom must never overflow the supplied buffer on an oversized datagram,

@@ -7,8 +7,10 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 // The single containment point for platform socket differences. NOTHING outside
@@ -79,7 +81,45 @@ public:
 
     bool valid() const noexcept;
     socket_t handle() const noexcept { return handle_.load(); }
+
+    // Shuts the socket down, waits for any syscall already running on the descriptor to leave,
+    // and only then frees it. Idempotent; safe to call from any thread.
+    //
+    // THE WAIT IS THE POINT (issue #90). Freeing a descriptor while another thread is parked in
+    // recv()/accept()/send() on it is undefined by POSIX, and the practical failure is not a lost
+    // wakeup: the moment ::close returns, that integer is free, so any thread opening any file or
+    // socket can be handed the SAME number while the first thread is still inside its syscall —
+    // which then refers to a DIFFERENT object. On a multi-tenant server that accepts connections
+    // during teardown the window is real rather than theoretical, and the idiom survives review
+    // because on Linux the blocked call usually returns EBADF and the code does the right thing.
+    // "Usually" is what an instrument is for: this was the single most-reported race in the first
+    // TSan run (17 arms, issue #28).
+    //
+    // Ordering, and why each step is needed:
+    //   1. Take the descriptor out of handle_ under ioMutex_ — no NEW syscall can enter after this.
+    //   2. ::shutdown it, so a thread ALREADY inside returns now instead of at its poll deadline.
+    //   3. Wait for the in-flight count to reach zero.
+    //   4. ::close.
+    //
+    // BOUNDED, so this can never trade a race for a hang. The wait has a deadline (see
+    // drainTimeouts) and closes anyway if it expires — which is exactly the pre-existing behaviour,
+    // so the change can only remove races, never add a stall. Do NOT make the wait unbounded:
+    // ::shutdown does not wake a thread parked in recvfrom() on an UNCONNECTED UDP socket (it
+    // answers ENOTCONN), so that case leaves on its SO_RCVTIMEO and nothing else.
+    //
+    // CALLER RULE: never call close() from a thread that is itself inside one of this socket's own
+    // I/O methods. Nothing in naudio does — every teardown path calls it after its I/O call has
+    // returned — but such a caller would wait out the whole deadline against itself.
     void close() noexcept;
+
+    // How many close() calls so far in this process reached the drain deadline with a syscall
+    // still in flight, and therefore freed the descriptor the old, racy way.
+    //
+    // THIS IS THE CONTROL, not a statistic. The claim "close() no longer frees a descriptor
+    // out from under a live syscall" is only true while this stays 0, and the residual is
+    // otherwise invisible — a forced close looks exactly like a clean one. Tests assert it,
+    // which is what makes the claim a measurement rather than a hope.
+    static std::uint64_t drainTimeouts() noexcept;
 
     // Half-closes BOTH directions with ::shutdown, which wakes any thread currently parked in
     // send() or recv() on this socket. Errors are ignored on purpose: ENOTCONN on a socket that
@@ -280,12 +320,45 @@ public:
                 std::uint16_t port);
 
 private:
+    // Registers the calling thread as being inside a syscall on this socket for its lifetime,
+    // and hands out the descriptor to use. `entered()` false means the socket was already closed
+    // (or a close is in progress) and the caller must fail without touching the descriptor at all.
+    //
+    // This is what keeps close()'s step 3 honest: the count it waits on is incremented here under
+    // the same mutex close() takes to remove the handle, so a scope that observes a live handle is
+    // already counted, and one that starts after the removal sees nothing to use.
+    class IoScope {
+    public:
+        explicit IoScope(const Socket& s) noexcept;
+        ~IoScope();
+        IoScope(const IoScope&) = delete;
+        IoScope& operator=(const IoScope&) = delete;
+
+        bool entered() const noexcept { return entered_; }
+        socket_t handle() const noexcept { return h_; }
+
+    private:
+        const Socket& s_;
+        socket_t h_;
+        bool entered_;
+    };
+
     // Atomic so close() (which stores kInvalidSocket) cannot data-race the
     // receive worker / send path reading the handle for a syscall (C4 — the
     // TSan-flagged Socket::close vs AudioProtocolHandler recv race). Each I/O
     // method loads the handle once into a local before the syscall; a close()
     // landing after the load makes the syscall fail cleanly (EBADF) with no UB.
+    //
+    // The atomic answers "is the read of the handle a data race?" — issue #90 is the SEPARATE
+    // question it cannot answer: whether the descriptor that read names is still ours by the time
+    // the syscall runs. That one needs the scope below, not a wider load.
     std::atomic<socket_t> handle_;
+
+    // Mutable because the const accessors (localPort, remoteAddress) make syscalls too, and a
+    // descriptor freed underneath getsockname() is the same defect as one freed underneath recv().
+    mutable std::mutex ioMutex_;
+    mutable std::condition_variable ioIdle_;
+    mutable int inFlight_ = 0;  // threads currently inside a syscall on handle_
 };
 
 }  // namespace naudio::net

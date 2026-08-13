@@ -109,6 +109,57 @@ void closeNative(socket_t h) {
 #endif
 }
 
+// Half-closes both directions so a thread parked in the kernel on this descriptor returns now.
+// The return value is deliberately unread — ENOTCONN is the expected answer for a listener or an
+// unconnected UDP socket, and no caller could act on any other failure either.
+void shutdownNative(socket_t h) {
+#ifdef _WIN32
+    ::shutdown(h, SD_BOTH);
+#else
+    ::shutdown(h, SHUT_RDWR);
+#endif
+}
+
+// How long close() waits for in-flight syscalls to leave before freeing the descriptor anyway.
+//
+// SIZED AGAINST THE MEASURED CALLERS, not picked for looking round. What has to fit inside it is
+// the longest a syscall can stay in flight after close() has issued its ::shutdown:
+//
+//   * a TCP recv or send — promptly, because ::shutdown does wake those (MEASURED at 11 ms on
+//     Linux, see setSendTimeout's note; 206 ms in the macOS probe below).
+//   * an accept — at most kAcceptPollSliceMs, because that call polls in slices and checks for a
+//     pending close between them. It is NOT the caller's 1000 ms deadline; that is the whole
+//     reason the slice exists.
+//   * a UDP recvFrom — its SO_RCVTIMEO, and nothing shorter: ::shutdown answers ENOTCONN on an
+//     unconnected datagram socket and wakes nothing. The largest in the tree is 2000 ms
+//     (tests/net/test_dual_transport.cpp:67); the demux loop's 500 ms never reaches the drain at
+//     all, since UdpServerTransport::close joins that thread before closing the socket.
+//
+// So 2000 ms is the real worst case and this is 2.5x it. Every one of them is a kernel wait rather
+// than compute, so a sanitizer build does not stretch it.
+//
+// Reaching this deadline is not an error path to be tuned away — it means a descriptor was freed
+// with a syscall still on it, i.e. exactly the defect. Socket::drainTimeouts() counts it so that
+// stays visible instead of becoming a silent fallback.
+constexpr int kDrainTimeoutMs = 5000;
+
+std::atomic<std::uint64_t> g_drainTimeouts{0};
+
+// The longest acceptTcp will sit in one ::select before looking up to see whether a close() has
+// begun. It is NOT a change to the caller's deadline — the slices are summed back up to it.
+//
+// MEASURED, and it is the difference between a 20% slower test suite and a 0.4% one. ::shutdown
+// does not wake a thread parked in select() on a LISTENER: measured on macOS 2026-08-13, a bare
+// close() ends that wait in 204 ms while a shutdown() leaves it parked for the full 5000 ms
+// (/tmp/naudio-fdprobe/wake.c). So once close() stopped freeing the descriptor immediately, every
+// server teardown paid out the accept loop's whole 1000 ms poll: the full suite went 138.58 s ->
+// 165.85 s, +28.0 s spread over 29 tests in flat ~1.00 s steps — the accept poll's signature.
+//
+// Linux gains from this too rather than merely being unharmed: close() does not wake a blocked
+// select() there at ALL (the reason self-pipes exist), so before this the accept thread already
+// sat out its remaining poll on every stop — it was just charged to the join instead of to close.
+constexpr int kAcceptPollSliceMs = 50;
+
 void setErr(std::string* err, const char* what) {
     if (err) *err = std::string(what) + " (errno=" + std::to_string(lastErr()) + ")";
 }
@@ -215,17 +266,44 @@ std::int64_t elapsedMsSince(std::chrono::steady_clock::time_point t0) {
 
 // ---------------------------------------------------------------------------
 
+Socket::IoScope::IoScope(const Socket& s) noexcept : s_(s), h_(kInvalidSocket), entered_(false) {
+    std::lock_guard<std::mutex> lock(s_.ioMutex_);
+    // Read the handle under the SAME lock close() takes to remove it. That is the whole ordering
+    // argument: either we see a live descriptor and are counted before close() can start waiting,
+    // or close() has already taken it and we see the sentinel and never touch it.
+    h_ = s_.handle_.load();
+    if (h_ == kInvalidSocket) return;
+    ++s_.inFlight_;
+    entered_ = true;
+}
+
+Socket::IoScope::~IoScope() {
+    if (!entered_) return;
+    std::lock_guard<std::mutex> lock(s_.ioMutex_);
+    if (--s_.inFlight_ == 0) s_.ioIdle_.notify_all();
+}
+
+std::uint64_t Socket::drainTimeouts() noexcept { return g_drainTimeouts.load(); }
+
 Socket::Socket() noexcept : handle_(kInvalidSocket) {}
 
 Socket::Socket(socket_t handle) noexcept : handle_(handle) {}
 
 Socket::~Socket() { close(); }
 
-Socket::Socket(Socket&& other) noexcept : handle_(other.handle_.exchange(kInvalidSocket)) {}
+Socket::Socket(Socket&& other) noexcept : handle_(kInvalidSocket) {
+    // Under the SOURCE's lock, so the steal cannot land between an IoScope's handle read and its
+    // count increment. Moving a socket that has live I/O on it was never meaningful — the moved-to
+    // object has its own mutex and would not be waited on — but taking the lock costs nothing and
+    // keeps the handle transfer ordered against the same mutex everything else here uses.
+    std::lock_guard<std::mutex> lock(other.ioMutex_);
+    handle_.store(other.handle_.exchange(kInvalidSocket));
+}
 
 Socket& Socket::operator=(Socket&& other) noexcept {
     if (this != &other) {
-        close();
+        close();  // drains this socket's own in-flight I/O before the descriptor goes
+        std::lock_guard<std::mutex> lock(other.ioMutex_);
         handle_.store(other.handle_.exchange(kInvalidSocket));
     }
     return *this;
@@ -234,29 +312,47 @@ Socket& Socket::operator=(Socket&& other) noexcept {
 bool Socket::valid() const noexcept { return handle_.load() != kInvalidSocket; }
 
 void Socket::close() noexcept {
-    // Atomic exchange: only one caller (or the destructor) ever takes the real
-    // handle, so close() is both data-race-free against concurrent readers and
-    // safe against a double close from two threads.
-    socket_t h = handle_.exchange(kInvalidSocket);
-    if (h != kInvalidSocket) {
-        closeNative(h);
+    // 1. Take the descriptor. Under ioMutex_ so it is ordered against IoScope's read: after this,
+    //    every new scope sees the sentinel and no further syscall can enter. The exchange also
+    //    keeps close() single-shot — two threads racing here, or a destructor following an explicit
+    //    close(), and only one gets a real handle.
+    socket_t h;
+    {
+        std::lock_guard<std::mutex> lock(ioMutex_);
+        h = handle_.exchange(kInvalidSocket);
     }
+    if (h == kInvalidSocket) return;
+
+    // 2. Wake whoever is already inside, so the wait below is microseconds rather than the
+    //    caller's own receive deadline. It does NOT reach every waiter — a select on a listener
+    //    and a recvfrom on an unconnected UDP socket both ignore it (measured; see
+    //    kAcceptPollSliceMs) — which is why acceptTcp polls in slices and why step 3 is bounded.
+    shutdownNative(h);
+
+    // 3. Wait for them to leave. This is the step that makes the descriptor safe to free.
+    {
+        std::unique_lock<std::mutex> lock(ioMutex_);
+        if (!ioIdle_.wait_for(lock, std::chrono::milliseconds(kDrainTimeoutMs),
+                              [this] { return inFlight_ == 0; })) {
+            // Deadline reached with a syscall still on the descriptor. Freeing it here is the
+            // pre-#90 behaviour and the pre-#90 hazard; the alternative is leaking the descriptor
+            // or blocking forever, both worse. Counted so it cannot pass unnoticed.
+            g_drainTimeouts.fetch_add(1);
+        }
+    }
+
+    // 4. Now the number is ours alone to give back.
+    closeNative(h);
 }
 
 void Socket::shutdownBoth() noexcept {
-    // Read the handle rather than exchanging it: this must NOT take ownership, because close()
-    // still has to run afterwards to free the descriptor. A concurrent close() that wins the race
-    // leaves h invalid here and the shutdown is simply skipped, which is correct — the socket is
-    // already going away.
-    socket_t h = handle_.load();
-    if (h == kInvalidSocket) return;
-#ifdef _WIN32
-    ::shutdown(h, SD_BOTH);
-#else
-    ::shutdown(h, SHUT_RDWR);
-#endif
-    // Return value deliberately unread: ENOTCONN is the expected answer for a listener or an
-    // unconnected UDP socket, and every other failure still leaves close() to do the real work.
+    // Scoped like every other syscall here: shutdown() takes a descriptor, so it is exposed to the
+    // same reuse hazard as recv() if it runs after some other thread's close() freed the number.
+    // A concurrent close() that wins leaves this un-entered and the shutdown is simply skipped,
+    // which is correct — close() issues its own shutdown at step 2 anyway.
+    IoScope io(*this);
+    if (!io.entered()) return;
+    shutdownNative(io.handle());
 }
 
 void Socket::ensureStartup() {
@@ -337,24 +433,50 @@ Socket Socket::listenTcp(const std::string& bindHost, std::uint16_t port,
 }
 
 IoStatus Socket::acceptTcp(int timeoutMs, Socket& out, std::string* err) {
-    socket_t h = handle_.load();
-    if (h == kInvalidSocket) {
+    // Held across the select AND the accept: both take the listener's descriptor, so neither may
+    // run on a number close() has already handed back.
+    IoScope io(*this);
+    if (!io.entered()) {
         setErr(err, "acceptTcp on invalid socket");
         return IoStatus::Error;
     }
-    if (timeoutMs > 0) {
+    const socket_t h = io.handle();
+
+    // POLLED IN SLICES rather than in one wait of the caller's whole deadline, and the slices are
+    // summed back up to it — so this is not a change to the contract, only to how often the wait
+    // looks up. What it looks up for is a close() that began while we were parked: close() takes
+    // the handle before it waits for us, so an invalid handle_ here means the descriptor is on its
+    // way out and there is nothing left to accept. Without this the drain in close() would sit out
+    // the caller's full poll on every teardown, because ::shutdown does not wake a select on a
+    // listener (see kAcceptPollSliceMs for the measurement).
+    //
+    // timeoutMs <= 0 keeps its documented "blocks until a client arrives" meaning — it just loops
+    // forever instead of parking in one indefinite ::accept, which is what makes even that case
+    // answer a close instead of hanging until the drain deadline expires.
+    for (int remaining = timeoutMs;;) {
+        const int slice = (timeoutMs > 0 && remaining < kAcceptPollSliceMs) ? remaining
+                                                                           : kAcceptPollSliceMs;
         fd_set rf;
         FD_ZERO(&rf);
         FD_SET(h, &rf);
-        timeval tv = msToTimeval(timeoutMs);
+        timeval tv = msToTimeval(slice);
         int sel = ::select(static_cast<int>(h) + 1, &rf, nullptr, nullptr, &tv);
-        if (sel == 0) return IoStatus::TimedOut;
+        if (sel > 0) break;  // a connection is pending — go take it
         if (sel < 0) {
+            // EINTR reports TimedOut exactly as it always has, rather than being retried here:
+            // every caller already loops on TimedOut, and preserving the old answer keeps this
+            // change to the polling cadence alone.
             if (isInterrupted(lastErr())) return IoStatus::TimedOut;
             setErr(err, "select() failed in acceptTcp");
             return IoStatus::Error;
         }
+        if (handle_.load() == kInvalidSocket) {
+            setErr(err, "acceptTcp: socket closed");
+            return IoStatus::Error;
+        }
+        if (timeoutMs > 0 && (remaining -= slice) <= 0) return IoStatus::TimedOut;
     }
+
     socket_t c = ::accept(h, nullptr, nullptr);
     if (c == kInvalidSocket) {
         int e = lastErr();
@@ -510,25 +632,34 @@ int resizeSocketBuffer(socket_t h, int optname, int bytes) {
 }
 }  // namespace
 
+// The option setters are scoped too, and not out of symmetry. A setsockopt that lands on a REUSED
+// descriptor silently reconfigures whatever socket now owns that number — a buffer size or a
+// timeout applied to an unrelated connection, with no error anywhere. That is a quieter failure
+// than a stray recv, not a smaller one.
 bool Socket::setSendBufferAtLeast(int bytes) {
-    return raiseSocketBuffer(handle_.load(), SO_SNDBUF, bytes);
+    IoScope io(*this);
+    return io.entered() && raiseSocketBuffer(io.handle(), SO_SNDBUF, bytes);
 }
 
 bool Socket::setRecvBufferAtLeast(int bytes) {
-    return raiseSocketBuffer(handle_.load(), SO_RCVBUF, bytes);
+    IoScope io(*this);
+    return io.entered() && raiseSocketBuffer(io.handle(), SO_RCVBUF, bytes);
 }
 
 int Socket::setSendBufferSize(int bytes) {
-    return resizeSocketBuffer(handle_.load(), SO_SNDBUF, bytes);
+    IoScope io(*this);
+    return io.entered() ? resizeSocketBuffer(io.handle(), SO_SNDBUF, bytes) : 0;
 }
 
 int Socket::setRecvBufferSize(int bytes) {
-    return resizeSocketBuffer(handle_.load(), SO_RCVBUF, bytes);
+    IoScope io(*this);
+    return io.entered() ? resizeSocketBuffer(io.handle(), SO_RCVBUF, bytes) : 0;
 }
 
 bool Socket::setRecvTimeout(int ms) {
-    socket_t h = handle_.load();
-    if (h == kInvalidSocket) return false;
+    IoScope io(*this);
+    if (!io.entered()) return false;
+    const socket_t h = io.handle();
 #ifdef _WIN32
     DWORD t = static_cast<DWORD>(ms < 0 ? 0 : ms);
     return ::setsockopt(h, SOL_SOCKET, SO_RCVTIMEO,
@@ -540,8 +671,9 @@ bool Socket::setRecvTimeout(int ms) {
 }
 
 bool Socket::setSendTimeout(int ms) {
-    socket_t h = handle_.load();
-    if (h == kInvalidSocket) return false;
+    IoScope io(*this);
+    if (!io.entered()) return false;
+    const socket_t h = io.handle();
 #ifdef _WIN32
     DWORD t = static_cast<DWORD>(ms < 0 ? 0 : ms);
     return ::setsockopt(h, SOL_SOCKET, SO_SNDTIMEO,
@@ -553,8 +685,9 @@ bool Socket::setSendTimeout(int ms) {
 }
 
 std::uint16_t Socket::localPort() const {
-    socket_t h = handle_.load();
-    if (h == kInvalidSocket) return 0;
+    IoScope io(*this);
+    if (!io.entered()) return 0;
+    const socket_t h = io.handle();
     sockaddr_in addr;
     socklen_t len = sizeof(addr);
     if (::getsockname(h, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
@@ -564,8 +697,9 @@ std::uint16_t Socket::localPort() const {
 }
 
 std::string Socket::remoteAddress() const {
-    socket_t h = handle_.load();
-    if (h == kInvalidSocket) return "";
+    IoScope io(*this);
+    if (!io.entered()) return "";
+    const socket_t h = io.handle();
     sockaddr_in addr;
     socklen_t len = sizeof(addr);
     if (::getpeername(h, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
@@ -577,7 +711,11 @@ std::string Socket::remoteAddress() const {
 }
 
 RecvResult Socket::recv(void* buf, std::size_t len) {
-    socket_t h = handle_.load();
+    // THE CALL THE 17 TSan ARMS NAMED. The scope is what stops close() freeing this descriptor
+    // while the ::recv below is parked in the kernel on it.
+    IoScope io(*this);
+    if (!io.entered()) return {IoStatus::Error, 0};
+    const socket_t h = io.handle();
     for (;;) {
         int n = static_cast<int>(
             ::recv(h, static_cast<char*>(buf), static_cast<int>(len), 0));
@@ -591,7 +729,12 @@ RecvResult Socket::recv(void* buf, std::size_t len) {
 }
 
 bool Socket::sendAll(const void* buf, std::size_t len) {
-    socket_t h = handle_.load();
+    // Held across the whole retry loop, including the sendTimeoutMs() getsockopt inside it — a
+    // partial write that resumes on a reused descriptor would put this frame's tail on someone
+    // else's connection.
+    IoScope io(*this);
+    if (!io.entered()) return false;
+    const socket_t h = io.handle();
     const char* p = static_cast<const char*>(buf);
     std::size_t left = len;
 
@@ -631,7 +774,13 @@ bool Socket::sendAll(const void* buf, std::size_t len) {
 }
 
 RecvFromResult Socket::recvFrom(void* buf, std::size_t len) {
-    socket_t h = handle_.load();
+    // The UDP counterpart of recv's scope, and the one case where close()'s ::shutdown does NOT
+    // shorten the wait: an unconnected datagram socket answers ENOTCONN, so a thread parked here
+    // leaves on its SO_RCVTIMEO (500 ms on the demux loop) and nothing sooner. That is precisely
+    // why the drain has a deadline rather than waiting forever.
+    IoScope io(*this);
+    if (!io.entered()) return {IoStatus::Error, 0, "", 0, false};
+    const socket_t h = io.handle();
     sockaddr_in src;
     socklen_t sl = sizeof(src);
     // Linux MSG_TRUNC makes recvfrom return the datagram's TRUE length even when
@@ -675,7 +824,9 @@ RecvFromResult Socket::recvFrom(void* buf, std::size_t len) {
 
 bool Socket::sendTo(const void* buf, std::size_t len, const std::string& host,
                     std::uint16_t port) {
-    socket_t h = handle_.load();
+    IoScope io(*this);
+    if (!io.entered()) return false;
+    const socket_t h = io.handle();
     sockaddr_in dst;
     if (!resolveV4(host, port, dst, nullptr)) return false;
     for (;;) {

@@ -739,6 +739,13 @@ void AudioStreamServer::stop() {
     stopSharedAudio();
 
     // Close the transport to unblock the accept thread, then join it.
+    //
+    // This is the call stack issue #90 quoted, and it is still the right shape — but the close no
+    // longer unblocks the accept by yanking the descriptor out from under it. Socket::close() takes
+    // the handle, and acceptTcp's poll notices that between slices and returns; only once it has
+    // left is the descriptor freed. So this line now RETURNS with the accept thread already out of
+    // the kernel, and the join below reaps a thread that is on its way out rather than one that
+    // still has to be woken.
     std::shared_ptr<ServerTransport> transport;
     {
         std::lock_guard<std::mutex> lock(runMutex_);
