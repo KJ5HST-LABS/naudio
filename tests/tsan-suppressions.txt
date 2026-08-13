@@ -11,18 +11,13 @@
 # Nothing here is suppressed because it was hard to read. Every line costs an issue.
 
 # ---------------------------------------------------------------------------------------------
-# issue #90 — Socket::close() runs while a worker thread is blocked in ::recv() on the SAME
-# descriptor. Reported 17 times in the first instrumented run, and not only from tests: the
-# production path is AudioStreamServer::stop() -> TcpServerTransport::close() ->
-# TcpClientConnection::close() -> AudioProtocolHandler::close() -> Socket::close(), which is
-# stop()'s documented "close the transport to unblock the accept thread" idiom.
+# THERE ARE NO SUPPRESSIONS. The file stays because the job passes its path in TSAN_OPTIONS
+# unconditionally and TSan refuses to start if it cannot read it — and because this is where the
+# next one goes, under rule 1 above.
 #
-# POSIX leaves close() concurrent with a blocking syscall on the same fd undefined; the practical
-# hazard is descriptor reuse, where the blocked recv() ends up referring to a different object. The
-# fix changes every transport's shutdown ordering (shutdown() before close(), or join-then-close)
-# and must not regress the two-pass stop() structure from #57, so it is a decision rather than a
-# patch and is tracked in #90.
-#
-# DELETE THIS LINE TO GET THE 17 FAILURES BACK. That is the check that this entry is still earning
-# its place.
-race:closeNative
+# The only entry this file ever held was `race:closeNative`, for issue #90: Socket::close() freeing
+# a descriptor while a worker thread was blocked in ::recv() on it, 17 arms in the first
+# instrumented run. It was removed when #90 was fixed rather than because it had grown quiet —
+# Socket::close() now takes the handle, ::shutdown()s it, waits for every in-flight syscall to
+# leave, and only then frees the number (include/naudio/net/Socket.hpp, Socket::close). Rule 2 is
+# what retired it: deleting the line has to reproduce a filed defect, and after the fix it does not.

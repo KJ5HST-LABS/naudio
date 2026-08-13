@@ -339,9 +339,12 @@ jobs:
             echo "TSAN_OPTIONS=$TSAN_OPTIONS"
           fi
           ctest --test-dir build --output-on-failure
-        # The thread leg carries ONE suppression, for the shutdown-path race filed as #90, so this
-        # job still reddens on every other race instead of not existing. See
-        # tests/tsan-suppressions.txt — it states what deleting the entry must reproduce.
+        # The thread leg now carries NO suppressions — its one entry, for the shutdown-path race
+        # filed as #90, was removed when that race was fixed. So this leg reddens on every race in
+        # the tree with nothing excused, and it is the ONLY instrument that can: measured
+        # 2026-08-13, Apple clang 21's TSan reports nothing for a close()/recv() descriptor race
+        # even in a 20-line program, while the same program with a plain data race added reports
+        # and exits 134. The macOS legs of this workflow cannot stand in for this one.
 
   ffi-clients:
     name: ffi example clients (python + java + rust vs the C ABI)

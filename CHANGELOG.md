@@ -261,6 +261,38 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **`Socket::close()` no longer frees a descriptor while a syscall is still running on it**
+  (issue #90). Every transport's shutdown path closed a socket while another thread was parked in
+  `recv()` / `accept()` on that same descriptor — `AudioStreamServer::stop()` →
+  `TcpServerTransport::close()` → … → `Socket::close()`, doing exactly what its comment said
+  ("close the transport to unblock the accept thread"). POSIX leaves that undefined, and the
+  practical hazard is not a lost wakeup but **descriptor reuse**: once `::close` returns the integer
+  is free, so any thread opening any file or socket can be handed the same number while the first
+  thread is still inside its syscall, which then refers to a different object. On a server that
+  accepts connections during teardown the window is real. It was the single most-reported race in
+  the first instrumented run — 17 arms.
+
+  **Fixed inside `Socket` rather than by reordering each transport's teardown.** The descriptor's
+  lifetime is the socket's own invariant, so a rule spread across every transport would have to be
+  re-derived by the next one. `close()` now takes the handle (no new syscall can enter), `shutdown`s
+  it to wake anyone already inside, waits for the in-flight count to reach zero, and only then
+  frees it. Every method that hands the descriptor to a syscall — including the option setters,
+  where a stray `setsockopt` would silently reconfigure whatever socket inherited the number — is
+  covered. No transport's shutdown ordering changed, so the two-pass `stop()` from #57 is untouched.
+
+  **The wait is bounded and cannot trade the race for a hang**; if the deadline is ever reached the
+  descriptor is freed as before, and `Socket::drainTimeouts()` counts it so that residual is
+  visible instead of silent.
+
+  **`Socket::acceptTcp` now polls in slices** (summed back to the caller's unchanged deadline) so a
+  concurrent `close()` is seen promptly. `shutdown` does not wake a `select` on a listener, so
+  without this every server teardown paid out the accept loop's whole poll: measured 138.58 s →
+  165.85 s on the full suite, +28.0 s in flat ~1.00 s steps across 29 tests, brought back to
+  140.00 s by the slicing. Linux gains too — `close()` never woke a blocked `select` there at all.
+
+  **The TSan suppression this issue existed to retire is gone**, so the sanitizer job now reddens
+  on every race in the tree with nothing excused.
+
 - **`na_hamlib_bridge` builds again against a current Hamlib PR #2116 branch** (issue #81). Upstream
   commit `b538567b` replaced `rig_stream_caps`' `channels_min`/`channels_max` **range** with an exact
   0-terminated `channels[]` **list** — openable channel counts need not be contiguous, so a backend
