@@ -1113,11 +1113,26 @@ void AudioStreamServer::threadStarted() {
 }
 
 void AudioStreamServer::threadFinished() {
-    {
-        std::lock_guard<std::mutex> lock(threadsMutex_);
-        --activeThreads_;
-    }
-    threadsCv_.notify_all();
+    // notify_all() is INSIDE the lock, and that is load-bearing rather than stylistic (issue #28).
+    //
+    // Releasing first is the usual advice — it avoids waking a waiter that immediately blocks on
+    // the mutex — but it is unsound when the waiter's next act is to DESTROY the condition
+    // variable. The sequence TSan caught on ubuntu: this thread decrements to 0 and unlocks,
+    // stop()'s barrier at :727 wakes and returns, ~AudioStreamServer runs to completion and
+    // destroys threadsCv_, and this thread — still between the unlock and the notify — calls
+    // pthread_cond_broadcast on freed memory.
+    //
+    //   Write of size 8 by main thread:      pthread_cond_destroy
+    //                                        AudioStreamServer::~AudioStreamServer() :638
+    //   Previous read of size 8 by T5:       pthread_cond_broadcast
+    //                                        AudioStreamServer::threadFinished() :1120
+    //
+    // Holding the lock across the notify closes it: the waiter cannot return from wait() until it
+    // re-acquires threadsMutex_, which cannot happen until this scope ends — after notify_all()
+    // has returned. AudioStreamClient::threadFinished() has always done it this way; the two
+    // siblings disagreed and only the client was right.
+    std::lock_guard<std::mutex> lock(threadsMutex_);
+    if (--activeThreads_ == 0) threadsCv_.notify_all();
 }
 
 // Each notify* snapshots the listeners then POSTS the fan-out to the dispatcher,
