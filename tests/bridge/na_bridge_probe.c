@@ -161,6 +161,18 @@ static atomic_int g_txsrv_calls = 0;
 static atomic_int g_txsrv_bytes = 0;
 static atomic_int g_txsrv_peak  = 0;
 
+/* The selftest's inject barrier (issue #48). Set from on_stream_started, which fires only after
+ * the session has been registered as a broadcast target — so once this is 1, na_server_inject_audio
+ * actually reaches the selftest client. na_server_client_count() cannot say that: it reports the
+ * ROSTER, which a client joins at accept, before its handshake has even been read. */
+static atomic_int g_srv_streaming = 0;
+
+static void on_selftest_stream_started(const char* client_id, void* user) {
+    (void)client_id;
+    (void)user;
+    atomic_store(&g_srv_streaming, 1);
+}
+
 static void on_server_tx_audio(const unsigned char* pcm, size_t n_bytes, void* user) {
     (void)user;
     const size_t n = n_bytes / 2u;
@@ -405,6 +417,16 @@ static int run_selftest(void) {
         na_server_destroy(srv);
         return EXIT_HARNESS;
     }
+    /* The inject barrier — also before start, like every other server callback. */
+    na_server_callbacks scbs;
+    memset(&scbs, 0, sizeof scbs);
+    scbs.struct_size = sizeof scbs;
+    scbs.on_stream_started = on_selftest_stream_started;
+    if (na_server_set_callbacks(srv, &scbs, NULL) != NA_OK) {
+        fprintf(stderr, "na_bridge_probe: selftest server callbacks rejected\n");
+        na_server_destroy(srv);
+        return EXIT_HARNESS;
+    }
     if (na_server_start(srv, err, (int)sizeof err) != NA_OK) {
         fprintf(stderr, "na_bridge_probe: selftest server start failed (%s)\n", err);
         na_server_destroy(srv);
@@ -418,12 +440,30 @@ static int run_selftest(void) {
         na_server_destroy(srv);
         return EXIT_HARNESS;
     }
-    /* The roster has to actually carry this client before injecting, or the first frames are
-     * broadcast to nobody and the content arm fails for a reason that is not the detector's. */
-    for (int i = 0; i < 200 && na_server_client_count(srv) < 1; i++) sleep_ms(10);
+    /* This client has to be a BROADCAST TARGET before injecting, or the first frames are broadcast
+     * to nobody and the content arm fails for a reason that is not the detector's.
+     *
+     * This gate used to poll na_server_client_count() >= 1 and its comment claimed exactly the
+     * guarantee above — which that call does not give (issue #48): it reports the ROSTER, which a
+     * client joins at accept, before the handshake. on_stream_started is the barrier that means
+     * what the comment says.
+     *
+     * MEASURED, because the wrong gate costs nothing until it does. On this loopback the old gate
+     * delivered 60 of 60 frames in 5 runs — the window is too narrow to lose anything, which is
+     * exactly why it went unnoticed. Forcing it open with a 300 ms sleep before addTarget (the
+     * technique tests/net/test_server.cpp already uses for issue #46):
+     *
+     *     old gate (na_server_client_count), 300 ms window:  36, 37, 37 frames of 60 — and the
+     *                                                        selftest still reported OK
+     *     new gate (on_stream_started),      300 ms window:  60, 60, 60
+     *
+     * So the arm was passing while silently dropping 40% of the audio it claims to verify: it
+     * asserts calls > 0, not calls == 60, and was carried by selftest_arm's 60-frame retry loop
+     * underneath the gate rather than by the gate. */
+    for (int i = 0; i < 200 && atomic_load(&g_srv_streaming) == 0; i++) sleep_ms(10);
     int rc = EXIT_MET;
-    if (na_server_client_count(srv) < 1) {
-        fprintf(stderr, "na_bridge_probe: selftest client never joined the roster\n");
+    if (atomic_load(&g_srv_streaming) == 0) {
+        fprintf(stderr, "na_bridge_probe: selftest client never became a broadcast target\n");
         rc = EXIT_HARNESS;
     } else {
         rc = selftest_arm(srv, cli, 1, "content");

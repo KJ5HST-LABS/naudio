@@ -759,6 +759,20 @@ NA_EXPORT na_error_t na_client_get_stats(na_stream_client* client, na_client_sta
  *     na_server_set_playback_device(). The na_server_tx_audio_cb is NOT delivered on this backend
  *     (TX goes to the playback device instead); na_server_inject_audio() is also unused.
  *
+ * EVENT PAIRING CONTRACT — what the two nested pairs mean:
+ *   - on_client_connected / on_client_disconnected BRACKET ROSTER MEMBERSHIP. Every connect is
+ *     followed by exactly one disconnect for the same client_id, INCLUDING for a peer that never
+ *     completes a handshake — a port scanner, a version-mismatched client, a half-open probe all
+ *     produce the pair, not a lone connect. A listener may therefore treat the two as balanced and
+ *     count with them; the interval between them is exactly what na_server_client_count() reports.
+ *   - on_stream_started / on_stream_stopped nest INSIDE that pair and bracket the window in which
+ *     the client is actually carrying audio — which is the window na_server_inject_audio() reaches
+ *     (read its "WHO RECEIVES IT" note). A session that fails its handshake emits the outer pair
+ *     and neither of these.
+ *   - The outer pair was previously unbalanced on the failed-handshake path: the connect fired and
+ *     nothing ever closed it, so an event-pairing listener accumulated one phantom client per
+ *     probe. See the CHANGELOG entry for issue #64.
+ *
  * THREADING / LIFETIME CONTRACT — read before using callbacks:
  *   - LIFECYCLE/roster callbacks (na_server_callbacks: started / stopped / client connect-disconnect
  *     / stream start-stop / error) fire on a single dedicated DISPATCH thread, one at a time and in
@@ -890,8 +904,39 @@ NA_EXPORT int na_server_is_running(na_audio_server* server);
 NA_EXPORT int na_server_port(na_audio_server* server);
 
 /* --- Audio I/O --- */
-/* Broadcast `n_bytes` of RX PCM to all connected clients (the radio-RX-audio analog; NULL backend /
- * inject-only). Returns NA_OK, or NA_ERR_INVALID on a NULL server / NULL buffer / n_bytes <= 0.
+/* Broadcast `n_bytes` of RX PCM to every client that is ready to receive (the radio-RX-audio
+ * analog; NULL backend / inject-only). Returns NA_OK, or NA_ERR_INVALID on a NULL server / NULL
+ * buffer / n_bytes <= 0.
+ *
+ * WHO RECEIVES IT — and it is NOT everyone na_server_client_count() counts. A client joins the
+ * ROSTER when the server accepts its connection, which is before it has said a word; it becomes a
+ * BROADCAST TARGET only once its handshake has completed. In the window between those two moments
+ * the roster counts it and this call does not reach it, and a frame injected there is DISCARDED —
+ * there is no queue and no retry for it, and this call still returns NA_OK, because nothing
+ * failed. NA_OK means "handed to every ready client", never "handed to every client you can count".
+ *
+ * THE BARRIER IS on_stream_started, NOT na_server_client_count(). That callback fires after the
+ * session has been registered as a broadcast target, so a client it has named is a client this
+ * call reaches. The obvious inject-as-soon-as-a-client-appears loop, gated on the count, drops
+ * audio at every join — non-deterministically, and with no counter anywhere that reports it:
+ *
+ *     static atomic_int ready;                       // written on the dispatch thread, read here
+ *     static void on_stream_started(const char* id, void* user)
+ *         { (void)id; (void)user; atomic_store(&ready, 1); }
+ *     ...
+ *     na_server_callbacks cbs = {0};
+ *     cbs.struct_size = sizeof cbs;
+ *     cbs.on_stream_started = on_stream_started;
+ *     na_server_set_callbacks(srv, &cbs, NULL);      // BEFORE na_server_start
+ *     ...
+ *     while (!atomic_load(&ready)) sleep_ms(10);     // NOT: na_server_client_count(srv) < 1
+ *     na_server_inject_audio(srv, pcm, n_bytes);
+ *
+ * (tests/bridge/na_bridge_probe.c gates exactly this way, for exactly this reason.)
+ *
+ * No accessor reports the ready set, and that is a decision rather than an omission:
+ * on_stream_started already marks the exact moment, so a second way to learn it would widen a
+ * published ABI to say what the callback says (issue #48).
  *
  * SIZE CONTRACT: there is NO upper bound on `n_bytes`. naudio frames the buffer internally to
  * whatever the v1 wire can carry, so a large call is delivered COMPLETE rather than clamped —
@@ -910,7 +955,16 @@ NA_EXPORT na_error_t na_server_inject_audio(na_audio_server* server, const unsig
                                             int n_bytes);
 
 /* --- Roster --- */
-/* Currently-connected client count (>= 0), or -1 on NULL / error (na_last_error disambiguates). */
+/* Clients on the ROSTER (>= 0), or -1 on NULL / error (na_last_error disambiguates).
+ *
+ * Roster membership begins when the server accepts the connection -- BEFORE the client's
+ * handshake -- and ends when the session is torn down. It is exactly the interval bracketed by the
+ * on_client_connected / on_client_disconnected pair, and exactly the quantity na_server_max_clients
+ * bounds. A client that connects and then fails its handshake is on the roster for the duration of
+ * that attempt and is counted here throughout it.
+ *
+ * It is NOT the set na_server_inject_audio() reaches. Read that call's "WHO RECEIVES IT" note
+ * before gating an inject on this number (issue #48). */
 NA_EXPORT int na_server_client_count(na_audio_server* server);
 /* The configured maximum client count (> 0), or -1 on NULL / error. */
 NA_EXPORT int na_server_max_clients(na_audio_server* server);
