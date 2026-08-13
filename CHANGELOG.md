@@ -6,6 +6,35 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **`AudioStreamServer::removeStreamListener()` (C++ API) — hand a listener back and know when it is
+  safe to destroy.** `addStreamListener` had no counterpart, so the only way to satisfy its
+  borrowed-must-outlive-the-server rule was to declare the listener first and never destroy it
+  early. Its sibling `AudioStreamClient` already had a `removeStreamListener`, which makes the
+  server the asymmetric one — and that existing client function **only erased from the roster**,
+  which reads as a detach and was not one.
+
+  **The wait is the feature.** Every `notify*` snapshots the listener roster and captures the
+  *pointers* by value, so a callback queued before an erase still holds the pointer. Erasing alone
+  returns while that task is pending, so a caller that erased and then destroyed raced it. Both
+  classes now erase and then fence the dispatcher, so the documented post-condition holds: once
+  `removeStreamListener()` returns, no callback for that listener is running or will ever fire
+  again. Called from *inside* a callback it detaches without waiting — a thread cannot wait for
+  itself, and the only task that could hold the pointer is the one on the caller's own stack.
+
+  **`stop()` deliberately still does not drain** (issue #89). The obvious repair — drain the
+  dispatcher inside `stop()` — was implemented and measured before being rejected: `start()` after
+  `stop()` is a supported, documented transition (`na_server_stats.running`), and
+  `CallbackDispatcher` is not restartable, so the drain left a restarted server running correctly
+  and **permanently mute with `start()` still returning success**. It also would not have held on
+  the re-entrant path `naudio.h` explicitly permits (calling `na_server_stop` from inside a
+  callback), where the dispatcher's own same-thread guard skips the join. The strong
+  "no callback in flight once it returns" guarantee stays on `na_server_destroy` /
+  `~AudioStreamServer`, where it is already documented and costs nothing.
+
+  **No C ABI change and no wire change.** The C ABI reaches its callbacks through a single
+  library-owned adapter destroyed by `na_server_destroy`, which already drains and joins, so it
+  never had this hole.
+
 - **`NAUDIO_SANITIZE` build option — sanitizer instrumentation for the whole tree.** Accepts
   `address`, `undefined`, `thread`, or a comma list (`address,undefined`); empty is the default and
   adds no flag to a normal build. `address` and `thread` are rejected at configure time because the

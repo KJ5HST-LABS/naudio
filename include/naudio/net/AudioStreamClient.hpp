@@ -246,7 +246,18 @@ public:
     ClientStats stats() const;
 
     // --- Listeners ---
+    // Borrowed, and must outlive the CLIENT unless handed back with removeStreamListener() below.
+    // Callbacks are delivered on the dispatcher thread, which ~AudioStreamClient drains and joins.
     void addStreamListener(AudioClientListener* listener);
+    // Detaches a listener and WAITS for any callback already in flight to finish. After this
+    // returns, no callback for `listener` is running or will ever fire again, so destroying it is
+    // safe — including before the client.
+    //
+    // The wait is not incidental (issue #89): each notify* snapshots the roster and captures the
+    // listener POINTERS by value, so erasing alone would return with a task still holding this
+    // one. This function DID only erase, which read as a detach and was not one. Calling it from
+    // inside a callback detaches but cannot wait — sound, because the only task that could hold
+    // the pointer is the one on your own stack.
     void removeStreamListener(AudioClientListener* listener);
     // Raw PCM RX listener (FFT / waterfall). Returns a token for removal (closures have no identity).
     using AudioListener = std::function<void(const std::uint8_t*, std::size_t)>;

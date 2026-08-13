@@ -1101,8 +1101,18 @@ void AudioStreamClient::addStreamListener(AudioClientListener* listener) {
 }
 
 void AudioStreamClient::removeStreamListener(AudioClientListener* listener) {
-    std::lock_guard<std::mutex> lock(listenersMutex_);
-    listeners_.erase(std::remove(listeners_.begin(), listeners_.end(), listener), listeners_.end());
+    {
+        std::lock_guard<std::mutex> lock(listenersMutex_);
+        listeners_.erase(std::remove(listeners_.begin(), listeners_.end(), listener),
+                         listeners_.end());
+    }
+    // Issue #89. The erase alone was a detach that did not make destruction safe: every notify*
+    // above snapshots the roster and captures the listener POINTERS by value, so a task queued
+    // before the erase still holds this one, and a caller that erased and then destroyed raced it.
+    // This class is the sibling of AudioStreamServer, which had no removal API at all — the same
+    // hole in two shapes. Fenced OUTSIDE listenersMutex_ for the reason given there: the task
+    // being waited on may re-enter the client, and every notify* takes this lock to snapshot.
+    dispatcher_.fence();
 }
 
 int AudioStreamClient::addAudioListener(AudioListener listener) {
