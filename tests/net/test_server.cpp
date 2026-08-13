@@ -1493,6 +1493,74 @@ TEST(Server, AClientThatDrainsIsNeverEvictedByTheSameVolume) {
     EXPECT_GE(conn->rxAudioCalls(), total - 50) << conn->diagnostics();
 }
 
+// ---------------------------------------------------------------------------------------
+// Issue #56 — THE IDLE STALL. The gap the two arms above cannot reach.
+//
+// Both arms above evict through the BACKLOG CAP, and the cap is a bound on VOLUME. So they
+// only speak about a peer that stops draining WHILE AUDIO IS FLOWING. Take the audio away
+// and every mechanism they exercise goes quiet: nothing is enqueued, outQueueBytes_ stays 0,
+// the cap is never approached, and writerLoop sits on its condition variable having never
+// attempted a send. The peer is just as dead and holds just as much — two detached threads
+// and one of DEFAULT_MAX_CLIENTS == 4 slots — but no volume ever accumulates to prove it.
+//
+// In that state the session's ONLY liveness machinery is runLoop's heartbeat. And the peer
+// this arm stages is the one #56 leads with: it has stopped READING while still SENDING.
+// That distinction is the whole arm, because isConnectionTimedOut() keys on lastReceiveTime_
+// (AudioProtocolHandler.cpp, isConnectionTimedOut) — NOT on send time. A peer that keeps
+// sending refreshes that clock forever, so the timeout can never fire no matter how long its
+// receive window has been shut. setTimedOut is therefore left FALSE on purpose: flipping it
+// would stage a different, easier peer and the arm would pass without the fix.
+//
+// What is left is the heartbeat's own return value. Since #56's deadline half, a heartbeat
+// into a shut window does not park forever — sendAll spends CONNECTION_TIMEOUT_MS / 2 and
+// reports failure. That failure is the ONLY evidence the server gets, and failHeartbeatSends
+// is that failure with the five-second wait taken out.
+//
+// The mirror of this on the client was issue #71, and the client's heartbeatLoop already
+// checks its watchdog on both sides of the send and reports a failed one
+// (AudioStreamClient.cpp, heartbeatLoop). The server's runLoop never received that fix.
+// Note writerLoop in this same file already treats a failed send as fatal — so the server
+// holds two send paths with opposite failure policies, and this arm pins the one that is
+// missing rather than asserting a new policy invented here.
+TEST(Server, APeerThatStopsReadingButKeepsSendingIsEvictedWithNoAudioFlowing) {
+    ScriptedFixture fx;
+    std::string err;
+    ASSERT_TRUE(fx.server.start(&err)) << err;
+
+    auto conn = connectScripted(*fx.transport, "idle-stalled");
+    ASSERT_TRUE(conn) << "no ClientsUpdate: a real session never registered";
+    ASSERT_EQ(fx.server.clientCount(), 1) << "premise: the peer is connected";
+
+    // The staging, and each line is load-bearing:
+    //   - heartbeats fail, because the peer's receive window is shut and the send deadline
+    //     has expired against it;
+    //   - the connection is NOT timed out, because the peer is still sending to us.
+    conn->failHeartbeatSends();
+    conn->setTimedOut(false);
+    conn->setShouldSendHeartbeat(true);
+
+    // No injectAudio anywhere in this arm. That absence IS the fixture.
+
+    for (int i = 0; i < 600 && fx.server.clientCount() > 0; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // GUARD "the fault actually fired" before reading the subject (L136). If runLoop never
+    // attempted a heartbeat, a green verdict below would mean nothing — and this is exactly
+    // the guard that separates "the session was torn down by the fix" from "the run loop
+    // stopped iterating for some reason unrelated to the subject".
+    ASSERT_GT(conn->heartbeatsSent(), 0)
+        << "premise failed: runLoop never attempted a heartbeat, so nothing was staged; "
+        << conn->diagnostics();
+
+    // SUBJECT.
+    EXPECT_EQ(fx.server.clientCount(), 0)
+        << "a peer whose every heartbeat fails was never evicted: with no audio flowing the "
+           "backlog cap cannot fire and isConnectionTimedOut() keys on RECEIVE time, so the "
+           "failed heartbeat is the only evidence there is and runLoop discards it; "
+        << conn->diagnostics();
+}
+
 // #59: the server's END of the device-loss path. The Broadcaster/Mixer arms prove those loops
 // catch and report; this arm is what proves AudioStreamServer actually INSTALLS the hooks, and
 // that the loss reaches a listener's onError — the surface a C consumer sees.

@@ -213,6 +213,7 @@ public:
                         ", rxAudioCalls=" + std::to_string(rxAudioCalls_) +
                         ", stallRx=" + (stallRx_ ? "armed" : "off") +
                         ", failControls=" + (failControls_ ? "armed" : "off") +
+                        ", failHeartbeats=" + (failHeartbeats_ ? "armed" : "off") +
                         ", controlSendsDeclined=" + std::to_string(controlSendsDeclined_) +
                         ", stallMask=" + std::to_string(stallMask_) +
                         ", sendsEntered=" + std::to_string(sendsEntered_) +
@@ -256,6 +257,26 @@ public:
     void failControlSends() {
         std::lock_guard<std::mutex> lock(mutex_);
         failControls_ = true;
+    }
+
+    // Makes every subsequent sendHeartbeat RETURN FALSE rather than park. This is what the
+    // production server session sees once #56's send deadline is armed: the writer does not
+    // block forever any more, it blocks for CONNECTION_TIMEOUT_MS / 2 and then sendAll gives
+    // up and reports failure (Socket.cpp, sendAll's budget check).
+    //
+    // FAILING IS A DIFFERENT INSTRUMENT FROM STALLING, and the distinction is the whole point
+    // of this seam. stallHeartbeatSends() models the pre-deadline world where the watchdog
+    // never gets another turn — that is #71's subject, on the client. This models the world
+    // AFTER the deadline landed, where the watchdog DOES get another turn and the question
+    // becomes what it does with the failure it was just handed. A double that only parks
+    // cannot ask that question at all.
+    //
+    // Heartbeats are still counted when they fail (heartbeatsSent_ increments before the
+    // verdict), so an arm can assert the loop kept ATTEMPTING — which is how "the session was
+    // torn down" is told apart from "the loop stopped running for some unrelated reason".
+    void failHeartbeatSends() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failHeartbeats_ = true;
     }
 
     // --- The client-side wedge (#71) ---
@@ -391,12 +412,15 @@ public:
 
     bool sendHeartbeat() override {
         std::lock_guard<std::mutex> serialize(sendMutex_);
+        bool fail;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ++heartbeatsSent_;
+            fail = failHeartbeats_;
         }
         cv_.notify_all();
-        return enterSend(kHeartbeat);
+        if (!enterSend(kHeartbeat)) return false;
+        return !fail;
     }
 
     // Both default to the answers the server arms have always seen — no heartbeats, never
@@ -501,6 +525,7 @@ private:
     std::vector<Handed> handedOut_;
     std::map<ControlType, int> sentControls_;
     bool failControls_ = false;
+    bool failHeartbeats_ = false;
     bool stallRx_ = false;
     int rxAudioCalls_ = 0;
     int controlSendsDeclined_ = 0;

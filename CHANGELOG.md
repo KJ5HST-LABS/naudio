@@ -192,6 +192,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **A server client that stopped reading but kept sending was never evicted when no audio was
+  flowing** (issue #56). The session's heartbeat loop discarded the result of its own send, and it
+  was the only mechanism that could have noticed. The connection timeout could not: it is keyed on
+  the time of the last *receive*, so a peer that keeps transmitting refreshes that clock however
+  long its receive window has been shut. The outbound backlog cap could not either: it bounds
+  queued *volume*, and nothing queues while the server has no audio to fan out. With both silent,
+  a session failing every send stayed on the roster indefinitely, holding two threads and one of
+  the four default client slots — so four such peers locked out every subsequent client.
+
+  A failed heartbeat now tears the session down and reports why. This matches the writer thread in
+  the same class, which already treated a failed send as fatal; the heartbeat loop was the one send
+  path that ignored its verdict. Consumers see `on_error` followed by `on_client_disconnected`, and
+  the client slot is released. Measured before the fix: seven consecutive failed heartbeats across
+  eight timeout evaluations with the client still counted as connected.
+
+  **No C ABI change and no wire change** — a client that was previously retained forever is now
+  disconnected, through the existing callbacks.
+
 - **Two lifecycle races reachable from the public C ABI** (issue #57). `na_server_stop` could
   return while a client admitted *during* its teardown was still starting: `handleNewClient`
   sampled the running flag once at entry, so `stop()` passed its thread barrier precisely because

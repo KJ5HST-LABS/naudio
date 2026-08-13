@@ -162,8 +162,9 @@ private:
     //
     // WHY THIS QUANTITY. It makes one deadline govern both directions of "this peer has
     // stopped making progress". The server already declares a peer dead after
-    // CONNECTION_TIMEOUT_MS of not SENDING (AudioProtocolHandler::isConnectionTimedOut);
-    // this applies the same window to a peer that will not DRAIN. The coupling is
+    // CONNECTION_TIMEOUT_MS of not SENDING TO US — isConnectionTimedOut() keys on
+    // lastReceiveTime_ (AudioProtocolHandler.cpp), i.e. on what WE last received; this
+    // applies the same window to a peer that will not DRAIN. The coupling is
     // deliberate and is a real coupling: CONNECTION_TIMEOUT_MS is frozen by the wire spec
     // (docs/audio-streaming-protocol-v1.md:291-292 and the constants table at :552-553), so
     // moving it there moves this cap with it. That is the intended behaviour, not a
@@ -314,8 +315,37 @@ void AudioStreamServer::ClientSession::runLoop() {
 
     // Heartbeat / timeout loop.
     while (!closed_.load() && server_->running_.load()) {
-        if (connection_->shouldSendHeartbeat()) {
-            connection_->sendHeartbeat();
+        // A FAILED HEARTBEAT IS FATAL, because for one class of dead peer it is the only
+        // evidence this loop will ever get (issue #56, the idle stall).
+        //
+        // isConnectionTimedOut() below keys on lastReceiveTime_, NOT on send time. So a peer
+        // that has stopped READING while it keeps SENDING refreshes that clock forever and
+        // the timeout cannot fire however long its receive window has been shut. The other
+        // eviction path — the outbound backlog cap — is a bound on VOLUME, so it is equally
+        // silent when no audio happens to be flowing. Take both away and a session that is
+        // failing every single send stays on the roster indefinitely, holding two detached
+        // threads and one of DEFAULT_MAX_CLIENTS slots. MEASURED before this guard existed:
+        // seven consecutive failed heartbeats across eight watchdog evaluations, and
+        // clientCount() still 1 (Server.APeerThatStopsReadingButKeepsSendingIsEvicted...).
+        //
+        // Since #56's deadline half, this send is bounded — sendAll spends
+        // CONNECTION_TIMEOUT_MS / 2 and reports failure rather than parking forever — which
+        // is what makes the return value worth reading at all. Before that it never came back.
+        //
+        // NOT A NEW POLICY: writerLoop in this same class already closes the session on a
+        // failed send, for the same reason and with the same "never silently" reporting. This
+        // loop was simply the one send path that discarded its verdict. The client's mirror of
+        // this loop reports a failed heartbeat too (AudioStreamClient::heartbeatLoop, #71).
+        //
+        // The closed_ re-check keeps a session that is ALREADY tearing down from reporting a
+        // spurious error: sendPacket also returns false once the handler is closed, and that
+        // is an ordinary teardown, not a peer fault.
+        if (connection_->shouldSendHeartbeat() && !connection_->sendHeartbeat()) {
+            if (!closed_.load()) {
+                server_->notifyError(clientId_,
+                                     "Heartbeat send failed: client is not draining");
+                break;
+            }
         }
         if (connection_->isConnectionTimedOut()) {
             server_->notifyError(clientId_, "Connection timeout");
