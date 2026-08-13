@@ -261,6 +261,29 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **`na_hamlib_bridge` builds again against a current Hamlib PR #2116 branch** (issue #81). Upstream
+  commit `b538567b` replaced `rig_stream_caps`' `channels_min`/`channels_max` **range** with an exact
+  0-terminated `channels[]` **list** — openable channel counts need not be contiguous, so a backend
+  offering 1 and 4 but neither 2 nor 3 could not be described by a range, and the range form quietly
+  implied counts that were not openable. The bridge still read the old field names, so it failed to
+  compile against the branch it tracks; anyone building the bridge from current upstream got four
+  compile errors.
+
+  **naudio keeps tracking the PR branch head rather than pinning a commit.** The streaming API is
+  still in review, and early notice that it moved is worth more than a build that cannot be
+  surprised. What absorbs the churn is that nothing assumes a shape: `tools/CMakeLists.txt` now
+  capability-checks *which* revision is installed and compiles the matching code, so both the list
+  and the range form build. The channel-list check is a `check_struct_has_member` rather than a
+  `check_symbol_exists`, because a struct-field change exports identical symbols and would otherwise
+  surface only as a compile error. Verified against three real prefixes — pre-`961093f2`,
+  `961093f2`, and `b538567b` — all three configure, build, and produce a working binary.
+
+  **The caps diagnostic prints a list where the API provides one.** On a failed `rig_stream_open`
+  the bridge dumps the backend's capabilities; `channels=1..4` becomes `channels=1,4` against a
+  current libhamlib, which is the openable set rather than a range spanning counts that are not.
+
+  No C ABI change and no wire change. The bridge is an optional tool, off by default.
+
 - **Server teardown no longer destroys the worker-barrier condition variable while a session worker
   is still signalling it** (issue #28). `AudioStreamServer::threadFinished()` released
   `threadsMutex_` *before* calling `threadsCv_.notify_all()`, which let the whole teardown complete
