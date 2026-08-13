@@ -273,4 +273,30 @@ void AudioProtocolHandler::close() {
     socket_.close();
 }
 
+std::size_t AudioProtocolHandler::discardPendingInput(int budgetMs) {
+    if (closed_.load() || !socket_.valid()) return 0;
+
+    // A SHORT per-read timeout, not the budget: with data already buffered the first read returns
+    // at once and only the read that finds the buffer empty pays the wait, so the ordinary cost of
+    // this call is one 2 ms timeout rather than the whole budget. That matters because the only
+    // caller runs on the ACCEPT THREAD — every millisecond spent here is a millisecond no other
+    // client can be accepted.
+    socket_.setRecvTimeout(2);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
+    std::uint8_t scratch[2048];
+    std::size_t discarded = 0;
+    for (;;) {
+        RecvResult r = socket_.recv(scratch, sizeof scratch);
+        // Anything but Ok means we are done: TimedOut is the buffer being empty (the expected
+        // exit), Closed is the peer having already gone, Error is a socket about to be thrown
+        // away anyway.
+        if (r.status != IoStatus::Ok) break;
+        discarded += r.bytes;
+        if (std::chrono::steady_clock::now() >= deadline) break;
+    }
+    // The receive timeout is deliberately left as set — this socket is closed immediately after.
+    return discarded;
+}
+
 }  // namespace naudio::net

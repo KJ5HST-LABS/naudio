@@ -72,6 +72,15 @@ public:
         protocol_.close();
     }
 
+    // The TCP half of the reject-path rule (issue #87): closing a socket that still holds unread
+    // received data sends an RST, and the RST makes the peer throw away its own receive buffer —
+    // losing a CONNECT_REJECT that had already arrived. Draining first turns that close into a
+    // FIN. The full rationale is on AudioProtocolHandler::discardPendingInput.
+    std::size_t discardPendingInput(int budgetMs) override {
+        if (closed_.load()) return 0;
+        return protocol_.discardPendingInput(budgetMs);
+    }
+
 private:
     AudioProtocolHandler protocol_;
     ClientAddress address_;
