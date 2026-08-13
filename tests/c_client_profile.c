@@ -45,7 +45,7 @@
  *
  * Hardware-free: NULL backends on both ends, loopback UDP, no PortAudio, no radio.
  */
-#include <stdatomic.h>
+#include "c_atomic_compat.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -67,7 +67,7 @@
 static const unsigned char SIG_UNIT[SIG_PERIOD] = {0x5A, 0xA5, 0x3C, 0xC3};
 static unsigned char RXBUF[8192];
 
-static _Atomic int g_rx_ok = 0;
+static NA_TEST_ATOMIC int g_rx_ok = 0;
 
 static void on_rx_audio(const unsigned char *pcm, size_t n_bytes, void *user) {
     (void)user;

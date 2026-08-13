@@ -40,26 +40,21 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# MSVC gates C11 atomics behind an opt-in flag even at /std:c11, and without it <stdatomic.h> is a
-# hard #error rather than a missing feature (issue #28):
+# No MSVC C11-atomics opt-in here, deliberately, and the record is worth keeping (issue #28).
 #
-#   vcruntime_c11_stdatomic.h(12,1): error C1189: #error: "C atomic support is not enabled"
+# The C smoke tests need an atomic qualifier for the flags their callbacks set on naudio's worker
+# threads — TSan proved `volatile` is not sufficient. MSVC gates C11 atomics behind
+# /experimental:c11atomics even at /std:c11, and <stdatomic.h> is a hard
+# `#error "C atomic support is not enabled"` without it. That flag was delivered from here TWICE —
+# first as add_compile_options($<$<COMPILE_LANGUAGE:C>:...>), then as a plain
+# string(APPEND CMAKE_C_FLAGS ...) with no generator in the middle — and windows-latest / MSVC
+# 14.51 returned the BYTE-IDENTICAL error to all four targets each time. Two failed deliveries with
+# no observable difference means the mechanism was never established, and a third guess against a
+# toolchain nobody here can run is not a measurement.
 #
-# Measured on windows-latest / MSVC 14.51, where it failed all four C smoke tests at once. Those
-# tests use _Atomic for the flags their callbacks set on naudio's worker threads — TSan proved
-# `volatile` was not sufficient there — so the flag is what keeps the race fix portable. Clang and
-# GCC need nothing here.
-#
-# Appended to CMAKE_C_FLAGS rather than delivered through
-# add_compile_options($<$<COMPILE_LANGUAGE:C>:...>). The generator-expression form was tried first
-# and the error came back BYTE-IDENTICAL on windows-latest, so whatever it did, it did not reach
-# cl.exe for these TUs. CMAKE_C_FLAGS is the mechanism with no generator in the middle: every C
-# compile gets it, and the four failing targets are mixed C/C++ (each links a .cpp fixture), which
-# is exactly the shape where per-language options are least predictable under the Visual Studio
-# generator. Do not "tidy" this back into a generator expression without a green Windows job.
-if(MSVC)
-    string(APPEND CMAKE_C_FLAGS " /experimental:c11atomics")
-endif()
+# The dependency is removed instead: tests/c_atomic_compat.h picks the qualifier per compiler, so
+# Windows keeps the `volatile` it already had and every platform the sanitizers actually run on
+# gets _Atomic. See that header for the residual exposure.
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
