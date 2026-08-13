@@ -214,6 +214,18 @@ private:
     void handleNewClient(const std::shared_ptr<ClientConnection>& connection);
     void rejectClient(const std::shared_ptr<ClientConnection>& connection, RejectReason reason,
                       const std::string& message);
+    // Drop a connection the server accepted but never turned into a session — all three reject
+    // paths, and handleNewClient's entry check for a server that is already stopping (issue #64.1).
+    // NOT handleNewClient's second stopping check: that one runs holding sessionsMutex_, and this
+    // takes runMutex_, which would invert a lock order the class otherwise never nests.
+    //
+    // Closing the connection is NOT enough. The transport's connection map is what every
+    // ServerStats aggregate sums over, and only disconnectClient() removes an entry from it, so a
+    // merely-closed connection keeps contributing its counters for the life of the transport —
+    // which is what makes the documented roster GAUGE (see ServerStats above) drift upward on a
+    // server that is doing nothing but refusing clients. ClientSession::close() already ends this
+    // way for sessions that were admitted; this is the same ending for the ones that were not.
+    void evictConnection(const std::shared_ptr<ClientConnection>& connection);
     void broadcastClientsUpdate();
 
     AudioFormat formatFromConfig() const;

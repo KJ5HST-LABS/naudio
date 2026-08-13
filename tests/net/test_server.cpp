@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -1720,6 +1721,181 @@ TEST(Server, PlaybackDeviceLostMidStreamSurfacesOnError) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     EXPECT_TRUE(listener.sawError("Playback device lost"));
+
+    server.stop();
+}
+
+// ===========================================================================
+// Roster hygiene on the accept/reject path (issue #64).
+// ===========================================================================
+
+namespace {
+
+// Records the connect/disconnect events a listener is told about, in order and with ids, so an
+// arm can assert PAIRING rather than merely counting. ConnectCountingListener above counts only
+// connects, which is the detector #57 needed; this is the one #64.2 needs.
+class LifecyclePairingListener : public AudioStreamListener {
+public:
+    void onClientConnected(const std::string& id, const std::string&) override {
+        std::lock_guard<std::mutex> l(m_);
+        connected_.push_back(id);
+    }
+    void onClientDisconnected(const std::string& id) override {
+        std::lock_guard<std::mutex> l(m_);
+        disconnected_.push_back(id);
+    }
+    std::size_t connects() const {
+        std::lock_guard<std::mutex> l(m_);
+        return connected_.size();
+    }
+    std::size_t disconnects() const {
+        std::lock_guard<std::mutex> l(m_);
+        return disconnected_.size();
+    }
+    // The unpaired set: every id that was announced as connected and never as disconnected.
+    std::vector<std::string> unpaired() const {
+        std::lock_guard<std::mutex> l(m_);
+        std::vector<std::string> out;
+        for (const auto& id : connected_) {
+            if (std::find(disconnected_.begin(), disconnected_.end(), id) == disconnected_.end()) {
+                out.push_back(id);
+            }
+        }
+        return out;
+    }
+
+private:
+    mutable std::mutex m_;
+    std::vector<std::string> connected_;
+    std::vector<std::string> disconnected_;
+};
+
+// Connects one raw client, sends CONNECT_REQUEST, and waits for the CONNECT_REJECT the server
+// sends at accept time. Returns false if no reject arrived.
+//
+// The CONNECT_REQUEST is required on UDP and harmless on TCP: UdpServerTransport creates a
+// connection only for a valid CONNECT_REQUEST (anti-spoof, UdpServerTransport.cpp:104-109), so
+// without it the server never accepts and never rejects. TCP accepts the socket itself, and
+// rejects before reading anything, so the request is simply left unread in a socket that is
+// about to close.
+bool rejectedOnce(ClientTransport& transport, std::uint16_t port, const std::string& name) {
+    std::string err;
+    auto c = transport.connect("127.0.0.1", port, 2000, &err);
+    if (!c) return false;
+    if (!c->sendControl(ControlMessage::connectRequest(name, AudioPacket::VERSION))) return false;
+    const bool rejected =
+        recvUntil(*c, PacketType::Control, ControlType::ConnectReject, 3000).has_value();
+    c->close();
+    return rejected;
+}
+
+}  // namespace
+
+// #64.1 — a client the server REJECTS must leave the transport's connection map, not merely have
+// its socket closed.
+//
+// ServerStats is a gauge over the LIVE ROSTER (its contract in AudioStreamServer.hpp, pinned by
+// GateServerStatsIsARosterGaugeNotALifetimeTotal above), and the aggregation is a sum over the
+// transport's connection map — TcpServerTransport::packetsSent and friends iterate connections_
+// (TcpServerTransport.cpp:96-148); the UDP mirror iterates byId_ (UdpServerTransport.cpp:216-270).
+// A rejected connection that stays in that map keeps contributing its own reject message forever,
+// so a server being polled by a retrying client accrues one dead entry per attempt.
+//
+// This arm rejects on the NO-CAPTURE-DEVICE path rather than the Busy path, which is what makes
+// the assertion exact rather than approximate: with no session on the roster at all there is no
+// heartbeat traffic, so the gauge's correct reading is a hard ZERO at every point. Reaching the
+// same statement through the Busy path needs a resident client whose run loop is sending
+// heartbeats on a 1 s pacing wait, and the storm's own duration then bounds the tolerance. All
+// three reject paths (no capture device, Busy, devices unavailable) funnel through the single
+// rejectClient(), so this covers the eviction; it does not separately cover the other two
+// callers' reasons for getting there.
+//
+// MEASURED PRE-FIX, 8 attempts: packetsSent 8, bytesSent 440 — IDENTICAL on TCP and UDP, which is
+// the useful part: it says the leak is in the shared rejectClient() and not in either transport.
+// clientsConnected reads 0 throughout and is therefore NOT a detector here; the byte counters are.
+TEST(Server, GateRejectedClientsLeaveNoTraceInTheRosterGauge) {
+    for (TransportType tt : {TransportType::Tcp, TransportType::Udp}) {
+        AudioStreamConfig config{};
+        config.transportType = tt;
+        AudioStreamServer server{0, config};  // no capture device, NOT inject-only => reject all
+        std::string err;
+        ASSERT_TRUE(server.start(&err)) << err;
+        const auto port = static_cast<std::uint16_t>(server.port());
+
+        const ServerStats before = server.stats();
+        ASSERT_TRUE(before.running);
+        ASSERT_EQ(before.clientsConnected, 0);
+        ASSERT_EQ(before.packetsSent, 0);
+
+        const int kAttempts = 8;
+        for (int i = 0; i < kAttempts; i++) {
+            std::unique_ptr<ClientTransport> t;
+            if (tt == TransportType::Tcp) {
+                t = std::make_unique<TcpClientTransport>();
+            } else {
+                t = std::make_unique<UdpClientTransport>();
+            }
+            ASSERT_TRUE(rejectedOnce(*t, port, "probe-" + std::to_string(i)))
+                << "transport " << static_cast<int>(tt) << " attempt " << i;
+        }
+
+        // The roster is still empty, so every aggregate over it must still be zero. Pre-fix each
+        // rejected connection is still in the map and still counting its own reject message.
+        const ServerStats after = server.stats();
+        EXPECT_EQ(after.clientsConnected, 0);
+        EXPECT_EQ(after.packetsSent, 0) << "transport " << static_cast<int>(tt);
+        EXPECT_EQ(after.bytesSent, 0) << "transport " << static_cast<int>(tt);
+
+        server.stop();
+    }
+}
+
+// #64.2 — a session that fails the handshake must not leave an unpaired connect event behind.
+//
+// onClientConnected fires at accept, when the session enters the roster (AudioStreamServer.cpp:858)
+// — before the handshake has been read. runLoop's failure paths then call close() and return, and
+// close() emits no listener event, so a peer that connects and says the wrong thing produces a
+// connect with no matching disconnect. A listener that pairs the two accumulates phantom clients:
+// every port scanner, every version-mismatched client, every half-open probe.
+//
+// The event pair BRACKETS ROSTER MEMBERSHIP: connected means the session is in sessions_ and
+// counted by clientCount(), disconnected means it has left. This arm is the pin on that, and it
+// deliberately reads the roster too — a fix that emitted the disconnect without the session
+// actually being gone would pass on events alone.
+//
+// MEASURED PRE-FIX: connects 1, disconnects 0, one unpaired id, clientCount() 0. Note which of
+// those is the detector — the roster ALREADY reads 0, because close() erases the session itself.
+// The damage is in the listener's model, not in the server's, so only the event pair can see it.
+TEST(Server, AFailedHandshakeLeavesNoUnpairedConnectEvent) {
+    AudioStreamServer server{0};
+    server.setInjectOnlyMode(true);
+    LifecyclePairingListener listener;
+    server.addStreamListener(&listener);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    TcpClientTransport t;
+    auto c = t.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
+    ASSERT_TRUE(c) << err;
+
+    // A HEARTBEAT is a well-formed frame that is not a CONNECT_REQUEST, so performHandshake
+    // rejects it on the first packet rather than sitting out its 10 s budget. That budget is the
+    // other half of the defect — a peer that says NOTHING holds the session for ten seconds — but
+    // an arm that waited it out would cost ten seconds to prove the same thing.
+    ASSERT_TRUE(c->sendHeartbeat());
+
+    // The connect event must arrive (it is not this arm's job to move it), and the disconnect
+    // must follow it.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (listener.disconnects() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    EXPECT_EQ(listener.connects(), 1u);
+    EXPECT_EQ(listener.disconnects(), 1u);
+    const auto orphans = listener.unpaired();
+    EXPECT_TRUE(orphans.empty()) << "unpaired connect for " << (orphans.empty() ? "" : orphans[0]);
+    EXPECT_EQ(server.clientCount(), 0);
 
     server.stop();
 }

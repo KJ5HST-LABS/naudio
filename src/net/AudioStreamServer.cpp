@@ -121,6 +121,11 @@ private:
     };
 
     void runLoop();
+    // close() + the matching onClientDisconnected + a roster refresh, in that order. The single
+    // exit from roster membership, so that the connect event handleNewClient already fired always
+    // has exactly one partner (issue #64.2). Idempotent only as far as close() is — call it once
+    // per session, on whichever path is leaving.
+    void leaveRoster();
     void receiveLoop();
     void writerLoop();
     bool performHandshake();
@@ -278,15 +283,30 @@ bool AudioStreamServer::ClientSession::performHandshake() {
 }
 
 void AudioStreamServer::ClientSession::runLoop() {
+    // THE CONNECT/DISCONNECT EVENT PAIR BRACKETS ROSTER MEMBERSHIP (issue #64.2). This session is
+    // already in sessions_ and already counted by clientCount(), and notifyClientConnected has
+    // already fired for it (handleNewClient) — so every exit from here owes the matching
+    // disconnect, including the ones that never get a client onto the air.
+    //
+    // Both paths below used to be a bare close() + return. close() erases the session and emits
+    // nothing, so the SERVER's roster was correct while a LISTENER's model was not: any peer that
+    // connected and said the wrong thing — a port scanner, a version-mismatched client, a
+    // half-open probe — left a connect event that nothing ever closed, and an event-pairing
+    // listener accumulated one phantom client per probe. Only the event pair can see that; the
+    // roster reads 0 either way, which is why it took an arm that asserts on pairing to find it.
+    //
+    // leaveRoster() is the same close/notify/broadcast trio the success path runs at the bottom of
+    // this function, minus the stream events — this session never started streaming, so it owes no
+    // onStreamStopped, and those pair on their own.
     if (!performHandshake()) {
-        close();
+        leaveRoster();
         return;
     }
 
     // Send config + accept directly (awaited before any RX audio is registered).
     if (!connection_->sendControl(ControlMessage::audioConfig(sessionConfig_)) ||
         !connection_->sendControl(ControlMessage::connectAccept())) {
-        close();
+        leaveRoster();
         return;
     }
 
@@ -361,9 +381,14 @@ void AudioStreamServer::ClientSession::runLoop() {
                             [this]() { return closed_.load() || !server_->running_.load(); });
     }
 
-    // Cleanup.
+    // Cleanup. The stream events pair around the streaming window; leaveRoster() closes the
+    // outer connect/disconnect pair, and is the same call both failure paths above make.
     streaming_.store(false);
     server_->notifyStreamStopped(clientId_);
+    leaveRoster();
+}
+
+void AudioStreamServer::ClientSession::leaveRoster() {
     close();
     server_->notifyClientDisconnected(clientId_);
     server_->broadcastClientsUpdate();
@@ -804,7 +829,7 @@ void AudioStreamServer::acceptLoop() {
 
 void AudioStreamServer::handleNewClient(const std::shared_ptr<ClientConnection>& connection) {
     if (!running_.load()) {
-        connection->close();
+        evictConnection(connection);
         return;
     }
 
@@ -850,6 +875,11 @@ void AudioStreamServer::handleNewClient(const std::shared_ptr<ClientConnection>&
         // about to be cleared, and no notifyClientConnected for a client that never really
         // connected — an event a listener would otherwise have to un-see.
         if (!running_.load()) {
+            // Under sessionsMutex_, so this must not reach for runMutex_ — evictConnection would
+            // invert the two locks. stop() closes the transport moments from now and its close()
+            // drains the whole connection map, so the entry cannot outlive the transport here;
+            // that is what makes the plain close() sufficient on this path and not on the
+            // reject paths, which run on a server that keeps serving.
             connection->close();
             return;
         }
@@ -861,7 +891,25 @@ void AudioStreamServer::handleNewClient(const std::shared_ptr<ClientConnection>&
 
 void AudioStreamServer::rejectClient(const std::shared_ptr<ClientConnection>& connection,
                                      RejectReason reason, const std::string& message) {
+    // Send FIRST, evict second: evictConnection closes the connection, and the peer is owed the
+    // reason it was turned away.
     connection->sendControl(ControlMessage::connectReject(reason, message));
+    evictConnection(connection);
+}
+
+void AudioStreamServer::evictConnection(const std::shared_ptr<ClientConnection>& connection) {
+    // The lock-drop discipline close() uses: copy the transport out under runMutex_, call into it
+    // unlocked. disconnectClient takes the transport's own map lock and must not be called with
+    // runMutex_ held.
+    std::shared_ptr<ServerTransport> transport;
+    {
+        std::lock_guard<std::mutex> lock(runMutex_);
+        transport = transport_;
+    }
+    if (transport) transport->disconnectClient(connection);
+    // Unconditional, and not redundant with the line above: disconnectClient closes only what it
+    // actually found in its map, and transport_ is already null on the stop path this is also
+    // called from. close() is idempotent, so the overlap costs nothing.
     connection->close();
 }
 
