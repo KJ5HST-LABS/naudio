@@ -460,15 +460,78 @@ TEST(Socket, ConnectRefusedReturnsInvalid) {
     EXPECT_FALSE(c.valid());
 }
 
-TEST(Socket, ReuseAddrAllowsRebindAfterClose) {
+// THE PERMIT-CONTROL for issue #85 — the half that a "second bind is refused" test cannot
+// cover, because refusing everything passes it just as happily as refusing the right thing.
+//
+// This replaces a test named ReuseAddrAllowsRebindAfterClose that ASSERTED NOTHING ABOUT THE
+// FLAG IT WAS NAMED FOR. It closed a listener that had never accepted a connection, and a bare
+// listener leaves no TIME_WAIT behind — so the rebind it checked succeeds with ownsPort=false
+// just as readily. Measured on macOS 2026-08-13 before rewriting it, with plain POSIX sockets so
+// the answer describes the OS rather than naudio's opinion of it:
+//
+//     rebind after closing a listener that never accepted   BOUND either way   <- the old test
+//     rebind after a connection closed SERVER-FIRST         refused without the flag, BOUND with
+//
+// The second row is the only state in which the flag does any work, so staging it is what makes
+// this a control rather than a formality. It has to be a real connection closed from the SERVER
+// end: TIME_WAIT is owned by whichever side sends FIN first, and only the server end holds the
+// listen port in it.
+//
+// Why this matters here and not in #83: that issue could delete the flag outright because UDP
+// has no TIME_WAIT to accommodate. TCP does, so a fix for #85 that dropped SO_REUSEADDR on POSIX
+// would trade a Windows double-bind for a POSIX server that cannot restart promptly — the exact
+// collateral this asserts against (Learning 188). Remove the SO_REUSEADDR line in
+// Socket::listenTcp and this test reddens; that mutation was run.
+//
+// ON WINDOWS this is also the load-bearing half of the fix, for a different reason: the fix sets
+// SO_EXCLUSIVEADDRUSE there, and if Winsock refused a rebind over TIME_WAIT under that option the
+// cure would be worse than #85. This test is what answers that on the platform, since no POSIX
+// box can.
+TEST(Socket, APortIsRebindableOnceItsServerIsGoneEvenWithConnectionsInTimeWait) {
     std::string err;
-    Socket first = Socket::listenTcp("", 0, true, &err);
-    ASSERT_TRUE(first.valid());
-    std::uint16_t port = first.localPort();
-    first.close();
+    std::uint16_t port = 0;
+    {
+        Socket server, client, accepted;
+        ASSERT_TRUE(makeTcpPair(server, client, accepted));
+        port = server.localPort();
+        ASSERT_GT(port, 0);
 
-    Socket second = Socket::listenTcp("", port, true, &err);
-    EXPECT_TRUE(second.valid()) << err;
+        // Server closes FIRST, so the accepted 5-tuple — whose local port is `port` — is the
+        // side that enters TIME_WAIT. Closing the client first would park TIME_WAIT on the
+        // client's ephemeral port instead and stage nothing.
+        accepted.close();
+        client.close();
+        server.close();
+    }
+
+    Socket restarted = Socket::listenTcp("", port, /*ownsPort=*/true, &err);
+    EXPECT_TRUE(restarted.valid())
+        << "port " << port << " could not be reclaimed by a restarting server while its own "
+        << "previous connections were in TIME_WAIT: " << err
+        << " — a supervised restart is broken (issue #85's permit-control)";
+}
+
+// The refuse-control's Socket-level twin. TcpTransport.ASecondServerCannotBindAPortAlreadyBeing-
+// Served is the one that maps to the na_server_start symptom; this one pins the primitive
+// underneath it, so a regression is attributed to the socket layer rather than to the transport.
+//
+// PLATFORM ASYMMETRY, STATED RATHER THAN LEFT TO BE DISCOVERED (Learning 63): against the pre-fix
+// code this is RED on Windows and GREEN on POSIX, because POSIX never permitted the double bind
+// in the first place — SO_REUSEADDR there is only the TIME_WAIT accommodation above. A green
+// macOS or Linux run is therefore NOT evidence that the Windows fix is still in place; only the
+// windows-latest job carries that.
+TEST(Socket, ASecondListenerCannotTakeAPortAlreadyBeingListenedOn) {
+    std::string err;
+    Socket first = Socket::listenTcp("", 0, /*ownsPort=*/true, &err);
+    ASSERT_TRUE(first.valid()) << err;
+    const std::uint16_t served = first.localPort();
+    ASSERT_GT(served, 0);
+
+    std::string secondErr;
+    Socket second = Socket::listenTcp("", served, /*ownsPort=*/true, &secondErr);
+    EXPECT_FALSE(second.valid())
+        << "a second listener bound port " << served << " while the first was still listening on "
+        << "it — na_server_start would report success for a port it does not have (issue #85)";
 }
 
 TEST(Socket, RemoteAddressReportsPeer) {

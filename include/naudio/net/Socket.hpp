@@ -115,8 +115,16 @@ public:
     // Creates a bound + listening TCP socket. An empty bindHost binds the
     // wildcard address "0.0.0.0" (the default — LAN-reachable); pass
     // "127.0.0.1" for loopback-only. port 0 selects an ephemeral port.
+    //
+    // `ownsPort` requests server port-ownership: no other live listener may
+    // share this port, and a restarting server may reclaim it from its own
+    // previous instance's TIME_WAIT connections. It is deliberately NOT named
+    // for a socket option, because the option that delivers it differs by
+    // platform — SO_REUSEADDR on POSIX, SO_EXCLUSIVEADDRUSE on Winsock, where
+    // SO_REUSEADDR means very nearly the opposite (issue #85). See the
+    // implementation comment in Socket.cpp for what each buys.
     static Socket listenTcp(const std::string& bindHost, std::uint16_t port,
-                            bool reuseAddr, std::string* err);
+                            bool ownsPort, std::string* err);
 
     // Accepts one pending connection. timeoutMs == 0 blocks; > 0 waits up to the
     // deadline (TimedOut if none arrives). On Ok, `out` receives the new socket.

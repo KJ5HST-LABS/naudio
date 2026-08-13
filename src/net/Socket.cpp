@@ -279,7 +279,7 @@ std::string Socket::resolveHostV4(const std::string& host) {
 }
 
 Socket Socket::listenTcp(const std::string& bindHost, std::uint16_t port,
-                         bool reuseAddr, std::string* err) {
+                         bool ownsPort, std::string* err) {
     ensureStartup();
     sockaddr_in addr;
     if (!resolveV4(bindHost, port, addr, err)) return Socket();
@@ -290,10 +290,38 @@ Socket Socket::listenTcp(const std::string& bindHost, std::uint16_t port,
         return Socket();
     }
     configureNew(fd);
-    if (reuseAddr) {
+    if (ownsPort) {
+        // PORT OWNERSHIP IS NOT THE SAME SYSCALL ON EVERY PLATFORM (issue #85). Both branches
+        // below request one policy — "no other live listener shares this port, and a restart
+        // may reclaim it" — but SO_REUSEADDR only delivers that policy on POSIX.
         int one = 1;
+#ifdef _WIN32
+        // Winsock's SO_REUSEADDR is not the POSIX flag under another name. It permits binding a
+        // port another socket is ACTIVELY LISTENING on — the behaviour SO_EXCLUSIVEADDRUSE
+        // exists to prevent — so while this passed SO_REUSEADDR here, a second server bound a
+        // port the first was serving and na_server_start() returned NA_OK for a port it did not
+        // have. Neither process was told. CI run 31643720529 caught it from the #58 arm.
+        //
+        // SO_EXCLUSIVEADDRUSE is strictly stronger than passing nothing: it also stops a foreign
+        // process from taking this port by setting SO_REUSEADDR itself, which is the hijack the
+        // bare default still permits.
+        //
+        // Return deliberately unread, matching the POSIX branch: the option requires no
+        // privilege on any supported Windows version, and if it were ever refused the socket
+        // falls back to Winsock's default — which still refuses the plain double bind this
+        // issue is about. Failing the listen over it would be the worse trade.
+        ::setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<char*>(&one),
+                     sizeof(one));
+#else
+        // The restart-after-TIME_WAIT accommodation, and it is load-bearing rather than
+        // decorative: a listener that has accepted and closed a connection leaves that 5-tuple
+        // in TIME_WAIT holding this port, and without this flag the rebind is refused with
+        // EADDRINUSE. Measured on macOS 2026-08-13 — see the permit-control in
+        // tests/net/test_socket.cpp, which reddens if this line is removed. It never permits
+        // two live listeners on any POSIX platform.
         ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&one),
                      sizeof(one));
+#endif
     }
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         setErr(err, "bind() failed");

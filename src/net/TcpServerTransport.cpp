@@ -37,7 +37,7 @@ bool TcpServerTransport::bind(std::uint16_t port, std::string* err) {
         if (err) *err = "Already bound";
         return false;
     }
-    listener_ = Socket::listenTcp(bindHost_, port, /*reuseAddr=*/true, err);
+    listener_ = Socket::listenTcp(bindHost_, port, /*ownsPort=*/true, err);
     if (!listener_.valid()) return false;
     bound_.store(true);
     return true;

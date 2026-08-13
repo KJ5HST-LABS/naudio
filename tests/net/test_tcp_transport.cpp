@@ -76,6 +76,48 @@ TEST(TcpTransport, DoubleBindFails) {
     EXPECT_FALSE(server.bind(0, &err));
 }
 
+// Issue #85, and the twin of TcpTransport.DoubleBindFails above rather than a duplicate of it:
+// that one rejects a SECOND bind() call on the SAME transport object, which is naudio's own
+// bound_ flag talking and never reaches the OS. This one is two independent servers racing for
+// one port, which is the deployment case — usually a previous instance that has not fully exited
+// — and it is the OS that has to say no.
+//
+// It reads as an OS-level truism and is not one. It held only because of a flag naudio chose: the
+// TCP listener requests port ownership, and while that was implemented as a bare SO_REUSEADDR on
+// every platform, WINDOWS let both sockets bind. Winsock's SO_REUSEADDR is not the POSIX flag
+// under another name — it permits binding a port another socket is ACTIVELY LISTENING on, the
+// behaviour SO_EXCLUSIVEADDRUSE exists to prevent. So two servers came up, neither was told, and
+// na_server_start() returned NA_OK for a port it did not have.
+//
+// That is #83's defect on the other transport and platform, and the two are worth reading
+// together: #83 was UDP-on-Linux and could be fixed by deleting the flag, because UDP has no
+// TIME_WAIT for it to accommodate. Here the flag is load-bearing on POSIX, so the fix is
+// platform-conditional and the still-allowed case needs its own assertion — that control is
+// Socket.APortIsRebindableOnceItsServerIsGoneEvenWithConnectionsInTimeWait.
+//
+// THIS TEST'S HONEST LIMIT: against the pre-fix code it is RED on Windows and GREEN on POSIX,
+// because POSIX never permitted the double bind. Its regression value is Windows-side, and the
+// windows-latest CI job is the only place it carries any (Learning 63, Learning 186 — a detector
+// whose premise is platform-dependent is vacuous exactly where you are not looking).
+//
+// Binds the first server to port 0 so the OS picks a free one: a hard-coded port would fail for
+// the unrelated reason that something else on the machine already holds it.
+TEST(TcpTransport, ASecondServerCannotBindAPortAlreadyBeingServed) {
+    TcpServerTransport first;
+    std::string err;
+    ASSERT_TRUE(first.bind(0, &err)) << err;
+    ASSERT_GT(first.port(), 0);
+    const auto served = static_cast<std::uint16_t>(first.port());
+
+    TcpServerTransport second;
+    std::string secondErr;
+    EXPECT_FALSE(second.bind(served, &secondErr))
+        << "a second server bound port " << served << " while the first was serving it — "
+        << "na_server_start would report success for a port it does not have (issue #85)";
+    EXPECT_FALSE(second.isBound());
+    EXPECT_EQ(second.port(), -1);
+}
+
 TEST(TcpTransport, AcceptBeforeBindErrors) {
     TcpServerTransport server;
     std::shared_ptr<ClientConnection> out;
