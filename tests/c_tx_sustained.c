@@ -23,6 +23,7 @@
  *
  * Hardware-free: NULL backends on both ends, loopback UDP, no PortAudio, no radio.
  */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -48,7 +49,7 @@ static unsigned char g_tx[TX_FRAME];
  * dry, and keeps emitting frames even with NO TX owner — so total callback bytes climb
  * steadily while nothing the client sent is getting through. Counting raw callback bytes
  * is precisely the metric that made this defect look healthy. */
-static volatile long long g_audible = 0;
+static _Atomic long long g_audible = 0;
 
 static void on_tx_audio(const unsigned char *pcm, size_t n, void *user) {
     (void)user;
@@ -60,7 +61,7 @@ static void on_tx_audio(const unsigned char *pcm, size_t n, void *user) {
     g_audible += audible;
 }
 
-static volatile int g_errors = 0;
+static _Atomic int g_errors = 0;
 static char g_last_error[256];
 
 static void on_error(const char *client_id, const char *message, void *user) {

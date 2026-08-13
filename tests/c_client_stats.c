@@ -46,6 +46,7 @@
  *
  * Hardware-free: NULL backends on both ends, loopback UDP, no PortAudio, no radio.
  */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -148,10 +149,10 @@ void naproxy_stop(void* handle);
 static const unsigned char SIG_UNIT[SIG_PERIOD] = {0x5A, 0xA5, 0x3C, 0xC3};
 static unsigned char RXBUF[4096];
 
-static volatile int g_rx_ok = 0;
+static _Atomic int g_rx_ok = 0;
 /* Non-zero makes the audio callback block for that many ms — the stalled-consumer arm. */
-static volatile int g_stall_cb_ms = 0;
-static volatile long g_cb_calls = 0;
+static _Atomic int g_stall_cb_ms = 0;
+static _Atomic long g_cb_calls = 0;
 
 static void sleep_ms(int ms);
 

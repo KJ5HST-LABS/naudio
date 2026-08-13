@@ -21,6 +21,7 @@
  * The loopback server is provided by net_smoke_server.cpp (a C++ test fixture exposing an
  * extern "C" surface) so this translation unit stays pure C and never names a C++ type.
  */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -52,7 +53,7 @@ static const unsigned char KNOWN[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x42};
 #define TXSIG_PERIOD 4
 static const unsigned char TXSIG_UNIT[TXSIG_PERIOD] = {0x11, 0x22, 0x33, 0x44};
 static unsigned char TXSIG[8192];
-static volatile int g_tx_ok = 0;  /* set when the signature reaches the server's TX callback */
+static _Atomic int g_tx_ok = 0;  /* set when the signature reaches the server's TX callback */
 
 static void on_tx_audio(const unsigned char* pcm, size_t n_bytes, void* user) {
     (void)user;
@@ -67,11 +68,14 @@ static void on_tx_audio(const unsigned char* pcm, size_t n_bytes, void* user) {
 }
 
 /* Cross-thread flags: callbacks fire on the client's internal worker threads; main polls these.
- * `volatile` + the 20ms nanosleep barriers in the poll loop suffice for a smoke. The load-bearing
- * roster/connection gates additionally use the C++-mutex/atomic-guarded accessors below. */
-static volatile int g_rx_ok = 0;          /* set when KNOWN arrives at the RX audio callback   */
-static volatile int g_connected = 0;      /* set by on_connected                               */
-static volatile int g_roster_count = -1;  /* last count seen via on_clients_update             */
+ * `_Atomic`, NOT `volatile`. This comment used to say volatile plus the 20 ms nanosleep barriers
+ * "suffice for a smoke"; TSan refuted it (issue #28) — volatile orders nothing between threads and
+ * a sleep is not a synchronisation edge, which is precisely how the report phrased it: "As if
+ * synchronized via sleep". The load-bearing roster/connection gates additionally use the
+ * C++-mutex/atomic-guarded accessors below. */
+static _Atomic int g_rx_ok = 0;          /* set when KNOWN arrives at the RX audio callback   */
+static _Atomic int g_connected = 0;      /* set by on_connected                               */
+static _Atomic int g_roster_count = -1;  /* last count seen via on_clients_update             */
 
 static void on_connected(const char* id, const char* addr, void* user) {
     (void)id; (void)addr; (void)user;
