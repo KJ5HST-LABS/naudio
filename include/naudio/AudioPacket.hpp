@@ -57,10 +57,45 @@ public:
     // Advisory MTU cap: a serialized datagram larger than this IP-fragments on a
     // standard ~1500-byte path, and losing one fragment drops the whole datagram
     // (defeating FEC). NOT enforced by the codec — the wire permits payloads up to
-    // MAX_PAYLOAD. UDP callers should size audio frames so packetSize(payload) stays
-    // at or below this. UdpClientConnection::sendPacket counts datagrams that exceed
-    // it (see UdpClientConnection::oversizedDatagrams()).
+    // MAX_PAYLOAD, and this constant constrains no packet a caller builds by hand.
+    //
+    // Issue #86 — WHO OBEYS THIS ADVISORY. It used to read "UDP callers should size
+    // audio frames so packetSize(payload) stays at or below this", which put the duty
+    // on the caller while naudio's own presets all broke it: every UDP preset's capture
+    // frame exceeded this cap, udpIq by 5.5x, with no oversized inject involved. It is
+    // now naudio's own job and is done in one place — UdpClientConnection splits
+    // outgoing audio at udpMaxAudioPayload() below, so the advisory holds for every
+    // preset, sample rate and channel count without a caller doing anything.
+    // oversizedDatagrams() therefore no longer counts ordinary traffic; what is left for
+    // it to report is the genuinely unsatisfiable config described there.
     static constexpr std::size_t UDP_MAX_PAYLOAD = 1400;  // Max safe UDP payload (no IP fragmentation).
+
+    // The advisory expressed as a PAYLOAD budget rather than a datagram one: what is
+    // left of UDP_MAX_PAYLOAD once the header and CRC are paid for.
+    static constexpr std::size_t UDP_MAX_AUDIO_PAYLOAD = UDP_MAX_PAYLOAD - HEADER_SIZE - CRC_SIZE;
+
+    // The largest audio payload that both fits the advisory and is a whole number of
+    // sample frames — the size a UDP sender should chunk audio to (issue #86). Rounding
+    // DOWN to a sample frame is not cosmetic: the receiver appends payloads to a
+    // byte-stream ring, so a chunk that ends mid-sample decodes every sample after it
+    // one channel out of phase, which no amount of MTU safety would make up for.
+    //
+    // A sample frame LARGER than the advisory budget has no size that is both MTU-safe
+    // and aligned, so the two properties are ranked here rather than left to callers:
+    // alignment wins. Fragmentation costs loss resilience on a lossy path; misalignment
+    // corrupts every sample after the split on every path. Such a config falls back to
+    // the largest aligned payload the wire itself permits, and UdpClientConnection's
+    // oversizedDatagrams() is what reports that it conceded — the one condition that
+    // counter still has to describe once ordinary presets stop tripping it.
+    //
+    // Never returns 0: a 0 chunk size would be an infinite send loop, not a diagnostic.
+    static constexpr std::size_t udpMaxAudioPayload(std::size_t sampleFrameBytes) {
+        if (sampleFrameBytes == 0) return UDP_MAX_AUDIO_PAYLOAD;
+        const std::size_t fits = (UDP_MAX_AUDIO_PAYLOAD / sampleFrameBytes) * sampleFrameBytes;
+        if (fits > 0) return fits;
+        const std::size_t raw = (MAX_PAYLOAD / sampleFrameBytes) * sampleFrameBytes;
+        return raw > 0 ? raw : MAX_PAYLOAD;  // one sample frame exceeds the wire limit too
+    }
 
     static constexpr std::uint8_t FLAG_COMPRESSED = 0x01;      // Payload is compressed.
     static constexpr std::uint8_t FLAG_LOW_BANDWIDTH = 0x02;   // Low bandwidth mode (12kHz).

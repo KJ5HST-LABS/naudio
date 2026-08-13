@@ -6,8 +6,12 @@
 //
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
+#include "naudio/AudioPacket.hpp"  // UDP_MAX_PAYLOAD / udpMaxAudioPayload — the MTU advisory this
+                                   // struct derives its UDP chunk size from, rather than restating
+                                   // the header/CRC arithmetic and letting the two drift.
 #include "naudio/TransportType.hpp"
 
 namespace naudio {
@@ -77,7 +81,18 @@ struct AudioStreamConfig {
 
     // --- Derived calculations ---
     std::int32_t samplesPerFrame() const { return (sampleRate * frameDurationMs) / 1000; }
-    std::int32_t bytesPerFrame() const { return samplesPerFrame() * (bitsPerSample / 8) * channels; }
+    // Bytes occupied by one sample across all channels — the unit no chunk boundary
+    // may split. bytesPerFrame() is stated in terms of it so the two cannot drift.
+    std::int32_t sampleFrameBytes() const { return (bitsPerSample / 8) * channels; }
+    std::int32_t bytesPerFrame() const { return samplesPerFrame() * sampleFrameBytes(); }
+    // The UDP audio chunk size this format implies (issue #86): the MTU advisory,
+    // rounded down to a whole sample frame. See AudioPacket::udpMaxAudioPayload for
+    // what a 0 return means and who decides it.
+    std::int32_t udpMaxAudioPayload() const {
+        const std::int32_t sf = sampleFrameBytes();
+        return static_cast<std::int32_t>(
+            AudioPacket::udpMaxAudioPayload(sf <= 0 ? 0 : static_cast<std::size_t>(sf)));
+    }
     std::int32_t bytesPerSecond() const { return sampleRate * (bitsPerSample / 8) * channels; }
     std::int32_t msToBytes(std::int32_t ms) const { return (bytesPerSecond() * ms) / 1000; }
     std::int32_t bytesToMs(std::int32_t bytes) const {

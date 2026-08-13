@@ -146,6 +146,22 @@ struct UdpReliabilityConfig {
     // AudioStreamConfig::DEFAULT_FRAME_MS, which is >= every UDP preset's value, so
     // a fill site that forgets this field over-widens the bound and never narrows it.
     int frameDurationMs = 20;
+    // The largest audio payload this connection puts in ONE datagram (issue #86). A
+    // frame larger than this is split across several independently-sequenced packets
+    // rather than handed to the IP layer to fragment. Fill it from
+    // AudioStreamConfig::udpMaxAudioPayload(), which rounds the MTU budget down to a
+    // whole sample frame of the negotiated format.
+    //
+    // The default is deliberately NOT the 16-bit-stereo answer (1376), because the two
+    // ways a forgotten copy can hurt are not symmetric: too small costs extra packets,
+    // while a value that is not a multiple of the sample frame splits a sample and
+    // decodes everything after it one channel out of phase. So the default is the
+    // largest multiple of 48 that fits the budget — a whole number of sample frames for
+    // every sample-frame size 48 admits (1, 2, 3, 4, 6, 8, 12, 16, 24, 48 bytes), which
+    // covers every format the C ABI can express and every plausible one this struct can.
+    // A missed copy is then merely suboptimal, never corrupting — the same fail-safe
+    // direction frameDurationMs above is asserted to have.
+    int maxAudioPayloadBytes = 1344;
     bool adaptiveJitterEnabled = false;
     int jitterMinMs = 0;
     int jitterMaxMs = 0;
@@ -288,9 +304,17 @@ public:
 
     // UDP datagrams handed to the socket whose serialized size exceeded
     // AudioPacket::UDP_MAX_PAYLOAD and therefore IP-fragment on a standard
-    // ~1500-byte-MTU path. Non-zero means a caller is sizing UDP audio frames
-    // above the MTU — every fragment must arrive or the whole datagram (and any
+    // ~1500-byte-MTU path: every fragment must arrive or the whole datagram (and any
     // FEC benefit) is lost. Advisory only; the datagram is still sent.
+    //
+    // Since issue #86 outgoing AUDIO is sized to the advisory here rather than by the
+    // caller, so on a normal stream this stays 0 at every preset and that is asserted
+    // (UdpConnection.NoUdpPresetPutsAFragmentingAudioDatagramOnTheWire). Non-zero now
+    // means one of the two things nothing upstream can shrink: an outsized control /
+    // handshake message, or a format whose single sample frame does not fit the
+    // advisory, where alignment was deliberately preferred over MTU safety
+    // (AudioPacket::udpMaxAudioPayload). Before #86 it counted ordinary audio at every
+    // UDP preset and nothing anywhere read it.
     std::int64_t oversizedDatagrams() const { return oversizedDatagrams_.load(); }
 
     std::string remoteAddress() const override {
@@ -307,6 +331,10 @@ private:
     // Records an audio packet in the FEC encoder and sends the parity packet if a
     // block completed. Collect-under-lock / send-after-unlock.
     void maybeSendFecParity(const AudioPacket& audioPacket);
+    // The shared body of sendRxAudio/sendTxAudio: splits an audio buffer into datagrams
+    // that fit the MTU advisory (issue #86). See the definition.
+    bool sendAudioChunked(PacketType type, const std::uint8_t* data, std::size_t offset,
+                          std::size_t length);
 
     // Outcome of a control-reliability pass: whether the packet was consumed (an
     // ACK/NACK that must not surface to the application) and any packets to send
@@ -382,6 +410,11 @@ private:
     std::atomic<int> crcErrors_{0};
     std::atomic<int> consecutiveCrcErrors_{0};
     std::atomic<std::int64_t> oversizedDatagrams_{0};  // datagrams > UDP_MAX_PAYLOAD (will IP-fragment)
+
+    // Chunk size for outgoing audio, resolved once from UdpReliabilityConfig at
+    // construction (issue #86). Immutable after the ctor, so the send path reads it
+    // without synchronization.
+    std::size_t maxAudioPayload_ = 0;
 
     // Sequence-gap detection state (single writer: the receive thread).
     std::atomic<std::int64_t> highestSequenceSeen_{-1};

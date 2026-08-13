@@ -49,6 +49,41 @@ UdpClientConnection::UdpClientConnection(Socket ownedSocket, std::string remoteH
 UdpClientConnection::~UdpClientConnection() { close(); }
 
 void UdpClientConnection::initPipeline(const UdpReliabilityConfig& cfg) {
+    // Issue #86 — resolve the outgoing audio chunk size once, here, so the send path
+    // reads a plain immutable size_t and never re-derives it per datagram.
+    //
+    // UdpReliabilityConfig is a public struct with no validation, so both guards below
+    // are reachable, and both fall back to the struct's own fail-safe default rather
+    // than to a clamp:
+    //
+    //   <= 0            would make the send loop's chunk 0 and never advance — a hang,
+    //                   not a diagnostic.
+    //   > MAX_PAYLOAD   is not a request for a bigger datagram, because no 0xAF01 frame
+    //                   can carry one: serialize() clamps the payload (AudioPacket.cpp:83)
+    //                   and the remainder is lost with every layer reporting success —
+    //                   the exact defect #20 was filed for. Clamping to MAX_PAYLOAD would
+    //                   avoid the truncation and still be the wrong answer, because a
+    //                   16 KB datagram is refused outright by the sending host on some
+    //                   platforms (measured: macOS loopback rejects it, Linux accepts it),
+    //                   so it trades a silent truncation for a stream that dies at the
+    //                   syscall on one OS and not the other. The default is the only value
+    //                   that is deliverable everywhere.
+    //
+    // Values between the advisory and MAX_PAYLOAD are honoured untouched — a caller on a
+    // jumbo-frame path is entitled to ask for them.
+    static_assert(UdpReliabilityConfig{}.maxAudioPayloadBytes > 0,
+                  "the default chunk size must be positive, or the send loop cannot advance");
+    static_assert(static_cast<std::size_t>(UdpReliabilityConfig{}.maxAudioPayloadBytes) <=
+                      AudioPacket::UDP_MAX_AUDIO_PAYLOAD,
+                  "a forgotten maxAudioPayloadBytes copy must stay inside the MTU advisory");
+    static_assert(UdpReliabilityConfig{}.maxAudioPayloadBytes % 48 == 0,
+                  "the default must be a whole number of sample frames for every format the "
+                  "C ABI admits; 48 is the divisor that covers them (see the field's comment)");
+    const bool usable = cfg.maxAudioPayloadBytes > 0 &&
+                        static_cast<std::size_t>(cfg.maxAudioPayloadBytes) <= AudioPacket::MAX_PAYLOAD;
+    maxAudioPayload_ = static_cast<std::size_t>(
+        usable ? cfg.maxAudioPayloadBytes : UdpReliabilityConfig{}.maxAudioPayloadBytes);
+
     // Resolve the server host to a numeric IPv4 once, for datagram-source
     // validation in the client-owned receive path. Runs in the ctor before
     // any receive thread exists, so no synchronization is needed.
@@ -141,9 +176,18 @@ bool UdpClientConnection::sendPacket(const AudioPacket& packet) {
     // MTU advisory guard: a datagram larger than UDP_MAX_PAYLOAD IP-fragments on a
     // standard ~1500-byte-MTU path, and losing any one fragment drops the whole
     // datagram — which defeats the FEC parity layer. We do NOT app-layer fragment
-    // (that would be a 0xAF01 wire change) and we NEVER drop valid audio; we only
-    // count the event so a caller can see it is oversizing UDP frames and shrink
-    // them below the path MTU. The datagram is still sent, unchanged.
+    // (that would be a 0xAF01 wire change) and we NEVER drop valid audio. The datagram
+    // is still sent, unchanged; this only counts.
+    //
+    // Issue #86 changed what a non-zero count MEANS. This used to fire on ordinary
+    // audio at every UDP preset, and the policy it recorded — "let the caller see it is
+    // oversizing UDP frames and shrink them" — had no reader and no caller who could act
+    // on it. Audio is now sized to the advisory before it gets here
+    // (sendAudioChunked below), so the paths that can still trip this are the ones
+    // nothing upstream can shrink: a control message or a handshake larger than the
+    // advisory, and the degenerate format whose single sample frame does not fit it
+    // (AudioPacket::udpMaxAudioPayload). A non-zero count is now a real signal rather
+    // than a description of normal operation.
     if (data.size() > AudioPacket::UDP_MAX_PAYLOAD) {
         oversizedDatagrams_.fetch_add(1);
     }
@@ -182,21 +226,55 @@ bool UdpClientConnection::trySendControl(const ControlMessage& message) {
     return sendControl(message);
 }
 
-bool UdpClientConnection::sendRxAudio(const std::uint8_t* data, std::size_t offset,
-                                      std::size_t length) {
-    std::vector<std::uint8_t> audioData(data + offset, data + offset + length);
-    AudioPacket packet = AudioPacket::createRxAudio(nextSequence(), std::move(audioData));
-    bool ok = sendPacket(packet);
-    maybeSendFecParity(packet);
+// Issue #86: SIZE THE DATAGRAM FROM THE MTU ADVISORY, NOT FROM THE FRAME CADENCE.
+//
+// Before this, one call here became exactly one datagram, so the datagram was however
+// large `frameDurationMs` worth of audio happened to be — and at EVERY UDP preset that
+// was over UDP_MAX_PAYLOAD with no oversized inject involved (udpLan/udpWan/udpFt8 1943 B,
+// udpIq 7703 B). udpWan is the only preset that enables FEC, so it was a preset whose own
+// frames defeated the FEC it turns on: a 1943 B datagram IP-fragments on a ~1500 B path,
+// and losing any one fragment discards the whole datagram AND the parity covering it.
+//
+// This is NOT app-layer fragmentation and NOT a 0xAF01 wire change. Each chunk is a
+// complete, independently-sequenced audio packet, exactly like the frames the capture path
+// already emits; the receiver reassembles nothing, because it appends payloads to a
+// byte-stream ring in sequence order (AudioStreamClient.cpp:410) and the server hands them
+// to the mixer the same way. It is the same property AudioBroadcaster::broadcastToTargets
+// already relies on for #20's oversized-inject path, applied one layer down so that BOTH
+// audio producers are covered: the RX fan-out arrives here through ClientSession's writer
+// thread, and the client's TX capture loop arrives here directly (AudioStreamClient.cpp:536).
+// Fixing either producer alone would have left the other fully exposed.
+//
+// FEC parity needs no separate treatment: parity is the XOR of its block's payloads, so it
+// is exactly as large as the largest member and shrinks with them.
+bool UdpClientConnection::sendAudioChunked(PacketType type, const std::uint8_t* data,
+                                           std::size_t offset, std::size_t length) {
+    bool ok = true;
+    std::size_t sent = 0;
+    // do/while, not while: a zero-length call must still emit exactly one packet, which is
+    // the pre-#86 behaviour. AudioBroadcaster's chunk loop makes the same choice.
+    do {
+        const std::size_t n = std::min(length - sent, maxAudioPayload_);
+        std::vector<std::uint8_t> audioData(data + offset + sent, data + offset + sent + n);
+        AudioPacket packet(type, nextSequence(), std::move(audioData));
+        ok = sendPacket(packet);
+        // Unconditional, matching the pre-#86 single-packet path exactly: parity was
+        // recorded whether or not the send reported success. Making it conditional here
+        // would be a second, unasked-for change to how a block is composed on a failing
+        // socket — a separate decision from sizing, and not this issue's.
+        maybeSendFecParity(packet);
+        sent += n;
+    } while (ok && sent < length);
     return ok;
 }
 
+bool UdpClientConnection::sendRxAudio(const std::uint8_t* data, std::size_t offset,
+                                      std::size_t length) {
+    return sendAudioChunked(PacketType::AudioRx, data, offset, length);
+}
+
 bool UdpClientConnection::sendTxAudio(const std::uint8_t* data, std::size_t length) {
-    std::vector<std::uint8_t> audioData(data, data + length);
-    AudioPacket packet = AudioPacket::createTxAudio(nextSequence(), std::move(audioData));
-    bool ok = sendPacket(packet);
-    maybeSendFecParity(packet);
-    return ok;
+    return sendAudioChunked(PacketType::AudioTx, data, 0, length);
 }
 
 void UdpClientConnection::maybeSendFecParity(const AudioPacket& audioPacket) {

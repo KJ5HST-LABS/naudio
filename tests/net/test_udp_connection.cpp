@@ -16,6 +16,7 @@
 //                  one datagram withheld, and the ARQ NACK-retransmit / ACK path).
 // Hardware-free.
 
+#include "naudio/AudioStreamConfig.hpp"
 #include "naudio/FecDecoder.hpp"
 #include "naudio/FecEncoder.hpp"
 #include "naudio/net/Socket.hpp"
@@ -1032,4 +1033,171 @@ TEST(UdpConnection, ClientOwnedRecoveredFrameKeepsProvenanceThroughTheReorderLim
         }
     }
     EXPECT_EQ(1, seenRecovered) << "the rebuilt slot never surfaced";
+}
+
+// ---------------------------------------------------------------------------
+// #86 — the MTU advisory, applied to naudio's own frames
+// ---------------------------------------------------------------------------
+//
+// THIS ARM ASSERTS ON DATAGRAM SIZE, NEVER ON ARRIVAL, and that is a requirement
+// rather than a preference: loopback has no MTU, so every one of these frames is
+// delivered intact whether it would fragment on a real path or not. An arrival-based
+// arm here is vacuous by construction — it passes against the unfixed code (measured:
+// it did). The observable that reddens is the number of bytes handed to sendTo().
+//
+// The premise being guarded: before this fix every UDP preset's OWN capture frame
+// exceeded UDP_MAX_PAYLOAD — udpLan/udpWan/udpFt8 at 1943 B, udpIq at 7703 B, the
+// TCP-default shape at 3863 B — with no oversized inject involved. udpWan is the
+// only preset that turns FEC ON, so it was a preset whose own frames defeated the
+// FEC it enables: a 1943 B datagram IP-fragments on a ~1500 B path, and losing one
+// fragment discards the whole datagram AND the parity meant to cover it.
+
+namespace {
+
+// One datagram as it went out on the wire.
+struct WireDatagram {
+    std::size_t bytes;                  // size on the wire — the subject of #86
+    std::optional<AudioPacket> packet;  // deserialized, for the reassembly check
+};
+
+// Reads every datagram the connection sent, stopping at the first timeout. Picks up
+// FEC parity as well as audio, so a preset that shrinks its audio frames but not its
+// parity is still caught.
+std::vector<WireDatagram> drainWire(Socket& peer, int quietMs = 300) {
+    std::vector<WireDatagram> out;
+    peer.setRecvTimeout(quietMs);
+    std::vector<std::uint8_t> buf(UdpClientConnection::MAX_DATAGRAM_SIZE);
+    while (true) {
+        RecvFromResult rr = peer.recvFrom(buf.data(), buf.size());
+        if (rr.status != IoStatus::Ok) break;
+        out.push_back(WireDatagram{static_cast<std::size_t>(rr.bytes),
+                                   AudioPacket::deserialize(buf.data(), rr.bytes)});
+    }
+    return out;
+}
+
+// Drives one preset's own capture frame through a real socket and checks the wire.
+// `sendAudio` selects the direction, because the two audio producers are different
+// code paths: RX fan-out (server -> client) and TX (client -> server).
+void expectPresetFitsTheMtu(const AudioStreamConfig& config, const char* presetName,
+                            bool useTxDirection) {
+    SCOPED_TRACE(std::string(presetName) + (useTxDirection ? " (TX)" : " (RX)"));
+
+    Socket peer = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    ASSERT_TRUE(peer.valid());
+    const std::uint16_t peerPort = peer.localPort();
+
+    Socket clientSock = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    ASSERT_TRUE(clientSock.valid());
+
+    UdpReliabilityConfig rc;
+    rc.reorderWindowSize = config.reorderBufferSize;
+    rc.reorderMaxHoldMs = config.reorderMaxHoldMs;
+    rc.fecEnabled = config.fecEnabled;
+    rc.fecBlockSize = config.fecBlockSize;
+    rc.frameDurationMs = config.frameDurationMs;
+    rc.maxAudioPayloadBytes = config.udpMaxAudioPayload();
+    UdpClientConnection conn(std::move(clientSock), "127.0.0.1", peerPort,
+                             ClientAddress("client", "127.0.0.1", peerPort), rc);
+
+    // ONE capture frame at this preset's own settings — no oversized inject.
+    const std::size_t frameBytes = static_cast<std::size_t>(config.bytesPerFrame());
+    ASSERT_GT(frameBytes, 0u);
+    std::vector<std::uint8_t> frame(frameBytes);
+    for (std::size_t i = 0; i < frameBytes; i++) frame[i] = static_cast<std::uint8_t>(i & 0xFF);
+
+    ASSERT_TRUE(useTxDirection ? conn.sendTxAudio(frame.data(), frameBytes)
+                               : conn.sendRxAudio(frame.data(), 0, frameBytes));
+
+    std::vector<WireDatagram> wire = drainWire(peer);
+    ASSERT_FALSE(wire.empty()) << "nothing reached the wire — the arm cannot prove anything";
+
+    const PacketType audioType = useTxDirection ? PacketType::AudioTx : PacketType::AudioRx;
+    std::vector<std::uint8_t> reassembled;
+    for (const WireDatagram& d : wire) {
+        EXPECT_LE(d.bytes, AudioPacket::UDP_MAX_PAYLOAD)
+            << presetName << " put a " << d.bytes << "-byte datagram on the wire; it IP-fragments "
+            << "on a standard ~1500 B path and takes its FEC parity down with it";
+        ASSERT_TRUE(d.packet.has_value()) << "a datagram this connection sent did not deserialize";
+        if (d.packet->packetType() == audioType) {
+            const std::vector<std::uint8_t>& p = d.packet->payload();
+            reassembled.insert(reassembled.end(), p.begin(), p.end());
+        }
+    }
+
+    // Splitting a frame must not lose, duplicate, or re-phase a single sample: the
+    // receiver appends payloads to a byte-stream ring, so a chunk that starts
+    // mid-sample decodes every sample after it one channel out of phase.
+    EXPECT_EQ(frame, reassembled)
+        << "the frame did not survive being split into MTU-sized packets";
+    const std::size_t sampleFrame = static_cast<std::size_t>(config.sampleFrameBytes());
+    for (const WireDatagram& d : wire) {
+        if (d.packet && d.packet->packetType() == audioType) {
+            EXPECT_EQ(0u, d.packet->payload().size() % sampleFrame)
+                << "a chunk is not a whole number of sample frames";
+        }
+    }
+
+    EXPECT_EQ(0, conn.oversizedDatagrams())
+        << "the counter that exists to see this condition still sees it";
+}
+
+}  // namespace
+
+TEST(UdpConnection, NoUdpPresetPutsAFragmentingAudioDatagramOnTheWire) {
+    for (bool tx : {false, true}) {
+        expectPresetFitsTheMtu(AudioStreamConfig::udpLan(), "udpLan", tx);
+        expectPresetFitsTheMtu(AudioStreamConfig::udpWan(), "udpWan", tx);
+        expectPresetFitsTheMtu(AudioStreamConfig::udpFt8(), "udpFt8", tx);
+        expectPresetFitsTheMtu(AudioStreamConfig::udpIq(), "udpIq", tx);
+        // Not a UDP preset, but the shape a DUAL server and a plain
+        // `transportType = Udp` config both inherit: 48 kHz stereo at 20 ms.
+        expectPresetFitsTheMtu(AudioStreamConfig{}, "default (48k/16/2 @ 20ms)", tx);
+        // 3 channels: the sample frame is 6 bytes, which does NOT divide the raw MTU
+        // budget. AudioStreamConfig is a public C++ struct with no channel guard, so
+        // this is reachable, and it is the case an unaligned chunk size corrupts.
+        AudioStreamConfig threeCh = AudioStreamConfig::udpLan();
+        threeCh.channels = 3;
+        expectPresetFitsTheMtu(threeCh, "udpLan @ 3 channels", tx);
+    }
+}
+
+// A caller CAN set maxAudioPayloadBytes above what one 0xAF01 frame may carry —
+// UdpReliabilityConfig is a public struct with no validation. Left as given, the chunk
+// loop would hand serialize() more than MAX_PAYLOAD, which clamps the payload
+// (AudioPacket.cpp:83) and drops the remainder while every layer reports success:
+// exactly the defect issue #20 was filed for, re-entering through #86's new path.
+// initPipeline treats such a value as unset and uses the struct default instead; this
+// is that guard's detector. Deliberately NOT written as "send 32 KB and check nothing
+// was lost" — that arm would need a >16 KB datagram, which macOS refuses at the syscall
+// and Linux accepts, so it would test the host's send buffer rather than this code.
+TEST(UdpConnection, AnOverlargeConfiguredChunkFallsBackInsteadOfTruncating) {
+    Socket peer = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    ASSERT_TRUE(peer.valid());
+    const std::uint16_t peerPort = peer.localPort();
+    Socket clientSock = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    ASSERT_TRUE(clientSock.valid());
+
+    UdpReliabilityConfig rc = passthroughCfg();
+    rc.maxAudioPayloadBytes = 99999;  // far above MAX_PAYLOAD (16384)
+    UdpClientConnection conn(std::move(clientSock), "127.0.0.1", peerPort,
+                             ClientAddress("client", "127.0.0.1", peerPort), rc);
+
+    const std::size_t kBytes = 4000;  // > the advisory, << any host's datagram ceiling
+    std::vector<std::uint8_t> frame(kBytes);
+    for (std::size_t i = 0; i < kBytes; i++) frame[i] = static_cast<std::uint8_t>((i * 7) & 0xFF);
+    ASSERT_TRUE(conn.sendRxAudio(frame.data(), 0, kBytes));
+
+    std::vector<std::uint8_t> reassembled;
+    int datagrams = 0;
+    for (const WireDatagram& d : drainWire(peer)) {
+        ASSERT_TRUE(d.packet.has_value());
+        ++datagrams;
+        EXPECT_LE(d.bytes, AudioPacket::UDP_MAX_PAYLOAD)
+            << "the nonsense value was honoured rather than replaced by the safe default";
+        const std::vector<std::uint8_t>& p = d.packet->payload();
+        reassembled.insert(reassembled.end(), p.begin(), p.end());
+    }
+    EXPECT_GT(datagrams, 1) << "premise: 4000 bytes must have been split at all";
+    EXPECT_EQ(frame, reassembled) << "audio was silently truncated — #20's defect, via #86's path";
 }
