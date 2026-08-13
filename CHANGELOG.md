@@ -213,6 +213,44 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **The installed package was unusable on MSVC and on any FetchContent-built install** (issue #61).
+  `find_package(naudio)` failed two different ways, both on platforms whose CI build was green —
+  and green precisely because those jobs built the library and never installed or consumed it.
+
+  The single root cause: `naudio_pa` linked PortAudio `PUBLIC`, so the *build-time target name* was
+  baked into the installed `naudioTargets.cmake` — `PkgConfig::PORTAUDIO` from a system build, the
+  bare `portaudio_static` from a bundled one — and `naudioConfig.cmake` had to recreate that exact
+  name. It could recreate only one of the two, and only through pkg-config. So a consumer with no
+  pkg-config (MSVC) got *"naudio could not be found because dependency PkgConfig could not be
+  found"*, and a consumer of a bundled install got *"imported targets are referenced, but are
+  missing: portaudio_static"*.
+
+  PortAudio is now linked in the **build interface only**, so both resolution paths export an
+  identical targets file naming no PortAudio target at all, and `naudioConfig.cmake` resolves
+  PortAudio on the *consumer's* side — pkg-config first, since `portaudio-2.0.pc` carries the full
+  private closure, then a plain `find_library`/`find_path` for hosts that have none.
+
+  **Not finding PortAudio is no longer fatal to the package.** It is needed by exactly one target,
+  `naudio::naudio_pa`; the shared C ABI `naudio::naudio` has its device backend linked in already,
+  so a C / Hamlib consumer — the primary audience — can now use the package on a host with no
+  PortAudio development files and no pkg-config. That case reports itself at configure time and
+  sets `naudio_PORTAUDIO_FOUND` to `FALSE`, rather than surfacing later as an undefined-`Pa_*` wall.
+
+- **A bundled build installed PortAudio's own files into naudio's prefix** (issue #61). PortAudio's
+  install rules ran as part of ours, depositing `portaudio.h`, `pa_mac_core.h`, `libportaudio.a`,
+  `libportaudio.{so,dylib}`, `lib/cmake/portaudio/`, `lib/pkgconfig/portaudio-2.0.pc` and
+  `share/doc/portaudio/` alongside naudio's. `PA_DISABLE_INSTALL` is the analogue of the
+  `INSTALL_GTEST OFF` already set for GoogleTest, which PortAudio had no counterpart for.
+
+- **`naudio.pc` hard-errored wherever `portaudio-2.0.pc` was absent** (issue #61). pkg-config
+  resolves `Requires.private` on **every** query, not only `--static`, so `Requires.private:
+  portaudio-2.0` made plain `pkg-config --cflags naudio` *and* `--libs naudio` exit 1 on such a host
+  (measured, pkgconf 2.5.1). On a bundled build the module does not exist anywhere and the claim was
+  simply false; on a system build it broke consumers needing none of it, since the file describes the
+  **shared** `libnaudio`, whose PortAudio dependency the dynamic linker already carries. The static
+  closure is now raw flags in `Libs.private`, which triggers no module lookup, so the `.pc` degrades
+  instead of erroring.
+
 - **On Linux, tearing down a session leaked its writer thread whenever the peer had stopped
   reading** (issue #56). Closing a socket drops a *descriptor*; it does not by itself return a
   thread already blocked in the kernel on that socket, because a blocked `send()` holds its own

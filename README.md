@@ -233,6 +233,20 @@ After `make install`, the C++ API is reachable via `find_package(naudio)` —
 full `naudio/**` header tree installs alongside. (The internal C++ classes ship as static archives,
 so the hidden-visibility the shared `naudio` C ABI relies on does not strip them from a static link.)
 
+> **`naudio::naudio_pa` is the one target that needs PortAudio on *your* side.** The installed
+> package names no PortAudio target, so `find_package(naudio)` resolves one itself — pkg-config
+> first, then a plain `find_library`/`find_path` — and attaches it to `naudio::naudio_pa` alone. If
+> your host has none, `find_package(naudio)` still succeeds and sets `naudio_PORTAUDIO_FOUND` to
+> `FALSE`: `naudio::naudio`, `naudio::naudio_core` and `naudio::naudio_net` all remain usable, and
+> only linking `naudio::naudio_pa` fails. Gate on that variable if you consume the device layer:
+>
+> ```cmake
+> find_package(naudio CONFIG REQUIRED)
+> if(NOT naudio_PORTAUDIO_FOUND)
+>     message(FATAL_ERROR "this app needs naudio::naudio_pa, which needs a PortAudio")
+> endif()
+> ```
+
 ```cpp
 #include "naudio/PortAudioBackend.hpp"
 #include "naudio/DeviceEnumerator.hpp"
