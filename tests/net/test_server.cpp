@@ -1675,11 +1675,17 @@ TEST(Server, CaptureDeviceLostMidStreamSurfacesOnError) {
     backend.throwAfterReads = 2;
     AudioStreamConfig config{};
     config.maxClients = 4;
+    // `listener` is declared BEFORE `server` so it is destroyed AFTER it. stop() only POSTS
+    // onServerStopped() to the dispatcher; the drain happens in ~AudioStreamServer
+    // (AudioStreamServer.cpp:637), so the callback is delivered after stop() has returned. With
+    // the declaration order reversed this arm was a stack-use-after-scope, which is how ASan
+    // found it (issue #28) — the listener died first and the dispatcher thread then read its
+    // vtable. Same borrowed-and-must-outlive rule the `backend` above already follows.
+    ErrorRecordingListener listener;
     AudioStreamServer server{0, config};
     server.setBackend(&backend);
     server.setCaptureDevice(0);
 
-    ErrorRecordingListener listener;
     server.addStreamListener(&listener);
 
     std::string err;
@@ -1703,6 +1709,8 @@ TEST(Server, PlaybackDeviceLostMidStreamSurfacesOnError) {
     backend.throwAfterWrites = 2;  // capture stays healthy (throwAfterReads = -1); playback dies
     AudioStreamConfig config{};
     config.maxClients = 4;
+    // Declared before `server` so it outlives it — see the note in the capture arm above.
+    ErrorRecordingListener listener;
     AudioStreamServer server{0, config};
     server.setBackend(&backend);
     // A capture device is REQUIRED to reach the playback path at all: startInternal opens the
@@ -1711,7 +1719,6 @@ TEST(Server, PlaybackDeviceLostMidStreamSurfacesOnError) {
     server.setCaptureDevice(0);
     server.setPlaybackDevice(0);
 
-    ErrorRecordingListener listener;
     server.addStreamListener(&listener);
 
     std::string err;

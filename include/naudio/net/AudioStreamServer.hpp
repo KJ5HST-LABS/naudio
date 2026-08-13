@@ -174,6 +174,15 @@ public:
     // Injects PCM to broadcast to all clients (recordings / engine audio / tests).
     void injectAudio(const std::vector<std::uint8_t>& data);
 
+    // Borrowed, and must outlive the SERVER — not merely the last stop(). Callbacks are delivered
+    // on the dispatcher thread, and stop() only POSTS onServerStopped(); the drain and join happen
+    // in ~AudioStreamServer. So a listener destroyed between a returned stop() and the server's
+    // destruction is still reachable, and reading it there is a use-after-free.
+    //
+    // Stated because it was NOT: the `backend` above carries the same borrowed-must-outlive rule
+    // and says so, this one said nothing, and two of this project's own arms in
+    // tests/net/test_server.cpp consequently declared their listener AFTER the server — destroying
+    // it first. ASan found both (issue #28). Declare listeners before the server they attach to.
     void addStreamListener(AudioStreamListener* listener);
 
     const AudioStreamConfig& config() const { return config_; }
