@@ -6,7 +6,7 @@ name: CI
 # on CI runners. The real-hardware smokes (na_audio_daemon / on-air audio) are
 # gated out here — they need a real sound device.
 #
-# Five job families (tri-platform + FetchContent + FFI + the Hamlib bridge):
+# Six job families (tri-platform + FetchContent + sanitizers + FFI + the Hamlib bridge):
 #   * build-and-test  — Ubuntu + macOS with a SYSTEM PortAudio (the supported path);
 #                       full ctest + install smoke + the external-consumer find_package
 #                       / pkg-config gate.
@@ -16,6 +16,12 @@ name: CI
 #                       compiles.
 #   * fetchcontent    — Ubuntu with NO system PortAudio: proves the FetchContent fallback
 #                       (build PortAudio v19.7.0 from source) compiles + passes.
+#   * sanitizers      — Ubuntu: the same hardware-free ctest suite under ASan+UBSan(+LSan) and
+#                       under TSan, via the NAUDIO_SANITIZE option. ~18 thread-creation sites and
+#                       five detached per-connection workers had never been run instrumented
+#                       (issue #28). Linux-only because LSan does not exist on Darwin. Asserts the
+#                       instrumentation is in the BINARY before trusting the run — a sanitizer
+#                       reports success by printing nothing, which an uninstrumented build also does.
 #   * ffi-clients     — Ubuntu: the Python / Java / Rust example clients, which ctest
 #                       never touches. Each hand-declares na_device, so each is diffed
 #                       against a C reference compiled from naudio.h. Asserts on matched
@@ -267,6 +273,64 @@ jobs:
           grep -q '^consume_cxx OK' consume.log || { echo "::error::consume_cxx did not run"; exit 1; }
         env:
           LD_LIBRARY_PATH: ${{ runner.temp }}/naudio-prefix/lib
+
+  sanitizers:
+    name: sanitize (${{ matrix.label }}, ubuntu-latest)
+    runs-on: ubuntu-latest
+    # Linux-only, and that is a MEASUREMENT rather than the caution the issue anticipated: LSan is
+    # unsupported on Darwin (`ASAN_OPTIONS=detect_leaks=1` on arm64 macOS answers "detect_leaks is
+    # not supported on this platform"), so the leak half of issue #28 is reachable HERE and in no
+    # local run. A developer's green ASan run on macOS is not leak coverage and must not be
+    # reported as any.
+    #
+    # Two configurations, never one: ASan and TSan cannot share a process, which NAUDIO_SANITIZE
+    # enforces at configure time. ASan+UBSan is one build (they compose, and LSan rides along with
+    # ASan on Linux for free); TSan is the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - san: address,undefined
+            label: asan+ubsan+lsan
+          - san: thread
+            label: tsan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PortAudio (matches the supported build-and-test path)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y portaudio19-dev pkg-config
+          # Deliberately the SAME dependency shape as build-and-test (ubuntu) so a failure here is
+          # attributable to the instrumentation and not to a different build. PortAudio itself is a
+          # system library and so is NOT instrumented; ASan still intercepts its allocations.
+
+      - name: Configure (NAUDIO_SANITIZE=${{ matrix.san }})
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DNAUDIO_SANITIZE=${{ matrix.san }}
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Assert the instrumentation is actually IN the binary
+        run: |
+          # The positive control for this whole job (issue #28). A sanitizer's passing result is
+          # the ABSENCE of a diagnostic — which is also exactly what a build that silently dropped
+          # -fsanitize= produces. Without this step a typo in the flag, a toolchain that ignored
+          # it, or a target created above the add_compile_options() call would all report as a
+          # clean run forever. Asserts on the SYMBOLS, never on the build's exit code.
+          case "${{ matrix.san }}" in
+            *address*) want=__asan ;;
+            *thread*)  want=__tsan ;;
+          esac
+          found=$(nm -u build/tests/naudio_net_tests | grep -c "$want" || true)
+          echo "undefined ${want} symbols in naudio_net_tests: ${found}"
+          [ "$found" -gt 0 ] \
+            || { echo "::error::${want} symbols absent — the build is NOT instrumented, so a green run below would mean nothing"; exit 1; }
+
+      - name: Test under ${{ matrix.label }}
+        run: ctest --test-dir build --output-on-failure
 
   ffi-clients:
     name: ffi example clients (python + java + rust vs the C ABI)
