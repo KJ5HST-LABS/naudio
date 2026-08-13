@@ -243,6 +243,22 @@ void Socket::close() noexcept {
     }
 }
 
+void Socket::shutdownBoth() noexcept {
+    // Read the handle rather than exchanging it: this must NOT take ownership, because close()
+    // still has to run afterwards to free the descriptor. A concurrent close() that wins the race
+    // leaves h invalid here and the shutdown is simply skipped, which is correct — the socket is
+    // already going away.
+    socket_t h = handle_.load();
+    if (h == kInvalidSocket) return;
+#ifdef _WIN32
+    ::shutdown(h, SD_BOTH);
+#else
+    ::shutdown(h, SHUT_RDWR);
+#endif
+    // Return value deliberately unread: ENOTCONN is the expected answer for a listener or an
+    // unconnected UDP socket, and every other failure still leaves close() to do the real work.
+}
+
 void Socket::ensureStartup() {
 #ifdef _WIN32
     static std::once_flag once;

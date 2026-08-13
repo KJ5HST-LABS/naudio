@@ -270,6 +270,13 @@ std::int64_t AudioProtocolHandler::timeSinceLastReceive() const {
 
 void AudioProtocolHandler::close() {
     closed_.store(true);
+    // BEFORE close(), not instead of it (issue #56, item 1). A session's writer thread can be
+    // parked inside Socket::sendAll against a peer whose receive window has shut, and dropping the
+    // descriptor does not reliably return that thread on every platform — it holds its own
+    // reference to the open file description. shutdown() changes the socket's state instead, so
+    // the parked send returns and the thread unwinds. Without it, teardown depends on a
+    // platform behaviour this project only ever verified on macOS.
+    socket_.shutdownBoth();
     socket_.close();
 }
 

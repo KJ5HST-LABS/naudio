@@ -81,6 +81,24 @@ public:
     socket_t handle() const noexcept { return handle_.load(); }
     void close() noexcept;
 
+    // Half-closes BOTH directions with ::shutdown, which wakes any thread currently parked in
+    // send() or recv() on this socket. Errors are ignored on purpose: ENOTCONN on a socket that
+    // was never connected (a listener, an unconnected UDP socket) is the expected answer, not a
+    // fault, and there is nothing a caller could do about it.
+    //
+    // WHY THIS IS NOT THE SAME AS close() (issue #56, item 1). close() drops a DESCRIPTOR; it does
+    // not by itself guarantee that a thread already blocked in the kernel on that socket returns.
+    // A blocked send holds its own reference to the open file description, so on Linux the
+    // descriptor going away need not disturb it — the classic symptom being a writer thread that
+    // stays parked after the connection was torn down. macOS/BSD do generally wake the sleeper,
+    // which is exactly why this went unnoticed here for so long: the tree had no ::shutdown call
+    // anywhere and the one platform it was developed on papers over the difference.
+    //
+    // shutdown() is the portable instrument for that: it changes the SOCKET's state rather than
+    // the descriptor table, so a parked send/recv returns promptly on every platform. Call it
+    // BEFORE close(), never instead of it — it frees no resources.
+    void shutdownBoth() noexcept;
+
     // Initializes the platform socket library (Winsock WSAStartup). Idempotent
     // and process-wide; a no-op on POSIX. Called implicitly by every factory,
     // exposed for tests/drivers that want to front-load it.
@@ -153,8 +171,30 @@ public:
     // much a single call hands the kernel — for naudio, one maximum-payload 0xAF01 frame
     // (16407 bytes), measured at 1.0x with a dead peer and 0.7x with one draining 8 KB per
     // 700 ms. Truly bounding a single ::send needs non-blocking send + poll, which would
-    // make the shared fd non-blocking underneath the concurrent receive thread — a bigger
-    // change than either issue asked for.
+    // make the shared fd non-blocking underneath the concurrent receive thread.
+    //
+    // #56 CLOSED THAT RESIDUAL WITHOUT THAT CHANGE, by measuring what it actually is here
+    // rather than what it is in the worst case. Two independent bounds, both measured:
+    //
+    //   1. THE RESIDUAL IS EXACTLY ONE DEADLINE, because naudio never hands ::send more than
+    //      one packet. There is a single sendAll call site (AudioProtocolHandler.cpp:68) and
+    //      it passes one serialized 0xAF01 frame, so the ceiling is 19 + MAX_PAYLOAD + 4 =
+    //      16407 bytes — not the 8 MB that produced the 4 s overshoot above. MEASURED on
+    //      Linux (gcc:13 container), 16407 B to a dead peer under a 5000 ms deadline:
+    //      returned after 5017 ms, 1.00x. So the honest whole bound is "the budget plus at
+    //      most one deadline", i.e. CONNECTION_TIMEOUT_MS end to end, which is the same
+    //      liveness window the rest of the protocol already uses.
+    //   2. TEARDOWN NOW INTERRUPTS IT ANYWAY. Since #56 item 1, AudioProtocolHandler::close()
+    //      calls Socket::shutdownBoth() before close(), and a ::send already parked in the
+    //      kernel returns promptly on that. MEASURED on the same Linux container: a thread
+    //      parked in send() was still parked 5 s after a bare close(), and returned 11 ms
+    //      after shutdown()+close(). macOS returns immediately either way, which is why the
+    //      difference stayed invisible in this project for so long.
+    //
+    // So non-blocking send + poll would buy a tighter constant, not a different guarantee,
+    // and would cost making the shared fd non-blocking under the concurrent receive thread.
+    // If that trade is ever revisited, revisit it against these numbers and not against the
+    // 8 MB figure, which no naudio call path can produce.
     //
     // It needs no new error handling: the timeout reports EAGAIN/EWOULDBLOCK
     // (WSAETIMEDOUT on Windows), which isInterrupted() does not match, so sendAll returns
