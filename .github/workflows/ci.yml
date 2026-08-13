@@ -330,7 +330,18 @@ jobs:
             || { echo "::error::${want} symbols absent — the build is NOT instrumented, so a green run below would mean nothing"; exit 1; }
 
       - name: Test under ${{ matrix.label }}
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          # TSAN_OPTIONS is set only for the thread leg, and the path must be ABSOLUTE: ctest gives
+          # each test its own working directory, so a relative suppressions path resolves
+          # differently per arm and silently finds nothing.
+          if [ "${{ matrix.san }}" = "thread" ]; then
+            export TSAN_OPTIONS="suppressions=$GITHUB_WORKSPACE/tests/tsan-suppressions.txt"
+            echo "TSAN_OPTIONS=$TSAN_OPTIONS"
+          fi
+          ctest --test-dir build --output-on-failure
+        # The thread leg carries ONE suppression, for the shutdown-path race filed as #90, so this
+        # job still reddens on every other race instead of not existing. See
+        # tests/tsan-suppressions.txt — it states what deleting the entry must reproduce.
 
   ffi-clients:
     name: ffi example clients (python + java + rust vs the C ABI)

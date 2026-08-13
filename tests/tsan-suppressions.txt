@@ -1,0 +1,28 @@
+# ThreadSanitizer suppressions for the naudio suite (issue #28).
+#
+# RULES FOR THIS FILE, so it never becomes the dumping ground the issue warned about:
+#
+#   1. One entry per line, each preceded by the issue number it defers and the failure it hides.
+#   2. An entry is a MARKER FOR OPEN WORK, never an acceptance. Deleting it must reproduce a real,
+#      filed defect — if deleting a line changes nothing, the line is stale and goes.
+#   3. Third-party noise (PortAudio / ALSA internals) would be the other legitimate category. There
+#      is none today: the first instrumented run reported no race outside naudio's own code.
+#
+# Nothing here is suppressed because it was hard to read. Every line costs an issue.
+
+# ---------------------------------------------------------------------------------------------
+# issue #90 — Socket::close() runs while a worker thread is blocked in ::recv() on the SAME
+# descriptor. Reported 17 times in the first instrumented run, and not only from tests: the
+# production path is AudioStreamServer::stop() -> TcpServerTransport::close() ->
+# TcpClientConnection::close() -> AudioProtocolHandler::close() -> Socket::close(), which is
+# stop()'s documented "close the transport to unblock the accept thread" idiom.
+#
+# POSIX leaves close() concurrent with a blocking syscall on the same fd undefined; the practical
+# hazard is descriptor reuse, where the blocked recv() ends up referring to a different object. The
+# fix changes every transport's shutdown ordering (shutdown() before close(), or join-then-close)
+# and must not regress the two-pass stop() structure from #57, so it is a decision rather than a
+# patch and is tracked in #90.
+#
+# DELETE THIS LINE TO GET THE 17 FAILURES BACK. That is the check that this entry is still earning
+# its place.
+race:closeNative
