@@ -242,6 +242,35 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **`na_server_start` on a TCP transport no longer reports success on Windows for a port another
+  server is already listening on** (issue #85). The TCP listener was bound with `SO_REUSEADDR` on
+  every platform. On POSIX that is the restart-after-`TIME_WAIT` accommodation and it never permits
+  two live listeners — but Winsock's option of the same name permits binding a port another socket
+  is **actively listening on**, which is the behaviour `SO_EXCLUSIVEADDRUSE` exists to prevent. So
+  on Windows a second server started cleanly on a port already in use, `na_server_start` returned
+  `NA_OK` for a port it did not have, neither process was told, and connections reached only one of
+  them.
+
+  The listener now asks for *port ownership* rather than for a named flag, and each platform sets
+  whichever option delivers it: `SO_REUSEADDR` on POSIX, `SO_EXCLUSIVEADDRUSE` on Windows. The
+  Windows option is also strictly stronger than setting nothing, since the bare default still lets
+  another process take the port by setting `SO_REUSEADDR` itself.
+
+  This is the same defect as #83 on the other transport and platform, but not the same fix: #83
+  could drop the flag outright because UDP has no `TIME_WAIT` for it to accommodate, whereas TCP
+  does. **A port is still immediately rebindable by a restarting server while its own previous
+  connections are in `TIME_WAIT`, on Windows under the new option as well as on POSIX** — asserted
+  as an explicit control on every CI job, because a fix that traded the double bind for a server
+  that cannot restart promptly would pass a "second bind is refused" test just as happily. That
+  control replaces one that staged no `TIME_WAIT` at all and so held whether the flag was set or
+  not.
+
+  **This is a behaviour change on Windows**, and the only callers it can affect are ones that were
+  previously getting silent success: a start that used to return `NA_OK` on an occupied TCP port now
+  fails with a bind error. POSIX behaviour is unchanged. No C ABI change and no wire change —
+  `na_server_start`'s signature and error convention are untouched; it now reports failure where it
+  previously reported success.
+
 - **`na_hamlib_bridge` lost a client's TX channel without saying anything** (issue #17). The bridge
   would carry an operator's transmit audio for about a second and then discard everything after it,
   with a healthy-looking console, an open port and no error on either side.
