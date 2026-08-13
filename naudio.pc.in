@@ -11,9 +11,16 @@ Version: @PROJECT_VERSION@
 # naudio.h (the C ABI) and the naudio/ C++ API headers under ${includedir}.
 Libs: -L${libdir} -lnaudio
 Cflags: -I${includedir}
-# Static-link closure (only consulted by `pkg-config --static`): the bundled
-# device backend pulls PortAudio; the codec/net layers park the caller on a
-# std::condition_variable, so the platform thread library is added below (empty
-# where pthread is folded into libc, e.g. macOS).
-Requires.private: portaudio-2.0
+# Static-link closure (consulted by `pkg-config --static`): the device backend pulls
+# PortAudio, and the codec/net layers park the caller on a std::condition_variable, so
+# the platform thread library is included too — empty where pthread is folded into
+# libc, e.g. macOS.
+#
+# There is deliberately NO Requires.private here (issue #61). pkg-config resolves
+# Requires.private on every query, not just --static, so naming a module that is not
+# installed makes plain `--cflags` and `--libs` exit 1 (measured, pkgconf 2.5.1) — and
+# this file describes the SHARED libnaudio, whose PortAudio dependency the dynamic
+# linker already carries, so no consumer of it needs PortAudio's development files.
+# The closure is expressed as raw flags below instead: Libs.private triggers no module
+# lookup, so the .pc degrades instead of erroring on a host without PortAudio.
 Libs.private: @NAUDIO_PC_PRIVATE_LIBS@

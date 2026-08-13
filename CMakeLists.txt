@@ -193,10 +193,26 @@ if(NOT NAUDIO_PORTAUDIO_TARGET)
         set(NAUDIO_SAVED_POLICY_MIN "${CMAKE_POLICY_VERSION_MINIMUM}")
     endif()
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    # Keep PortAudio's own install rules out of `cmake --install` so our prefix ships
+    # only naudio — the exact analogue of INSTALL_GTEST OFF below, which PortAudio had
+    # no counterpart for. Measured before this line existed: a FetchContent install
+    # additionally deposited portaudio.h, pa_mac_core.h, libportaudio.a, libportaudio
+    # .dylib, lib/cmake/portaudio/*, lib/pkgconfig/portaudio-2.0.pc and
+    # share/doc/portaudio/* into the naudio prefix (issue #61).
+    #
+    # This is load-bearing in BOTH directions, and the two halves must land together:
+    # disabling PortAudio's install also removes it from any export set, so if
+    # naudio_pa still named a PortAudio target in its INSTALL interface, install(EXPORT
+    # naudioTargets) would hard-fail at generate time. The $<BUILD_INTERFACE:> below is
+    # what makes this safe.
+    set(PA_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
     FetchContent_Declare(portaudio
         GIT_REPOSITORY https://github.com/PortAudio/portaudio.git
         GIT_TAG v19.7.0)
     FetchContent_MakeAvailable(portaudio)
+    # Which resolution path we took — read by the naudio.pc generation below, where a
+    # bundled PortAudio must NOT be advertised as an external pkg-config module.
+    set(NAUDIO_PORTAUDIO_BUNDLED TRUE)
     # Restore exactly: a set("") would leave the variable defined-but-empty for the
     # rest of the configure (the googletest FetchContent below sees it too).
     if(DEFINED NAUDIO_SAVED_POLICY_MIN)
@@ -232,7 +248,18 @@ add_library(naudio_pa STATIC
 target_include_directories(naudio_pa PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
-target_link_libraries(naudio_pa PUBLIC naudio_core ${NAUDIO_PORTAUDIO_TARGET})
+# PortAudio is linked in the BUILD interface ONLY. Without the generator expression
+# the build-time target NAME is baked into the installed naudioTargets.cmake — either
+# `PkgConfig::PORTAUDIO` or the bare `portaudio_static`, depending on how this machine
+# resolved it — and naudioConfig.cmake must then recreate that exact name. It could
+# only ever recreate one of the two, and only via pkg-config, which is why
+# find_package(naudio) failed two different ways before this line (issue #61):
+#   * on MSVC (no pkg-config at all)  -> "dependency PkgConfig could not be found"
+#   * on a FetchContent-built install -> "imported targets are referenced, but are
+#                                         missing: portaudio_static"
+# With the install interface carrying no PortAudio target, naudioConfig.cmake resolves
+# PortAudio on the CONSUMER's terms and attaches it to naudio::naudio_pa there.
+target_link_libraries(naudio_pa PUBLIC naudio_core "$<BUILD_INTERFACE:${NAUDIO_PORTAUDIO_TARGET}>")
 set_target_properties(naudio_pa PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ----------------------------------------------------------------------------
@@ -305,17 +332,50 @@ set_target_properties(naudio PROPERTIES
 #                             of the build.
 # Both reachable via find_package(naudio) (CMake) or pkg-config (naudio.pc, C ABI).
 #
-# PortAudio note: naudio::naudio_pa references PkgConfig::PORTAUDIO in its install
-# interface, so naudioConfig.cmake recreates it via pkg-config. This assumes a
-# system/Homebrew PortAudio (the supported build path). PortAudio is already a
-# runtime dependency of the naudio dylib (the bundled backend loads libportaudio),
-# so requiring it at find_package time adds no new burden. Exporting against a
-# FetchContent-built PortAudio is out of scope here (a CI concern).
+# PortAudio note: the installed package names NO PortAudio target (the link above is
+# $<BUILD_INTERFACE:>-scoped), so this export is independent of how THIS machine
+# resolved PortAudio — system pkg-config or FetchContent both produce the same
+# naudioTargets.cmake. naudioConfig.cmake resolves PortAudio on the consumer's terms
+# (pkg-config, else a plain find_library/find_path) and attaches it to
+# naudio::naudio_pa, the only target that needs it. When nothing is found the package
+# still loads: naudio::naudio, the shared C ABI, has its backend linked in already and
+# is the surface a C / Hamlib consumer uses. Only the C++ naudio::naudio_pa archive
+# needs a consumer-side PortAudio. (Issue #61; exporting against a FetchContent-built
+# PortAudio was previously waved off here as "out of scope, a CI concern" — it was the
+# defect.)
 include(CMakePackageConfigHelpers)
 
-# Portable thread lib for the pkg-config static-link closure: CMAKE_THREAD_LIBS_INIT
-# is "-lpthread" where a separate lib is needed and empty where it is folded into libc.
+# The pkg-config static-link closure, as literal linker flags.
+#
+# naudio.pc carries NO Requires.private, deliberately (issue #61). pkg-config resolves
+# Requires.private on EVERY query, not just --static, so a module named there that is
+# not installed makes plain `pkg-config --cflags naudio` and `--libs naudio` exit 1
+# (measured, pkgconf 2.5.1). `Requires.private: portaudio-2.0` therefore broke the .pc
+# two ways: on a bundled build the module does not exist anywhere and the claim was
+# simply false, and on a system build any consumer without PortAudio's DEVELOPMENT
+# files hit the same hard error — while needing none of it, since naudio.pc describes
+# the SHARED libnaudio, whose PortAudio dependency the dynamic linker already carries.
+# For Hamlib upstream that is a build failure over a dependency Hamlib never uses.
+#
+# Libs.private is raw flags and triggers no module lookup, so the .pc degrades instead
+# of erroring on every host. CMAKE_THREAD_LIBS_INIT is "-lpthread" where a separate lib
+# is needed and empty where it is folded into libc (e.g. macOS).
 set(NAUDIO_PC_PRIVATE_LIBS "${CMAKE_THREAD_LIBS_INIT}")
+if(NOT NAUDIO_PORTAUDIO_BUNDLED)
+    # System PortAudio: record its static closure for `pkg-config --static`. Prefer the
+    # STATIC flag set — it carries the platform audio libraries (CoreAudio/AudioToolbox
+    # frameworks, libasound/libjack) that plain --libs omits. A bundled PortAudio needs
+    # no entry at all: it is linked INTO libnaudio.
+    if(PORTAUDIO_STATIC_LDFLAGS)
+        set(NAUDIO_PA_PC_LIBS "${PORTAUDIO_STATIC_LDFLAGS}")
+    else()
+        set(NAUDIO_PA_PC_LIBS "${PORTAUDIO_LDFLAGS}")
+    endif()
+    if(NAUDIO_PA_PC_LIBS)
+        string(REPLACE ";" " " NAUDIO_PA_PC_LIBS "${NAUDIO_PA_PC_LIBS}")
+        string(STRIP "${NAUDIO_PC_PRIVATE_LIBS} ${NAUDIO_PA_PC_LIBS}" NAUDIO_PC_PRIVATE_LIBS)
+    endif()
+endif()
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/naudio.pc.in"
                "${CMAKE_CURRENT_BINARY_DIR}/naudio.pc" @ONLY)
 

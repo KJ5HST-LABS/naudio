@@ -9,21 +9,90 @@
 #     naudio::naudio_net    -- transport/server/client (static C++)
 #     naudio::naudio_pa     -- PortAudio device backend (static C++)
 #
-# naudio::naudio_core / naudio_net use std::thread/std::mutex (Threads); the
-# device backend naudio::naudio_pa links PortAudio. Both are imported targets the
-# exported naudioTargets.cmake references by name, so they must exist before it is
-# included. PortAudio is also a runtime dependency of the naudio dylib (its bundled
-# backend loads libportaudio), so requiring it here is not an extra burden.
+# naudio::naudio_core / naudio_net use std::thread/std::mutex (Threads).
+#
+# PortAudio is required by exactly ONE target, naudio::naudio_pa, and this file does
+# NOT make it a hard dependency of the package (issue #61). The shared C ABI
+# naudio::naudio already has its device backend linked in, so a C / Hamlib consumer
+# — the primary audience — must be able to use the package on a host with no
+# PortAudio development files and no pkg-config at all. Before this, the package
+# hard-failed for both of them:
+#   * no pkg-config (MSVC)        -> "naudio could not be found because dependency
+#                                     PkgConfig could not be found"
+#   * FetchContent-built install  -> "imported targets are referenced, but are
+#                                     missing: portaudio_static"
+# The installed naudioTargets.cmake now names no PortAudio target at all, so the two
+# build paths export identically and the resolution happens here, on the consumer's
+# terms.
+#
+# Sets, for consumers who care:
+#   naudio_PORTAUDIO_FOUND  -- TRUE when naudio::naudio_pa is linkable
 
 include(CMakeFindDependencyMacro)
 
 find_dependency(Threads)
 
-if(NOT TARGET PkgConfig::PORTAUDIO)
-    find_dependency(PkgConfig)
-    pkg_check_modules(PORTAUDIO REQUIRED IMPORTED_TARGET portaudio-2.0)
+include("${CMAKE_CURRENT_LIST_DIR}/naudioTargets.cmake")
+
+# ---- PortAudio, for naudio::naudio_pa only ---------------------------------
+set(naudio_PORTAUDIO_FOUND FALSE)
+set(_naudio_pa_portaudio "")
+set(_naudio_pa_portaudio_includes "")
+
+# 1. pkg-config, where the host has it. Preferred: portaudio-2.0.pc carries the full
+#    private-link closure (on macOS the CoreAudio/AudioToolbox frameworks, on Linux
+#    libasound/libjack), which no find_library() result can reconstruct.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    if(NOT TARGET PkgConfig::PORTAUDIO)
+        pkg_check_modules(PORTAUDIO QUIET IMPORTED_TARGET portaudio-2.0)
+    endif()
+    if(TARGET PkgConfig::PORTAUDIO)
+        set(_naudio_pa_portaudio PkgConfig::PORTAUDIO)
+        set(naudio_PORTAUDIO_FOUND TRUE)
+    endif()
 endif()
 
-include("${CMAKE_CURRENT_LIST_DIR}/naudioTargets.cmake")
+# 2. Plain find_library/find_path fallback, for hosts with no pkg-config — MSVC and
+#    vcpkg above all. Names cover the vcpkg/system spellings and PortAudio's own
+#    MSVC output names.
+if(NOT naudio_PORTAUDIO_FOUND)
+    find_library(NAUDIO_PORTAUDIO_LIBRARY
+        NAMES portaudio portaudio_static
+              portaudio_x86 portaudio_x64
+              portaudio_static_x86 portaudio_static_x64)
+    find_path(NAUDIO_PORTAUDIO_INCLUDE_DIR NAMES portaudio.h)
+    mark_as_advanced(NAUDIO_PORTAUDIO_LIBRARY NAUDIO_PORTAUDIO_INCLUDE_DIR)
+    if(NAUDIO_PORTAUDIO_LIBRARY AND NAUDIO_PORTAUDIO_INCLUDE_DIR)
+        set(_naudio_pa_portaudio "${NAUDIO_PORTAUDIO_LIBRARY}")
+        set(_naudio_pa_portaudio_includes "${NAUDIO_PORTAUDIO_INCLUDE_DIR}")
+        set(naudio_PORTAUDIO_FOUND TRUE)
+        # Honest limit: a STATIC libportaudio found this way carries no record of the
+        # platform audio libraries it needs (frameworks / libasound / libjack). If the
+        # consumer's link fails on Pa_* dependencies rather than Pa_* itself, install a
+        # pkg-config-visible PortAudio and branch 1 above will supply the full closure.
+    endif()
+endif()
+
+if(TARGET naudio::naudio_pa AND naudio_PORTAUDIO_FOUND)
+    set_property(TARGET naudio::naudio_pa APPEND
+                 PROPERTY INTERFACE_LINK_LIBRARIES "${_naudio_pa_portaudio}")
+    if(_naudio_pa_portaudio_includes)
+        set_property(TARGET naudio::naudio_pa APPEND
+                     PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${_naudio_pa_portaudio_includes}")
+    endif()
+elseif(NOT naudio_PORTAUDIO_FOUND)
+    # Deliberately not a fatal error, and deliberately not silent: naudio::naudio,
+    # naudio::naudio_core and naudio::naudio_net are all fully usable from here. Only a
+    # consumer that links naudio::naudio_pa is affected, and it would otherwise learn
+    # this as an undefined-Pa_*-symbol wall at link time with nothing naming the cause.
+    message(STATUS
+        "naudio: no PortAudio found (no pkg-config portaudio-2.0, no portaudio library "
+        "on the search path). naudio::naudio and the C ABI are unaffected; linking "
+        "naudio::naudio_pa will fail until a PortAudio is installed.")
+endif()
+
+unset(_naudio_pa_portaudio)
+unset(_naudio_pa_portaudio_includes)
 
 check_required_components(naudio)
