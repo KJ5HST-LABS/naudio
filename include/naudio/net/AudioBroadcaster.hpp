@@ -108,6 +108,9 @@ public:
 private:
     void captureLoop();
     void broadcastToTargets(const std::uint8_t* data, std::size_t offset, std::size_t length);
+    // The largest single fan-out frame: the wire limit, rounded DOWN to a whole sample frame
+    // so a chunk boundary can never fall mid-sample (#20).
+    std::size_t maxFrameBytes() const;
     void notifyTargetFailed(const std::string& targetId, const std::string& reason);
 
     AudioStreamConfig config_;

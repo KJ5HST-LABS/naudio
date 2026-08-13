@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "naudio/AudioPacket.hpp"
 #include "naudio/AudioStreamConfig.hpp"
 #include "naudio/FakeBackend.hpp"
 #include "naudio/Stream.hpp"
@@ -44,6 +45,7 @@ public:
         std::lock_guard<std::mutex> lock(m_);
         received_.insert(received_.end(), data + offset, data + offset + length);
         ++calls_;
+        callLengths_.push_back(length);
         return true;
     }
     std::string targetId() const override { return id_; }
@@ -56,12 +58,19 @@ public:
         std::lock_guard<std::mutex> lock(m_);
         return calls_;
     }
+    // The length of each individual fan-out call. bytes() concatenates them and so cannot see
+    // where one frame ended and the next began — which is exactly what #20's framing is about.
+    std::vector<std::size_t> callLengths() {
+        std::lock_guard<std::mutex> lock(m_);
+        return callLengths_;
+    }
 
 private:
     std::string id_;
     bool accept_;
     std::mutex m_;
     std::vector<std::uint8_t> received_;
+    std::vector<std::size_t> callLengths_;
     int calls_ = 0;
 };
 
@@ -131,6 +140,47 @@ TEST(Broadcaster, InjectFansOutByteIdenticalToAllTargets) {
     EXPECT_EQ(t3->bytes(), expected);
     EXPECT_EQ(t1->bytes(), t2->bytes());
     EXPECT_EQ(t2->bytes(), t3->bytes());
+}
+
+// #20: the fan-out frames an oversized buffer to the wire limit — and never mid-sample.
+//
+// The end-to-end proof that no bytes are LOST is Server.OversizedInjectIsFramedNotTruncated;
+// this arm pins the framing MECHANISM at the choke point, which the end-to-end arm cannot see
+// cleanly: where the chunk boundaries fall.
+//
+// The 3-channel config is the point of the arm, not incidental. At 16-bit stereo a sample frame
+// is 4 bytes and MAX_PAYLOAD (16384) is an exact multiple of it, so chunking at MAX_PAYLOAD is
+// sample-aligned BY COINCIDENCE and a naive implementation looks correct forever. At 3 channels
+// the sample frame is 6 bytes, 16384 is NOT a multiple of 6, and a naive chunk splits a sample
+// across two packets — every subsequent sample in that chunk is then decoded one channel out of
+// phase. AudioStreamConfig is a public C++ struct with no channel-count guard, so this is
+// reachable; the C ABI separately pins channels to 1 or 2 (naudio_c_api.cpp:1178), which is why
+// no C-level arm can reach it.
+TEST(Broadcaster, OversizedInjectIsFramedToWireLimitOnSampleBoundaries) {
+    AudioStreamConfig cfg{};
+    cfg.channels = 3;
+    cfg.bitsPerSample = 16;
+    const std::size_t kSampleFrame = 6;  // (16 / 8) * 3
+
+    AudioBroadcaster b{cfg};
+    auto t = std::make_shared<RecordingTarget>("a");
+    b.addTarget(t);
+
+    // A multiple of the sample frame, spanning two full chunks plus a partial.
+    const std::size_t kInject = kSampleFrame * 5500;  // 33000
+    std::vector<std::uint8_t> payload(kInject);
+    for (std::size_t i = 0; i < kInject; ++i) {
+        payload[i] = static_cast<std::uint8_t>((i * 7 + 13) & 0xFF);
+    }
+    b.injectAudio(payload);
+
+    EXPECT_EQ(t->bytes(), payload) << "bytes lost or reordered by the framing";
+    const std::vector<std::size_t> lengths = t->callLengths();
+    ASSERT_GT(lengths.size(), 1u) << "did not frame at all — one oversized call";
+    for (std::size_t n : lengths) {
+        EXPECT_LE(n, AudioPacket::MAX_PAYLOAD) << "frame exceeds what serialize() will emit";
+        EXPECT_EQ(n % kSampleFrame, 0u) << "frame boundary split a sample";
+    }
 }
 
 TEST(Broadcaster, InjectWithNoTargetsIsNoOp) {

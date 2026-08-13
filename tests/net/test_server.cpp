@@ -207,6 +207,62 @@ TEST(Server, SingleClientHandshakeAndInjectedRx) {
     server.stop();
 }
 
+// #20: an inject larger than MAX_PAYLOAD must not be silently truncated.
+//
+// serialize() clamps the payload to MAX_PAYLOAD (AudioPacket.cpp:73). That clamp is correct in
+// itself — the length field is a u16 and deserialize() rejects anything longer, so the encoder
+// must never emit a frame the decoder would reject. What was missing is the layer above it:
+// nothing SPLIT an oversized buffer, so a single injectAudio serialized to ONE clamped packet and
+// the remainder was dropped with no error, no counter and no log, while every layer reported
+// success. MEASURED before the fix, over this exact path: inject(70000) -> NA_OK, 16384 bytes at
+// the client, 53616 gone; inject(16385) -> NA_OK, one byte gone. The fan-out now frames an
+// oversized buffer instead, so every injected byte arrives.
+//
+// THIS ARM IS END-TO-END ON PURPOSE. A broadcaster-level arm cannot see this defect at all: the
+// whole buffer does reach the BroadcastTarget today: the loss happens later, inside serialize().
+// Only a real client reading real 0xAF01 frames off a real socket observes it.
+TEST(Server, OversizedInjectIsFramedNotTruncated) {
+    AudioStreamServer server{0};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    TcpClientTransport client;
+    auto cc = client.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
+    ASSERT_TRUE(cc) << err;
+    ASSERT_TRUE(clientHandshake(*cc, "tester"));
+    ASSERT_TRUE(waitForClientsUpdate(*cc, 1, 3000));
+
+    // Two full chunks plus a partial, so the arm pins the full-chunk path AND the remainder —
+    // a fix that framed only whole chunks would drop the tail and still look green on a
+    // round multiple.
+    const std::size_t kInject = AudioPacket::MAX_PAYLOAD * 2 + 1234;
+    std::vector<std::uint8_t> payload(kInject);
+    for (std::size_t i = 0; i < kInject; ++i) {
+        // Position-derived, not constant: a constant fill cannot distinguish "all bytes arrived"
+        // from "one chunk arrived three times", and cannot see reordering at all.
+        payload[i] = static_cast<std::uint8_t>((i * 7 + 13) & 0xFF);
+    }
+    server.injectAudio(payload);
+
+    // Reassemble across however many AUDIO_RX frames the server chose to send. The count is
+    // deliberately not asserted — the contract is "every byte, in order, each frame wire-legal",
+    // not a particular chunk size.
+    std::vector<std::uint8_t> got;
+    while (got.size() < kInject) {
+        auto rx = recvUntil(*cc, PacketType::AudioRx, std::nullopt, 2000);
+        ASSERT_TRUE(rx.has_value())
+            << "stalled after " << got.size() << " of " << kInject << " bytes";
+        EXPECT_LE(rx->payload().size(), AudioPacket::MAX_PAYLOAD)
+            << "emitted a frame the decoder would reject";
+        got.insert(got.end(), rx->payload().begin(), rx->payload().end());
+    }
+    EXPECT_EQ(got.size(), kInject);
+    EXPECT_EQ(got, payload);
+
+    server.stop();
+}
+
 // maxClients enforced: the third client is rejected BUSY while two are connected.
 TEST(Server, MaxClientsRejectsBusy) {
     AudioStreamConfig config{};
