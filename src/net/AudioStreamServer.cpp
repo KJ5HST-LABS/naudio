@@ -662,6 +662,7 @@ std::shared_ptr<ServerTransport> AudioStreamServer::createTransport() {
             cfg.fecEnabled = config_.fecEnabled;
             cfg.fecBlockSize = config_.fecBlockSize;
             cfg.frameDurationMs = config_.frameDurationMs;
+            cfg.maxAudioPayloadBytes = config_.udpMaxAudioPayload();  // #86
             cfg.adaptiveJitterEnabled = config_.adaptiveJitterEnabled;
             cfg.jitterMinMs = config_.bufferMinMs;
             cfg.jitterMaxMs = config_.bufferMaxMs;

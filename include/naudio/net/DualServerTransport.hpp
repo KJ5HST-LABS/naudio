@@ -40,6 +40,7 @@ public:
         cfg.fecEnabled = config.fecEnabled;
         cfg.fecBlockSize = config.fecBlockSize;
         cfg.frameDurationMs = config.frameDurationMs;
+        cfg.maxAudioPayloadBytes = config.udpMaxAudioPayload();  // #86
         cfg.adaptiveJitterEnabled = config.adaptiveJitterEnabled;
         cfg.jitterMinMs = config.bufferMinMs;
         cfg.jitterMaxMs = config.bufferMaxMs;
