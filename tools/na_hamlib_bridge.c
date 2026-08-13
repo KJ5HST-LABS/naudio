@@ -242,6 +242,49 @@ typedef struct {
     int use_ptt;
 } bridge;
 
+/* ------------------------------------------------------------------ naudio server events */
+
+/* The naudio server names every fault it hits — a refused send, an outbound backlog, a heartbeat
+ * that could not go out, a connection that timed out — through notifyError. Until now this bridge
+ * registered no callbacks table at all, so all of it fanned out to nobody: the C ABI forwards
+ * onError only when cbs.on_error is set. That is the open half of issue #17.
+ *
+ * The one that motivated this is worth naming, because it is the reason a TX lapse looked causeless.
+ * writerLoop closes a session whose send failed, and closing it unregisters it from the mixer, which
+ * releases any TX channel it held — an operator mid-transmission goes off the air. The library has
+ * reported the direction and the size of that failed send since the #17 investigation added it
+ * ("Send error: RX audio frame (16407 bytes)"), precisely so an oversized-frame kill is
+ * distinguishable from a client that genuinely went away. On this path the message was constructed,
+ * posted to the dispatch thread, and dropped for want of a listener.
+ *
+ * Errors go to stderr, roster changes to stdout, matching the rest of this file: stderr is what a
+ * supervisor's journal shows first, and the roster lines belong beside the periodic health block. */
+static void on_server_error(const char *client_id, const char *message, void *user) {
+    (void)user;
+    /* An empty client_id means the fault is the server's own rather than one session's — an accept
+     * error or a lost device (AudioStreamServer.cpp notifyError call sites). Do not print an empty
+     * bracket for it. */
+    if (client_id && *client_id)
+        fprintf(stderr, "na_hamlib_bridge: server error [%s]: %s\n", client_id, message);
+    else
+        fprintf(stderr, "na_hamlib_bridge: server error: %s\n", message);
+}
+
+static void on_client_connected(const char *client_id, const char *addr, void *user) {
+    (void)user;
+    printf("na_hamlib_bridge: client %s connected from %s\n", client_id, addr);
+    fflush(stdout);
+}
+
+/* The other half of a TX lapse caused by a dropped session: the error above says WHY, this says the
+ * client is gone. Either alone is ambiguous — a disconnect with no error is an ordinary client
+ * leaving, and #17's whole complaint was that the operator got neither. */
+static void on_client_disconnected(const char *client_id, void *user) {
+    (void)user;
+    printf("na_hamlib_bridge: client %s disconnected\n", client_id);
+    fflush(stdout);
+}
+
 /* ------------------------------------------------------------------ TX: naudio -> ring */
 
 static void on_tx_frame(const unsigned char *pcm, size_t n_bytes, void *user) {
@@ -294,6 +337,21 @@ static void *tx_thread(void *arg) {
     printf("na_hamlib_bridge: tx write budget %zu bytes/call\n", chunk);
     fflush(stdout);
     int ptt_on = 0;
+    /* TX-ownership episodes. Issue #17's signature is ownership claimed at the start of a run, held
+     * for about a second, and then gone for the rest of it — while the mixer keeps handing this
+     * thread silence frames that the `has_owner` test below correctly discards. Nothing on this path
+     * said so, which is what made the operator's audio disappear quietly.
+     *
+     * A line per transition, carrying how long the episode lasted and how many bytes actually
+     * reached the radio, makes that shape readable in the log on its own — whether or not the cause
+     * announces itself through on_server_error above. The counters are local to this loop and read
+     * by nobody else, so unlike the ring's loss counters and the RX meter they need no mutex.
+     *
+     * A run that is still transmitting when SIGINT arrives leaves its final episode unclosed and
+     * unprinted. That is deliberate: it is the operator's own shutdown, not a lapse. */
+    int owned = 0;
+    struct timespec owned_since = {0, 0};
+    unsigned long long owned_written = 0;
     for (;;) {
         if (g_stop) break;
         size_t n = ring_pop(&b->txring, tmp, chunk);
@@ -306,6 +364,22 @@ static void *tx_thread(void *arg) {
          * matching session before any claim can be recorded. An empty-string owner is therefore
          * unrepresentable and "length 0 == nobody is transmitting" holds. */
         int has_owner = na_server_tx_owner(b->srv, NULL, 0) > 0;
+        if (has_owner != owned) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (has_owner) {
+                owned_since = now;
+                owned_written = 0;
+                printf("na_hamlib_bridge: tx owner acquired\n");
+            } else {
+                double held = (double)(now.tv_sec - owned_since.tv_sec)
+                            + (double)(now.tv_nsec - owned_since.tv_nsec) / 1e9;
+                printf("na_hamlib_bridge: tx owner released after %.2fs, %llu B to the rig\n",
+                       held, owned_written);
+            }
+            fflush(stdout);
+            owned = has_owner;
+        }
         if (b->use_ptt) {
             if (has_owner && !ptt_on) { rig_set_ptt(b->rig, RIG_VFO_CURR, RIG_PTT_ON);  ptt_on = 1; }
             else if (!has_owner && ptt_on) { rig_set_ptt(b->rig, RIG_VFO_CURR, RIG_PTT_OFF); ptt_on = 0; }
@@ -323,6 +397,7 @@ static void *tx_thread(void *arg) {
                 break;
             }
             if (written > n) written = n;   /* never trust a count past what we offered */
+            owned_written += written;       /* what this episode actually delivered to the radio */
             if (written < n) {
                 /* Short write — including the -RIG_ETIMEOUT case, where the popped bytes are just
                  * as gone as on the success path. Hand the tail back and retry it next pass, which
@@ -594,6 +669,26 @@ int main(int argc, char **argv) {
     if (na_server_set_reliability_profile(b.srv, profile) != NA_OK ||
         na_server_set_audio_format(b.srv, 48000, 16, channels) != NA_OK) {
         fprintf(stderr, "na_hamlib_bridge: server config: %s\n", na_strerror(na_last_error()));
+        startup_failed = 1;
+        goto teardown_all;
+    }
+    /* Roster + fault reporting. This MUST precede na_server_start — na_server_set_callbacks refuses
+     * with NA_ERR_INVALID once the server has been started, because the dispatch worker reads the
+     * table with no lock. The struct is caller-allocated and carries its own size, so the memset +
+     * struct_size pair is the documented way to stay forward-compatible (naudio.h).
+     *
+     * A failure here is fatal for the same reason the config calls above are: it can only mean the
+     * ABI contract was broken (a NULL server, a short struct, or a server already started), and a
+     * bridge that comes up unable to report its own faults is the exact condition issue #17 is
+     * about. Better to refuse to start than to run blind. */
+    na_server_callbacks cbs;
+    memset(&cbs, 0, sizeof cbs);
+    cbs.struct_size = sizeof cbs;
+    cbs.on_client_connected = on_client_connected;
+    cbs.on_client_disconnected = on_client_disconnected;
+    cbs.on_error = on_server_error;
+    if (na_server_set_callbacks(b.srv, &cbs, NULL) != NA_OK) {
+        fprintf(stderr, "na_hamlib_bridge: server callbacks: %s\n", na_strerror(na_last_error()));
         startup_failed = 1;
         goto teardown_all;
     }

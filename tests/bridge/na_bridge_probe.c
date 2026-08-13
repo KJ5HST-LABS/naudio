@@ -127,7 +127,7 @@ static void sleep_ms(int ms) {
  *
  * Issue #6's fault — a short rig_stream_write silently dropping TX audio — cannot be provoked
  * unless a client is ACTUALLY transmitting: na_hamlib_bridge's tx_thread calls rig_stream_write
- * only while na_server_tx_owner reports an owner (tools/na_hamlib_bridge.c:275-286). A pure RX
+ * only while na_server_tx_owner reports an owner (tools/na_hamlib_bridge.c:366-397). A pure RX
  * probe leaves that whole path unreached, so --tx exists to key up and feed it.
  *
  * The route is public C ABI end to end: na_client_set_tx_inject BEFORE connect (it decides whether

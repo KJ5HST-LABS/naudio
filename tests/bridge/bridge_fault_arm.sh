@@ -12,14 +12,14 @@
 # scratchpad that evaporated with it (issues #5 and #6, then #15, then #35).
 #
 #   #5  a dead worker thread left the bridge running with no audio. Fixed by worker_failed()
-#       (tools/na_hamlib_bridge.c:49-57), which sets g_stop and g_failed so main tears down and
+#       (tools/na_hamlib_bridge.c:61-69), which sets g_stop and g_failed so main tears down and
 #       returns 1. #5's acceptance list has TWO checkboxes — an RX stream error and a TX one —
 #       because rx_thread and tx_thread have the same shape and the same fix. Arm A guards the RX
 #       half; arm D guards the TX half (issue #37). One arm did not cover both: the two workers
 #       reach worker_failed() from separate call sites, and a mutation that deletes only the TX
 #       one leaves arm A entirely green (measured — see the mutation table in issue #37).
 #   #6  a short rig_stream_write silently dropped the unwritten tail. Fixed by ring_requeue()
-#       (tools/na_hamlib_bridge.c:122-137), which hands the tail back and counts what no longer
+#       (tools/na_hamlib_bridge.c:146-161), which hands the tail back and counts what no longer
 #       fits. Guarded here by arm C.
 #
 # THE ARMS MUST DISAGREE, and arm B is the one that makes the others mean anything:

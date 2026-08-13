@@ -11,16 +11,22 @@
 # skip that scrolls past. The content detector it relies on is proved separately and unconditionally
 # by `naudio_bridge_probe --selftest`, which runs on every platform.
 #
-# TWO ARMS, AND THE SECOND IS THE POINT.
-#   tone    -> the probe must see CONTENT
-#   silence -> the probe must see SILENCE
-# Measured on 2026-07-31 against the Hamlib dummy, those two runs are indistinguishable on every
-# volume-shaped metric (956160 vs 954240 bytes, 996 vs 994 callbacks, and the bridge's own meter
-# says 83% of nominal for both). Only peak |sample| separates them, 16383 against 0. A one-armed
-# version of this test would pass against a completely silent bridge, which is exactly the failure
-# issue #15's own comment calls the single highest-value line in the harness.
+# FOUR ARMS:
+#   tone      -> the probe must see CONTENT                                        (issue #15)
+#   silence   -> the probe must see SILENCE                                        (issue #15)
+#   exit-code -> a bridge whose na_server_start failed must NOT exit 0             (issue #16)
+#   lapse     -> a lost TX channel must name its cause instead of going quiet      (issue #17)
 #
-# The two arms must DISAGREE, so no constant-returning probe satisfies both (Learning 58).
+# THE FIRST TWO ARE A PAIR, AND THE SECOND IS THE POINT. Measured on 2026-07-31 against the Hamlib
+# dummy, those two runs are indistinguishable on every volume-shaped metric (956160 vs 954240 bytes,
+# 996 vs 994 callbacks, and the bridge's own meter says 83% of nominal for both). Only peak |sample|
+# separates them, 16383 against 0. A one-armed version of this test would pass against a completely
+# silent bridge, which is exactly the failure issue #15's own comment calls the single highest-value
+# line in the harness.
+#
+# The two arms must DISAGREE, so no constant-returning probe satisfies both (Learning 58). The
+# lapse arm is paired the same way: its `server error` grep means something only because run_arm
+# asserts an undisturbed run produces none.
 #
 # macOS SIP TRAP (CLAUDE.md Learning 6): the bridge is launched DIRECTLY from this script and never
 # wrapped in `timeout`, `perl` or another shell. Those are SIP-protected binaries, and exec'ing one
@@ -61,7 +67,7 @@ run_arm () {
 
     # Wait for the bridge to report itself listening rather than sleeping a guessed constant. The
     # "-> naudio :<port>" line is printed only AFTER na_server_start succeeds
-    # (tools/na_hamlib_bridge.c:480), and the fflush on the next line exists precisely so it is not
+    # (tools/na_hamlib_bridge.c:706), and the fflush just below it exists precisely so it is not
     # stuck in a buffer when stdout is a file — so it is a real readiness signal, not a guess.
     #
     # Retrying the PROBE instead would be far more expensive: a UDP connect to a port with no
@@ -92,6 +98,17 @@ run_arm () {
     # crash, and three startup paths that exit 0 wrongly are already tracked as #16.
     if [ "$bexit" -ne 0 ]; then
         echo "FAIL bridge_arm/$mode: bridge exited $bexit on SIGINT, expected 0" >&2
+        prc=1
+    fi
+
+    # NEGATIVE CONTROL for the lapse arm below (issue #17). That arm passes when the bridge prints
+    # a `server error` line; this asserts an undisturbed run prints none, so the grep it keys on
+    # cannot be satisfied by something the bridge says anyway. Without this pair the lapse arm would
+    # be green against a bridge that logged "server error" unconditionally.
+    if grep -q 'server error' "$log" 2>/dev/null; then
+        echo "FAIL bridge_arm/$mode: the bridge reported a server error on an undisturbed run," >&2
+        echo "  which both breaks this arm and makes the #17 lapse arm's grep meaningless." >&2
+        sed -n '/server error/s/^/    | /p' "$log" >&2
         prc=1
     fi
 
@@ -207,6 +224,141 @@ run_exit_code_arm () {
     return 0
 }
 
+# ------------------------------------------------- arm: a TX lapse must NAME ITSELF (issue #17)
+#
+# #17: the bridge holds TX ownership for about a second, loses it, and discards every later frame in
+# silence — "unattended box, healthy console, no audio". Its root cause was characterized and fixed
+# in the LIBRARY (a legal RX packet exceeding SO_SNDBUF was refused, writerLoop closed the session,
+# and closing it released the TX channel), and the library has named the direction and size of that
+# failed send ever since. None of it reached this bridge: na_hamlib_bridge registered no
+# na_server_callbacks table, so the C ABI forwarded onError to nobody and every server fault was
+# constructed, dispatched, and dropped. That is what this arm guards.
+#
+# It cannot reproduce the ORIGINAL fault — that needs an RX frame over 9216 bytes, and the Hamlib
+# dummy tops out at 2880 (measured in #17's own investigation). It does not need to. What was broken
+# was DELIVERY, one seam shared by every server fault, so any real notifyError exercises it. An
+# abruptly-killed client is the cheap one: no clean DISCONNECT, so the session dies on the UDP
+# connection timeout (UdpClientConnection.hpp UDP_CONNECTION_TIMEOUT_MS = 8000) and the server
+# reports it exactly as it would report a refused send.
+#
+# FOUR ASSERTIONS, AND THEY FAIL SEPARATELY ON PURPOSE:
+#   1  tx owner acquired           the client really did take the channel (else 2 is vacuous)
+#   2  tx owner released after     the lapse itself is logged, with duration and bytes delivered
+#   3  server error [...]          the CAUSE reaches the operator — the registration this fixes
+#   4  client ... disconnected     the roster change reaches the operator
+# 1 is what keeps the rest honest: without it a bridge that never saw a client would satisfy "no
+# audio was silently lost" by never having any. The negative control lives in run_arm above, which
+# asserts an undisturbed run prints no `server error` at all.
+#
+# The probe is SIGKILLed rather than asked to stop: a clean na_client_disconnect is an ordinary
+# departure the server has no reason to report, and asserting on it would test nothing.
+run_lapse_arm () {
+    log="$workdir/bridge.lapse.log"
+    plog="$workdir/probe.lapse.log"
+
+    "$BRIDGE" -m 1 -S loopback -p "$PORT" >"$log" 2>&1 &
+    bpid=$!
+    ready=0
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$bpid" 2>/dev/null; then break; fi
+        if grep -q -- '-> naudio :' "$log" 2>/dev/null; then ready=1; break; fi
+        sleep 0.1
+    done
+    if [ "$ready" -eq 0 ]; then
+        echo "FAIL bridge_arm/lapse: the bridge never reported itself listening" >&2
+        sed 's/^/    | /' "$log" >&2
+        kill -INT "$bpid" 2>/dev/null
+        wait "$bpid" 2>/dev/null
+        return 2
+    fi
+
+    # --seconds outlives the arm deliberately: the probe must still be transmitting when it is
+    # killed, so the channel is lost mid-transmission rather than released on its way out.
+    "$PROBE" --port "$PORT" --seconds 60 --tx --expect content >"$plog" 2>&1 &
+    ppid=$!
+
+    # Wait for the client to ARRIVE before killing anything. Sleeping a constant here would race the
+    # connect on a loaded runner and kill a probe that never transmitted, reporting a harness timing
+    # fault as a bridge defect.
+    #
+    # The gate keys on `clients=1` from the periodic health block — NOT on any line this issue added.
+    # That matters: gating on `tx owner acquired` was the first version, and it made deleting the
+    # ownership log look like "no client ever connected" (a harness fault, exit 2) instead of the
+    # regression it is. A readiness gate must never be the thing under test, or its absence and the
+    # defect's presence become the same observation. `clients=` is na_server_client_count, which
+    # predates all of this. Costs up to one 5 s health tick.
+    arrived=0
+    for _ in $(seq 1 150); do
+        if ! kill -0 "$ppid" 2>/dev/null; then break; fi
+        if grep -q 'clients=1' "$log" 2>/dev/null; then arrived=1; break; fi
+        sleep 0.1
+    done
+    if [ "$arrived" -eq 0 ]; then
+        echo "FAIL bridge_arm/lapse: no client ever reached the bridge, so this arm cannot" >&2
+        echo "  measure a lapse (harness fault, not a bridge defect)." >&2
+        sed 's/^/    | /' "$log" >&2
+        sed 's/^/    p /' "$plog" >&2
+        kill -9 "$ppid" 2>/dev/null; wait "$ppid" 2>/dev/null
+        kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        return 2
+    fi
+    # A client is provably present, so from here the ownership line's absence is a REGRESSION, not a
+    # timing fault. Bounded wait: the probe keys up immediately after connect, and `clients=1` may
+    # have been printed on a tick before ownership was claimed.
+    for _ in $(seq 1 100); do
+        if grep -q 'tx owner acquired' "$log" 2>/dev/null; then break; fi
+        if ! kill -0 "$ppid" 2>/dev/null; then break; fi
+        sleep 0.1
+    done
+
+    kill -9 "$ppid" 2>/dev/null
+    wait "$ppid" 2>/dev/null
+
+    # Deadline past the 8 s connection timeout with room for a slow runner. Polling the log rather
+    # than sleeping the worst case keeps the arm at about the timeout's length on a healthy machine.
+    for _ in $(seq 1 250); do
+        if ! kill -0 "$bpid" 2>/dev/null; then break; fi
+        if grep -q 'server error' "$log" 2>/dev/null; then break; fi
+        sleep 0.1
+    done
+
+    kill -INT "$bpid" 2>/dev/null
+    wait "$bpid" 2>/dev/null
+    bexit=$?
+
+    arc=0
+    if ! grep -q 'tx owner acquired' "$log" 2>/dev/null; then
+        echo "FAIL bridge_arm/lapse: the bridge never logged taking the TX channel" >&2
+        arc=1
+    fi
+    if ! grep -q 'tx owner released after' "$log" 2>/dev/null; then
+        echo "FAIL bridge_arm/lapse: TX ownership was lost and the bridge never said so. This is" >&2
+        echo "  issue #17's silence: every later frame is discarded correctly and invisibly." >&2
+        arc=1
+    fi
+    if ! grep -q 'server error' "$log" 2>/dev/null; then
+        echo "FAIL bridge_arm/lapse: the server reported a fault and the bridge printed nothing." >&2
+        echo "  na_hamlib_bridge must register an na_server_callbacks table with on_error set" >&2
+        echo "  BEFORE na_server_start, or the C ABI forwards onError to nobody and a lost" >&2
+        echo "  session has no stated cause — issue #17's open half regressing." >&2
+        arc=1
+    fi
+    if ! grep -q 'disconnected' "$log" 2>/dev/null; then
+        echo "FAIL bridge_arm/lapse: the client was dropped and the roster change was not logged" >&2
+        arc=1
+    fi
+    if [ "$bexit" -ne 0 ]; then
+        echo "FAIL bridge_arm/lapse: bridge exited $bexit on SIGINT, expected 0" >&2
+        arc=1
+    fi
+    if [ "$arc" -ne 0 ]; then
+        sed 's/^/    | /' "$log" >&2
+        return "$arc"
+    fi
+    echo "  bridge_arm/lapse: OK ($(grep -c 'server error' "$log") server error line(s), TX episode logged)"
+    return 0
+}
+
 echo "bridge_arm: $BRIDGE on :$PORT, ${SECS}s per arm"
 
 run_arm tone content   || rc=$?
@@ -217,8 +369,12 @@ run_arm silence silence || { arc=$?; [ "$rc" -eq 0 ] && rc=$arc; }
 # "the bridge delivers nothing" and "the bridge misreports a failed startup" are different
 # diagnoses, and only running both tells them apart.
 run_exit_code_arm       || { arc=$?; [ "$rc" -eq 0 ] && rc=$arc; }
+# Same reasoning again: "the bridge delivers no audio" and "the bridge loses a session in silence"
+# are different diagnoses, and this arm is the only one that can report the second.
+run_lapse_arm           || { arc=$?; [ "$rc" -eq 0 ] && rc=$arc; }
 
 if [ "$rc" -eq 0 ]; then
-    echo "bridge_arm: OK — content on tone, silence on silence, and a failed startup exits non-zero"
+    echo "bridge_arm: OK — content on tone, silence on silence, a failed startup exits non-zero," \
+         "and a lost TX channel names its cause"
 fi
 exit "$rc"
