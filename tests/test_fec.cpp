@@ -145,7 +145,13 @@ AudioPacket buildParity(std::int32_t startSeq, const std::vector<std::vector<std
         static_cast<std::uint8_t>((s >> 8) & 0xFF),  static_cast<std::uint8_t>(s & 0xFF),
         static_cast<std::uint8_t>(payloads.size())};
     payload.insert(payload.end(), xorData.begin(), xorData.end());
-    return AudioPacket(PacketType::FecParity, startSeq + static_cast<std::int32_t>(payloads.size()),
+    // The parity seq is computed in UNSIGNED space, matching how the wire treats a sequence number
+    // and how `s` is already derived four lines up. Signed arithmetic here is undefined on
+    // overflow, and this helper is called with startSeq at INT32_MAX-4 by
+    // FecDecoder.ADisplacedMemberEvictedByThePacketCapIsStillDeclined — an arm that exists to
+    // exercise wrap. UBSan caught it: "signed integer overflow: 2147483643 + 5" (issue #28).
+    return AudioPacket(PacketType::FecParity,
+                       static_cast<std::int32_t>(s + static_cast<std::uint32_t>(payloads.size())),
                        std::move(payload));
 }
 
