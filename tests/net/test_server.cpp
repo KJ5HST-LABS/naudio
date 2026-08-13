@@ -1770,19 +1770,37 @@ private:
     std::vector<std::string> disconnected_;
 };
 
-// Connects one raw client, sends CONNECT_REQUEST, and waits for the CONNECT_REJECT the server
-// sends at accept time. Returns false if no reject arrived.
+// Connects one raw client and waits for the CONNECT_REJECT the server sends at accept time.
+// Returns false if no reject arrived.
 //
-// The CONNECT_REQUEST is required on UDP and harmless on TCP: UdpServerTransport creates a
-// connection only for a valid CONNECT_REQUEST (anti-spoof, UdpServerTransport.cpp:104-109), so
-// without it the server never accepts and never rejects. TCP accepts the socket itself, and
-// rejects before reading anything, so the request is simply left unread in a socket that is
-// about to close.
-bool rejectedOnce(ClientTransport& transport, std::uint16_t port, const std::string& name) {
+// `sendRequest` is TRUE ONLY FOR UDP, and the asymmetry is load-bearing rather than tidiness.
+// UdpServerTransport creates a connection only for a valid CONNECT_REQUEST (anti-spoof,
+// UdpServerTransport.cpp:105-110), so without one the server never accepts and never rejects.
+// TCP accepts the socket itself and rejects before reading anything — so a CONNECT_REQUEST sent
+// there is never consumed, and closing a socket that still holds unread data makes the stack send
+// an RST rather than a FIN, which discards the peer's already-delivered receive buffer. The
+// CONNECT_REJECT is in that buffer.
+//
+// What is MEASURED is the failure, not the mechanism: an earlier version of this helper sent the
+// request on both transports; it passed on macOS and ubuntu and FAILED on windows-latest (CI run
+// 31660239300) at transport 0, attempt 1 — the second TCP reject, the first having won the race.
+// The RST-on-unread-data rule above is the standard socket behaviour (RFC 1122 §4.2.2.13) and is
+// the explanation, not a second measurement; what makes it the likely one is that the other two
+// reject arms in this file (RejectsWhenNoCaptureDevice, MaxClientsRejectsBusy) send nothing before
+// reading the reject, and neither has ever failed there.
+//
+// The RST is NOT a defect in the fix under test, and it is not this arm's subject — it is a real
+// pre-existing property of the reject path that this helper stumbled into, filed separately. This
+// arm is about the transport-map leak, so it stops conflating the two.
+bool rejectedOnce(ClientTransport& transport, std::uint16_t port, const std::string& name,
+                  bool sendRequest) {
     std::string err;
     auto c = transport.connect("127.0.0.1", port, 2000, &err);
     if (!c) return false;
-    if (!c->sendControl(ControlMessage::connectRequest(name, AudioPacket::VERSION))) return false;
+    if (sendRequest &&
+        !c->sendControl(ControlMessage::connectRequest(name, AudioPacket::VERSION))) {
+        return false;
+    }
     const bool rejected =
         recvUntil(*c, PacketType::Control, ControlType::ConnectReject, 3000).has_value();
     c->close();
@@ -1835,7 +1853,8 @@ TEST(Server, GateRejectedClientsLeaveNoTraceInTheRosterGauge) {
             } else {
                 t = std::make_unique<UdpClientTransport>();
             }
-            ASSERT_TRUE(rejectedOnce(*t, port, "probe-" + std::to_string(i)))
+            ASSERT_TRUE(rejectedOnce(*t, port, "probe-" + std::to_string(i),
+                                     /*sendRequest=*/tt == TransportType::Udp))
                 << "transport " << static_cast<int>(tt) << " attempt " << i;
         }
 
