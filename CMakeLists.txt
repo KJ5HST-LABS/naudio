@@ -50,10 +50,15 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # `volatile` was not sufficient there — so the flag is what keeps the race fix portable. Clang and
 # GCC need nothing here.
 #
-# Scoped to C: the flag is meaningless for the C++ TUs, and $<COMPILE_LANGUAGE:C> keeps it off them
-# rather than relying on MSVC to ignore it quietly.
+# Appended to CMAKE_C_FLAGS rather than delivered through
+# add_compile_options($<$<COMPILE_LANGUAGE:C>:...>). The generator-expression form was tried first
+# and the error came back BYTE-IDENTICAL on windows-latest, so whatever it did, it did not reach
+# cl.exe for these TUs. CMAKE_C_FLAGS is the mechanism with no generator in the middle: every C
+# compile gets it, and the four failing targets are mixed C/C++ (each links a .cpp fixture), which
+# is exactly the shape where per-language options are least predictable under the Visual Studio
+# generator. Do not "tidy" this back into a generator expression without a green Windows job.
 if(MSVC)
-    add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+    string(APPEND CMAKE_C_FLAGS " /experimental:c11atomics")
 endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
