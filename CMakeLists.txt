@@ -40,6 +40,22 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# MSVC gates C11 atomics behind an opt-in flag even at /std:c11, and without it <stdatomic.h> is a
+# hard #error rather than a missing feature (issue #28):
+#
+#   vcruntime_c11_stdatomic.h(12,1): error C1189: #error: "C atomic support is not enabled"
+#
+# Measured on windows-latest / MSVC 14.51, where it failed all four C smoke tests at once. Those
+# tests use _Atomic for the flags their callbacks set on naudio's worker threads — TSan proved
+# `volatile` was not sufficient there — so the flag is what keeps the race fix portable. Clang and
+# GCC need nothing here.
+#
+# Scoped to C: the flag is meaningless for the C++ TUs, and $<COMPILE_LANGUAGE:C> keeps it off them
+# rather than relying on MSVC to ignore it quietly.
+if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
@@ -190,7 +206,7 @@ if(NAUDIO_SANITIZE)
         # (:1191) switch on the parameter and reject the unknown value in `default:`. The check
         # therefore fires on precisely the code that is being defensive, and the tests that trip it
         # exist to prove that defence works — c_abi_smoke.c:133 passes (na_error_t)(-999), and
-        # c_client_profile.c:163 passes (na_reliability_profile)99 to each of the two setters.
+        # c_client_profile.c:164 passes (na_reliability_profile)99 to each of the two setters.
         #
         # MEASURED, not assumed: both arms PASS in the normal optimized build, so the `default:`
         # branches do execute on today's toolchains and the ABI really does reject these values.

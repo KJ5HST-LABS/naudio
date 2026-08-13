@@ -261,6 +261,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **Server teardown no longer destroys the worker-barrier condition variable while a session worker
+  is still signalling it** (issue #28). `AudioStreamServer::threadFinished()` released
+  `threadsMutex_` *before* calling `threadsCv_.notify_all()`, which let the whole teardown complete
+  in the gap: the worker decrements to zero and unlocks, `stop()`'s barrier wakes and returns,
+  `~AudioStreamServer` runs to completion and destroys `threadsCv_`, and the worker — still between
+  the unlock and the notify — calls `pthread_cond_broadcast` on freed memory. The notify now happens
+  under the lock, so the waiter cannot return from `wait()` until after it completes.
+
+  Found by the TSan CI job added in this release, **on Linux only** — two full TSan runs on
+  macOS/libc++ never reproduced it. `AudioStreamClient::threadFinished()` had always notified under
+  its lock; the two siblings disagreed and only the client was right.
+
+  No C ABI change and no wire change.
+
 - **`na_server_start` on a TCP transport no longer reports success on Windows for a port another
   server is already listening on** (issue #85). The TCP listener was bound with `SO_REUSEADDR` on
   every platform. On POSIX that is the restart-after-`TIME_WAIT` accommodation and it never permits
