@@ -6,6 +6,25 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **`NAUDIO_SANITIZE` build option — sanitizer instrumentation for the whole tree.** Accepts
+  `address`, `undefined`, `thread`, or a comma list (`address,undefined`); empty is the default and
+  adds no flag to a normal build. `address` and `thread` are rejected at configure time because the
+  two runtimes cannot share a process. Two CI jobs on `ubuntu-latest` now run the hardware-free
+  ctest suite under ASan+UBSan(+LSan) and under TSan.
+
+  **Two flag choices are measurements, not conventions.** `-fno-sanitize-recover=all` rides with
+  `undefined` because UBSan is *recoverable* by default — it prints `runtime error: …` and still
+  exits 0, so without the flag a CI job would report PASS forever while printing findings nobody
+  reads. And `-fno-sanitize=enum` is the one suppression, carrying its justification in place: the
+  three sites it fires on are the C ABI's own defensive validation of untrusted C input
+  (`na_strerror`, `na_client_set_reliability_profile`, `na_server_set_reliability_profile`), whose
+  `default:` branches are measured to work on today's toolchains.
+
+  Leak detection is Linux-only — `detect_leaks` is unsupported on Darwin — so a local macOS ASan
+  run is not leak coverage.
+
+  **No C ABI change and no wire change.** Build-system and test-suite only.
+
 - **`Socket::setSendBufferSize` / `Socket::setRecvBufferSize` (C++ API) — socket buffer sizing that
   can *shrink*, and that reports what the kernel actually did.** `setSendBufferAtLeast` /
   `setRecvBufferAtLeast` only ever raise, and their never-shrink clause is load-bearing for UDP
