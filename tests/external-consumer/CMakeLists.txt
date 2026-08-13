@@ -23,3 +23,19 @@ target_link_libraries(consume_c PRIVATE naudio::naudio)
 # C++ consumer: the C++ API through the installed static archives.
 add_executable(consume_cxx consume_cxx.cpp)
 target_link_libraries(consume_cxx PRIVATE naudio::naudio_net naudio::naudio_core)
+
+# Device-backend consumer: naudio::naudio_pa, the ONLY installed target whose
+# PortAudio dependency the consumer must resolve itself (issue #61). Conditional
+# because that is the actual contract — naudioConfig.cmake sets
+# naudio_PORTAUDIO_FOUND FALSE on a host with no PortAudio, where the package still
+# loads and every other target here still links.
+#
+# A silently-skipped arm is how this project has been fooled before, so the status
+# below is printed either way and run.sh asserts on the line, never on exit status.
+if(naudio_PORTAUDIO_FOUND)
+    add_executable(consume_pa consume_pa.cpp)
+    target_link_libraries(consume_pa PRIVATE naudio::naudio_pa)
+    message(STATUS "external-consumer: naudio_pa arm ENABLED (naudio_PORTAUDIO_FOUND)")
+else()
+    message(STATUS "external-consumer: naudio_pa arm SKIPPED — no consumer-side PortAudio")
+endif()
