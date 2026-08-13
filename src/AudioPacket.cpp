@@ -70,6 +70,16 @@ std::vector<std::uint8_t> AudioPacket::serialize() const {
     // so clamp here — the encoder must never emit a frame the decoder would reject (or
     // a u16 that wrapped). Real audio frames are far below MAX_PAYLOAD (16 KB), so this
     // guard never triggers on the live path and leaves normal frames byte-identical.
+    //
+    // #20: THIS CLAMP IS A LAST-RESORT WIRE GUARD, NOT A SIZE POLICY — it is silent, and for a
+    // while it was the whole of naudio's answer to an oversized buffer: a 70000-byte inject
+    // serialized to one 16384-byte packet, returned success at every layer, and lost 53616 bytes
+    // with no error, no counter and no log. The policy now lives upstream, in
+    // AudioBroadcaster::broadcastToTargets, which frames an oversized buffer into MAX_PAYLOAD-sized
+    // packets so nothing reaches here oversized in the first place. Keep the clamp — defence in
+    // depth for any future producer — but do NOT treat it as the place that decides what happens
+    // to a large buffer. Truncating audio is never the right answer at this layer; it cannot
+    // report, and by here the caller is long gone.
     std::size_t payloadLen = std::min(payload_.size(), MAX_PAYLOAD);
     ByteWriter w(HEADER_SIZE + payloadLen + CRC_SIZE);
     // Header (big-endian).

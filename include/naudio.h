@@ -891,7 +891,21 @@ NA_EXPORT int na_server_port(na_audio_server* server);
 
 /* --- Audio I/O --- */
 /* Broadcast `n_bytes` of RX PCM to all connected clients (the radio-RX-audio analog; NULL backend /
- * inject-only). Returns NA_OK, or NA_ERR_INVALID on a NULL server / NULL buffer / n_bytes <= 0. */
+ * inject-only). Returns NA_OK, or NA_ERR_INVALID on a NULL server / NULL buffer / n_bytes <= 0.
+ *
+ * SIZE CONTRACT: there is NO upper bound on `n_bytes`. naudio frames the buffer internally to
+ * whatever the v1 wire can carry, so a large call is delivered COMPLETE rather than clamped —
+ * every accepted byte reaches every connected client, in order. `pcm` must match the layout set
+ * with na_server_set_audio_format (nothing here resamples or converts).
+ *
+ * The consequence a caller must handle: ONE inject may surface at the client as MORE THAN ONE
+ * RX audio callback. The byte STREAM is preserved exactly; the frame BOUNDARIES are naudio's to
+ * choose and are not a stable part of this ABI. Code that assumes one inject == one client
+ * callback is relying on something never promised.
+ *
+ * (This bound was previously undocumented AND unenforced: an inject over 16384 bytes was silently
+ * truncated to 16384 and still returned NA_OK — see the CHANGELOG entry for issue #20. If you are
+ * chunking your own audio solely to stay under that ceiling, you no longer need to.) */
 NA_EXPORT na_error_t na_server_inject_audio(na_audio_server* server, const unsigned char* pcm,
                                             int n_bytes);
 

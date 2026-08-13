@@ -221,9 +221,14 @@ bool AudioStreamServer::ClientSession::enqueueRxAudio(std::vector<std::uint8_t> 
         }
 
         // Tested against the CURRENT depth before adding, the shape BlockingPacketQueue
-        // already uses: an empty queue always accepts one chunk however large the host made
-        // it (injectAudio forwards whatever it is given), so overshoot is bounded by exactly
-        // one chunk and a healthy client can never be refused.
+        // already uses: an empty queue always accepts one chunk, so overshoot is bounded by
+        // exactly one chunk and a healthy client can never be refused.
+        //
+        // That chunk used to be "however large the host made it", because injectAudio forwarded
+        // whatever it was given. Since #20 the fan-out frames to AudioPacket::MAX_PAYLOAD, so the
+        // overshoot bound is now a CONSTANT (<= 16384 bytes) rather than caller-controlled — a
+        // tightening, not a relaxation. A host injecting a 1 MB buffer no longer parks 1 MB in
+        // this queue in a single push.
         outQueueBytes_ += data.size();
         outQueue_.push_back(Outgoing{std::nullopt, std::move(data)});
     }

@@ -192,6 +192,29 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **`na_server_inject_audio` silently discarded everything past 16384 bytes and still reported
+  success** (issue #20). `AudioPacket::serialize()` clamps its payload to `MAX_PAYLOAD` — correctly,
+  because the wire's length field is a `u16` and the decoder rejects anything longer — but nothing
+  above it ever split an oversized buffer. A single inject therefore became one clamped packet and
+  the remainder was dropped with no error, no counter and no log, while every layer from the codec
+  up to the C ABI returned success. Measured before the fix, over a real loopback client:
+  `na_server_inject_audio(srv, buf, 70000)` returned `NA_OK` and delivered 16384 bytes, losing
+  53616; a 16385-byte call lost exactly one byte. The ceiling was also undocumented, so a consumer
+  had no way to discover it — and `na_hamlib_bridge` injects exactly 16384, sitting precisely on it.
+
+  The RX fan-out now frames an oversized buffer into wire-sized packets, so every injected byte is
+  delivered. This is **not** app-layer fragmentation and **not** a wire-format change: each chunk is
+  a complete, independently-sequenced `0xAF01` audio packet, indistinguishable from the frames the
+  capture path already emits, and the receiver reassembles nothing. Chunks are aligned to a whole
+  sample frame so a boundary can never fall mid-sample.
+
+  **Behavior change for consumers:** one `na_server_inject_audio` call may now surface at the client
+  as more than one RX audio callback. The byte stream is preserved exactly and in order; the frame
+  boundaries are naudio's to choose and were never a promised part of the ABI. An inject of 16384
+  bytes or fewer is byte-identical to before, so callers already sized under the old ceiling —
+  including the bridge — see no change at all. The size contract is now stated on the function in
+  `naudio.h`.
+
 - **A server client that stopped reading but kept sending was never evicted when no audio was
   flowing** (issue #56). The session's heartbeat loop discarded the result of its own send, and it
   was the only mechanism that could have noticed. The connection timeout could not: it is keyed on
