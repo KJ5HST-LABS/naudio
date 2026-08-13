@@ -93,7 +93,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure (no system PortAudio -> FetchContent; tools/ excluded on WIN32)
-        run: cmake -S . -B build -DNAUDIO_BUILD_APPS=OFF
+        run: cmake -S . -B build -DNAUDIO_BUILD_APPS=OFF -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/naudio-prefix"
         # No portaudio-2.0.pc on Windows, so the build fetches + builds PortAudio
         # v19.7.0 from source (MME/WASAPI/DirectSound backends, Windows SDK only).
         # tools/ (the na_audio_daemon hardware smoke) is guarded out by `if(NOT WIN32)` in CMakeLists;
@@ -106,6 +106,57 @@ jobs:
 
       - name: Test (conformance vectors + Winsock loopback smokes)
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+
+      - name: Install (the step this job never had — issue #61)
+        run: cmake --install build --config RelWithDebInfo
+
+      - name: External-consumer gate — find_package(naudio) on MSVC, with no pkg-config
+        run: |
+          # THE gate this job existed without. MSVC has no pkg-config, and
+          # naudioConfig.cmake used to open with find_dependency(PkgConfig), so
+          # find_package(naudio) failed outright here — on the one platform whose CI
+          # build was green. Nothing in this job installed or consumed the package, so
+          # nothing could see it. (Issue #61.)
+          $prefix = "${{ runner.temp }}/naudio-prefix"
+
+          # The installed export must name no PortAudio target: this is a FetchContent
+          # build, so it used to bake in the bare `portaudio_static`, which
+          # naudioConfig.cmake had no way to recreate.
+          $targets = "$prefix/lib/cmake/naudio/naudioTargets.cmake"
+          if (Select-String -Path $targets -Pattern 'portaudio' -Quiet) {
+            Write-Output "::error::naudioTargets.cmake names a PortAudio target — it must not (issue #61)"
+            Select-String -Path $targets -Pattern 'portaudio'
+            exit 1
+          }
+          Write-Output "naudioTargets.cmake names no PortAudio target — correct"
+
+          cmake -S tests/external-consumer -B consumer-build -DCMAKE_PREFIX_PATH="$prefix" 2>&1 |
+            Tee-Object -FilePath consumer.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error::find_package(naudio) failed on MSVC — issue #61 regressed"
+            exit 1
+          }
+          cmake --build consumer-build --config RelWithDebInfo
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::consumer build failed"; exit 1 }
+
+          # No PortAudio development files on this runner, so the correct outcome is a
+          # SKIPPED naudio_pa arm and a package that loads anyway.
+          if (-not (Select-String -Path consumer.log -Pattern 'naudio_pa arm SKIPPED' -Quiet)) {
+            Write-Output "::error::expected the naudio_pa arm to be SKIPPED on a host with no PortAudio"
+            exit 1
+          }
+
+          # Assert on OUTPUT, never on exit status: a consumer that fails to start
+          # would otherwise be indistinguishable from one that ran and printed nothing.
+          $env:PATH = "$prefix/bin;" + $env:PATH
+          & "consumer-build/RelWithDebInfo/consume_c.exe"   2>&1 | Tee-Object -FilePath consume.log
+          & "consumer-build/RelWithDebInfo/consume_cxx.exe" 2>&1 | Tee-Object -FilePath consume.log -Append
+          if (-not (Select-String -Path consume.log -Pattern '^consume_c OK' -Quiet)) {
+            Write-Output "::error::consume_c did not run"; exit 1
+          }
+          if (-not (Select-String -Path consume.log -Pattern '^consume_cxx OK' -Quiet)) {
+            Write-Output "::error::consume_cxx did not run"; exit 1
+          }
 
   fetchcontent:
     name: build+test (ubuntu, no system PortAudio -> FetchContent)
@@ -124,7 +175,11 @@ jobs:
           # FetchContent path that CI must exercise.
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNAUDIO_BUILD_APPS=OFF
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNAUDIO_BUILD_APPS=OFF \
+                -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/naudio-prefix"
+        # CMAKE_INSTALL_PREFIX is set at CONFIGURE time, not left to `--install --prefix`,
+        # because naudio.pc bakes the prefix in when it is generated (issue #61).
         # NAUDIO_BUILD_APPS=OFF: the no-system-deps mandate is that the LIBRARIES +
         # C ABI + the full hardware-free ctest build against a FetchContent PortAudio.
         # The demo app (na_audio_daemon) links PortAudio into an executable and is a
@@ -136,6 +191,82 @@ jobs:
 
       - name: Test (conformance vectors + README snippet gate)
         run: ctest --test-dir build --output-on-failure
+
+      - name: Install (the step this job never had — issue #61)
+        run: cmake --install build
+        # Until #61 this job proved the FetchContent build COMPILES and never asked
+        # whether the thing it produces can be installed or consumed. Both defects it
+        # was blind to were in that gap.
+
+      - name: Assert PortAudio did not leak into the naudio prefix
+        run: |
+          # PortAudio's own install rules used to run as part of ours, depositing
+          # portaudio.h, pa_mac_core.h, libportaudio.a, libportaudio.so,
+          # lib/cmake/portaudio/, lib/pkgconfig/portaudio-2.0.pc and
+          # share/doc/portaudio/ into naudio's prefix. PA_DISABLE_INSTALL stops it.
+          # Assert on the FILES, not on the install step's exit code — the leak was
+          # always a clean, successful install.
+          # '*portaudio*', not 'portaudio*' — the latter misses libportaudio.a and
+          # libportaudio.so, which is most of what actually leaked. The one exclusion is
+          # naudio's OWN header, which the glob legitimately matches.
+          leaked=$(find "${{ runner.temp }}/naudio-prefix" \
+                     \( -iname '*portaudio*' -o -iname 'pa_*.h' \) \
+                     -not -path '*/naudio/PortAudioBackend.hpp' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::PortAudio leaked into the naudio install prefix:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "no PortAudio artifacts in the prefix — correct"
+
+          # The installed export must name NO PortAudio target. When it named one, it
+          # named a target naudioConfig.cmake could not recreate, and every consumer of
+          # this build failed with "imported targets are referenced, but are missing".
+          if grep -qi portaudio "${{ runner.temp }}/naudio-prefix/lib/cmake/naudio/naudioTargets.cmake"; then
+            echo "::error::naudioTargets.cmake names a PortAudio target — it must not (issue #61)"
+            grep -in portaudio "${{ runner.temp }}/naudio-prefix/lib/cmake/naudio/naudioTargets.cmake"
+            exit 1
+          fi
+          echo "naudioTargets.cmake names no PortAudio target — correct"
+
+      - name: External-consumer gate on a bundled install (no PortAudio on this host)
+        run: |
+          # Consume the prefix installed above rather than calling
+          # tests/external-consumer/run.sh, which builds and installs naudio itself —
+          # here that would mean a SECOND from-source PortAudio build in the same job.
+          #
+          # This runner has no PortAudio development files at all, which is exactly the
+          # case that used to fail: find_package(naudio) must still succeed, the C ABI
+          # and C++ consumers must still build, and only the naudio_pa arm drops out.
+          set +e
+          cmake -S tests/external-consumer -B consumer-build \
+                -DCMAKE_PREFIX_PATH="${{ runner.temp }}/naudio-prefix" > consumer.log 2>&1
+          rc=$?
+          set -e
+          cat consumer.log
+          if [ $rc -ne 0 ]; then
+            echo "::error::find_package(naudio) failed against a bundled install — issue #61 regressed"
+            exit 1
+          fi
+          cmake --build consumer-build -j
+
+          # Assert on the arm's own status line. On this host the correct outcome is
+          # SKIPPED, and asserting it is the direct test of the contract #61 settled:
+          # a consumer with no PortAudio still gets a loadable package. An ENABLED arm
+          # here would mean the runner grew a PortAudio and this job stopped testing
+          # the case it exists for.
+          grep -q 'external-consumer: naudio_pa arm SKIPPED' consumer.log \
+            || { echo "::error::expected the naudio_pa arm to be SKIPPED on a host with no PortAudio"; exit 1; }
+
+          # And the two consumers that must work anyway are asserted on their OUTPUT,
+          # never on exit status.
+          ./consumer-build/consume_c  > consume.log 2>&1
+          ./consumer-build/consume_cxx >> consume.log 2>&1
+          cat consume.log
+          grep -q '^consume_c OK'   consume.log || { echo "::error::consume_c did not run"; exit 1; }
+          grep -q '^consume_cxx OK' consume.log || { echo "::error::consume_cxx did not run"; exit 1; }
+        env:
+          LD_LIBRARY_PATH: ${{ runner.temp }}/naudio-prefix/lib
 
   ffi-clients:
     name: ffi example clients (python + java + rust vs the C ABI)
