@@ -213,6 +213,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   added below are what tell the two apart.
 
 ### Fixed
+- **On Windows, a rejected client received no reason at all — it saw a reset connection instead of
+  "Maximum clients (N) reached"** (issue #87). The server decides a reject at *accept*, before
+  reading a byte, so a client that behaved normally — connect, send `CONNECT_REQUEST`, then wait for
+  ACCEPT/REJECT, which is exactly what `na_client_connect` does — had left that request unread in
+  the server's receive buffer. Closing a TCP socket on top of unread received data makes the stack
+  send an RST rather than a FIN (RFC 1122 §4.2.2.13), and the RST makes the peer discard its own
+  receive buffer, the already-delivered CONNECT_REJECT with it. The reject reason is the only
+  diagnostic a turned-away operator gets, and `Busy` vs `Rejected` is what distinguishes "try again
+  later" from "this server will never take you". The reject path now drains that pending input
+  before closing, so the close emits a FIN.
+
+  **Not reproducible off Windows**, which is worth stating so nobody reads a green macOS run as
+  coverage: the same sequence was driven 200 times on macOS loopback (five read-delays from 0 to
+  300 ms crossed with 0 and 20 unread filler packets) and the reject arrived 200/200. The failing
+  evidence is CI, where it is deterministic from the first attempt.
+
+  **Delivery is documented as BEST-EFFORT, not guaranteed** — the code previously read as though it
+  were. The drain fixes the case a real client hits; a peer that keeps sending past the drain budget,
+  or whose data arrives after the close, can still reset. A client should treat a bare disconnect
+  during connect as "rejected, reason unknown".
+
 - **A client the server rejected stayed in the transport's connection map for the life of the
   server, inflating every `na_server_get_stats` counter** (issue #64). `rejectClient` sent the
   CONNECT_REJECT and closed the socket, but closing is not leaving: only the transport's

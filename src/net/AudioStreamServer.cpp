@@ -894,6 +894,24 @@ void AudioStreamServer::rejectClient(const std::shared_ptr<ClientConnection>& co
     // Send FIRST, evict second: evictConnection closes the connection, and the peer is owed the
     // reason it was turned away.
     connection->sendControl(ControlMessage::connectReject(reason, message));
+
+    // Then DRAIN before closing, or the peer never reads what we just sent (issue #87).
+    //
+    // This reject was decided at accept, before a byte was read — so a client that behaved
+    // normally has a CONNECT_REQUEST sitting unread in our receive buffer, and closing on top of
+    // unread data makes the stack send an RST instead of a FIN. The RST makes the peer discard its
+    // receive buffer, reject included. MEASURED on windows-latest: without this, a client that
+    // sends before reading gets no CONNECT_REJECT at all — deterministically, from the first
+    // attempt (CI run 31663121086). macOS and Linux deliver it either way; 200 loopback runs there
+    // across five read-delays could not open the window, so this is not reproducible off Windows.
+    //
+    // A no-op on UDP, which has no reset semantics and whose server connections share one socket.
+    //
+    // 20 ms is a CEILING, not a cost: the ordinary call finds the request already buffered, reads
+    // it, and exits on the next read's 2 ms timeout. It is bounded at all because this runs on the
+    // accept thread, where time spent is time no other client is admitted.
+    connection->discardPendingInput(/*budgetMs=*/20);
+
     evictConnection(connection);
 }
 

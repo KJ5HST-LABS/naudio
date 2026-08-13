@@ -169,6 +169,17 @@ public:
 
     virtual bool isClosed() const = 0;
     virtual void close() = 0;
+
+    // Reads and discards already-buffered input so that the close which follows emits a FIN
+    // rather than an RST, and returns how many bytes went. Bounded by `budgetMs`.
+    //
+    // DEFAULTS TO A NO-OP, and that default is correct for every non-TCP connection rather than
+    // merely convenient. UDP has no such rule to work around — there is no connection state to
+    // reset — and a UDP server connection does not even own its socket: it borrows the one shared
+    // demux socket, so "draining pending input" there would consume OTHER clients' datagrams.
+    //
+    // Only the server's reject path calls this. See TcpClientConnection for the full rule.
+    virtual std::size_t discardPendingInput(int /*budgetMs*/) { return 0; }
 };
 
 // Client-side transport — connects to a server and yields a ClientConnection.

@@ -1860,13 +1860,97 @@ TEST(Server, GateRejectedClientsLeaveNoTraceInTheRosterGauge) {
 
         // The roster is still empty, so every aggregate over it must still be zero. Pre-fix each
         // rejected connection is still in the map and still counting its own reject message.
-        const ServerStats after = server.stats();
+        //
+        // THE GAUGE IS ALLOWED TO SETTLE, and the wait is not a flake-patch. Since #87 rejectClient
+        // drains the peer's unread CONNECT_REQUEST before closing (so the close emits a FIN and the
+        // reject is not lost to an RST), so the map entry is released up to the drain budget AFTER
+        // the client has already read its reject. The contract this arm pins is that a rejected
+        // client LEAVES the map — not that it leaves before an observer can look. Measured: without
+        // this wait the arm read packetsSent == 1, the final attempt still inside its 20 ms drain.
+        //
+        // It stays a real detector: a leak that never resolves still fails, because the budget is
+        // 100x the drain. Confirmed by re-running the M-A mutation after this wait was added.
+        ServerStats after = server.stats();
+        const auto settleBy = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+        while ((after.packetsSent != 0 || after.bytesSent != 0) &&
+               std::chrono::steady_clock::now() < settleBy) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            after = server.stats();
+        }
         EXPECT_EQ(after.clientsConnected, 0);
         EXPECT_EQ(after.packetsSent, 0) << "transport " << static_cast<int>(tt);
         EXPECT_EQ(after.bytesSent, 0) << "transport " << static_cast<int>(tt);
 
         server.stop();
     }
+}
+
+// #87 — a rejected client must actually RECEIVE its reason, when it behaves the way the real
+// client does.
+//
+// THE POINT OF THIS ARM IS THE ORDER OF TWO LINES. Both older reject arms above
+// (RejectsWhenNoCaptureDevice, MaxClientsRejectsBusy) connect and read WITHOUT SENDING ANYTHING.
+// AudioStreamClient does not: it connects, sends CONNECT_REQUEST, and only then waits for
+// ACCEPT/REJECT (AudioStreamClient.cpp:248 is where it handles the reject). The server decides the
+// reject at ACCEPT, before reading anything, so that request is still unread when the connection
+// is torn down — and closing a socket that holds unread received data makes the stack send an RST
+// rather than a FIN, which discards the peer's already-delivered receive buffer, reject included.
+//
+// So the two existing arms could never have seen this: the coverage was shaped exactly like the
+// bug's blind spot. This arm drives the path the way production does.
+//
+// PLATFORM NOTE, MEASURED, so nobody reads a green macOS run as proof: this arm is a detector on
+// Windows and (so far) nowhere else. A scratch probe drove this exact sequence 200 times on
+// macOS/arm64 loopback — 5 read-delays from 0 to 300 ms crossed with 0 and 20 unread filler
+// packets — and the reject arrived 200/200. The window would not open here however hard it was
+// staged. The failing evidence is CI run 31660239300 on windows-latest, where the same sequence
+// failed at attempt 1 of 8 with attempt 0 having won the race. Keep the loop: one attempt is not
+// a reliable detector even on the platform that fails.
+//
+// The Busy path is used rather than no-capture-device because "Maximum clients (N) reached" is the
+// reason an operator actually needs to read: it distinguishes "retry later" from "this server will
+// never take you". Losing THAT is the user-visible cost.
+TEST(Server, ARejectedClientReceivesItsReasonWhenItBehavesLikeARealClient) {
+    AudioStreamConfig config{};
+    config.maxClients = 1;
+    AudioStreamServer server{0, config};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+    const auto port = static_cast<std::uint16_t>(server.port());
+
+    // Fill the single slot so every later client is rejected Busy.
+    TcpClientTransport t0;
+    auto resident = t0.connect("127.0.0.1", port, 2000, &err);
+    ASSERT_TRUE(resident) << err;
+    ASSERT_TRUE(clientHandshake(*resident, "resident"));
+    ASSERT_TRUE(waitForClientsUpdate(*resident, 1, 3000));
+
+    const int kAttempts = 8;
+    for (int i = 0; i < kAttempts; i++) {
+        TcpClientTransport t;
+        auto c = t.connect("127.0.0.1", port, 2000, &err);
+        ASSERT_TRUE(c) << "attempt " << i << ": " << err;
+        // The realistic order — send, THEN read. This is the line the older arms omit.
+        ASSERT_TRUE(c->sendControl(
+            ControlMessage::connectRequest("real-" + std::to_string(i), AudioPacket::VERSION)))
+            << "attempt " << i;
+
+        auto reject = recvUntil(*c, PacketType::Control, ControlType::ConnectReject, 3000);
+        ASSERT_TRUE(reject.has_value())
+            << "attempt " << i << ": no CONNECT_REJECT reached a client that had sent a "
+            << "CONNECT_REQUEST first — the reason was lost in transit, not withheld";
+
+        auto msg = ControlMessage::deserialize(reject->payload());
+        ASSERT_TRUE(msg.has_value()) << "attempt " << i;
+        const auto reason = msg->parseErrorMessage();
+        EXPECT_TRUE(reason.has_value() &&
+                    reason->find("Maximum clients") != std::string::npos)
+            << "attempt " << i << " reason: " << reason.value_or("<none>");
+        c->close();
+    }
+
+    server.stop();
 }
 
 // #64.2 — a session that fails the handshake must not leave an unpaired connect event behind.

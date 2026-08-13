@@ -98,6 +98,23 @@ public:
     bool isClosed() const { return closed_.load(); }
     void close();
 
+    // Reads and DISCARDS whatever is already sitting in the receive buffer, then returns the
+    // byte count. Bounded twice over: each read waits at most a couple of milliseconds, and the
+    // whole call gives up after `budgetMs` however much keeps arriving, so a peer that floods
+    // cannot pin the caller.
+    //
+    // This exists for ONE caller — the server's reject path — and the reason is a socket rule
+    // rather than anything about this protocol. Closing a TCP socket that still holds unread
+    // received data makes the stack send an RST instead of a FIN (RFC 1122 4.2.2.13), and an RST
+    // makes the peer discard its own receive buffer — including a CONNECT_REJECT that had already
+    // been delivered. The server decides a reject at accept, before reading a byte, so a client
+    // that behaved normally (connect, send CONNECT_REQUEST, then read) has always left exactly
+    // that unread data behind. Draining it first is what makes the close a FIN.
+    //
+    // Do NOT reach for this on a live session: there the receive thread is already draining, and
+    // discarding buffered input would throw away real frames.
+    std::size_t discardPendingInput(int budgetMs);
+
 private:
     // Receive FSM phases.
     enum Phase { PHASE_HEADER = 0, PHASE_PAYLOAD = 1, PHASE_SKIP = 2 };

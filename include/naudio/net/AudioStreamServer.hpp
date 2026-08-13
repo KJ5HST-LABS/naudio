@@ -212,6 +212,20 @@ private:
     void teardownSessions();
     void acceptLoop();
     void handleNewClient(const std::shared_ptr<ClientConnection>& connection);
+    // Turn a client away with a reason, then drop its connection.
+    //
+    // DELIVERY OF THE REASON IS BEST-EFFORT, and it is worth stating because the obvious reading of
+    // the code is that it is guaranteed (issue #87). The reject is decided at accept, before a byte
+    // has been read, so a client that behaved normally — connect, send CONNECT_REQUEST, then read —
+    // has left unread data in our receive buffer; closing on top of unread data makes the stack
+    // emit an RST, and an RST makes the peer discard its own receive buffer, the reject with it.
+    // discardPendingInput() below removes that data first so the close is a FIN, which is what
+    // makes delivery work in practice. What it cannot promise is the general case: a peer that
+    // keeps sending past the drain budget, or one whose data arrives after the close, can still
+    // reset. A client must therefore treat a bare disconnect during connect as "rejected, reason
+    // unknown" rather than assuming it will always be told why.
+    //
+    // Runs on the ACCEPT THREAD — everything here is bounded for that reason.
     void rejectClient(const std::shared_ptr<ClientConnection>& connection, RejectReason reason,
                       const std::string& message);
     // Drop a connection the server accepted but never turned into a session — all three reject
