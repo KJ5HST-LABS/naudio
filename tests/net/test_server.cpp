@@ -209,7 +209,8 @@ TEST(Server, SingleClientHandshakeAndInjectedRx) {
 
 // #20: an inject larger than MAX_PAYLOAD must not be silently truncated.
 //
-// serialize() clamps the payload to MAX_PAYLOAD (AudioPacket.cpp:73). That clamp is correct in
+// serialize() clamps the payload to MAX_PAYLOAD (AudioPacket.cpp:83, in serialize()). That clamp
+// is correct in
 // itself — the length field is a u16 and deserialize() rejects anything longer, so the encoder
 // must never emit a frame the decoder would reject. What was missing is the layer above it:
 // nothing SPLIT an oversized buffer, so a single injectAudio serialized to ONE clamped packet and

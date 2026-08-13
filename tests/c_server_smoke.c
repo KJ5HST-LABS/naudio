@@ -273,7 +273,7 @@ static int check_ordering_arm(int order, const char* name, int want_udp, int wan
  * ABI: na_server_max_clients reports the configured value pre-start. The three audio-format fields
  * have NO public accessor, and the obvious byte-volume route is a DEAD detector —
  * na_server_inject_audio neither resamples nor converts, so a client receives the same byte COUNT
- * whatever format the server carries (src/net/AudioStreamServer.cpp:925, injectAudio). Since #20
+ * whatever format the server carries (src/net/AudioStreamServer.cpp:930, injectAudio). Since #20
  * the fan-out may split those bytes across several packets, which changes the frame count but not
  * the total — so this detector is dead for the same reason it always was. Measured, not assumed: deleting `pc.sampleRate = rate;` from the setter
  * leaves all 299 tests GREEN. That is why this section pins one field rather than four, and the

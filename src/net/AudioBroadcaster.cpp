@@ -141,7 +141,7 @@ void AudioBroadcaster::broadcastToTargets(const std::uint8_t* data, std::size_t 
 
     // #20: FRAME TO THE WIRE LIMIT — do not hand a target more than one packet can carry.
     //
-    // AudioPacket::serialize() clamps its payload to MAX_PAYLOAD (AudioPacket.cpp:73) because the
+    // AudioPacket::serialize() clamps its payload to MAX_PAYLOAD (AudioPacket.cpp:83) because the
     // length field is a u16 and deserialize() rejects anything longer — the encoder must never
     // emit a frame the decoder would reject. That guard is right, but nothing above it split an
     // oversized buffer, so a single oversized fan-out became ONE clamped packet and the remainder
