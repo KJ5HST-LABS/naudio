@@ -29,16 +29,20 @@ void ControlReliability::recordSentAt(const AudioPacket& packet, std::int64_t se
 
     const std::int32_t seq = packet.sequence();
 
-    // Evict oldest if at capacity (unconditional before the put, even when seq is a
-    // duplicate update).
-    if (pending_.size() >= BUFFER_SIZE) pending_.erase(pending_.begin());
-
+    // The duplicate scan comes FIRST, because a re-record of a sequence already pending
+    // replaces in place and adds no entry — so it needs no room, and evicting to make room
+    // for it costs an unrelated control its remaining retransmits for a put that never
+    // happens. Order matters only at capacity, which is exactly when a wrong eviction is
+    // unrecoverable.
     for (auto& entry : pending_) {
         if (entry.first == seq) {
             entry.second = PendingControl(packet, sendTimeMs);  // replace in place
             return;
         }
     }
+
+    // A genuine insert: now the buffer really does need a free slot.
+    if (pending_.size() >= BUFFER_SIZE) pending_.erase(pending_.begin());
     pending_.emplace_back(seq, PendingControl(packet, sendTimeMs));
 }
 

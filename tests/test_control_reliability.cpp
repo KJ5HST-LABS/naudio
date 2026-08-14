@@ -165,6 +165,36 @@ TEST(ControlReliability, NoArgWrappersStampInTheMonotonicDomain) {
     EXPECT_EQ(1u, r.checkRetransmitsAt(after + 500).size());
 }
 
+// A re-record of an already-pending sequence replaces in place and adds no entry, so it needs no
+// room. Evicting before the duplicate scan therefore destroyed an unrelated pending control — the
+// one with the fewest retransmits left — to make room for a put that never happened, and left the
+// buffer one short of capacity.
+TEST(ControlReliability, DuplicateSequenceReRecordEvictsNothing) {
+    ControlReliability r = reliability();
+    const auto full = static_cast<std::int32_t>(ControlReliability::BUFFER_SIZE);
+    for (std::int32_t i = 0; i < full; ++i) {
+        r.recordSentAt(controlPacket(i, ControlMessage::txGranted()), 1000);
+    }
+    ASSERT_EQ(ControlReliability::BUFFER_SIZE, r.pendingCount());
+
+    // Re-record the NEWEST sequence. The oldest (seq 0) is unrelated to it and must survive.
+    r.recordSentAt(controlPacket(full - 1, ControlMessage::txGranted()), 2000);
+    EXPECT_EQ(ControlReliability::BUFFER_SIZE, r.pendingCount());
+    EXPECT_TRUE(r.onNackReceived(0).has_value());
+
+    // ...and the replace itself still has to work: only the re-recorded entry carries the new
+    // send time, so at 1500 every other entry is due and it is not. Without this the fix could be
+    // "delete the eviction" and still pass.
+    ControlReliability r2 = reliability();
+    for (std::int32_t i = 0; i < full; ++i) {
+        r2.recordSentAt(controlPacket(i, ControlMessage::txGranted()), 1000);
+    }
+    r2.recordSentAt(controlPacket(full - 1, ControlMessage::txGranted()), 2000);
+    std::vector<AudioPacket> due = r2.checkRetransmitsAt(1500);
+    EXPECT_EQ(static_cast<std::size_t>(full - 1), due.size());
+    for (const AudioPacket& p : due) EXPECT_NE(full - 1, p.sequence());
+}
+
 TEST(ControlReliability, GenerateAckForCriticalControl) {
     ControlReliability r = reliability();
     auto ack = r.generateAck(controlPacket(7, ControlMessage::txGranted()));

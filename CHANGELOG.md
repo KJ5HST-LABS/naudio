@@ -15,6 +15,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   on the wire, so the monotonic clock is strictly correct here. Behaviour is unchanged on a machine
   whose clock does not step.
 
+- **Re-recording an already-pending control sequence no longer evicts an unrelated one.**
+  `ControlReliability::recordSentAt` freed a slot before checking whether the sequence was already
+  pending. A re-record replaces in place and adds no entry, so at capacity the eviction destroyed
+  the oldest pending control — the one with the fewest retransmits left — to make room for a put
+  that never happened, and left the buffer one entry short of capacity. Latent for naudio's own
+  callers, none of which re-records a sequence; reachable by any consumer of the installed
+  `naudio/ControlReliability.hpp`.
+
 - **Two distinct devices that share a name are no longer merged into one.** Device identity was
   `name + hostApi`, so two identical rigs on one host API — e.g. a pair of "USB Audio CODEC"
   interfaces, which is the shape naudio's own default capture pattern looks for — collapsed into a
