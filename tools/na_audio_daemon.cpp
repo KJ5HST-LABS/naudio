@@ -227,7 +227,10 @@ int runCaptureProbe(const Args& a) {
         std::fprintf(stderr, "error: no capture device matched (try --list-devices / --capture-id)\n");
         return 1;
     }
-    std::printf("capture-probe: device [%d] %s\n", dev->backendId, dev->name.c_str());
+    // backendIdFor: StreamOpener opens the per-direction id, so print that one rather than the
+    // merged record's `backendId`, which on a split pair can name a different record entirely.
+    std::printf("capture-probe: device [%d] %s\n", dev->backendIdFor(naudio::Direction::Capture),
+                dev->name.c_str());
 
     naudio::AudioFormat requested;  // 48 kHz / 16-bit / stereo
     std::unique_ptr<naudio::CaptureStream> stream;
@@ -331,7 +334,11 @@ int runHardware(const Args& a) {
         std::fprintf(stderr, "error: no capture device matched (try --list-devices / --capture-id)\n");
         return 1;
     }
-    std::printf("server capture: device [%d] %s\n", capDev->backendId, capDev->name.c_str());
+    // backendIdFor, never backendId: on an ALSA-style split record the two directions live on
+    // DIFFERENT backend ids and `backendId` is only the first-seen record's. Print the id that
+    // is actually opened, so the log names the device the server really uses.
+    const int captureId = capDev->backendIdFor(naudio::Direction::Capture);
+    std::printf("server capture: device [%d] %s\n", captureId, capDev->name.c_str());
 
     const naudio::AudioStreamConfig cfg = configFor(a.transport);
 
@@ -363,10 +370,10 @@ int runHardware(const Args& a) {
     bool realSink = false;
     if (sinkDev) {
         clientBackend = &backend;  // share the one PortAudio init
-        clientPlaybackId = sinkDev->backendId;
+        clientPlaybackId = sinkDev->backendIdFor(naudio::Direction::Playback);
         realSink = true;
         std::printf("client sink  : device [%d] %s (real — external apps can read this)\n",
-                    sinkDev->backendId, sinkDev->name.c_str());
+                    clientPlaybackId, sinkDev->name.c_str());
     } else {
         // Hardware-free drain: register the 48k/16/stereo playback format the client will open.
         fakeBackend.add(naudio::RawDevice{/*backendId=*/0, "fake-sink", "fake", 0, 2, 48000.0});
@@ -379,7 +386,7 @@ int runHardware(const Args& a) {
     // --- Start the server (capture-only; NEVER opens a playback line to the radio). ---
     naudio::net::AudioStreamServer server(static_cast<std::uint16_t>(a.port), cfg, "127.0.0.1");
     server.setBackend(&backend);
-    server.setCaptureDevice(capDev->backendId);
+    server.setCaptureDevice(captureId);
     std::string err;
     if (!server.start(&err)) {
         std::fprintf(stderr, "error: server.start failed: %s\n", err.c_str());

@@ -125,6 +125,62 @@ TEST(DeviceEnumerator, SingleDuplexRecordSharesBackendId) {
     EXPECT_EQ(devs[0].playbackBackendId, 5);
 }
 
+// Two DISTINCT full-duplex devices that share a name are two devices, not one. This is the
+// project's own default capture shape — two identical USB-audio rigs on one host API. Before the
+// complementary-direction guard the second record was merged away: its backend ids were dropped
+// and it appeared nowhere, so the second radio could not be opened even by --capture-id.
+TEST(DeviceEnumerator, TwoDuplexRecordsSharingANameAreNotMerged) {
+    FakeBackend be;
+    be.add(dev(0, "USB Audio CODEC", "Core Audio", 2, 2));  // rig A
+    be.add(dev(1, "USB Audio CODEC", "Core Audio", 2, 2));  // rig B — a different radio
+    DeviceEnumerator e(be, Platform::MacOS);
+
+    auto devs = e.list();
+    ASSERT_EQ(devs.size(), 2u) << "two duplex records with one name are two devices";
+    // Each keeps its OWN id in both directions — the second rig is reachable, which is the
+    // property that was lost.
+    EXPECT_EQ(devs[0].backendIdFor(Direction::Capture), 0);
+    EXPECT_EQ(devs[0].backendIdFor(Direction::Playback), 0);
+    EXPECT_EQ(devs[1].backendIdFor(Direction::Capture), 1);
+    EXPECT_EQ(devs[1].backendIdFor(Direction::Playback), 1);
+    EXPECT_EQ(devs[0].capability, Capability::Duplex);
+    EXPECT_EQ(devs[1].capability, Capability::Duplex);
+}
+
+// Same-direction overlap, not just duplex-vs-duplex: two capture-only records sharing a name are
+// also two devices. A split pair is capture-only + playback-only and can never look like this.
+TEST(DeviceEnumerator, TwoCaptureOnlyRecordsSharingANameAreNotMerged) {
+    FakeBackend be;
+    be.add(dev(4, "USB Audio CODEC", "ALSA", 2, 0));
+    be.add(dev(9, "USB Audio CODEC", "ALSA", 2, 0));
+    DeviceEnumerator e(be, Platform::Linux);
+
+    auto devs = e.list();
+    ASSERT_EQ(devs.size(), 2u);
+    EXPECT_EQ(devs[0].backendIdFor(Direction::Capture), 4);
+    EXPECT_EQ(devs[1].backendIdFor(Direction::Capture), 9);
+}
+
+// The guard must not break the shape the merge exists for. A duplex record followed by a
+// same-named playback-only record overlaps on playback, so it stays separate; the capture-only
+// record that follows pairs with the MOST RECENT record rather than with the duplex device that
+// already owns a capture direction.
+TEST(DeviceEnumerator, ComplementaryPairAfterADuplexRecordStillMerges) {
+    FakeBackend be;
+    be.add(dev(0, "CODEC", "ALSA", 2, 2));  // a duplex device
+    be.add(dev(1, "CODEC", "ALSA", 0, 2));  // a second device, playback half
+    be.add(dev(2, "CODEC", "ALSA", 2, 0));  // ... and its capture half
+    DeviceEnumerator e(be, Platform::Linux);
+
+    auto devs = e.list();
+    ASSERT_EQ(devs.size(), 2u);
+    EXPECT_EQ(devs[0].backendIdFor(Direction::Capture), 0);
+    EXPECT_EQ(devs[0].backendIdFor(Direction::Playback), 0);
+    EXPECT_EQ(devs[1].capability, Capability::Duplex);
+    EXPECT_EQ(devs[1].backendIdFor(Direction::Playback), 1);
+    EXPECT_EQ(devs[1].backendIdFor(Direction::Capture), 2);
+}
+
 TEST(DeviceEnumerator, VirtualMatchingFindsCaptureDevice) {
     FakeBackend be;
     be.add(dev(0, "MacBook Pro Microphone", "Core Audio", 1, 0));

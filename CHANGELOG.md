@@ -6,6 +6,28 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Two distinct devices that share a name are no longer merged into one.** Device identity was
+  `name + hostApi`, so two identical rigs on one host API — e.g. a pair of "USB Audio CODEC"
+  interfaces, which is the shape naudio's own default capture pattern looks for — collapsed into a
+  single record. The second device's backend ids were dropped and it appeared nowhere in the
+  enumeration, so it could not be selected even by explicit device id.
+
+  The merge exists for one real backend shape: an ALSA-style **split** record, where the same
+  physical device is reported once capture-only and once playback-only. Those two records'
+  directions are disjoint by construction, so the merge is now restricted to
+  **complementary-direction** records; two records that both claim the same direction stay separate
+  devices with their own ids. A genuine split pair can never overlap, which is what makes the
+  overlap a safe discriminator.
+
+- **`na_audio_daemon` opens each direction on that direction's own backend id.** The daemon passed
+  the merged record's `backendId` — the first-seen record's id — to both the server's capture
+  device and the client's playback device, bypassing `backendIdFor()`. On a split capture-only +
+  playback-only pair the per-direction ids are exactly where the two directions differ, so the
+  daemon opened the wrong record and failed on a correctly configured system. `StreamOpener` and
+  the C ABI already resolved per direction; the daemon — the tool used for real-hardware
+  verification — was the outlier. Its progress lines now also print the id actually opened rather
+  than the merged one.
+
 - **An FEC-recovered packet is delivered in its own sequence position instead of after the rest of
   its block.** A repair can only be built when the parity arrives, and parity is computed over the
   block, so it necessarily arrives after every member that follows the loss. The decoder delivered

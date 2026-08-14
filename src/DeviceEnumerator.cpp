@@ -74,24 +74,43 @@ std::vector<DeviceInfo> DeviceEnumerator::list() {
         const std::string identity = matchKey(r.name, r.hostApi);
         auto it = byIdentity.find(identity);
         if (it != byIdentity.end()) {
-            // DUPLEX merge: the same device seen as both capture and playback is
-            // upgraded to DUPLEX. Order-independent (the merge
-            // adds capture first, then upgrades; this unions either order).
             DeviceInfo& existing = out[it->second];
-            existing.capability = capabilityFor(existing.supportsCapture() || canCapture,
-                                                existing.supportsPlayback() || canPlayback);
-            // Union the per-direction channel counts / default rate so the merged record
-            // reports the real capture+playback capability. Element-wise max keeps this
-            // order-independent (like the capability union above).
-            existing.maxInputChannels = std::max(existing.maxInputChannels, r.maxInputChannels);
-            existing.maxOutputChannels = std::max(existing.maxOutputChannels, r.maxOutputChannels);
-            existing.defaultSampleRate = std::max(existing.defaultSampleRate, r.defaultSampleRate);
-            // Record the incoming record's backend id for the direction(s) it adds, so a split
-            // capture-only + playback-only pair (ALSA-style) stays openable in BOTH directions
-            // rather than collapsing onto the first record's single id.
-            if (canCapture && existing.captureBackendId < 0) existing.captureBackendId = r.backendId;
-            if (canPlayback && existing.playbackBackendId < 0) existing.playbackBackendId = r.backendId;
-            continue;
+            // The merge exists for ONE backend shape: an ALSA-style SPLIT pair, where the same
+            // physical device is reported once capture-only and once playback-only. In that
+            // shape the two records' directions are disjoint by construction.
+            //
+            // Two records that both claim the SAME direction are two DISTINCT devices that
+            // happen to share a name — e.g. two identical USB-audio rigs on one host API, which
+            // is this project's own default capture pattern (tools/na_audio_daemon.cpp). Merging
+            // those dropped the second device's backend ids on the floor and erased it from the
+            // listing entirely, so it could not be reached even by --capture-id. A genuine split
+            // pair can never overlap, so the overlap is the discriminator.
+            const bool overlaps = (canCapture && existing.supportsCapture()) ||
+                                  (canPlayback && existing.supportsPlayback());
+            if (!overlaps) {
+                // DUPLEX merge: the same device seen as both capture and playback is
+                // upgraded to DUPLEX. Order-independent (the merge
+                // adds capture first, then upgrades; this unions either order).
+                existing.capability = capabilityFor(existing.supportsCapture() || canCapture,
+                                                    existing.supportsPlayback() || canPlayback);
+                // Union the per-direction channel counts / default rate so the merged record
+                // reports the real capture+playback capability. Element-wise max keeps this
+                // order-independent (like the capability union above).
+                existing.maxInputChannels = std::max(existing.maxInputChannels, r.maxInputChannels);
+                existing.maxOutputChannels =
+                    std::max(existing.maxOutputChannels, r.maxOutputChannels);
+                existing.defaultSampleRate =
+                    std::max(existing.defaultSampleRate, r.defaultSampleRate);
+                // Record the incoming record's backend id for the direction(s) it adds, so a
+                // split capture-only + playback-only pair (ALSA-style) stays openable in BOTH
+                // directions rather than collapsing onto the first record's single id.
+                if (canCapture) existing.captureBackendId = r.backendId;
+                if (canPlayback) existing.playbackBackendId = r.backendId;
+                continue;
+            }
+            // Overlapping: fall through and emit a second record. `byIdentity` is then re-pointed
+            // at it below, so a later complementary record pairs with the most recent device
+            // rather than with one that already owns that direction.
         }
 
         DeviceInfo info;
@@ -106,7 +125,9 @@ std::vector<DeviceInfo> DeviceEnumerator::list() {
         info.defaultSampleRate = r.defaultSampleRate;
         info.maxInputChannels = r.maxInputChannels;
         info.maxOutputChannels = r.maxOutputChannels;
-        byIdentity.emplace(identity, out.size());
+        // Assign, not emplace: an overlapping record reaches here with the identity already
+        // mapped, and the newest record is the one a later complementary record should join.
+        byIdentity[identity] = out.size();
         out.push_back(std::move(info));
     }
     return out;
