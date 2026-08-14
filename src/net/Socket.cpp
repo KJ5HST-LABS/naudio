@@ -41,6 +41,15 @@
 #  include <unistd.h>
 #endif
 
+// Per-socket receive-buffer overflow reporting (issue #29). Linux only: SO_RXQ_OVFL makes the
+// kernel attach its own discard count to each received datagram as SCM ancillary data.
+// macOS/BSD report UDP overflow system-wide (netstat -s) and never per socket; Winsock has no
+// equivalent. Feature-tested rather than assumed from __linux__ alone, so a libc that does not
+// declare the option degrades to "not measured" instead of failing to build.
+#if defined(__linux__) && defined(SO_RXQ_OVFL)
+#  define NAUDIO_HAVE_RXQ_OVFL 1
+#endif
+
 namespace naudio::net {
 
 #ifdef _WIN32
@@ -298,6 +307,7 @@ Socket::Socket(Socket&& other) noexcept : handle_(kInvalidSocket) {
     // keeps the handle transfer ordered against the same mutex everything else here uses.
     std::lock_guard<std::mutex> lock(other.ioMutex_);
     handle_.store(other.handle_.exchange(kInvalidSocket));
+    adoptDropCounter(other);
 }
 
 Socket& Socket::operator=(Socket&& other) noexcept {
@@ -305,8 +315,21 @@ Socket& Socket::operator=(Socket&& other) noexcept {
         close();  // drains this socket's own in-flight I/O before the descriptor goes
         std::lock_guard<std::mutex> lock(other.ioMutex_);
         handle_.store(other.handle_.exchange(kInvalidSocket));
+        adoptDropCounter(other);
     }
     return *this;
+}
+
+// The receive-drop counter is a property of the DESCRIPTOR (the kernel option is set on it), so
+// it has to travel with the handle above or a socket enabled before being moved into a connection
+// would silently report -1 forever. Called under the source's ioMutex_, like the handle steal.
+void Socket::adoptDropCounter(Socket& other) noexcept {
+    lastRawDrops_.store(other.lastRawDrops_.exchange(0, std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+    dropsAccum_.store(other.dropsAccum_.exchange(0, std::memory_order_relaxed),
+                      std::memory_order_relaxed);
+    dropCounterOn_.store(other.dropCounterOn_.exchange(false, std::memory_order_relaxed),
+                         std::memory_order_relaxed);
 }
 
 bool Socket::valid() const noexcept { return handle_.load() != kInvalidSocket; }
@@ -646,6 +669,33 @@ bool Socket::setRecvBufferAtLeast(int bytes) {
     return io.entered() && raiseSocketBuffer(io.handle(), SO_RCVBUF, bytes);
 }
 
+bool Socket::enableReceiveDropCounter() noexcept {
+#if defined(NAUDIO_HAVE_RXQ_OVFL)
+    IoScope io(*this);
+    if (!io.entered()) return false;
+    const int on = 1;
+    if (::setsockopt(io.handle(), SOL_SOCKET, SO_RXQ_OVFL, &on, sizeof(on)) != 0) return false;
+    // Zero the accumulator here rather than at construction: the kernel's counter is cumulative
+    // since the socket was created, and the first reading after this call is the baseline we
+    // difference against. Enabling twice restarts from the next datagram, which is the only
+    // meaning that does not double-count.
+    lastRawDrops_.store(0, std::memory_order_relaxed);
+    dropsAccum_.store(0, std::memory_order_relaxed);
+    dropCounterOn_.store(true, std::memory_order_relaxed);
+    return true;
+#else
+    return false;
+#endif
+}
+
+std::int64_t Socket::receiveDrops() const noexcept {
+    // The flag, not the accumulator, is what distinguishes "measured, and nothing was dropped"
+    // from "no mechanism on this platform". Collapsing the two into 0 is precisely the reading
+    // error this counter exists to prevent.
+    if (!dropCounterOn_.load(std::memory_order_relaxed)) return -1;
+    return static_cast<std::int64_t>(dropsAccum_.load(std::memory_order_relaxed));
+}
+
 int Socket::setSendBufferSize(int bytes) {
     IoScope io(*this);
     return io.entered() ? resizeSocketBuffer(io.handle(), SO_SNDBUF, bytes) : 0;
@@ -794,9 +844,57 @@ RecvFromResult Socket::recvFrom(void* buf, std::size_t len) {
     const int recvFlags = 0;
 #endif
     for (;;) {
-        int n = static_cast<int>(::recvfrom(h, static_cast<char*>(buf),
+        int n = -1;
+        bool taken = false;
+#if defined(NAUDIO_HAVE_RXQ_OVFL)
+        // The kernel's discard count rides on ancillary data, and only recvmsg can carry it.
+        // This branch is entered ONLY on a socket that asked for the counter, so every other
+        // receive path — the server's demux loop included — keeps the plain recvfrom below,
+        // byte for byte. That is deliberate: this file is the one place naudio touches platform
+        // socket headers, and the narrower the Linux-only path, the less a mistake in it can
+        // reach. MSG_TRUNC means the same thing here as it does to recvfrom: n is the
+        // datagram's TRUE length even when the tail was dropped.
+        if (dropCounterOn_.load(std::memory_order_relaxed)) {
+            taken = true;
+            iovec iov;
+            iov.iov_base = buf;
+            iov.iov_len = len;
+            // CMSG_SPACE, not CMSG_LEN — the kernel needs the alignment padding as well as the
+            // payload. The union is the portable way to get cmsghdr's alignment on the buffer.
+            union {
+                char bytes[CMSG_SPACE(sizeof(std::uint32_t))];
+                struct cmsghdr align;
+            } cmsgBuf;
+            msghdr msg{};
+            msg.msg_name = &src;
+            msg.msg_namelen = sizeof(src);
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsgBuf.bytes;
+            msg.msg_controllen = sizeof(cmsgBuf.bytes);
+            n = static_cast<int>(::recvmsg(h, &msg, recvFlags));
+            if (n >= 0) {
+                sl = msg.msg_namelen;
+                for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+                    if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SO_RXQ_OVFL) continue;
+                    std::uint32_t raw = 0;
+                    std::memcpy(&raw, CMSG_DATA(c), sizeof(raw));
+                    // Cumulative since socket creation, and 32-bit. Accumulate the DELTA so the
+                    // exported total does not wrap where the raw counter does — unsigned
+                    // subtraction across the wrap is well-defined and yields the true delta.
+                    const std::uint32_t prev =
+                        lastRawDrops_.exchange(raw, std::memory_order_relaxed);
+                    const std::uint32_t delta = raw - prev;
+                    if (delta != 0) dropsAccum_.fetch_add(delta, std::memory_order_relaxed);
+                }
+            }
+        }
+#endif
+        if (!taken) {
+            n = static_cast<int>(::recvfrom(h, static_cast<char*>(buf),
                                             static_cast<int>(len), recvFlags,
                                             reinterpret_cast<sockaddr*>(&src), &sl));
+        }
         if (n >= 0) {
             char ip[INET_ADDRSTRLEN] = {0};
             ::inet_ntop(AF_INET, &src.sin_addr, ip, sizeof(ip));

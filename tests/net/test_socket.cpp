@@ -565,6 +565,145 @@ TEST(Socket, UdpDatagramRoundTripCarriesSenderEndpoint) {
     EXPECT_EQ(r.senderPort, senderPort);
 }
 
+// --- receive-drop counter (issue #29) -------------------------------------------------------
+//
+// The three arms below are deliberately split by platform rather than skipped on the ones
+// without the mechanism: "-1 everywhere it is unavailable" IS the contract, and an arm that
+// skips there would leave the half that macOS and Windows actually ship untested.
+
+TEST(Socket, ReceiveDropsIsUnmeasuredBeforeTheCounterIsEnabled) {
+    std::string err;
+    Socket rx = Socket::bindUdp("", 0, true, &err);
+    ASSERT_TRUE(rx.valid()) << err;
+    // -1, not 0, on EVERY platform — including the ones that could measure it but were not
+    // asked to. A 0 here would say "nothing was dropped", which is the one thing an
+    // unmeasured loss counter must never say.
+    EXPECT_EQ(rx.receiveDrops(), -1);
+}
+
+TEST(Socket, EnablingTheDropCounterMatchesWhatThePlatformCanActuallyDo) {
+    std::string err;
+    Socket rx = Socket::bindUdp("", 0, true, &err);
+    ASSERT_TRUE(rx.valid()) << err;
+    const bool enabled = rx.enableReceiveDropCounter();
+#if defined(__linux__)
+    // Pinned rather than inferred: if this ever starts returning false on Linux the counter
+    // degrades to a permanent -1, which reads exactly like a platform without the mechanism.
+    EXPECT_TRUE(enabled);
+    EXPECT_EQ(rx.receiveDrops(), 0);  // measured now, and nothing has been dropped yet
+#else
+    EXPECT_FALSE(enabled);
+    EXPECT_EQ(rx.receiveDrops(), -1);  // and it stays unmeasured, not zero
+#endif
+}
+
+TEST(Socket, TheDropCounterSurvivesBeingMovedIntoItsOwner) {
+    // UdpClientConnection takes its socket BY VALUE and moves it, so a counter enabled before
+    // that move has to travel with the descriptor or the connection reports -1 forever.
+    std::string err;
+    Socket rx = Socket::bindUdp("", 0, true, &err);
+    ASSERT_TRUE(rx.valid()) << err;
+    const bool enabled = rx.enableReceiveDropCounter();
+    Socket moved = std::move(rx);
+    ASSERT_TRUE(moved.valid());
+#if defined(__linux__)
+    ASSERT_TRUE(enabled);
+    EXPECT_EQ(moved.receiveDrops(), 0);  // carried over as MEASURED, not reset to unmeasured
+#else
+    ASSERT_FALSE(enabled);
+    EXPECT_EQ(moved.receiveDrops(), -1);
+#endif
+    EXPECT_EQ(rx.receiveDrops(), -1);  // and the moved-from socket measures nothing
+}
+
+#if defined(__linux__)
+// The real thing: overflow a small receive buffer and read the kernel's own discard count back.
+//
+// Bounded against a quantity the socket layer never computes — datagrams the sender put on the
+// wire minus datagrams the kernel actually queued — rather than against `> 0`.
+TEST(Socket, ReceiveDropsReportsTheKernelsOwnDiscardCount) {
+    std::string err;
+    Socket rx = Socket::bindUdp("", 0, true, &err);
+    ASSERT_TRUE(rx.valid()) << err;
+    rx.setRecvBufferSize(4096);  // small enough that a flood cannot fit
+    ASSERT_TRUE(rx.enableReceiveDropCounter());
+    const std::uint16_t rxPort = rx.localPort();
+    ASSERT_GT(rxPort, 0);
+    rx.setRecvTimeout(50);
+
+    Socket tx = Socket::bindUdp("", 0, true, &err);
+    ASSERT_TRUE(tx.valid()) << err;
+
+    const std::vector<std::uint8_t> payload(1024, 0xAB);
+    int sent = 0;
+    for (int i = 0; i < 20000; ++i) {
+        if (tx.sendTo(payload.data(), payload.size(), "127.0.0.1", rxPort)) ++sent;
+    }
+    ASSERT_GT(sent, 0);
+
+    std::vector<std::uint8_t> buf(2048);
+    int queued = 0;
+    while (rx.recvFrom(buf.data(), buf.size()).status == IoStatus::Ok) ++queued;
+    ASSERT_GT(sent, queued) << "the flood fit in the receive buffer; nothing was dropped";
+
+    // THE COUNT IS STAMPED AT ENQUEUE. Everything drained above was queued before the buffer
+    // filled, so it carries a zero stamp; the reading only rides in on a datagram queued AFTER
+    // the discard. Sending into the now-drained buffer is what makes the loss observable, and
+    // it is why a permanently stalled consumer never learns of its own drops.
+    EXPECT_EQ(rx.receiveDrops(), 0) << "drops became visible without a post-discard arrival";
+
+    // THE TAIL SENDS MUST ALL FIT, and that is a real constraint rather than tidiness. A tail
+    // datagram that is itself dropped is dropped AFTER the last packet the kernel could stamp,
+    // so its discard is unobservable and the identity below goes off by exactly that many.
+    // Measured while writing this arm: five 1 KiB tails into the 4 KiB buffer above lost one,
+    // and the counter read 19996 where the true total was 19997. Three 64-byte tails fit with
+    // room to spare. The residual is inherent — the last drop before a stream goes quiet is
+    // never reported — and is documented on Socket::receiveDrops rather than asserted here.
+    const std::vector<std::uint8_t> tail(64, 0xEE);
+    const int kTailSends = 3;
+    for (int i = 0; i < kTailSends; ++i) {
+        ASSERT_TRUE(tx.sendTo(tail.data(), tail.size(), "127.0.0.1", rxPort));
+    }
+    int tailRead = 0;
+    while (rx.recvFrom(buf.data(), buf.size()).status == IoStatus::Ok) {
+        ++queued;
+        ++tailRead;
+    }
+    ASSERT_EQ(tailRead, kTailSends) << "a tail datagram was dropped; the identity below cannot hold";
+
+    // Two-directional, against quantities the socket layer never computes — the sender's own
+    // count and the drain's — never `> 0` alone.
+    EXPECT_EQ(rx.receiveDrops(), static_cast<std::int64_t>(sent + kTailSends - queued));
+    EXPECT_GT(rx.receiveDrops(), 0);
+}
+
+// The negative control for the arm above: the SAME setup with a buffer big enough to hold
+// everything must report exactly 0, not "some small number". Without this, an implementation
+// that reported garbage on every datagram would pass the overflow arm.
+TEST(Socket, ReceiveDropsStaysZeroWhenTheBufferKeepsUp) {
+    std::string err;
+    Socket rx = Socket::bindUdp("", 0, true, &err);
+    ASSERT_TRUE(rx.valid()) << err;
+    rx.setRecvBufferAtLeast(1 << 20);
+    ASSERT_TRUE(rx.enableReceiveDropCounter());
+    const std::uint16_t rxPort = rx.localPort();
+    rx.setRecvTimeout(50);
+
+    Socket tx = Socket::bindUdp("", 0, true, &err);
+    ASSERT_TRUE(tx.valid()) << err;
+
+    const std::vector<std::uint8_t> payload(64, 0xCD);
+    for (int i = 0; i < 8; ++i) {
+        ASSERT_TRUE(tx.sendTo(payload.data(), payload.size(), "127.0.0.1", rxPort));
+    }
+    std::vector<std::uint8_t> buf(256);
+    int got = 0;
+    while (rx.recvFrom(buf.data(), buf.size()).status == IoStatus::Ok) ++got;
+    EXPECT_EQ(got, 8);
+    EXPECT_EQ(rx.receiveDrops(), 0);
+}
+#endif  // __linux__
+
 TEST(Socket, MoveLeavesSourceInvalid) {
     std::string err;
     Socket a = Socket::listenTcp("", 0, true, &err);

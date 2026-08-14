@@ -263,6 +263,49 @@ public:
     bool setSendBufferAtLeast(int bytes);
     bool setRecvBufferAtLeast(int bytes);
 
+    // Asks the kernel to report how many datagrams it discarded because THIS socket's receive
+    // buffer was full. Returns true only where that mechanism exists, which today is Linux
+    // (SO_RXQ_OVFL); false elsewhere, and false is not an error.
+    //
+    // WHY THIS IS THE ONLY HONEST INSTRUMENT FOR THAT LOSS. A full receive buffer TAIL-DROPS:
+    // it discards the NEWEST arrivals, so a consumer that cannot keep up reads an unbroken
+    // PREFIX of the stream and simply stops early. Nothing it read has a hole in it, so no
+    // sequence-gap counter can see the loss — measured on a client stalled to a quarter of the
+    // offered rate: 127 of 400 packets read, with sequenceGaps() == 0 (issue #29). The kernel
+    // is the only party that witnesses the discard, and this is how it says so.
+    //
+    // NOT PORTABLE, AND DELIBERATELY NOT FAKED. macOS/BSD expose UDP overflow only
+    // system-wide (netstat -s), never per socket, and Winsock has no equivalent at all. A
+    // derived estimate (expected packets from the negotiated rate, minus those received) would
+    // move on every platform and would conflate local loss with wire loss — a counter whose
+    // name claims more than its mechanism observes, which is the defect class issue #29 exists
+    // to correct. So receiveDrops() reports -1 there rather than a plausible number.
+    //
+    // Call it AFTER the socket is bound and BEFORE the receive loop starts. It is sticky
+    // across a move, so enabling it on a socket that is later moved into a connection is safe.
+    bool enableReceiveDropCounter() noexcept;
+
+    // Datagrams the kernel discarded on this socket for want of receive-buffer room, since
+    // enableReceiveDropCounter() succeeded. -1 means NOT MEASURED — either the counter was
+    // never enabled or this platform has no mechanism — and never means "nothing was dropped".
+    //
+    // Accumulated as 64-bit deltas over the kernel's 32-bit counter, so it does not wrap where
+    // the raw value would.
+    //
+    // THE COUNT IS STAMPED AT ENQUEUE, NOT AT RECEIVE, and that sets the one real limitation.
+    // The kernel records its running discard total on each datagram AS IT QUEUES it, so the
+    // reading only reaches us on a datagram queued AFTER the discard — draining packets that
+    // were already queued before the buffer filled reports nothing, however many were lost.
+    // MEASURED in a Linux container: a socket flooded with 20000 datagrams on a 4 KiB receive
+    // buffer queued 4 and reported drops == 0 until five more were sent into the drained
+    // buffer, at which point it reported exactly 19996 == 20000 - 4. So a consumer that falls
+    // behind and then KEEPS READING (the case this counter is for) sees its losses, while one
+    // that stalls and never reads again never learns of them. Inherent to the mechanism, not a
+    // defect here.
+    //
+    // Only ever updated by a thread inside recvFrom().
+    std::int64_t receiveDrops() const noexcept;
+
     // Sets SO_SNDBUF / SO_RCVBUF toward `bytes` and, unlike the two above, will SHRINK a buffer
     // that is already larger. Returns the size the kernel actually settled on, or 0 if the
     // socket is invalid or the option could not be read back.
@@ -359,6 +402,20 @@ private:
     mutable std::mutex ioMutex_;
     mutable std::condition_variable ioIdle_;
     mutable int inFlight_ = 0;  // threads currently inside a syscall on handle_
+
+    // Moves the receive-drop counter's state off `other`, under `other`'s ioMutex_. Shares the
+    // handle steal's lock because the counter belongs to the descriptor being stolen.
+    void adoptDropCounter(Socket& other) noexcept;
+
+    // --- receive-drop counter (see enableReceiveDropCounter) ---
+    //
+    // All three are atomic because receiveDrops() is read from the stats path while recvFrom()
+    // writes them on the receive thread. dropsAccum_ is the 64-bit total; lastRawDrops_ holds
+    // the kernel's last 32-bit reading so the delta survives its wrap (unsigned subtraction is
+    // well-defined on the wrap). dropCounterOn_ is what separates a real 0 from "not measured".
+    std::atomic<bool> dropCounterOn_{false};
+    std::atomic<std::uint64_t> dropsAccum_{0};
+    std::atomic<std::uint32_t> lastRawDrops_{0};
 };
 
 }  // namespace naudio::net
