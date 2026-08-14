@@ -28,8 +28,9 @@ namespace naudio {
 //
 // An insertion-ordered vector with oldest-first eviction + an ordered timeout
 // scan (BUFFER_SIZE = 16, so the linear lookups are trivial). recordSentAt
-// / checkRetransmitsAt (explicit "now" ms) are the primary, testable forms; the
-// no-arg wrappers read the wall clock. Pure (no threads): caller serializes.
+// / checkRetransmitsAt / onNackReceivedAt (explicit "now" ms) are the primary,
+// testable forms; the no-arg wrappers read the MONOTONIC clock. Pure (no
+// threads): caller serializes.
 //
 // Compiled into naudio_core (definitions in ControlReliability.cpp).
 class ControlReliability {
@@ -48,7 +49,7 @@ public:
 
     // --- Sender side ---
 
-    // Records a sent control packet, using the wall clock as the send time.
+    // Records a sent control packet, using the monotonic clock as the send time.
     void recordSent(const AudioPacket& packet);
 
     // Records a sent control packet with an explicit send time (the testable
@@ -62,7 +63,7 @@ public:
     // nullopt if evicted/not found.
     std::optional<AudioPacket> onNackReceived(std::int32_t nackedSeq);
 
-    // Returns packets needing retransmission, using the wall clock.
+    // Returns packets needing retransmission, using the monotonic clock.
     std::vector<AudioPacket> checkRetransmits();
 
     // Returns packets needing retransmission with an explicit "now" (the testable

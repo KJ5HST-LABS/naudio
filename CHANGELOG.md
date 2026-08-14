@@ -6,6 +6,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Control-message retransmission is no longer disrupted by a system clock step.**
+  `ControlReliability` was the one reliability component timed by the wall clock, while
+  `FecDecoder`, `PacketReorderBuffer` and `JitterEstimator` all use the monotonic clock. An NTP
+  step **backward** of T suppressed every pending critical-control retransmit for T; a step
+  **forward** timed them all out at once, burning retransmit attempts toward the silent
+  exhaustion-drop. The stamps are only ever compared against each other and never reported or put
+  on the wire, so the monotonic clock is strictly correct here. Behaviour is unchanged on a machine
+  whose clock does not step.
+
 - **Two distinct devices that share a name are no longer merged into one.** Device identity was
   `name + hostApi`, so two identical rigs on one host API — e.g. a pair of "USB Audio CODEC"
   interfaces, which is the shape naudio's own default capture pattern looks for — collapsed into a

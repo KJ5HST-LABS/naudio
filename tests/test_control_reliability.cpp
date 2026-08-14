@@ -8,6 +8,7 @@
 // these tests ARE the contract: critical-type gating, ACK/NACK, timeout-based
 // retransmit (driven via the injected checkRetransmitsAt clock, no sleeps),
 // oldest-first eviction at BUFFER_SIZE, and CONTROL_ACK generation.
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -131,6 +132,37 @@ TEST(ControlReliability, BufferEvictsOldestWhenFull) {
     EXPECT_EQ(ControlReliability::BUFFER_SIZE, r.pendingCount());
     EXPECT_FALSE(r.onNackReceived(0).has_value());   // seq 0 evicted
     EXPECT_TRUE(r.onNackReceived(100).has_value());   // seq 100 present
+}
+
+// The no-arg wrappers are the ONLY part of this class a test can get wrong silently: every other
+// arm injects its own "now", so the clock choice is invisible to them. This arm pins the domain by
+// bracketing the stamp between two steady_clock reads and asserting the timeout arithmetic works
+// out in THAT domain. On a system_clock stamp the recorded time is epoch-milliseconds (~1.7e12)
+// while a steady "now" is milliseconds-since-boot, so `nowMs - lastSendTime` is hugely negative,
+// nothing is ever due, and the second assertion below fails. The brackets make it independent of
+// how long recordSent() itself takes, so there is no sleep and no wall-clock flake.
+TEST(ControlReliability, NoArgWrappersStampInTheMonotonicDomain) {
+    auto steadyNowMs = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+
+    ControlReliability r = reliability();  // 3 attempts, 500 ms timeout
+    const std::int64_t before = steadyNowMs();
+    r.recordSent(controlPacket(1, ControlMessage::txGranted()));
+    const std::int64_t after = steadyNowMs();
+    ASSERT_EQ(1u, r.pendingCount());
+    ASSERT_LE(before, after);
+
+    // stamp >= before, so at before+499 the packet cannot yet be due. This is the negative
+    // control: without it, an implementation that returned every pending packet unconditionally
+    // would satisfy the assertion that matters.
+    EXPECT_TRUE(r.checkRetransmitsAt(before + 499).empty());
+
+    // stamp <= after, so at after+500 at least 500 ms have elapsed and it must be due.
+    // THIS is the assertion that dies if the class goes back to the wall clock.
+    EXPECT_EQ(1u, r.checkRetransmitsAt(after + 500).size());
 }
 
 TEST(ControlReliability, GenerateAckForCriticalControl) {

@@ -127,8 +127,13 @@ void ControlReliability::reset() {
 }
 
 std::int64_t ControlReliability::nowMillis() {
+    // steady_clock, matching FecDecoder / PacketReorderBuffer / JitterEstimator. These stamps are
+    // only ever compared against each other (nowMs - lastSendTime), never reported or put on the
+    // wire, so a monotonic source is strictly the right one and the wall clock was strictly wrong:
+    // an NTP step BACKWARD of T suppressed every pending retransmit for T, and a step FORWARD
+    // timed them all out at once, burning attempts toward the silent exhaustion-drop below.
     return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
+               std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
 
