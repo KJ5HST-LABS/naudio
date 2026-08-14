@@ -84,8 +84,9 @@ struct ClientStats {
     // server-side connection reaches: a client's only critical control message is DISCONNECT, sent
     // after the thread that pumps the retransmit sweep has exited; and a client fills and drains its
     // ordered queue from one thread, so the queue cannot back up to its 2048-packet cap (a slow
-    // consumer loses audio in the kernel socket buffer instead, which nothing here counts --
-    // not even sequenceGaps below, since that buffer tail-drops and leaves no hole to see). They are
+    // consumer loses audio in the kernel socket buffer instead -- not counted by sequenceGaps
+    // below, since that buffer tail-drops and leaves no hole to see, and reported ONLY by
+    // socketReceiveDrops, and there only where the platform has the mechanism). They are
     // 0 rather than -1 because -1 is reserved for "not measured" — these are measured, and the
     // client simply never produces the event. See the na_client_stats contract in naudio.h.
     std::int64_t controlRetransmits = 0;
@@ -105,6 +106,17 @@ struct ClientStats {
     // chance to refill the slot, so the unrecovered remainder is this minus
     // packetsRecoveredByFec. See Transport::sequenceGaps for the full contract.
     std::int64_t sequenceGaps = -1;
+
+    // Datagrams the KERNEL discarded for want of receive-buffer room — audio lost
+    // locally, before naudio saw it. This is the loss mode NOTHING else here reports:
+    // a full receive buffer tail-drops, so a consumer that falls behind reads an
+    // unbroken PREFIX and stops early, leaving no hole for sequenceGaps to count.
+    //
+    // -1 == unmeasured, and here that is a PLATFORM statement rather than a profile
+    // one: the mechanism is Linux's SO_RXQ_OVFL, and macOS/BSD/Windows expose no
+    // per-socket equivalent. See Socket::enableReceiveDropCounter for why no derived
+    // estimate stands in for it.
+    std::int64_t socketReceiveDrops = -1;
 };
 
 // Client for connecting to an AudioStreamServer.

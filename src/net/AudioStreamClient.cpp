@@ -1051,6 +1051,10 @@ ClientStats AudioStreamClient::stats() const {
     // there is no predicate to gate on here. It is the complement of the block above
     // — live exactly when those three are -1 — and the two are never both readings.
     s.sequenceGaps = conn->sequenceGaps();
+    // Same shape and the same reason: the connection returns -1 where nothing measures it, so
+    // there is nothing to gate on. Unlike sequenceGaps this one is unmeasured on most platforms
+    // rather than on most profiles — the mechanism is Linux-only (Socket::receiveDrops).
+    s.socketReceiveDrops = conn->socketReceiveDrops();
     return s;
 }
 
