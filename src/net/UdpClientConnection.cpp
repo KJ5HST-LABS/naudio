@@ -589,6 +589,13 @@ std::int64_t UdpClientConnection::sequenceGaps() const {
     return reorderBuffer_ ? reorderBuffer_->gapsEmitted() : -1;
 }
 
+std::int64_t UdpClientConnection::socketReceiveDrops() const {
+    // No pipe_ lock: the reading lives in the Socket's atomics, not behind the pipeline mutex
+    // every counter above it guards. Taking pipe_ here would put a stats call in line behind
+    // the receive path for a value that path does not own.
+    return socket_ ? socket_->receiveDrops() : -1;
+}
+
 double UdpClientConnection::jitterMs() const {
     std::lock_guard<std::mutex> lock(pipe_);
     return jitterEstimator_ ? jitterEstimator_->jitterMs() : 0.0;

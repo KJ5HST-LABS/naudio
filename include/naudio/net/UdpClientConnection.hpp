@@ -296,6 +296,13 @@ public:
     // case it reports the slots that buffer gave up on. See Transport::sequenceGaps.
     std::int64_t sequenceGaps() const override;
 
+    // Kernel receive-buffer discards on this connection's socket, or -1 when unmeasured —
+    // which covers every platform but Linux AND every SERVER-side connection, because those
+    // share the server's socket and nothing enables the counter on it. Delegates straight to
+    // the socket: unlike its neighbours here this counter is owned by the descriptor, not by a
+    // pipeline component, so it needs no pipe_ lock (Socket keeps it in atomics).
+    std::int64_t socketReceiveDrops() const override;
+
     // --- Diagnostics ---
     // Packets dropped from the ordered queue under backpressure and the
     // current queue depth — exposed so a flood test can assert the bound holds.

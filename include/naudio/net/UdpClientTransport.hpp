@@ -46,6 +46,14 @@ public:
         // receive side matters most here — this socket takes the server's RX fan-out.
         socket.setSendBufferAtLeast(static_cast<int>(UdpClientConnection::MAX_DATAGRAM_SIZE) * 8);
         socket.setRecvBufferAtLeast(static_cast<int>(UdpClientConnection::MAX_DATAGRAM_SIZE) * 8);
+        // Ask the kernel to count what it discards on this socket (issue #29). Deliberately
+        // AFTER the receive buffer is raised, so the counter measures the buffer the client
+        // actually runs with rather than the default it was born with. The return value is not
+        // checked because false is the expected answer everywhere but Linux, and the counter
+        // reports -1 there — an unavailable mechanism is not a connect failure. Enabled here,
+        // before the socket is moved into the connection below, which is safe because the
+        // counter travels with the descriptor (Socket::adoptDropCounter).
+        socket.enableReceiveDropCounter();
 
         connection_ = std::make_shared<UdpClientConnection>(
             std::move(socket), host, port, ClientAddress("client", host, port), cfg_);

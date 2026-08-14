@@ -153,6 +153,20 @@ public:
     // when it is not measuring. TCP and any passthrough profile keep the -1.
     virtual std::int64_t sequenceGaps() const { return -1; }
 
+    // Datagrams the KERNEL discarded for want of receive-buffer room on this connection's
+    // socket — audio lost locally, before naudio ever saw it. -1 means not measured.
+    //
+    // This is the one loss mode nothing else here can report, and sequenceGaps() above is
+    // precisely the counter that cannot: a full receive buffer tail-drops, so a consumer that
+    // falls behind reads an unbroken PREFIX and stops early, leaving no hole to count. The two
+    // are complements, not overlaps — a gap says the pipeline could not order what arrived, this
+    // says the arrival never happened.
+    //
+    // -1 on every transport that does not measure it, which today is every one except a
+    // client-owned UDP connection on Linux (see Socket::enableReceiveDropCounter for why the
+    // mechanism is not portable and why no derived estimate stands in for it).
+    virtual std::int64_t socketReceiveDrops() const { return -1; }
+
     // Whether packetsLost() / packetsOutOfOrder() / packetLossRate() are actually
     // MEASURED on this connection. When false they are unavailable, and a consumer
     // must not read their 0 as "nothing was lost".

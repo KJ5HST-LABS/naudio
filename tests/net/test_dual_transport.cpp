@@ -39,6 +39,60 @@ bool startsWith(const std::string& s, const std::string& prefix) {
 
 }  // namespace
 
+// Issue #29: the kernel receive-drop counter must actually be ENABLED on the socket a real
+// client connection runs on, not merely implemented in Socket. The arm is split by platform
+// rather than skipped, because "-1 where the mechanism does not exist" is half the contract.
+//
+// This is the wiring assertion. Whether the counter MOVES under induced loss is a separate
+// question, asked where the loss can be induced (tests/c_client_stats.c).
+TEST(DualTransport, AClientOwnedUdpConnectionMeasuresKernelReceiveDrops) {
+    UdpServerTransport server;
+    server.setReliabilityConfig(passthrough());
+    std::string err;
+    ASSERT_TRUE(server.bind(0, &err)) << err;
+    auto port = static_cast<std::uint16_t>(server.port());
+
+    UdpClientTransport client(passthrough());
+    auto cc = client.connect("127.0.0.1", port, 2000, &err);
+    ASSERT_TRUE(cc) << err;
+
+#if defined(__linux__)
+    // 0, not -1: measured, and nothing has been dropped on a connection this young. A -1 here
+    // means UdpClientTransport stopped enabling the counter and every consumer silently lost
+    // the reading — which looks exactly like running on macOS.
+    EXPECT_EQ(cc->socketReceiveDrops(), 0);
+#else
+    EXPECT_EQ(cc->socketReceiveDrops(), -1);
+#endif
+}
+
+// A SERVER-side connection shares the server's socket, which nobody enables the counter on, so
+// it reports unmeasured on every platform. Pinned so the -1 is a decision rather than an
+// accident that could be "fixed" into a misleading 0.
+TEST(DualTransport, AServerSideUdpConnectionDoesNotMeasureKernelReceiveDrops) {
+    UdpServerTransport server;
+    server.setReliabilityConfig(passthrough());
+    std::string err;
+    ASSERT_TRUE(server.bind(0, &err)) << err;
+    auto port = static_cast<std::uint16_t>(server.port());
+
+    UdpClientTransport client(passthrough());
+    auto cc = client.connect("127.0.0.1", port, 2000, &err);
+    ASSERT_TRUE(cc) << err;
+    // App-level handshake, as UdpClientServerFullLoopbackRoundTrip below: UDP has no
+    // transport-level handshake, so the server's demux only registers a session once the
+    // client announces itself.
+    ASSERT_TRUE(cc->sendControl(ControlMessage::connectRequest("u", AudioPacket::VERSION)));
+
+    std::shared_ptr<ClientConnection> sc;
+    ASSERT_EQ(server.acceptClient(2000, sc, &err), IoStatus::Ok) << err;
+    ASSERT_TRUE(sc);
+    EXPECT_EQ(sc->socketReceiveDrops(), -1);
+
+    server.close();
+    client.close();
+}
+
 // Full bidirectional UDP loopback: a real UdpClientTransport connection exchanges
 // audio with a real UdpServerTransport-accepted connection.
 TEST(DualTransport, UdpClientServerFullLoopbackRoundTrip) {
