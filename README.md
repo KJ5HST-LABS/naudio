@@ -202,6 +202,13 @@ na_client_get_stats(c, &st, sizeof st);
 
 if (na_version_number() >= NA_VERSION_ENCODE(0, 2, 0) && st.sequence_gaps >= 0)
     printf("%lld sequence gaps\n", st.sequence_gaps);
+
+/* socket_rx_drops arrived in 0.3.0 and asks the same two questions in the same order — but
+   its -1 is a statement about the PLATFORM, not the connection: the mechanism is Linux-only
+   (see include/naudio.h). Note a 0 here is weaker than it looks; the counter lags by a whole
+   receive buffer, so it means "no loss reported yet", not "no loss". */
+if (na_version_number() >= NA_VERSION_ENCODE(0, 3, 0) && st.socket_rx_drops >= 0)
+    printf("%lld datagrams dropped by the kernel receive buffer\n", st.socket_rx_drops);
 ```
 
 Always compare **through** `NA_VERSION_ENCODE` rather than spelling the arithmetic — the packing is

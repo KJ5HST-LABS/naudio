@@ -42,6 +42,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `naudio/ControlReliability.hpp`.
 
 ### Added
+- **`na_client_stats.socket_rx_drops` (`@since 0.3.0`) — the first counter for audio lost
+  *locally*, in the kernel's socket receive buffer, before naudio ever sees it.** This was the
+  one loss mode no field reported: a full receive buffer tail-drops, discarding the *newest*
+  arrivals, so a consumer that cannot keep up reads an unbroken prefix and simply stops early.
+  Nothing it read has a hole in it, so `sequence_gaps` correctly reports nothing (measured: 127
+  of 400 packets read with `sequence_gaps == 0`), and `queue_drops` cannot move on a client at
+  all. Sourced from Linux `SO_RXQ_OVFL`; **`-1` on macOS and Windows**, which expose no
+  per-socket equivalent — the struct's established encoding for "not measuring". A portable
+  derived estimate was rejected: it would conflate local loss with wire loss and freeze a name
+  claiming more than the mechanism observes. It **lags by a whole receive buffer** — the kernel
+  stamps its discard total on each datagram as it *queues* it, so a 0 means "nothing reported
+  yet", never "nothing was lost". Version accordingly moves 0.2.0 → 0.3.0, and
+  `NA_CLIENT_STATS_SIZE_V3` joins V1/V2 rather than V2 being redefined.
+- `Socket::enableReceiveDropCounter()` / `Socket::receiveDrops()`, and
+  `ClientConnection::socketReceiveDrops()` — the C++ path behind that field.
 - `ControlReliability::onNackReceivedAt(seq, nowMs)` — the explicit-time form of
   `onNackReceived`, matching the existing `recordSentAt` / `checkRetransmitsAt` pair.
 

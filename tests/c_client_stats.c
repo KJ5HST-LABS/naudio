@@ -23,15 +23,24 @@
  *   (4) UDP_WAN, the same relay dropping nothing     -> it stays 0
  *   (5) UDP_WAN, one audio packet CORRUPTED per block -> crc_errors moves
  *   (6) UDP_WAN, a deliberately stalled audio callback -> queue_drops does NOT move
+ *   (7) UDP_WAN, a consumer falling behind but still draining -> socket_rx_drops DOES (Linux only)
  *
  * SINCE 0.2.0, arm (1) also covers the struct_size guard in BOTH directions — a caller declaring
  * MORE than the library writes (the tail is zero-filled, nothing past it touched) and a caller
  * declaring the V1 size against this longer library (sequence_gaps is not written at all). The
  * second is the case appending a field created, and only a shorter-than-ours declaration reaches
- * the guard, so neither block substitutes for the other. Arms (2)-(6) carry sequence_gaps through
- * the same fault matrix: -1 on TCP, 0 on the lossless control, bounded on both sides by the
- * relay's own drop count under loss, and — deliberately — 0 on the stalled consumer, because a
- * tail-dropping socket buffer leaves no hole for a gap counter to find.
+ * the guard, so neither block substitutes for the other. 0.3.0 adds a third: a caller declaring
+ * the V2 size, which is the only one that can tell a PER-FIELD guard from a single guard keyed to
+ * the newest version — it must receive sequence_gaps and must NOT receive socket_rx_drops.
+ *
+ * Arms (2)-(6) carry sequence_gaps through the same fault matrix: -1 on TCP, 0 on the lossless
+ * control, bounded on both sides by the relay's own drop count under loss, and — deliberately —
+ * 0 on the stalled consumer, because a tail-dropping socket buffer leaves no hole for a gap
+ * counter to find. socket_rx_drops (0.3.0) answers exactly that last case, and arms (6) and (7)
+ * are a matched pair rather than a repetition: the counter reads a live 0 under a HARD stall
+ * (the consumer never drains past its own pre-drop backlog, so no stamped datagram is ever read)
+ * and moves under a SOFTER one that keeps draining. Both readings are correct, and asserting only
+ * the second would hide the lag that makes a 0 here mean "nothing reported yet", not "no loss".
  *
  * DROPPING AND CORRUPTING ARE DIFFERENT FAULTS, and the distinction is the whole reason crc_errors
  * sat at 0 through fourteen sessions of loss testing: a dropped datagram never arrives, so nothing
@@ -43,6 +52,12 @@
  * should work and shows that it does not, so the claim in the header is executable rather than
  * merely asserted. If either counter ever does move here, this test fails and that header contract
  * is what needs updating.
+ *
+ * ARM (7) IS LINUX-ONLY, guarded whole rather than asserted-and-skipped, so it costs macOS and
+ * Windows no runtime at all. It is the one place socket_rx_drops is observed to MOVE end to end
+ * through the public ABI; the Socket-level arms in tests/net/test_socket.cpp bound the mechanism
+ * exactly, and the platform contract (-1 where there is no mechanism) is asserted on every
+ * platform by arms (2) and (6).
  *
  * Hardware-free: NULL backends on both ends, loopback UDP, no PortAudio, no radio.
  */
@@ -91,6 +106,13 @@ void naproxy_stop(void* handle);
  * UdpClientConnection's consecutive-error run — so the 20-error teardown threshold
  * (MAX_CONSECUTIVE_CRC_ERRORS) is never approached and the arm measures counting, not teardown. */
 #define STALL_CB_MS   100   /* how long the audio callback blocks in that arm */
+/* Arm (7), Linux-only. 20 ms against the 10 ms injection cadence falls behind about 4:1 — enough
+ * to overflow the receive buffer, but slow enough that the consumer still reads THROUGH the
+ * pre-drop backlog and reaches datagrams the kernel stamped. 100 ms (STALL_CB_MS) never does,
+ * which is what arm (6) asserts. The packet count has to outlast filling the buffer AND draining
+ * it once: measured, the counter first moves partway through this arm, not at its start. */
+#define DRAIN_CB_MS   20
+#define DRAIN_ARM_PACKETS 300
 
 /* The injection cadence is the PROFILE'S OWN frame period (AudioStreamConfig::UDP_FRAME_MS = 10),
  * not a number chosen here. It used to be 20 ms, and that single arbitrary constant is most of #43:
@@ -152,6 +174,10 @@ static unsigned char RXBUF[4096];
 static NA_TEST_ATOMIC int g_rx_ok = 0;
 /* Non-zero makes the audio callback block for that many ms — the stalled-consumer arm. */
 static NA_TEST_ATOMIC int g_stall_cb_ms = 0;
+
+/* Audio datagrams the relay put on the wire in the arm that just ran. The client never sees
+ * this number, which is what makes it a usable bound on socket_rx_drops. */
+static long long g_relay_audio_seen = 0;
 static NA_TEST_ATOMIC long g_cb_calls = 0;
 
 static void sleep_ms(int ms);
@@ -270,6 +296,10 @@ static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal, 
     *out_dropped = naproxy_audio_dropped(proxy);
     *out_parity = naproxy_parity_forwarded(proxy);
     *out_corrupted = naproxy_audio_corrupted(proxy);
+    /* File-scope rather than a sixth out-param: only the stalled-consumer arm needs it, and it
+     * needs it as the independent quantity to bound socket_rx_drops against — how many audio
+     * datagrams the RELAY put on the wire is something the library never sees. */
+    g_relay_audio_seen = naproxy_audio_seen(proxy);
 
     /* Echo the fault parameters this arm actually ran with, next to the results. An arm that prints
      * only its results cannot be told apart from a differently-parameterised one that silently fell
@@ -277,13 +307,13 @@ static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal, 
     printf("c_client_stats: %s — drop_ordinal=%d corrupt_ordinal=%d stall_cb_ms=%d; relay saw %lld "
            "audio, dropped %lld, corrupted %lld, forwarded %lld parity; client recovered %lld, "
            "unreconciled %lld, reordered %lld, crc_errors %d, control_retransmits %lld, "
-           "queue_drops %lld, sequence_gaps %lld, received %lld pkts / %lld B, cb_calls %ld, "
-           "rx_signature=%d (%d injected of %d budget)\n",
-           what, drop_ordinal, corrupt_ordinal, g_stall_cb_ms, naproxy_audio_seen(proxy),
+           "queue_drops %lld, sequence_gaps %lld, socket_rx_drops %lld, received %lld pkts / %lld B, "
+           "cb_calls %ld, rx_signature=%d (%d injected of %d budget)\n",
+           what, drop_ordinal, corrupt_ordinal, g_stall_cb_ms, g_relay_audio_seen,
            *out_dropped, *out_corrupted, *out_parity, st.packets_recovered_by_fec,
            st.fec_blocks_unreconciled, st.packets_reordered, st.crc_errors, st.control_retransmits,
-           st.queue_drops, st.sequence_gaps, st.packets_received, st.bytes_received, g_cb_calls,
-           g_rx_ok, injected, max_packets);
+           st.queue_drops, st.sequence_gaps, st.socket_rx_drops, st.packets_received,
+           st.bytes_received, g_cb_calls, g_rx_ok, injected, max_packets);
 
     na_client_disconnect(c);
     na_client_destroy(c);
@@ -393,6 +423,29 @@ int main(void) {
                 }
             }
         }
+        /* ---- and the case 0.3.0 created: a V2-compiled caller ----
+         * The block above proves the V1 floor is honoured, but it cannot tell a per-field guard
+         * from a single guard keyed to the NEWEST version — both leave a v1 caller's tail alone.
+         * A v2 consumer is the case that separates them: it is entitled to sequence_gaps and must
+         * NOT receive socket_rx_drops. Get this wrong by writing every post-v1 field under one
+         * `>= V2` test and this is the caller whose struct gets scribbled. */
+        {
+            struct { na_client_stats base; unsigned char tail[32]; } v2c;
+            unsigned char *raw = (unsigned char *)&v2c;
+            size_t i;
+            memset(&v2c, 0xA5, sizeof v2c);
+            if (na_client_get_stats(probe, &v2c.base, NA_CLIENT_STATS_SIZE_V2) != NA_OK) {
+                return fail("a v2-sized struct_size was rejected — v2 consumers must keep working",
+                            probe, NULL, NULL);
+            }
+            for (i = NA_CLIENT_STATS_SIZE_V2; i < sizeof v2c; i++) {
+                if (raw[i] != 0xA5) {
+                    return fail("na_client_get_stats wrote past a V2 caller's struct — a post-v2 "
+                                "field is guarded on the wrong version's size constant",
+                                probe, NULL, NULL);
+                }
+            }
+        }
         na_client_destroy(probe);
     }
 
@@ -453,6 +506,14 @@ int main(void) {
             fprintf(stderr, "  (sequence_gaps %lld on TCP, which builds no reorder buffer)\n",
                     st.sequence_gaps);
             return fail("sequence_gaps does not read -1 on TCP", tc, tsrv, NULL);
+        }
+        /* socket_rx_drops is -1 on TCP on EVERY platform, Linux included: the counter is enabled
+         * by UdpClientTransport and there is no UDP socket here to enable it on. This is the one
+         * arm where the -1 is not a platform statement. */
+        if (st.socket_rx_drops != -1) {
+            fprintf(stderr, "  (socket_rx_drops %lld on TCP, which has no UDP receive buffer)\n",
+                    st.socket_rx_drops);
+            return fail("socket_rx_drops does not read -1 on TCP", tc, tsrv, NULL);
         }
         if (!g_rx_ok) return fail("no RX signature reached the callback (tcp)", tc, tsrv, NULL);
 
@@ -700,10 +761,16 @@ int main(void) {
      * packets, the client read 127, and sequence_gaps and packets_reordered were both 0. The loss
      * was real and total silence from every counter was the correct reading.
      *
-     * This is why the field's header contract says local loss remains unreported by this struct,
-     * rather than claiming sequence_gaps closes that gap — issue #29's premise was that a
-     * post-reorder gap counter would report it, and this arm is the executable refutation. If it
-     * ever DOES move here, the tail-drop assumption has changed and that contract needs revisiting. */
+     * This is why sequence_gaps's header contract does not claim to close that gap — issue #29's
+     * premise was that a post-reorder gap counter would report local loss, and this arm is the
+     * executable refutation. If it ever DOES move here, the tail-drop assumption has changed and
+     * that contract needs revisiting.
+     *
+     * socket_rx_drops (@since 0.3.0) is what DOES report it, and it is asserted below. The two
+     * assertions together are the point: the same induced fault must leave the gap counter at 0
+     * and move the kernel counter, because that is precisely the complementarity the header
+     * claims. Asserting either alone would let a future change collapse them into one counter
+     * that answers neither question. */
     if (stalled.sequence_gaps != 0) {
         fprintf(stderr, "  (sequence_gaps %lld on a stalled consumer — the socket buffer is no "
                         "longer tail-dropping; revisit the contract in include/naudio.h)\n",
@@ -711,6 +778,43 @@ int main(void) {
         return fail("sequence_gaps moved on a stalled consumer, which tail-drop makes invisible",
                     NULL, srv, NULL);
     }
+    /* socket_rx_drops: the POSITIVE this arm previously had no way to assert.
+     *
+     * Same fault, same run, opposite reading — the loss that leaves queue_drops and sequence_gaps
+     * correctly at 0 is exactly the loss the kernel counter reports. Split by platform rather than
+     * skipped, because the -1 is the shipped contract on macOS and Windows and an arm that skipped
+     * there would leave two of naudio's three CI platforms asserting nothing about this field. */
+#if defined(__linux__)
+    /* MEASURED, AND STILL 0 — and that is the correct reading, not a defect. This is the arm
+     * that taught the field its real limitation, so the number is asserted rather than hoped for.
+     *
+     * The kernel stamps its discard total on a datagram AS IT QUEUES it, so a reading only
+     * arrives on a datagram queued AFTER the drops. A consumer stalled this hard (100 ms per
+     * callback against a 10 ms injection cadence) never drains past the backlog that was queued
+     * BEFORE the buffer filled: measured here, the relay put 225 audio datagrams on the wire, the
+     * client read 15, and the ~128-datagram receive buffer means it would have had to read an
+     * order of magnitude more before reaching a stamped one. So the loss is real, total, and
+     * still unreported — by socket_rx_drops as much as by the two counters above it.
+     *
+     * The counter IS live here, which is what separates this 0 from macOS's -1 and is why the
+     * assertion is `== 0` and not a skip. Arm (7) below is where it actually moves. */
+    if (stalled.socket_rx_drops != 0) {
+        fprintf(stderr, "  (socket_rx_drops %lld on the hard-stalled arm, where the consumer never "
+                        "drains past its pre-drop backlog — if this now moves, the enqueue-stamp "
+                        "reasoning in include/naudio.h needs revisiting)\n",
+                stalled.socket_rx_drops);
+        return fail("socket_rx_drops moved on a consumer that never drains its backlog", NULL, srv,
+                    NULL);
+    }
+#else
+    if (stalled.socket_rx_drops != -1) {
+        fprintf(stderr, "  (socket_rx_drops %lld on a platform with no per-socket overflow "
+                        "mechanism — it must read -1, never a plausible number)\n",
+                stalled.socket_rx_drops);
+        return fail("socket_rx_drops is not -1 where the platform cannot measure it", NULL, srv,
+                    NULL);
+    }
+#endif
     /* Same shape for control_retransmits, and for the same reason it is documented as unreachable:
      * ControlReliability::isCriticalType does not list ConnectRequest, HeartbeatAck or LatencyProbe,
      * so the only tracked control message a client ever sends is Disconnect — and by the time it is
@@ -725,6 +829,70 @@ int main(void) {
                 stalled.control_retransmits);
         return fail("control_retransmits moved on a client connection", NULL, srv, NULL);
     }
+
+    /* ---- (7) socket_rx_drops: the consumer that falls behind but KEEPS DRAINING ----
+     *
+     * Linux-only, because it is the only platform with the mechanism — and guarded whole rather
+     * than asserted-then-skipped so it costs macOS and Windows nothing at all.
+     *
+     * Arm (6) establishes that a HARD stall reports nothing: the consumer never drains past the
+     * backlog queued before the buffer filled, so no stamped datagram is ever read. This arm is
+     * the complement, and it is the case the field is actually for. A 20 ms callback against the
+     * 10 ms injection cadence falls behind about 4:1 — fast enough to overflow the receive
+     * buffer, slow enough that the client still reads its way THROUGH the pre-drop backlog and
+     * into datagrams the kernel stamped.
+     *
+     * Without this arm the field would ship with its end-to-end path unproven: everything before
+     * it shows the counter is wired (0 rather than -1) and correct in isolation (the Socket arms
+     * bound it exactly), which is not the same as showing a C consumer ever sees it move. */
+#if defined(__linux__)
+    {
+        na_client_stats draining;
+        long long dr_dropped = 0, dr_parity = 0, dr_corrupted = 0;
+        memset(&draining, 0, sizeof draining);
+        g_stall_cb_ms = DRAIN_CB_MS;
+        const int drain_ok = run_wan_arm(srv, port, NO_DROP, NO_CORRUPT,
+                                         "falling behind but still draining (audio cb blocks 20 ms)",
+                                         DRAIN_ARM_PACKETS, 0, &draining, &dr_dropped, &dr_parity,
+                                         &dr_corrupted);
+        g_stall_cb_ms = 0;
+        if (!drain_ok) {
+            return fail("the draining-consumer arm did not complete", NULL, srv, NULL);
+        }
+        if (g_cb_calls <= 0) {
+            return fail("the audio callback never ran in the draining arm", NULL, srv, NULL);
+        }
+        if (draining.socket_rx_drops <= 0) {
+            fprintf(stderr, "  (socket_rx_drops %lld while the relay put %lld audio datagrams on "
+                            "the wire and the client read %lld over %ld callbacks — either the "
+                            "consumer no longer falls behind, or it now drains fast enough to "
+                            "avoid overflow; retune DRAIN_CB_MS / DRAIN_ARM_PACKETS)\n",
+                    draining.socket_rx_drops, g_relay_audio_seen, draining.packets_received,
+                    g_cb_calls);
+            return fail("socket_rx_drops did not move on a consumer that drains its backlog", NULL,
+                        srv, NULL);
+        }
+        /* Bounded ABOVE by a quantity the library never computes: the relay's own count of what
+         * it put on the wire. The kernel cannot discard more datagrams than were sent to it, so a
+         * cross-wired or over-reporting counter fails here rather than sailing past a bare `> 0`.
+         *
+         * Deliberately NOT bounded below by (seen - received). Parity and control datagrams share
+         * this socket while the relay counts only audio, and the drops after the last stampable
+         * datagram are unobservable by construction — both push the true reading below that
+         * difference, in the honest direction. The lower bound stays "it moved". */
+        if (draining.socket_rx_drops > g_relay_audio_seen + dr_parity) {
+            fprintf(stderr, "  (socket_rx_drops %lld exceeds the %lld audio + %lld parity "
+                            "datagrams the relay ever sent)\n",
+                    draining.socket_rx_drops, g_relay_audio_seen, dr_parity);
+            return fail("socket_rx_drops reports more discards than datagrams sent", NULL, srv,
+                        NULL);
+        }
+        printf("c_client_stats: socket_rx_drops moved end to end — %lld discards reported against "
+               "%lld audio + %lld parity datagrams sent and %lld packets read\n",
+               draining.socket_rx_drops, g_relay_audio_seen, dr_parity,
+               draining.packets_received);
+    }
+#endif
 
     na_server_stop(srv);
     na_server_destroy(srv);

@@ -294,14 +294,16 @@ public:
     //
     // THE COUNT IS STAMPED AT ENQUEUE, NOT AT RECEIVE, and that sets the one real limitation.
     // The kernel records its running discard total on each datagram AS IT QUEUES it, so the
-    // reading only reaches us on a datagram queued AFTER the discard — draining packets that
-    // were already queued before the buffer filled reports nothing, however many were lost.
+    // reading only reaches us on a datagram queued AFTER the discard — and because the queue is
+    // FIFO, a reader must first consume everything queued BEFORE the buffer filled. So this
+    // LAGS BY A WHOLE BUFFER, and a 0 means "nothing reported yet", never "nothing was lost".
+    //
     // MEASURED in a Linux container: a socket flooded with 20000 datagrams on a 4 KiB receive
-    // buffer queued 4 and reported drops == 0 until five more were sent into the drained
-    // buffer, at which point it reported exactly 19996 == 20000 - 4. So a consumer that falls
-    // behind and then KEEPS READING (the case this counter is for) sees its losses, while one
-    // that stalls and never reads again never learns of them. Inherent to the mechanism, not a
-    // defect here.
+    // buffer queued 4 and reported drops == 0 until further datagrams were sent into the
+    // drained buffer, at which point it reported exactly 19996 == 20000 - 4. The same effect
+    // decides whether a real client ever sees its loss: one draining steadily does (429
+    // reported of 1080 datagrams), one stalled hard enough never to reach its own backlog does
+    // not (0 reported of 225). Inherent to the mechanism, not a defect here.
     //
     // Only ever updated by a thread inside recvFrom().
     std::int64_t receiveDrops() const noexcept;
