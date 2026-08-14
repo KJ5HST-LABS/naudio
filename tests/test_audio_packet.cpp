@@ -12,6 +12,7 @@
 #include "naudio/AudioPacket.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -81,6 +82,26 @@ TEST(AudioPacket, RoundTripPreservesFields) {
     EXPECT_EQ(0, decoded->flags());
     EXPECT_EQ(0, decoded->timestamp());
     EXPECT_EQ(p.payload(), decoded->payload());
+}
+
+// Every other packet test pins the timestamp to 0 (see `pinned` above), so no arm had ever driven
+// a byte with bit 7 set through the deserialize assembly loop — the one place the field is rebuilt
+// a byte at a time. These pin the two boundaries and the sign bit itself.
+TEST(AudioPacket, RoundTripPreservesATimestampWithTheHighBitSet) {
+    const std::int64_t hostile[] = {
+        static_cast<std::int64_t>(0xFFEEDDCCBBAA9988ULL),  // high byte 0xFF — the fuzzed shape
+        static_cast<std::int64_t>(0x8000000000000000ULL),  // the sign bit alone
+        -1,                                                // all bits set
+        std::numeric_limits<std::int64_t>::max(),          // largest value with bit 63 clear
+        std::numeric_limits<std::int64_t>::min(),
+    };
+    for (std::int64_t ts : hostile) {
+        AudioPacket p(PacketType::AudioRx, 7, hexToBytes("deadbeef"));
+        p.setTimestamp(ts);
+        auto decoded = AudioPacket::deserialize(p.serialize());
+        ASSERT_TRUE(decoded.has_value()) << "timestamp " << ts;
+        EXPECT_EQ(ts, decoded->timestamp()) << "timestamp " << ts;
+    }
 }
 
 TEST(AudioPacket, DeserializeAcceptVectorFields) {

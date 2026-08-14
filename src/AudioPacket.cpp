@@ -115,8 +115,14 @@ std::optional<AudioPacket> AudioPacket::deserialize(const std::uint8_t* data, st
     std::int32_t sequence = static_cast<std::int32_t>(
         (static_cast<std::uint32_t>(data[5]) << 24) | (static_cast<std::uint32_t>(data[6]) << 16) |
         (static_cast<std::uint32_t>(data[7]) << 8) | static_cast<std::uint32_t>(data[8]));
-    std::int64_t timestamp = 0;
-    for (std::size_t i = 9; i < 17; ++i) timestamp = (timestamp << 8) | data[i];
+    // Assembled in uint64_t, matching the sequence field just above. The accumulator was
+    // std::int64_t, so on a frame whose high timestamp byte has bit 7 set — attacker-controlled,
+    // and read here BEFORE the CRC check below — the last iteration shifted a signed value into
+    // the sign bit. Unsigned shifts are plain modular arithmetic, so the only conversion left is
+    // the explicit one, at one marked site, instead of implicit at the seventh loop iteration.
+    std::uint64_t rawTimestamp = 0;
+    for (std::size_t i = 9; i < 17; ++i) rawTimestamp = (rawTimestamp << 8) | data[i];
+    std::int64_t timestamp = static_cast<std::int64_t>(rawTimestamp);
     std::size_t payloadLen = static_cast<std::size_t>((data[17] << 8) | data[18]);
 
     auto type = packetTypeFromValue(typeByte);
