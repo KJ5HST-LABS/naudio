@@ -15,6 +15,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   on the wire, so the monotonic clock is strictly correct here. Behaviour is unchanged on a machine
   whose clock does not step.
 
+- **A NACK-driven control retransmit now spends an attempt and restarts the retransmit timer.**
+  `ControlReliability::onNackReceived` incremented only the retransmit counter, so a NACK-driven
+  resend was outside the `maxAttempts` budget the class documents and left `lastSendTime` at the
+  original send — meaning the timeout sweep could resend the same packet again moments later. A
+  packet already at `maxAttempts` is now dropped and `nullopt` returned, the same disposal
+  `checkRetransmitsAt` gives an exhausted entry. naudio never sends a NACK, but it does handle a
+  received one, so the budget was a peer's to spend without limit.
+
 - **Re-recording an already-pending control sequence no longer evicts an unrelated one.**
   `ControlReliability::recordSentAt` freed a slot before checking whether the sequence was already
   pending. A re-record replaces in place and adds no entry, so at capacity the eviction destroyed
@@ -23,6 +31,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   callers, none of which re-records a sequence; reachable by any consumer of the installed
   `naudio/ControlReliability.hpp`.
 
+### Added
+- `ControlReliability::onNackReceivedAt(seq, nowMs)` — the explicit-time form of
+  `onNackReceived`, matching the existing `recordSentAt` / `checkRetransmitsAt` pair.
+
+### Fixed
 - **Two distinct devices that share a name are no longer merged into one.** Device identity was
   `name + hostApi`, so two identical rigs on one host API — e.g. a pair of "USB Audio CODEC"
   interfaces, which is the shape naudio's own default capture pattern looks for — collapsed into a

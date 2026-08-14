@@ -57,11 +57,30 @@ bool ControlReliability::onAckReceived(std::int32_t ackedSeq) {
 }
 
 std::optional<AudioPacket> ControlReliability::onNackReceived(std::int32_t nackedSeq) {
-    for (auto& entry : pending_) {
-        if (entry.first == nackedSeq) {
-            ++controlRetransmits_;
-            return entry.second.packet;
+    return onNackReceivedAt(nackedSeq, nowMillis());
+}
+
+std::optional<AudioPacket> ControlReliability::onNackReceivedAt(std::int32_t nackedSeq,
+                                                                std::int64_t nowMs) {
+    for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+        if (it->first != nackedSeq) continue;
+        PendingControl& pc = it->second;
+
+        // A NACK-driven resend is an attempt like any other. It used to bump only the
+        // counter, which left two holes: the class promises "up to maxAttempts" with no
+        // NACK carve-out, and the un-restamped lastSendTime meant the timeout sweep could
+        // resend the same packet again immediately after. naudio never sends a NACK — the
+        // only ControlMessage::nack() call sites are tests and the conformance harness —
+        // but this handles a RECEIVED one, so the budget was a peer's to spend, and an
+        // unbounded resend per inbound NACK is an amplification a peer controls.
+        if (pc.attempts >= maxAttempts_) {
+            pending_.erase(it);  // exhausted — the same disposal checkRetransmitsAt gives
+            return std::nullopt;
         }
+        ++pc.attempts;
+        pc.lastSendTime = nowMs;
+        ++controlRetransmits_;
+        return pc.packet;
     }
     return std::nullopt;
 }

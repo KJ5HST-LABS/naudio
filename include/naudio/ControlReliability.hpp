@@ -59,9 +59,18 @@ public:
     // Processes an ACK; true if it matched a pending packet.
     bool onAckReceived(std::int32_t ackedSeq);
 
-    // Processes a NACK; returns the stored packet to retransmit (copy), or
-    // nullopt if evicted/not found.
+    // Processes a NACK, using the monotonic clock as the resend time; returns the
+    // stored packet to retransmit (copy), or nullopt if evicted/not found or the
+    // attempt budget is spent.
     std::optional<AudioPacket> onNackReceived(std::int32_t nackedSeq);
+
+    // Processes a NACK with an explicit resend time (the testable form). A
+    // NACK-driven resend is an attempt like any other: it spends one against
+    // maxAttempts and restamps the retransmit timer, so it neither exceeds the
+    // budget the class promises nor races the timeout sweep. A packet already at
+    // maxAttempts is dropped and nullopt returned — the same disposal
+    // checkRetransmitsAt gives an exhausted entry.
+    std::optional<AudioPacket> onNackReceivedAt(std::int32_t nackedSeq, std::int64_t nowMs);
 
     // Returns packets needing retransmission, using the monotonic clock.
     std::vector<AudioPacket> checkRetransmits();

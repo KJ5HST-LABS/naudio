@@ -195,6 +195,36 @@ TEST(ControlReliability, DuplicateSequenceReRecordEvictsNothing) {
     for (const AudioPacket& p : due) EXPECT_NE(full - 1, p.sequence());
 }
 
+// A NACK-driven resend used to bump only the counter — no attempt spent, no timer restamped — so
+// a peer could extract an unbounded number of resends from one buffered packet, and the timeout
+// sweep could resend it again immediately afterwards. Both halves get an arm.
+TEST(ControlReliability, NackSpendsAnAttemptAndStopsAtTheBudget) {
+    ControlReliability r(2, 500);  // 2 attempts total; the initial send is attempt 1
+    r.recordSentAt(controlPacket(7, ControlMessage::txGranted()), 0);
+
+    // Attempt 2 of 2 — the last the budget allows.
+    EXPECT_TRUE(r.onNackReceivedAt(7, 100).has_value());
+    EXPECT_EQ(1u, r.pendingCount());
+    EXPECT_EQ(1, r.controlRetransmits());
+
+    // Budget spent: dropped rather than resent, matching how checkRetransmitsAt disposes of an
+    // exhausted entry. Without this the packet was resendable forever, once per inbound NACK.
+    EXPECT_FALSE(r.onNackReceivedAt(7, 200).has_value());
+    EXPECT_EQ(0u, r.pendingCount());
+    EXPECT_EQ(1, r.controlRetransmits());
+}
+
+TEST(ControlReliability, NackRestampsTheRetransmitTimer) {
+    ControlReliability r(5, 500);  // budget deliberately loose — this arm is about the timer
+    r.recordSentAt(controlPacket(7, ControlMessage::txGranted()), 0);
+    EXPECT_TRUE(r.onNackReceivedAt(7, 100).has_value());
+
+    // The timer runs from the NACK resend at t=100, not the original send at t=0, so the sweep
+    // that would have fired at t=500 must not — otherwise the packet goes out twice in 400 ms.
+    EXPECT_TRUE(r.checkRetransmitsAt(500).empty());
+    EXPECT_EQ(1u, r.checkRetransmitsAt(600).size());
+}
+
 TEST(ControlReliability, GenerateAckForCriticalControl) {
     ControlReliability r = reliability();
     auto ack = r.generateAck(controlPacket(7, ControlMessage::txGranted()));
