@@ -19,6 +19,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   devices with their own ids. A genuine split pair can never overlap, which is what makes the
   overlap a safe discriminator.
 
+- **Unloading a virtual sink no longer destroys other sinks whose names merely contain its own.**
+  `unloadSinkPipeline` selected modules with a bare `grep <name>` and piped the result straight
+  into `xargs pactl unload-module`, so tearing down a sink named `naudio` also unloaded `naudio_2`
+  and `naudio-backup` — operator sinks naudio never created. `checkSinkCommand` had the matching
+  read-side fault: it reported a sink as existing whenever its name appeared as a substring of any
+  other sink's name, or of an unrelated line's driver or sample-spec field.
+
+  The `sink_name=<name>` token is now matched exactly, delimited by whitespace or the line edges,
+  and the existence check compares the whole name field (`cut -f2 | grep -Fx`). `grep -w` is not
+  sufficient here: sink names may contain `-`, which is not a word constituent, so `sink_name=my-sink`
+  would still have matched `sink_name=my-sink-2`. SAFE_SHELL_ARG guarantees the name cannot inject
+  shell syntax; it never guaranteed the name was unique.
+
+- **The guide's printed Linux commands apply the same SAFE_SHELL_ARG gate as the executed path.**
+  `linuxConfigurationCommands()` and the Linux sample-rate suggestions interpolated the configured
+  sink name and description into `pactl` command text with no validation, while
+  `PlatformConfigurator` validated both before running anything. The executed path was never
+  exposed, but the printed one was inviting an operator to paste an unvalidated command. Both now
+  refuse, with a note naming the offending value, so the documented and executed paths agree on
+  what is rejected.
+
 - **A device whose exact-format probe failed is no longer reported ready.** `verifyConfiguration`
   decided `success = formatSupported || issues.empty()`, so a failed probe could still pass on the
   second clause. When the probe fails the "detected" rate and channel count fall back to the

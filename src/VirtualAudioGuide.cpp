@@ -278,8 +278,17 @@ std::vector<std::string> VirtualAudioGuide::sampleRateConfigurationSuggestions(
         case Platform::Linux:
             suggestions.push_back("Recreate the virtual sink with correct sample rate:");
             suggestions.push_back("  pactl unload-module module-null-sink");
-            suggestions.push_back("  pactl load-module module-null-sink sink_name=" +
-                                  config_.sinkName + " rate=" + rate + " channels=" + channels);
+            // Same SAFE_SHELL_ARG gate the executed path applies. This text is printed for an
+            // operator to paste into a shell, so an unsafe sink name reaching it is a command the
+            // guide is inviting someone to run. PlatformConfigurator validates before executing;
+            // nothing validated before PRINTING.
+            if (PlatformConfigurator::isShellSafe(config_.sinkName)) {
+                suggestions.push_back("  pactl load-module module-null-sink sink_name=" +
+                                      config_.sinkName + " rate=" + rate + " channels=" + channels);
+            } else {
+                suggestions.push_back("  (no command shown: configured sink name '" +
+                                      config_.sinkName + "' is not a safe shell argument)");
+            }
             break;
 
         case Platform::Unknown:
@@ -293,6 +302,22 @@ std::vector<std::string> VirtualAudioGuide::linuxConfigurationCommands() const {
     // The substantive commands come from the shared pulse:: builder used by
     // PlatformConfigurator::autoConfigureLinux, so the documented commands cannot drift from
     // the ones auto-config actually runs.
+    //
+    // The shared builders do NO sanitizing — their header says callers must validate first — and
+    // PlatformConfigurator does exactly that before executing. This path never did, so an unsafe
+    // sink name or description produced a copy-pasteable injection dressed as documentation.
+    // Apply the same gate here: the executed path and the printed path now agree on what is
+    // refused.
+    if (!PlatformConfigurator::isShellSafe(config_.sinkName)) {
+        return {"# Refused: configured sink name '" + config_.sinkName +
+                "' is not a safe shell argument.",
+                "# Allowed: a non-empty name of [A-Za-z0-9_-] only."};
+    }
+    if (!PlatformConfigurator::isShellSafe(config_.sinkDescription)) {
+        return {"# Refused: configured sink description '" + config_.sinkDescription +
+                "' is not a safe shell argument.",
+                "# Allowed: a non-empty value of [A-Za-z0-9_-] only."};
+    }
     return {
         "# Remove existing sink if present",
         "pactl unload-module module-null-sink 2>/dev/null || true",

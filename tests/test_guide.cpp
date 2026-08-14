@@ -11,12 +11,14 @@
 #include <gtest/gtest.h>
 
 #include <cctype>
+#include <regex>
 #include <string>
 #include <vector>
 
 #include "naudio/DeviceEnumerator.hpp"
 #include "naudio/FakeBackend.hpp"
 #include "naudio/FormatProbe.hpp"
+#include "naudio/PulseCommands.hpp"
 #include "naudio/ShellRunner.hpp"
 #include "naudio/VirtualAudioGuide.hpp"
 
@@ -67,6 +69,103 @@ TEST(ShellSafe, RejectsEmptyAndShellMetacharacters) {
     EXPECT_FALSE(PlatformConfigurator::isShellSafe("a`b`"));           // backtick
     EXPECT_FALSE(PlatformConfigurator::isShellSafe("a&b"));            // background
     EXPECT_FALSE(PlatformConfigurator::isShellSafe("../etc"));         // path traversal (dot, slash)
+}
+
+// ===== pulse:: command builders — the name must be matched as a whole token =====
+//
+// These arms assert on the COMMAND STRING, which is the seam FakeShellRunner gives us; no pactl
+// runs. So that the pattern itself is checked and not just its spelling, the exact-token match is
+// additionally evaluated against realistic `pactl list short modules` output with std::regex in
+// POSIX-extended mode — the same dialect `grep -E` uses.
+
+TEST(PulseCommands, CheckSinkMatchesTheWholeNameFieldNotASubstring) {
+    // `pactl list short sinks` is index<TAB>name<TAB>driver<TAB>...: cut field 2, compare whole
+    // line, fixed string. A bare `grep <name>` reported "sink exists" for any line merely
+    // containing the name.
+    const std::string cmd = pulse::checkSinkCommand("naudio");
+    EXPECT_TRUE(contains(cmd, "cut -f2")) << "must isolate the name field";
+    EXPECT_TRUE(contains(cmd, "grep -Fx naudio")) << "fixed string, whole line";
+    EXPECT_FALSE(contains(cmd, "| grep naudio")) << "the unanchored substring grep is the defect";
+}
+
+TEST(PulseCommands, UnloadMatchesTheSinkNameTokenExactly) {
+    const std::string cmd = pulse::unloadSinkPipeline("naudio");
+    EXPECT_TRUE(contains(cmd, "sink_name=naudio([[:space:]]|$)"));
+    EXPECT_TRUE(contains(cmd, "(^|[[:space:]])sink_name=naudio"));
+    EXPECT_TRUE(contains(cmd, "grep module-null-sink"));  // still scoped to null sinks
+    EXPECT_TRUE(contains(cmd, "xargs -r pactl unload-module"));
+    EXPECT_FALSE(contains(cmd, "| grep naudio |")) << "the unanchored substring grep is the defect";
+}
+
+// The defect itself, evaluated rather than described: unloading `naudio` must not select the
+// modules backing `naudio_2` or `naudio-backup`. The result of this pipeline is piped straight
+// into `xargs pactl unload-module`, so a false match DESTROYS an unrelated operator sink.
+TEST(PulseCommands, UnloadPatternDoesNotSelectSinksWhoseNameMerelyStartsWithIt) {
+    // Extract the ERE the builder embeds between the single quotes.
+    const std::string cmd = pulse::unloadSinkPipeline("naudio");
+    const std::size_t open = cmd.find('\'');
+    ASSERT_NE(open, std::string::npos);
+    const std::size_t close = cmd.find('\'', open + 1);
+    ASSERT_NE(close, std::string::npos);
+    const std::regex pattern(cmd.substr(open + 1, close - open - 1), std::regex::extended);
+
+    // Realistic `pactl list short modules` lines (tab-separated, space-separated argument list).
+    const std::string target =
+        "12\tmodule-null-sink\tsink_name=naudio rate=48000 channels=2 format=s16le\t0";
+    const std::string sibling =
+        "13\tmodule-null-sink\tsink_name=naudio_2 rate=48000 channels=2 format=s16le\t0";
+    const std::string hyphenated =
+        "14\tmodule-null-sink\tsink_name=naudio-backup rate=48000 channels=2 format=s16le\t0";
+    const std::string atEndOfLine = "15\tmodule-null-sink\tsink_name=naudio";
+
+    EXPECT_TRUE(std::regex_search(target, pattern)) << "premise: it must still match its own sink";
+    EXPECT_TRUE(std::regex_search(atEndOfLine, pattern)) << "the token may end the line";
+    EXPECT_FALSE(std::regex_search(sibling, pattern)) << "naudio_2 is a DIFFERENT sink";
+    EXPECT_FALSE(std::regex_search(hyphenated, pattern))
+        << "naudio-backup is a different sink; '-' is why grep -w cannot be used here";
+}
+
+// ===== guide-facing builders apply the same SAFE_SHELL_ARG gate as the executed path =====
+
+TEST(Guide, LinuxCommandsRefuseAnUnsafeSinkName) {
+    GuideConfig c;
+    c.sinkName = "evil; rm -rf /";
+    const auto cmds = VirtualAudioGuide(c, Platform::Linux).linuxConfigurationCommands();
+
+    for (const auto& cmd : cmds) {
+        EXPECT_FALSE(contains(cmd, "load-module module-null-sink sink_name=evil"))
+            << "a pasteable injection must not be printed as documentation";
+    }
+    ASSERT_FALSE(cmds.empty());
+    EXPECT_TRUE(contains(cmds[0], "Refused"));
+}
+
+TEST(Guide, LinuxCommandsRefuseAnUnsafeSinkDescription) {
+    GuideConfig c;
+    c.sinkDescription = "$(whoami)";
+    const auto cmds = VirtualAudioGuide(c, Platform::Linux).linuxConfigurationCommands();
+
+    for (const auto& cmd : cmds) {
+        EXPECT_FALSE(contains(cmd, "$(whoami)") && contains(cmd, "load-module"));
+    }
+    ASSERT_FALSE(cmds.empty());
+    EXPECT_TRUE(contains(cmds[0], "Refused"));
+}
+
+TEST(Guide, SampleRateSuggestionsRefuseAnUnsafeSinkName) {
+    GuideConfig c;
+    c.sinkName = "a`id`";
+    const auto sugg =
+        VirtualAudioGuide(c, Platform::Linux).sampleRateConfigurationSuggestions("dev");
+
+    for (const auto& s : sugg) {
+        EXPECT_FALSE(contains(s, "load-module module-null-sink sink_name=a`id`"));
+    }
+    bool sawRefusal = false;
+    for (const auto& s : sugg) {
+        if (contains(s, "not a safe shell argument")) sawRefusal = true;
+    }
+    EXPECT_TRUE(sawRefusal);
 }
 
 // ===== autoConfigureLinux =====
