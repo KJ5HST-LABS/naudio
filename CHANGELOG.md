@@ -5,6 +5,43 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **`na_hamlib_bridge` negotiates its sample rate from the rig's `native_sample_rates` instead of
+  demanding 48 kHz.** The bridge asked libhamlib for 48 kHz and told naudio 48 kHz on every rig, and
+  never consulted `native_sample_rates` at all — it was read in exactly one place, the capability
+  dump on the *failed*-open path. On a rig whose native rate is not 48 kHz that bought a
+  libsamplerate resample the bridge had the information to avoid, inside the one hop this tool
+  exists to keep short.
+
+  It now keeps **48 kHz whenever the hardware offers it natively** — every case the dummy backend
+  produces, so the hardware-free path is byte-for-byte unchanged — and otherwise takes the
+  **closest native rate**, ties to the higher. Closest rather than highest is a bandwidth
+  judgement: the wire cost scales with the rate while a rig's demodulated audio is bandlimited
+  either way, so the highest native rate would spend the lossy hop's budget on content the radio
+  never produced.
+
+  **The rate must be native on both directions.** naudio carries one server-wide audio format, so
+  the rate chosen is also the rate the operator's TX audio arrives in; choosing from the RX caps
+  alone would open TX at a rate it may not be native at, moving the resample rather than removing
+  it — and silently, since nothing on the TX path reports a conversion. Where the two directions
+  share no native rate, RX wins: it is mandatory and continuous, TX only carries audio while an
+  operator is keyed.
+
+  **Operator-visible output changed.** The startup line gains `rate=`, a new line names the chosen
+  rate and the list it came from, and the conversion line reports the real rate — it previously
+  printed a hardcoded `S16@48k`, which was true only while the rate was hardcoded too. The
+  `% of nominal` RX health figure now derives its denominator from the negotiated rate; leaving it
+  at 48 kHz would have made a correct 24 kHz stream read as a 43% shortfall.
+
+  **The format axis is unchanged and `require_native` stays 0.** naudio's ABI carries signed 16-bit
+  PCM, so demanding a native format would fail against the dummy and would only relocate the
+  F32→S16 quantization into the bridge. Negotiating the rate removes one stage from what the
+  conversion line reports: `conv=0x1` instead of `conv=0x3`.
+
+  Compiled out against a libhamlib older than Hamlib PR #2116 commit `961093f2`, which has no
+  `native_*` caps fields — that prefix keeps the 48 kHz it always used. **No C ABI change and no
+  wire change.**
+
 ### Added
 - **`AudioStreamServer::removeStreamListener()` (C++ API) — hand a listener back and know when it is
   safe to destroy.** `addStreamListener` had no counterpart, so the only way to satisfy its

@@ -415,6 +415,49 @@ round-trip run without it shows RX bytes flowing from the tone generator and pro
 your TX path. `-h` lists the rest (`-m 2` for netrigctl, `-p` port, `-c` channels, `-R` reliability
 profile, `-k` PTT keying, `-x` RX-only).
 
+### The sample rate is negotiated, not assumed (issue #84)
+
+There is no rate flag, and that is deliberate — the bridge reads the rig's `native_sample_rates`
+and picks from it. It keeps **48 kHz whenever the hardware offers it natively**, which is every
+case the dummy backend produces, so on the hardware-free path nothing changed. Otherwise it takes
+the **closest native rate**, ties to the higher, and tells naudio the same number:
+
+```
+na_hamlib_bridge: rate 48000 — native, from rx=[8000,16000,24000,48000,96000]
+na_hamlib_bridge: rate 24000 instead of 48000 — 48000 is not native here, so this avoids a
+                  resample. rx=[24000,96000] tx=[24000,96000]
+```
+
+**Why closest and not highest.** The wire cost of this hop scales linearly with the rate, and a
+rig's demodulated audio is bandlimited to a few kHz either way — so taking the highest native rate
+would spend the lossy hop's budget carrying content the radio never produced.
+
+**Why it must be native on both directions.** naudio carries one audio format for the whole server,
+so the rate chosen here is also the rate the operator's TX audio arrives in. Picking it from the RX
+caps alone would open the TX stream at a rate the TX side may not be native at — moving the
+resample instead of removing it, and invisibly, since nothing on the TX path reports a conversion.
+Where the two directions share no native rate at all, RX wins: it is the mandatory stream and runs
+continuously, while TX only carries audio while an operator is keyed.
+
+**What it does not do.** It does not set `require_native = 1`. That flag is all-or-nothing across
+*both* axes, and the format axis cannot move — naudio's ABI carries signed 16-bit PCM, so demanding
+native format would fail outright against the dummy (which advertises `PCM_F32|OPUS`) and, on
+hardware, would only relocate the F32→S16 quantization into the bridge. Negotiating the rate just
+removes one stage from what the conversion line has to report: `conv=0x1` (format only) instead of
+`conv=0x3` (format + resample).
+
+Against a libhamlib older than PR [#2116](https://github.com/Hamlib/Hamlib/pull/2116) commit
+`961093f2` the `native_*` caps fields do not exist, the negotiation compiles out, and the bridge
+asks for 48 kHz exactly as it always did.
+
+> **What has been measured, and what has not.** The *policy* is unit-tested on the whole CI matrix
+> (`tests/test_stream_rate.cpp`, 10 arms) because it is a pure function over the rate lists. The
+> *plumbing* — caps → both streams → `na_server_set_audio_format` → the health metric → a real
+> naudio client — was measured against a synthesized non-48 kHz backend, with `conv` losing its
+> resample bit and a client receiving clean content at 24 kHz. **No rig has run this.** The dummy
+> backend advertises 48 kHz natively, so no hardware-free path exercises a negotiated rate; issue
+> [#12](https://github.com/KJ5HST-LABS/naudio/issues/12) is still the open on-air check.
+
 ### Over a remote `rigctld` (`-m 2`)
 
 Two commands, and both halves matter:
