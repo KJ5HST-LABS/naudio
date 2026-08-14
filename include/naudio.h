@@ -76,7 +76,7 @@ extern "C" {
  * CMakeLists.txt, so they cannot drift from the SONAME or from naudio.pc's Version.
  */
 #define NAUDIO_VERSION_MAJOR 0
-#define NAUDIO_VERSION_MINOR 2
+#define NAUDIO_VERSION_MINOR 3
 #define NAUDIO_VERSION_PATCH 0
 
 /* The largest value NA_VERSION_ENCODE accepts for minor and for patch. Above it a lower component
@@ -648,8 +648,9 @@ typedef struct na_client_stats {
      * audio), and on a client the same thread both fills the queue and drains it — the receive path
      * empties the queue before it reads the socket, so a slow consumer stalls the producer with it
      * and the depth never exceeds one reorder burst. A consumer too slow to keep up loses audio in
-     * the kernel's socket buffer instead, which NO field here reports — not this one, and not
-     * sequence_gaps either, because that buffer tail-drops and leaves no hole to detect. The
+     * the kernel's socket buffer instead — not reported by this field, and not by sequence_gaps
+     * either, because that buffer tail-drops and leaves no hole to detect. Since 0.3.0 it IS
+     * reported, by socket_rx_drops, and there only where the platform has the mechanism. The
      * counter moves on the
      * SERVER side, where a demux thread fills the queue and the application thread drains it. */
     long long queue_drops;
@@ -695,12 +696,63 @@ typedef struct na_client_stats {
      *     buffer tail-drops, so a consumer that cannot keep up reads a contiguous prefix of the
      *     stream and simply stops early. There is no hole in what it read, so there is nothing
      *     for a gap counter to count. Measured: a client stalled to a quarter of the offered
-     *     rate read 127 of 400 packets with sequence_gaps == 0. Local loss remains unreported
-     *     by any field in this struct (see queue_drops, which cannot move on a client either).
+     *     rate read 127 of 400 packets with sequence_gaps == 0. Local loss is reported by
+     *     socket_rx_drops instead (@since 0.3.0), and by nothing else here — see queue_drops,
+     *     which cannot move on a client either.
      *
      * It counts every packet type sharing the sequence space (audio, parity, control), not
      * audio packets alone, so it moves a little on a busy roster even with no loss. */
     long long sequence_gaps;
+
+    /* @since 0.3.0 — read it only when na_version_number() >= NA_VERSION_ENCODE(0, 3, 0);
+     * an older library zero-fills this slot and that 0 is fill, not a measurement.
+     *
+     * Datagrams the KERNEL discarded because this connection's socket receive buffer was
+     * full — audio lost LOCALLY, before the library ever saw it. This is the counter for
+     * the dominant local-loss mode on a real client, and until 0.3.0 nothing in this
+     * struct reported it at all.
+     *
+     * WHY NO OTHER FIELD HERE CAN SEE IT. A full receive buffer TAIL-DROPS: it discards
+     * the NEWEST arrivals, so a consumer that cannot keep up reads an unbroken PREFIX of
+     * the stream and simply stops early. Nothing it read has a hole in it, so sequence_gaps
+     * has nothing to count (measured: a client stalled to a quarter of the offered rate read
+     * 127 of 400 packets with sequence_gaps == 0), and queue_drops cannot move on a client
+     * for the separate reason given above. The kernel is the only party that witnesses the
+     * discard, and this field is the kernel saying so.
+     *
+     * -1 MEANS NOT MEASURED, and here that is a statement about the PLATFORM, not the
+     * profile — which is what makes it different from every other -1 in this struct. The
+     * mechanism is Linux's SO_RXQ_OVFL; macOS and the BSDs expose UDP overflow only
+     * system-wide (netstat -s) and never per socket, and Winsock has no equivalent at all.
+     * So this reads a real count on Linux and -1 elsewhere, on every profile. It is also -1
+     * on TCP and before connect.
+     *
+     * A DERIVED ESTIMATE WAS DELIBERATELY NOT SHIPPED HERE. Expected packets from the
+     * negotiated rate, minus those received, would move on every platform — and would
+     * conflate local loss with wire loss, freezing a field whose name claims more than the
+     * mechanism observes. A -1 you can trust is worth more than a number you cannot.
+     *
+     * IT LAGS BY A WHOLE BUFFER, and that is the one thing to understand before trusting a 0.
+     * The kernel stamps its running discard total on each datagram AS IT QUEUES it, so a
+     * reading only arrives on a datagram queued AFTER the discard — and the receive queue is
+     * FIFO, so a consumer must first read its way through everything queued BEFORE the buffer
+     * filled. Two consequences, both measured through this ABI rather than argued:
+     *
+     *   - A consumer that falls behind and keeps draining DOES see its loss. Measured: a
+     *     client whose audio callback blocked 20 ms against a 10 ms arrival cadence read 183
+     *     of 1080 datagrams and reported 429 here.
+     *   - A consumer that falls behind and STAYS behind sees nothing, however much it loses.
+     *     Measured: a client blocking 100 ms per callback read 15 of 225 datagrams and
+     *     reported 0 — it never drained past its own pre-drop backlog, so no stamped datagram
+     *     was ever read. Both arms are pinned in tests/c_client_stats.c.
+     *
+     * So a 0 means "no drop has been reported to me YET", not "no audio was lost", and the
+     * shortfall is bounded below rather than exact: drops after the last datagram the kernel
+     * could stamp are never reported. Use it as evidence of loss, never as its absence.
+     *
+     * Counts DATAGRAMS, so it counts every packet type sharing the socket — audio, parity
+     * and control alike — exactly as sequence_gaps counts every sequence slot. */
+    long long socket_rx_drops;
 } na_client_stats;
 
 /* The size of na_client_stats in the FIRST published ABI, and the floor na_client_get_stats
@@ -715,6 +767,14 @@ typedef struct na_client_stats {
  * repeats: one frozen constant per version, each the offset+size of that version's last field. */
 #define NA_CLIENT_STATS_SIZE_V2 \
     (offsetof(na_client_stats, sequence_gaps) + sizeof(long long))
+
+/* The size through the last field added in 0.3.0, following the shape V2 established: one
+ * frozen constant per version, each the offset+size of that version's last field. V2 is NOT
+ * redefined to cover socket_rx_drops — redefining it would silently raise the threshold for
+ * everyone already compiled against the 0.2.0 header, which is the exact breakage the
+ * size-as-a-parameter scheme exists to prevent. */
+#define NA_CLIENT_STATS_SIZE_V3 \
+    (offsetof(na_client_stats, socket_rx_drops) + sizeof(long long))
 
 /* Fill *out with a snapshot of the client's counters. Safe to call from any thread at any
  * time, including while streaming and before connect (which yields connected == 0 and

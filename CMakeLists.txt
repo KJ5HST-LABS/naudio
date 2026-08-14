@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(naudio
-        VERSION 0.2.0
+        VERSION 0.3.0
         DESCRIPTION "Cross-platform C/C++ network-audio streaming toolkit: the 0xAF01 wire spec, multi-tenant server + clients, reliability stack (jitter/FEC/reorder/ARQ), device I/O, and a versioned C ABI"
         LANGUAGES C CXX)
 

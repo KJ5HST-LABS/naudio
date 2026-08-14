@@ -924,11 +924,13 @@ extern "C" int na_client_server_tx_owner(na_stream_client* client, char* buf, in
 // Field-wise, not byte-wise, for the mirror of the reason copyCallerStruct above is byte-wise:
 // this side has no second na_client_stats to copy from, only a differently-shaped C++ struct.
 //
-// 0.2.0 appended the first post-v1 field, so the guard this comment used to describe in the future
-// tense is now below and load-bearing: EVERY post-v1 field is written only if the CALLER's declared
-// size reaches it. The floor check rejects anything under v1 and nothing more, which is the whole
-// point -- a v1-compiled consumer is exactly who this scheme exists to keep working, and it is
-// still entitled to call a 0.2.0 library with `sizeof` its own shorter struct.
+// 0.2.0 appended the first post-v1 field and 0.3.0 the second, so the guard this comment once
+// described in the future tense is now below and load-bearing: EVERY post-v1 field is written only
+// if the CALLER's declared size reaches it, each against its OWN version's constant rather than
+// against the newest. The floor check rejects anything under v1 and nothing more, which is the
+// whole point -- a v1-compiled consumer is exactly who this scheme exists to keep working, and it
+// is still entitled to call a 0.3.0 library with `sizeof` its own shorter struct. A v2-compiled
+// one is entitled to the same, and gets sequence_gaps but not socket_rx_drops.
 
 extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out,
                                           std::size_t struct_size) {
@@ -939,7 +941,7 @@ extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_st
         }
         // A caller compiled against a LONGER version of this header gets its tail zeroed rather
         // than left indeterminate. (A caller compiled against a SHORTER one absolutely can reach
-        // here -- a v1 consumer calling a 0.2.0 library is the case this whole scheme is for --
+        // here -- a v1 consumer calling a 0.3.0 library is the case this whole scheme is for --
         // which is why every post-v1 field below is guarded on struct_size individually. The
         // unguarded writes are exactly the v1 set, which the floor check guarantees fits.)
         if (struct_size > sizeof(na_client_stats)) {
@@ -966,6 +968,9 @@ extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_st
         // ---- end of v1. Everything below is guarded on the CALLER's declared size. ----
         if (struct_size >= NA_CLIENT_STATS_SIZE_V2) {
             out->sequence_gaps = static_cast<long long>(s.sequenceGaps);
+        }
+        if (struct_size >= NA_CLIENT_STATS_SIZE_V3) {
+            out->socket_rx_drops = static_cast<long long>(s.socketReceiveDrops);
         }
         return NA_OK;
     });
