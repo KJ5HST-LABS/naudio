@@ -232,6 +232,45 @@ TEST(UdpConnection, ServerFedFecRecoversSingleLostPacket) {
     EXPECT_TRUE(foundRecovered);
 }
 
+// THE CONSUMER-LEVEL #66 ARM. The arm above searches `got` for seq 2 by content, which
+// is order-blind by construction — every FEC arm was, which is how a repair delivered
+// after its block's later members survived them all. Measured here before the hold:
+// "0 1 3 4 2", with the reorder buffer ON, i.e. the shipped shape. The reorder buffer
+// cannot help: it sits AHEAD of the decoder, so the disorder is created downstream of
+// the last stage able to re-sequence.
+TEST(UdpConnection, ARecoveredPacketReachesTheConsumerInSequenceOrder) {
+    UdpReliabilityConfig cfg;
+    cfg.reorderWindowSize = 8;  // the shipped shape, not FEC in isolation
+    cfg.fecEnabled = true;
+    cfg.fecBlockSize = 5;
+    Socket shared = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    UdpClientConnection conn(&shared, "127.0.0.1", 9999,
+                             ClientAddress("udp-1", "127.0.0.1", 9999), cfg);
+
+    std::vector<AudioPacket> block;
+    for (std::int32_t s = 0; s < 5; s++) block.push_back(rxPacket(s, payloadFor(s)));
+    FecEncoder encoder(5);
+    std::optional<AudioPacket> parity;
+    for (const AudioPacket& p : block) parity = encoder.recordAndMaybeEmit(p);
+    ASSERT_TRUE(parity.has_value());
+
+    for (std::int32_t s = 0; s < 5; s++) {
+        if (s == 2) continue;  // induced loss
+        conn.enqueueReceived(block[s], 23);
+    }
+    conn.enqueueReceived(*parity, 23);
+
+    std::vector<AudioPacket> got = drainN(conn, 5);
+    ASSERT_EQ(got.size(), 5u);
+    ASSERT_EQ(conn.packetsRecoveredByFec(), 1) << "premise: the repair happened";
+    std::string order;
+    for (const AudioPacket& p : got) order += std::to_string(p.sequence()) + " ";
+    EXPECT_EQ("0 1 2 3 4 ", order) << "the repair must reach the consumer in its own slot";
+    // The repair is still the repair: bytes and type intact after the detour.
+    EXPECT_EQ(got[2].payload(), payloadFor(2));
+    EXPECT_EQ(got[2].packetType(), PacketType::AudioRx);
+}
+
 TEST(UdpConnection, ServerFedTwoLossesPerBlockAreNotRecovered) {
     UdpReliabilityConfig cfg;
     cfg.reorderWindowSize = 0;

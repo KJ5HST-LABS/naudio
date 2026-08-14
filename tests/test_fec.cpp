@@ -998,4 +998,154 @@ TEST(FecDecoder, ATimedOutBlocksSilenceIsMarkedLive) {
     EXPECT_EQ(0, d.packetsRecoveredByFec());
 }
 
+// ---- Hold-until-resolved delivery (issue #66) ----
+
+// The sequence of every emit, in emit order — the observable #66 is about. Every arm
+// above reads content via find(), which is order-BLIND by construction, which is why
+// the defect survived them all.
+std::string emitOrder(const DecSink& s) {
+    std::string out;
+    for (const auto& p : s.packets) out += std::to_string(p.sequence()) + " ";
+    return out;
+}
+
+// THE #66 REGRESSION ARM. Before the hold this measured "100 101 103 104 102": the
+// repair was delivered after every member that follows it in sequence order, because
+// parity necessarily arrives after them.
+TEST(FecDecoder, ARecoveredFrameIsDeliveredInSequenceOrderNotAfterItsBlock) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> p0{0x10}, p1{0x11}, p2{0x12}, p3{0x13}, p4{0x14};
+    d.processPacket(rx(100, p0));
+    d.processPacket(rx(101, p1));
+    d.process(std::nullopt, 102);  // lost
+    d.processPacket(rx(103, p3));
+    d.processPacket(rx(104, p4));
+    d.processPacket(buildParity(100, {p0, p1, p2, p3, p4}));
+
+    ASSERT_EQ(1, d.packetsRecoveredByFec()) << "premise: the block recovered";
+    EXPECT_EQ("100 101 102 103 104 ", emitOrder(s));
+    const Provenance* prov = s.provenanceOf(102);
+    ASSERT_NE(nullptr, prov);
+    EXPECT_EQ(Provenance::Recovered, *prov) << "in-order delivery must not cost provenance";
+    const AudioPacket* rec = s.find(102);
+    ASSERT_NE(nullptr, rec);
+    EXPECT_EQ(p2, rec->payload()) << "and must not cost the bytes";
+}
+
+// THE ARM THAT MAKES THE FIX REACH PRODUCTION. No explicit gap marker anywhere — the
+// shipped receive path has none, because all three production call sites use
+// processPacket() and the reorder buffer's NULL gaps are dropped for want of a
+// sequence. A hold keyed to the marker would pass the arm above and do nothing on the
+// wire; this one fails unless the decoder detects the discontinuity itself.
+TEST(FecDecoder, AnObservedGapOpensTheHoldWithNoExplicitMarker) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> p0{0x10}, p1{0x11}, p2{0x12}, p3{0x13}, p4{0x14};
+    d.processPacket(rx(100, p0));
+    d.processPacket(rx(101, p1));
+    // 102 simply never arrives — no process(nullopt, ...) call.
+    d.processPacket(rx(103, p3));
+    d.processPacket(rx(104, p4));
+    d.processPacket(buildParity(100, {p0, p1, p2, p3, p4}));
+
+    ASSERT_EQ(1, d.packetsRecoveredByFec()) << "premise: the block recovered";
+    EXPECT_EQ("100 101 102 103 104 ", emitOrder(s));
+}
+
+// THE FALSE-POSITIVE GUARD. Parity draws its own fresh sequence from the connection's
+// shared counter, so a tracker watching only audio sees a two-step jump at every block
+// boundary and would hold on EVERY block — silently converting this conditional design
+// into the universal-latency one it exists to avoid. Two clean blocks, no loss: nothing
+// may be held, so every packet is emitted before the next is processed.
+TEST(FecDecoder, AParitysOwnSequenceIsNotAGapSoACleanBlockHoldsNothing) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a{0xA0}, b{0xB0};
+    // Block 1: audio 0..1, parity takes seq 2. Block 2: audio 3..4, parity takes 5.
+    d.processPacket(rx(0, a));
+    EXPECT_EQ(1u, s.packets.size()) << "a packet with no gap behind it must not be held";
+    d.processPacket(rx(1, b));
+    EXPECT_EQ(2u, s.packets.size());
+    AudioPacket parity1 = buildParity(0, {a, b});
+    parity1.setSequence(2);  // the fresh sequence maybeSendFecParity assigns
+    d.processPacket(parity1);
+    d.processPacket(rx(3, a));
+    EXPECT_EQ(3u, s.packets.size()) << "the parity's consumed slot must not read as a gap";
+    d.processPacket(rx(4, b));
+    EXPECT_EQ(4u, s.packets.size());
+    EXPECT_EQ("0 1 3 4 ", emitOrder(s));
+    EXPECT_EQ(0, d.packetsRecoveredByFec());
+}
+
+// A late or duplicate arrival is BEHIND the frontier, not a forward gap. Without the
+// half-space test it would advance the expectation backwards and re-open every slot
+// already passed, holding the stream on a packet that is merely old.
+TEST(FecDecoder, ALateArrivalBehindTheFrontierOpensNoHold) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a{0xA0};
+    d.processPacket(rx(10, a));
+    d.processPacket(rx(11, a));
+    d.processPacket(rx(11, a));  // duplicate
+    d.processPacket(rx(9, a));   // late
+    EXPECT_EQ(4u, s.packets.size()) << "nothing behind the frontier may open a hold";
+    EXPECT_EQ("10 11 11 9 ", emitOrder(s));
+}
+
+// BOUND 1 — the idle timeout. A hold must not outlive the parity it waits for: when
+// none arrives, the timeout flush delivers the held frames rather than stranding them.
+TEST(FecDecoder, AHoldIsReleasedByTheIdleTimeoutWhenNoParityArrives) {
+    DecSink s;
+    FecDecoder d(s.emitter(), 10);  // pending idle bound = 2x = 20 ms
+    std::int64_t fakeNow = 1000;
+    d.setClock([&fakeNow]() { return fakeNow; });
+    std::vector<std::uint8_t> a{0xA0};
+    d.processPacket(rx(0, a));
+    d.processPacket(rx(2, a));  // gap at 1 -> hold opens, 2 is held
+    ASSERT_EQ(1u, s.packets.size()) << "premise: 2 is being held, not emitted";
+    d.checkTimeoutAt(1021);      // 21 > 20 -> give up on the block
+    EXPECT_EQ(2u, s.packets.size()) << "a held frame must be delivered, never stranded";
+    EXPECT_EQ("0 2 ", emitOrder(s));
+}
+
+// BOUND 2 — the packet cap, which is the bound that still holds when NOTHING ticks the
+// decoder (a consumer that stops polling gets no tick in either connection mode). One
+// gap and then a parity stream that never resumes.
+TEST(FecDecoder, AHoldIsBoundedByItsPacketCapWhenParityStopsArriving) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a{0xA0};
+    d.processPacket(rx(0, a));
+    d.processPacket(rx(2, a));  // gap at 1 -> hold opens
+    ASSERT_EQ(1u, s.packets.size()) << "premise: the hold is open";
+    // Feed past the cap without ever sending a parity or ticking the clock.
+    for (std::int32_t seq = 3; seq <= 3 + static_cast<std::int32_t>(
+                                           FecDecoder::MAX_HELD_PACKETS); ++seq) {
+        d.processPacket(rx(seq, a));
+    }
+    EXPECT_GT(s.packets.size(), FecDecoder::MAX_HELD_PACKETS)
+        << "the cap must release, or a stalled parity stream stalls delivery";
+    // And what it released is still in order.
+    std::string order = emitOrder(s);
+    EXPECT_EQ("0 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 ", order);
+}
+
+// reset() is a state PURGE, not a flush: emitting a queued frame from it would deliver
+// audio into whatever stream the caller is resetting for.
+TEST(FecDecoder, ResetDropsHeldPacketsRatherThanDeliveringThem) {
+    DecSink s;
+    FecDecoder d(s.emitter());
+    std::vector<std::uint8_t> a{0xA0};
+    d.processPacket(rx(0, a));
+    d.processPacket(rx(2, a));  // held
+    ASSERT_EQ(1u, s.packets.size());
+    d.reset();
+    EXPECT_EQ(1u, s.packets.size()) << "reset must not emit";
+    // And the tracker is re-armed: the first packet after a reset establishes a new
+    // origin rather than reading as a gap against the old stream.
+    d.processPacket(rx(500, a));
+    EXPECT_EQ(2u, s.packets.size()) << "the first packet after reset opens no hold";
+}
+
 }  // namespace

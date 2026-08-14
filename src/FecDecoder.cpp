@@ -34,16 +34,49 @@ std::int64_t FecDecoder::pendingIdleTimeoutMs() const { return pendingIdleMs_; }
 
 void FecDecoder::process(std::optional<AudioPacket> packet, std::int32_t sequence) {
     if (packet.has_value() && packet->packetType() == PacketType::FecParity) {
+        // The parity's OWN sequence is consumed from the connection's shared counter,
+        // so it must advance the tracker or every block boundary reads as a gap. Its
+        // return value is discarded deliberately: a gap ahead of a parity is about to
+        // be answered by that very parity, and handleParity is the thing that answers
+        // it. Opening a hold here would close again microseconds later.
+        noteSequenceAndDetectGap(packet->sequence());
         handleParity(*packet);
+        // The block is resolved either way — recovered, declined, complete or failed.
+        // Nothing further can arrive to fill a slot behind the held packets, so this is
+        // where a hold ends and the queued frames go out in order.
+        releaseHeld();
         return;
     }
-    if (nextEmitSeq_ < 0) nextEmitSeq_ = sequence;
     if (packet.has_value()) {
-        // Live: this packet arrived on the wire. It is emitted before it is stored,
-        // so the copy the repair cache holds has already been delivered as Live.
-        emit(&*packet, Provenance::Live);  // emit immediately, then store for FEC
-        storeInBlock(sequence, std::move(*packet));
+        // The hold's origin is the MISSING slot, never this packet — see the
+        // declaration for the measured failure that distinction fixes.
+        if (std::optional<std::int32_t> gapStart = noteSequenceAndDetectGap(sequence)) {
+            beginHold(*gapStart);
+        }
+        if (holding_) {
+            // Held, NOT emitted: a repair for the slot behind this packet is still
+            // possible, and delivering this one first is precisely the defect (#66).
+            // Stored as well as held — the two containers answer different questions,
+            // and only heldPackets_ is a delivery queue (see MAX_HELD_PACKETS).
+            heldPackets_.insert_or_assign(sequence, HeldPacket{*packet, Provenance::Live});
+            storeInBlock(sequence, std::move(*packet));
+            // Bounded HERE rather than inside capPending, which must never emit: this
+            // point is between two settled operations, whereas capPending runs mid-insert
+            // and from inside handleParity's re-file loop.
+            if (heldPackets_.size() > MAX_HELD_PACKETS) releaseHeld();
+        } else {
+            // Live and in order: emitted before it is stored, at zero added latency.
+            // This is the no-loss path and the hold costs it nothing.
+            emit(&*packet, Provenance::Live);
+            storeInBlock(sequence, std::move(*packet));
+        }
     } else {
+        // An EXPLICIT gap marker. Unreachable from the shipping receive path — every
+        // production call site uses processPacket() — so this limb is the tests' and any
+        // future caller's way in, and it opens the hold for the same reason the observed
+        // discontinuity above does. See MAX_HELD_PACKETS for why the observed gap, not
+        // this marker, is what makes the fix reach production at all.
+        beginHold(sequence);
         recordMissing(sequence);  // gap — don't emit yet (FEC may recover it)
     }
 }
@@ -86,6 +119,11 @@ void FecDecoder::checkTimeoutAt(std::int64_t nowMs) {
     pendingPacketsDiscarded_ += discarded;
     // Silence gaps carry no packet, so there is nothing to have been repaired: Live.
     for (std::size_t i = 0; i < nullsToEmit; ++i) emit(nullptr, Provenance::Live);
+    // The block this hold was waiting on has just been given up on, so no repair can
+    // still arrive to sit in front of the queued frames. Releasing here is what stops a
+    // hold outliving the parity it was waiting for — the idle bound is the reason a
+    // consumer that loses its parity stream sees a bounded delay rather than a stall.
+    releaseHeld();
 }
 
 std::int64_t FecDecoder::packetsRecoveredByFec() const { return packetsRecoveredByFec_; }
@@ -105,7 +143,12 @@ bool FecDecoder::isAudio(PacketType type) {
 void FecDecoder::reset() {
     activeBlocks_.clear();
     discardedSequences_.clear();
-    nextEmitSeq_ = -1;
+    // Dropped, NOT released: reset() is a state purge, and emitting a queued frame from
+    // it would deliver audio into whatever stream the caller is resetting FOR.
+    heldPackets_.clear();
+    holding_ = false;
+    holdBaseSeq_ = 0;
+    nextExpectedSeq_ = -1;
     packetsRecoveredByFec_ = 0;
     fecBlocksComplete_ = 0;
     fecBlocksFailed_ = 0;
@@ -115,6 +158,53 @@ void FecDecoder::reset() {
 
 void FecDecoder::emit(const AudioPacket* p, Provenance provenance) {
     if (emitter_) emitter_(p, provenance);
+}
+
+std::optional<std::int32_t> FecDecoder::noteSequenceAndDetectGap(std::int32_t sequence) {
+    const std::int32_t next =
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(sequence) + 1u);
+    if (nextExpectedSeq_ < 0) {  // first packet establishes the origin, never a gap
+        nextExpectedSeq_ = next;
+        return std::nullopt;
+    }
+    // Forward distance from what we expected, in the same wrapping/unsigned half-space
+    // handleParity's displacement witness uses. A distance in the BACKWARD half-space is
+    // a late or duplicate arrival, not a gap: it leaves the expectation alone (advancing
+    // to it would re-open every already-closed slot) and opens no hold.
+    const std::uint32_t ahead =
+        static_cast<std::uint32_t>(sequence) - static_cast<std::uint32_t>(nextExpectedSeq_);
+    if (ahead >= 0x80000000u) return std::nullopt;  // behind the frontier — not a gap
+    const std::int32_t gapStart = nextExpectedSeq_;  // the first slot never seen
+    nextExpectedSeq_ = next;
+    if (ahead == 0) return std::nullopt;
+    return gapStart;
+}
+
+void FecDecoder::beginHold(std::int32_t baseSeq) {
+    if (holding_) return;  // an open hold keeps its original ordering origin
+    holding_ = true;
+    holdBaseSeq_ = baseSeq;
+}
+
+void FecDecoder::releaseHeld() {
+    if (!holding_) return;  // the no-loss path: nothing was ever held
+    // Ordered WRAPPING against the hold's origin, never by the map's signed key order.
+    // A hold spans at most MAX_HELD_PACKETS, so every member sits inside one forward
+    // half-space of holdBaseSeq_ and this is a strict weak ordering.
+    std::vector<HeldPacket> ordered;
+    ordered.reserve(heldPackets_.size());
+    for (auto& [seq, held] : heldPackets_) ordered.push_back(std::move(held));
+    const std::uint32_t base = static_cast<std::uint32_t>(holdBaseSeq_);
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [base](const HeldPacket& a, const HeldPacket& b) {
+                         return (static_cast<std::uint32_t>(a.packet.sequence()) - base) <
+                                (static_cast<std::uint32_t>(b.packet.sequence()) - base);
+                     });
+    // State is settled BEFORE the first emit: the class invariant is that nothing is
+    // emitted while internal state is mid-flight, and an emitter is free to re-enter.
+    heldPackets_.clear();
+    holding_ = false;
+    for (const HeldPacket& held : ordered) emit(&held.packet, held.provenance);
 }
 
 std::optional<std::int32_t> FecDecoder::matchingBlockKey(std::int32_t sequence) const {
@@ -425,12 +515,23 @@ void FecDecoder::handleParity(const AudioPacket& parityPacket) {
         // memberTypeSeen is guaranteed by the blockSize floor at the top of this function:
         // blockSize >= 2 with exactly one slot missing leaves at least one present member.
         AudioPacket recoveredPacket(memberType, missingSeq, std::move(recovered));
-        // THE one Recovered emit in the project. This frame never arrived on the
-        // wire — its payload is the XOR remainder of the block. Every guard above
-        // exists to make sure that remainder is a genuinely missing slot rather
-        // than one this decoder discarded (#52) or displaced (#55); provenance is
-        // what lets a downstream consumer act on the distinction (#65).
-        emit(&recoveredPacket, Provenance::Recovered);
+        // THE one Recovered frame in the project. It never arrived on the wire — its
+        // payload is the XOR remainder of the block. Every guard above exists to make
+        // sure that remainder is a genuinely missing slot rather than one this decoder
+        // discarded (#52) or displaced (#55); provenance is what lets a downstream
+        // consumer act on the distinction (#65).
+        //
+        // QUEUED rather than emitted (issue #66). Emitting here delivers the repair
+        // after every member that follows it in sequence order, because parity always
+        // arrives after them — the defect itself. The caller calls releaseHeld() next,
+        // which puts this frame back in its sequence position among the held members.
+        // When no hold is open (the loss was the block's last slot, or an explicit gap
+        // marker on a decoder with nothing queued behind it) beginHold + releaseHeld
+        // still delivers it immediately; the hold is opened here so the queue has an
+        // ordering origin even on that path.
+        beginHold(missingSeq);
+        heldPackets_.insert_or_assign(missingSeq,
+                                      HeldPacket{std::move(recoveredPacket), Provenance::Recovered});
         block.missingSequences.erase(missingSeq);
         ++packetsRecoveredByFec_;
         ++fecBlocksComplete_;

@@ -75,12 +75,18 @@ public:
 
     // --- Pending-block retention policy (issue #47) ---
     //
-    // The pending block is a REPAIR CACHE, not a delivery queue. process() emits
-    // each audio packet BEFORE storing a copy of it, and the stored copies are read
-    // only by handleParity's missing-count and XOR. So discarding the pending block
-    // costs a repair opportunity and never costs audio or adds latency — which is
-    // why the time bound below is generous and memory is bounded by a packet count
-    // instead.
+    // The pending block is a REPAIR CACHE, not a delivery queue. The stored copies are
+    // read only by handleParity's missing-count and XOR, so discarding the pending
+    // block costs a repair opportunity and never costs audio — which is why the time
+    // bound below is generous and memory is bounded by a packet count instead.
+    //
+    // That remains true under the hold (issue #66) for a reason worth stating, because
+    // the two containers now overlap: while a hold is open a packet is stored in the
+    // block AND queued in heldPackets_, and only the SECOND of those is a delivery
+    // queue. capPending may therefore evict a packet that has not been emitted yet —
+    // it is still delivered, from heldPackets_, and the eviction costs the same repair
+    // opportunity it always did. Before #66 this said the stored copy had "already been
+    // delivered", which was the same conclusion resting on a premise the hold retires.
     //
     // The bound is IDLE, not lifetime: it is measured from the last insert into the
     // block (touchedAtMs), so it expresses a maximum in-block ARRIVAL GAP and is
@@ -112,6 +118,56 @@ public:
     // derived from the encoder's validated range; the 4 is a stated headroom choice.
     static constexpr std::size_t MAX_PENDING_PACKETS = 4 * FecEncoder::MAX_BLOCK_SIZE;
 
+    // --- Hold-until-resolved delivery policy (issue #66) ---
+    //
+    // A recovered packet can only be built when the PARITY arrives, and parity
+    // necessarily arrives after the block members that follow the loss in sequence
+    // order. So a decoder that emits every live packet the instant it arrives must
+    // deliver every repair out of order — measured, at the shipped shape: a block
+    // 100..104 losing 102 was delivered 100, 101, 103, 104, 102, and the repair landed
+    // LAST for every loss position except the block's own last slot.
+    //
+    // Nothing downstream re-orders it: the reorder buffer sits AHEAD of this class,
+    // the "jitter" stage is an ESTIMATOR that only timestamps arrivals, and everything
+    // after this class is a FIFO queue feeding a byte ring that is appended in call
+    // order. Every stage able to re-sequence sits upstream of the one stage that can
+    // disorder, which is why no buffer depth anywhere masks this.
+    //
+    // The fix is a hold, and it is CONDITIONAL rather than universal — that is the
+    // whole design. A general ordering stage downstream would pay block latency on
+    // every packet whether or not anything was lost. But the only packet that can ever
+    // arrive out of order is a repair, and a repair is only possible where a slot is
+    // missing, so the hold opens ONLY on an observed sequence discontinuity and closes
+    // at the next block resolution. With no loss nothing is ever held and the added
+    // latency is exactly zero.
+    //
+    // WHAT OPENS THE HOLD, and why it is not the gap marker. process()'s nullopt limb
+    // records an explicit missing slot, and that is the obvious trigger — but it is
+    // unreachable in production: all three production call sites use processPacket(),
+    // and the reorder buffer's chain to this class drops its NULL gaps because that
+    // callback carries no sequence (UdpClientConnection.cpp). A hold keyed to it would
+    // pass every unit test and never once fire on the shipped path. So the hold is
+    // opened by THIS class observing a forward gap in the sequences it is handed, and
+    // the explicit marker opens it too.
+    //
+    // Continuity is tracked over EVERY packet this decoder sees, not only audio,
+    // because parity draws its own fresh sequence from the connection's shared counter
+    // (UdpClientConnection::maybeSendFecParity). Tracking audio alone would read the
+    // parity's consumed slot as a gap and open a hold on every single block — the
+    // universal-latency design this one exists to avoid, arrived at by accident.
+    //
+    // Sequences this decoder never sees still read as gaps: a consumed CONTROL_ACK, a
+    // CRC failure, a late packet the reorder buffer dropped. Those open a hold that was
+    // not needed. That is a deliberate asymmetry — the trigger's precision governs how
+    // OFTEN the bounded delay is paid, never whether delivery is correct, and the
+    // false-positive hold still closes at the very next parity.
+    //
+    // Bound: a hold is closed by the next parity, by checkTimeoutAt, or by this cap,
+    // whichever comes first. Two maximum blocks — enough that the parity for the block
+    // in flight always lands first, so reaching the cap means parity has stopped
+    // arriving and the right move is to give up on ordering and deliver.
+    static constexpr std::size_t MAX_HELD_PACKETS = 2 * FecEncoder::MAX_BLOCK_SIZE;
+
     explicit FecDecoder(Emitter emitter, std::int64_t blockTimeoutMs = DEFAULT_BLOCK_TIMEOUT_MS);
 
     // Sets the pending block's idle timeout, clamped to
@@ -129,10 +185,12 @@ public:
     // (testability — §3.3). Production uses the default steady-clock source.
     void setClock(Clock clock);
 
-    // Processes a packet (or a silence gap) from the reorder buffer. Audio
-    // packets are emitted immediately AND stored for potential FEC recovery;
-    // FEC_PARITY packets trigger a recovery attempt; nullopt records a missing
-    // slot. `sequence` is required when `packet` is nullopt.
+    // Processes a packet (or a silence gap) from the reorder buffer. Audio packets are
+    // stored for potential FEC recovery and emitted immediately UNLESS a hold is open,
+    // in which case they are queued and delivered in sequence order when the block
+    // resolves (issue #66 — see the hold policy above); FEC_PARITY packets trigger a
+    // recovery attempt and then close any open hold; nullopt records a missing slot and
+    // opens one. `sequence` is required when `packet` is nullopt.
     void process(std::optional<AudioPacket> packet, std::int32_t sequence);
 
     // Convenience for a known non-null packet.
@@ -209,7 +267,9 @@ public:
     // missingSequences, and the client's reorder->FEC chain drops gap markers, so
     // that set is always empty in production) and nothing is emitted. A non-zero
     // value means repair opportunities were lost to arrival stalls, never that
-    // audio was lost — the packets themselves were emitted on arrival.
+    // audio was lost — an evicted packet has either been emitted already or is still
+    // queued in heldPackets_, which is a separate container this eviction cannot reach
+    // (issue #66). Delivery and repair-retention are bounded independently.
     std::int64_t pendingPacketsDiscarded() const;
 
     void reset();
@@ -269,7 +329,33 @@ private:
     void recordMissing(std::int32_t sequence);
 
     // Handles a parity packet: attempts to recover a single missing audio packet.
+    // Any recovered frame is QUEUED into heldPackets_ rather than emitted, so that
+    // releaseHeld() — the caller's next step — delivers it in sequence position
+    // relative to the members held behind it (issue #66).
     void handleParity(const AudioPacket& parityPacket);
+
+    // --- Hold-until-resolved delivery (issue #66) ---
+
+    // Advances the continuity tracker past `sequence`. Returns the FIRST MISSING SLOT
+    // when a forward gap preceded it, and nullopt otherwise. It returns the gap's start
+    // rather than a bare bool because that sequence is the hold's ordering origin: keying
+    // the hold to the packet that REVEALED the gap puts the recovered frame one whole
+    // wrap behind the origin, and releaseHeld sorts it back out last — which is the
+    // original defect, reproduced inside its own fix. Measured, not reasoned: the arm
+    // FecDecoder.AnObservedGapOpensTheHoldWithNoExplicitMarker failed exactly this way.
+    // Wrapping and unsigned, bounded by the forward half-space, for the same reason
+    // handleParity's displacement witness is: §3.4 defines the counter as two's-
+    // complement, so a signed comparison is wrong at every wrap.
+    std::optional<std::int32_t> noteSequenceAndDetectGap(std::int32_t sequence);
+
+    // Opens the hold, if it is not already open, recording `baseSeq` as the ordering
+    // origin that releaseHeld() sorts against.
+    void beginHold(std::int32_t baseSeq);
+
+    // Emits every held packet in sequence order and closes the hold. Called at each
+    // block resolution (parity handled, or a timeout flush) and when the hold hits
+    // MAX_HELD_PACKETS. A no-op when no hold is open, which is the no-loss path.
+    void releaseHeld();
 
     static std::int64_t defaultNowMs();
 
@@ -287,7 +373,27 @@ private:
     // entries are deliberately NOT recorded — a slot that was always missing is
     // legitimately recoverable.
     std::set<std::int32_t> discardedSequences_;
-    std::int32_t nextEmitSeq_ = -1;  // set-only ordering hint
+
+    // An audio packet awaiting in-order delivery, with the provenance it will carry.
+    // Provenance travels WITH the packet rather than being re-derived at release: the
+    // one Recovered frame is queued alongside Live ones and must not lose that on the
+    // way out (issue #65's contract, unchanged by #66).
+    struct HeldPacket {
+        AudioPacket packet;
+        Provenance provenance;
+    };
+    // Packets delivered late and in order rather than immediately and out of order.
+    // Keyed by sequence for de-duplication; the ORDER used at release is computed
+    // wrapping against holdBaseSeq_, never this map's signed key order.
+    std::map<std::int32_t, HeldPacket> heldPackets_;
+    bool holding_ = false;
+    std::int32_t holdBaseSeq_ = 0;
+    // Continuity tracker: the sequence expected next, over every packet this decoder
+    // is handed (audio AND parity — see MAX_HELD_PACKETS). Negative until the first
+    // packet establishes the origin. Replaces the vestigial `nextEmitSeq_`, which was
+    // written by process(), read by nothing, and commented "set-only ordering hint" —
+    // this is the ordering it was a hint at.
+    std::int32_t nextExpectedSeq_ = -1;
     std::int64_t packetsRecoveredByFec_ = 0;
     std::int64_t fecBlocksComplete_ = 0;
     std::int64_t fecBlocksFailed_ = 0;
