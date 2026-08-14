@@ -5,6 +5,33 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **An FEC-recovered packet is delivered in its own sequence position instead of after the rest of
+  its block.** A repair can only be built when the parity arrives, and parity is computed over the
+  block, so it necessarily arrives after every member that follows the loss. The decoder delivered
+  each packet the instant it arrived, so the repair was always handed over last: a block
+  `100..104` losing `102` was delivered `100, 101, 103, 104, 102`, on both the RX and TX lanes.
+  Measured across every loss position, the repair landed last in all of them — displaced by four
+  frame positions when the block's *first* slot was lost, and in order only when the loss was the
+  block's own last slot.
+
+  **No buffer setting masked this.** The reorder buffer sits ahead of the decoder, the "jitter"
+  stage is an estimator that only timestamps arrivals, and everything after the decoder is a FIFO
+  queue feeding a ring appended in call order — so every stage able to re-sequence sat upstream of
+  the one stage that could disorder. Depth bought delay, not order.
+
+  The decoder now **holds the audio behind an observed sequence gap** until the block resolves
+  (its parity, the block timeout, or a packet cap, whichever comes first) and then delivers it in
+  sequence order. The hold is conditional, which is the whole point: with no loss nothing is held
+  and the added latency is exactly zero. A general ordering stage after the decoder would instead
+  have paid block latency on every packet whether or not anything was lost.
+
+  **Latency after a loss is bounded** by the block remainder plus its parity — at `udpWan`, the
+  only preset that enables FEC, at most ~40–50 ms against that profile's 120 ms buffer target.
+  Provenance is unchanged: the repair still arrives marked recovered, with the same bytes and the
+  same audio type. No wire change and no C ABI change — the spec already classed recovery delivery
+  as a local delivery rule rather than a wire rule.
+
 ### Changed
 - **`na_hamlib_bridge` negotiates its sample rate from the rig's `native_sample_rates` instead of
   demanding 48 kHz.** The bridge asked libhamlib for 48 kHz and told naudio 48 kHz on every rig, and
