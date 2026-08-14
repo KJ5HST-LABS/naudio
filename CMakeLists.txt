@@ -739,6 +739,23 @@ if(NOT WIN32)
 endif()
 
 # ----------------------------------------------------------------------------
+# Daemon argument gate (issue #63) — na_audio_daemon's main() has no injection seam, so driving
+# the built binary is the only coverage its option parsing can have. Every case the script runs is
+# decided BEFORE any device work (the parse loop exits on a bad value; --transport is validated
+# immediately after it), so this arm opens no PortAudio stream and is safe on a headless runner —
+# unlike naudio_bridge_arm above, it needs no external dependency at all.
+#
+# Registered only where the target exists (NAUDIO_BUILD_APPS, and not Windows), so on a lib-only
+# configuration ctest has no such test rather than a skip that reads like coverage. That is the
+# same discipline as the bridge arm, and it is why per-job ctest totals differ by design.
+# ----------------------------------------------------------------------------
+if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_audio_daemon)
+    add_test(NAME naudio_daemon_argcheck
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/argcheck.sh"
+                          "$<TARGET_FILE:na_audio_daemon>")
+endif()
+
+# ----------------------------------------------------------------------------
 # Bridge arm (issue #15) — the half of the bridge harness that cannot be portable. Registered ONLY
 # when na_hamlib_bridge actually exists as a target, which needs both NAUDIO_BUILD_HAMLIB_BRIDGE=ON
 # and a streaming-capable libhamlib; on a stock build ctest has no such test at all, rather than a

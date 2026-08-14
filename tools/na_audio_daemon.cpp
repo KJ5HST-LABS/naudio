@@ -43,11 +43,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -156,6 +159,10 @@ void usage() {
         "  --capture-id N    force capture device backendId (skips name lookup)\n"
         "  --playback <pat>  hardware mode: client RX sink, e.g. BlackHole (the digital-mode feed);\n"
         "                    omitted/not-found => hardware-free FakeBackend drain\n"
+        "                    WARNING: a pattern that matches NOTHING takes that same drain and the\n"
+        "                    run can still exit 0 -- so a misspelled sink name reports a PASS for a\n"
+        "                    check that never fed your digital-mode app. Confirm the 'client sink'\n"
+        "                    line names a real device before trusting a hardware-mode pass.\n"
         "  --playback-id N   force playback device backendId\n"
         "  --transport       tcp (default) | udp | dual\n"
         "  --port N          server port; 0 = ephemeral (default %d)\n"
@@ -381,6 +388,16 @@ int runHardware(const Args& a) {
         clientBackend = &fakeBackend;
         clientPlaybackId = 0;
         std::printf("client sink  : FakeBackend drain (no virtual sink found; pipeline-only)\n");
+        // An EXPLICIT --playback that matched nothing takes this same silent fallback, and the run
+        // can still exit 0 — so a misspelled sink name reports a pass for a check that never fed
+        // the digital-mode app. Name the pattern that missed, so the drain is not mistaken for the
+        // "no sink configured" case.
+        if (!a.playbackPattern.empty()) {
+            std::printf("               NOTE: --playback '%s' matched NO device; this run does NOT\n"
+                        "               feed any external consumer, and a pass here says nothing\n"
+                        "               about your digital-mode app.\n",
+                        a.playbackPattern.c_str());
+        }
     }
 
     // --- Start the server (capture-only; NEVER opens a playback line to the radio). ---
@@ -477,6 +494,29 @@ int runHardware(const Args& a) {
     return (gotStream && noErrors) ? 0 : 1;
 }
 
+// Parse an integer option value STRICTLY: the whole token must be consumed and the result must sit
+// in [lo, hi]. std::atoi returns 0 for a non-numeric string and gives the caller no way to tell
+// that from a genuine "0" — and 0 is a VALID PortAudio device index, so `--capture-id usb` used to
+// open device 0 and the RMS gate could then pass on whatever that device happened to hear. A typo
+// must stop the run, not quietly select a different radio. Exits 2 (the usage-error code the rest
+// of the parser uses) rather than returning a sentinel, because there is no in-band value left to
+// mean "invalid".
+long long requireInt(const char* name, const std::string& text, long long lo, long long hi) {
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(text.c_str(), &end, 10);
+    if (text.empty() || end == text.c_str() || *end != '\0') {
+        std::fprintf(stderr, "error: %s expects an integer, got '%s'\n", name, text.c_str());
+        std::exit(2);
+    }
+    if (errno == ERANGE || v < lo || v > hi) {
+        std::fprintf(stderr, "error: %s must be in [%lld, %lld], got '%s'\n", name, lo, hi,
+                     text.c_str());
+        std::exit(2);
+    }
+    return v;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -492,12 +532,18 @@ int main(int argc, char** argv) {
         };
         if (a == "--mode") args.mode = next("--mode");
         else if (a == "--capture") args.capturePattern = next("--capture");
-        else if (a == "--capture-id") args.captureId = std::atoi(next("--capture-id").c_str());
+        else if (a == "--capture-id")
+            args.captureId = static_cast<int>(
+                requireInt("--capture-id", next("--capture-id"), 0, INT_MAX));
         else if (a == "--playback") args.playbackPattern = next("--playback");
-        else if (a == "--playback-id") args.playbackId = std::atoi(next("--playback-id").c_str());
+        else if (a == "--playback-id")
+            args.playbackId = static_cast<int>(
+                requireInt("--playback-id", next("--playback-id"), 0, INT_MAX));
         else if (a == "--transport") args.transport = next("--transport");
-        else if (a == "--port") args.port = std::atoi(next("--port").c_str());
-        else if (a == "--duration-ms") args.durationMs = std::atoll(next("--duration-ms").c_str());
+        else if (a == "--port")
+            args.port = static_cast<int>(requireInt("--port", next("--port"), 0, 65535));
+        else if (a == "--duration-ms")
+            args.durationMs = requireInt("--duration-ms", next("--duration-ms"), 0, LLONG_MAX);
         else if (a == "--list-devices") args.listDevices = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }

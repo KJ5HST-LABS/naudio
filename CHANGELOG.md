@@ -19,6 +19,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   devices with their own ids. A genuine split pair can never overlap, which is what makes the
   overlap a safe discriminator.
 
+- **`na_audio_daemon` rejects a non-numeric `--capture-id` / `--playback-id` instead of opening
+  device 0.** The numeric options went through `std::atoi`, which returns 0 for a non-numeric string
+  and gives the caller no way to tell that from a genuine `0` — and 0 is a valid PortAudio device
+  index. So `--capture-id usb` opened device 0 and the RMS gate could pass on whatever that device
+  happened to hear, reporting a green on-air check against the wrong radio; `--capture-id 3x` was
+  silently accepted as 3. All four numeric options (`--capture-id`, `--playback-id`, `--port`,
+  `--duration-ms`) are now parsed strictly — the whole token must be consumed — and range-checked,
+  with a distinct message for each failure.
+
+  Its `--help` text now also warns that an explicitly requested `--playback` pattern matching
+  nothing falls back to the hardware-free drain and can still exit 0, and the run itself names the
+  pattern that missed. That path is unchanged behaviour; it was simply invisible, and a misspelled
+  sink name produced a pass for a check that never fed the digital-mode app.
+
 - **Unloading a virtual sink no longer destroys other sinks whose names merely contain its own.**
   `unloadSinkPipeline` selected modules with a bare `grep <name>` and piped the result straight
   into `xargs pactl unload-module`, so tearing down a sink named `naudio` also unloaded `naudio_2`
