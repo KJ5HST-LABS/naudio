@@ -14,19 +14,28 @@
  *
  * DATA PATH (both directions are straight S16LE byte copies ON THIS SIDE — this file never
  * resamples and never converts a sample format):
- *   RX: rig_stream_read(AUDIO_RX, S16@48k) ---> na_server_inject_audio()  [fan-out + FEC]
- *   TX: na_server_tx_audio_cb() --ring--> rig_stream_write(AUDIO_TX, S16@48k)
+ *   RX: rig_stream_read(AUDIO_RX, S16@rate) ---> na_server_inject_audio()  [fan-out + FEC]
+ *   TX: na_server_tx_audio_cb() --ring--> rig_stream_write(AUDIO_TX, S16@rate)
  *
  * That is a claim about THIS PROCESS, not about the whole path. Since Hamlib PR #2116 commit
  * 961093f2, libhamlib itself may convert underneath these calls: backends now advertise only
  * their hardware-native capability, and the streaming core serves anything else through a
- * frontend conversion pipeline. S16@48k is not native on every backend — the dummy now
- * advertises PCM_F32|OPUS natively — so the request above is commonly served through an
- * F32->S16 conversion, and on hardware whose native rate is not 48 kHz it adds libsamplerate
- * resampling inside the very hop this bridge exists to keep short. That is a deliberate
- * trade: converting reaches far more hardware than demanding native would, and demanding it
- * (rig_stream_config.require_native = 1) would fail outright against the dummy backend. What
- * is NOT acceptable is doing it silently, so open_stream() reports the active stages at open.
+ * frontend conversion pipeline. S16 is not native on every backend — the dummy now advertises
+ * PCM_F32|OPUS natively — so the request above is commonly served through an F32->S16
+ * conversion. That is a deliberate trade: converting reaches far more hardware than demanding
+ * native would, and demanding it (rig_stream_config.require_native = 1) would fail outright
+ * against the dummy backend. What is NOT acceptable is doing it silently, so open_stream()
+ * reports the active stages at open.
+ *
+ * THE RATE IS THE AXIS THIS BRIDGE CAN MOVE, AND IT DOES (issue #84). The format axis is
+ * pinned — naudio's ABI carries signed 16-bit PCM and nothing else (naudio.h), so asking for
+ * a native F32 would only relocate the quantization into this file. The RATE is free: naudio
+ * carries whatever the server advertises, and tells every client what that is (AUDIO_CONFIG,
+ * docs/audio-streaming-protocol-v1.md §6.3). So instead of demanding 48 kHz and letting
+ * libsamplerate serve it, the bridge reads native_sample_rates and picks from it — keeping
+ * 48 kHz whenever it is offered, which is every case the dummy backend produces. What that
+ * removes is a resample inside the very hop this bridge exists to keep short. The policy, and
+ * the argument for it, live in na_stream_rate.h; negotiate_rate() below applies it.
  *
  * Pure C: links the naudio C ABI (naudio.h) + libhamlib (<hamlib/rig.h>). The C ABI's
  * na_server_set_reliability_profile()/_set_audio_format() expose the FEC profile + mono
@@ -46,6 +55,8 @@
 #include <hamlib/riglist.h>
 
 #include "naudio.h"
+#include "na_stream_rate.h"   /* the rate-negotiation policy (issue #84), kept separate so
+                               * it is unit-tested on every CI job — see its header */
 
 /* ------------------------------------------------------------------ config + globals */
 
@@ -474,14 +485,20 @@ static void print_native_channels(FILE *f, const struct rig_stream_caps *c) {
 
 /* Name the conversion stages libhamlib is running between the hardware and an open stream.
  *
- * The bridge asks for S16@48k because that is what naudio carries. Since PR #2116 commit
- * 961093f2 that request is served whether or not the hardware speaks it, so silence here is
- * ambiguous — it could mean a native stream or an undisclosed resample sitting in the local
- * hop. One line at open removes the ambiguity. Reported, never enforced: require_native is
- * left at 0 deliberately (see the DATA PATH note in this file's header).
+ * The bridge asks for S16 because that is what naudio carries, at the rate negotiate_rate()
+ * chose. Since PR #2116 commit 961093f2 that request is served whether or not the hardware
+ * speaks it, so silence here is ambiguous — it could mean a native stream or an undisclosed
+ * conversion sitting in the local hop. One line at open removes the ambiguity. Reported,
+ * never enforced: require_native is left at 0 deliberately (see the DATA PATH note in this
+ * file's header).
+ *
+ * `rate` is passed in rather than re-read from the stream so this line names the rate the
+ * bridge actually opened at. It used to print a hardcoded "48k", which was true only while
+ * the rate was hardcoded too — a caption that would have quietly disagreed with the stream
+ * it describes on the first rig that negotiated anything else (issue #84).
  *
  * Compiled out against a streaming libhamlib built before 961093f2, which has no such call. */
-static void report_conversions(rig_stream_t *stream, rig_stream_type_t type) {
+static void report_conversions(rig_stream_t *stream, rig_stream_type_t type, int rate) {
 #ifdef NAUDIO_HAMLIB_HAS_STREAM_CONV
     int conv = rig_stream_get_conversions(stream);
     if (conv < 0) {
@@ -490,14 +507,14 @@ static void report_conversions(rig_stream_t *stream, rig_stream_type_t type) {
         return;
     }
     if (conv == RIG_STREAM_CONV_NONE) {
-        printf("na_hamlib_bridge: stream type=%d S16@48k is NATIVE (libhamlib converts nothing)\n",
-               (int)type);
+        printf("na_hamlib_bridge: stream type=%d S16@%d is NATIVE (libhamlib converts nothing)\n",
+               (int)type, rate);
     } else {
         /* Rate conversion is called out first and by name: it is the one stage that adds
          * latency and libsamplerate cost to the hop this bridge exists to keep short. */
-        printf("na_hamlib_bridge: stream type=%d S16@48k is CONVERTED by libhamlib:%s%s%s "
+        printf("na_hamlib_bridge: stream type=%d S16@%d is CONVERTED by libhamlib:%s%s%s "
                "(conv=0x%x)\n",
-               (int)type,
+               (int)type, rate,
                (conv & RIG_STREAM_CONV_RATE)     ? " resample" : "",
                (conv & RIG_STREAM_CONV_FORMAT)   ? " sample-format" : "",
                (conv & RIG_STREAM_CONV_CHANNELS) ? " channel-map" : "",
@@ -509,24 +526,106 @@ static void report_conversions(rig_stream_t *stream, rig_stream_type_t type) {
 #endif
 }
 
-/* Open one stream of `type` as S16 @ 48k / `channels`. On success, report what libhamlib is
+#ifdef NAUDIO_HAMLIB_HAS_STREAM_CONV
+/* The caps block for one stream type, or NULL if the backend publishes none for it.
+ *
+ * rig_stream_caps_at() serves the FRONTEND-DERIVED caps, which is what makes the native_*
+ * view meaningful here: backends leave those fields zero and the frontend fills them in
+ * (hamlib/rig.h, struct rig_stream_caps). A backend that publishes no block for a type at
+ * all reads as "no native information" and leaves the rate where it was. */
+static const struct rig_stream_caps *caps_for(RIG *rig, rig_stream_type_t type) {
+    int n = rig_stream_caps_count(rig);
+    for (int i = 0; i < n; i++) {
+        const struct rig_stream_caps *c = rig_stream_caps_at(rig, i);
+        if (c && c->type == type) return c;
+    }
+    return NULL;
+}
+#endif
+
+/* Pick the sample rate to open both audio streams at and to run the naudio server at.
+ *
+ * The policy — prefer 48 kHz, else the closest native rate, and require it of BOTH
+ * directions in use — lives in na_stream_rate.h, where it is unit-tested on every CI job.
+ * This function is only the plumbing: find the caps, hand over the two native lists, and
+ * say out loud what came back.
+ *
+ * Compiled out entirely against a libhamlib older than PR #2116 commit 961093f2, which has
+ * no native_* fields to consult — that prefix keeps the 48 kHz the bridge always used. The
+ * gate is the EXISTING conversion-reporting gate rather than a new one: the same commit
+ * added rig_stream_get_conversions() and the native_* view, so one check covers both, and
+ * tools/CMakeLists.txt already documents it.
+ *
+ * `want_tx` is the operator's intent (-x clears it), not whether the TX stream opened —
+ * this runs BEFORE either open, which is the only place it can run, since the rate is an
+ * input to both. A TX stream that then fails to open leaves the bridge RX-only at a rate
+ * chosen to suit a TX direction it no longer has. That is deliberate and it is the cheap
+ * side of the trade: re-opening RX to re-optimise it would tear down a working stream to
+ * chase a rate difference that only exists on hardware whose two directions disagree. */
+static int negotiate_rate(RIG *rig, int want_tx) {
+#ifdef NAUDIO_HAMLIB_HAS_STREAM_CONV
+    const struct rig_stream_caps *rx = caps_for(rig, RIG_STREAM_TYPE_AUDIO_RX);
+    const struct rig_stream_caps *tx = want_tx ? caps_for(rig, RIG_STREAM_TYPE_AUDIO_TX) : NULL;
+
+    int rate = na_choose_stream_rate(rx ? rx->native_sample_rates : NULL,
+                                     HAMLIB_MAX_STREAM_RATES,
+                                     tx ? tx->native_sample_rates : NULL,
+                                     HAMLIB_MAX_STREAM_RATES,
+                                     NA_STREAM_RATE_PREFERRED);
+    if (rate <= 0) rate = NA_STREAM_RATE_PREFERRED;   /* unreachable: the preference is a constant */
+
+    /* Say which way it went, and on what evidence. A silent negotiation would replace one
+     * undisclosed behaviour with another — and the rate is the single fact an operator needs
+     * to reconcile this bridge's console against what their client is playing. */
+    if (!rx || na_rate_list_len(rx->native_sample_rates, HAMLIB_MAX_STREAM_RATES) == 0) {
+        printf("na_hamlib_bridge: rate %d (backend publishes no native rates to choose from)\n",
+               rate);
+    } else if (rate == NA_STREAM_RATE_PREFERRED) {
+        printf("na_hamlib_bridge: rate %d — native, from rx=[", rate);
+        print_int_list(stdout, rx->native_sample_rates, HAMLIB_MAX_STREAM_RATES);
+        printf("]\n");
+    } else {
+        printf("na_hamlib_bridge: rate %d instead of %d — %d is not native here, so this "
+               "avoids a resample. rx=[",
+               rate, NA_STREAM_RATE_PREFERRED, NA_STREAM_RATE_PREFERRED);
+        print_int_list(stdout, rx->native_sample_rates, HAMLIB_MAX_STREAM_RATES);
+        if (tx) {
+            printf("] tx=[");
+            print_int_list(stdout, tx->native_sample_rates, HAMLIB_MAX_STREAM_RATES);
+        }
+        printf("]\n");
+    }
+    fflush(stdout);
+    return rate;
+#else
+    (void)rig; (void)want_tx;
+    return NA_STREAM_RATE_PREFERRED;
+#endif
+}
+
+/* Open one stream of `type` as S16 @ `rate` / `channels`. On success, report what libhamlib is
  * converting. On failure, dump the backend's caps so the user can see what it actually offers.
- * Returns RIG_OK / negative. */
-static int open_stream(RIG *rig, rig_stream_type_t type, int channels, rig_stream_t **out) {
+ * Returns RIG_OK / negative.
+ *
+ * `rate` comes from negotiate_rate() below rather than being pinned here (issue #84), and both
+ * audio streams are opened at the SAME one — naudio carries a single server-wide format, so the
+ * two directions cannot disagree about it. */
+static int open_stream(RIG *rig, rig_stream_type_t type, int channels, int rate,
+                       rig_stream_t **out) {
     struct rig_stream_config *cfg = rig_stream_config_alloc();
     if (!cfg) return -RIG_ENOMEM;
     cfg->type = type;
     cfg->format = RIG_STREAM_FORMAT_PCM_S16;
-    cfg->sample_rate = 48000;
+    cfg->sample_rate = rate;
     cfg->channels = channels;
     int r = rig_stream_open(rig, cfg, out);
     rig_stream_config_free(cfg);
     if (r == RIG_OK) {
-        report_conversions(*out, type);
+        report_conversions(*out, type, rate);
         return r;
     }
-    fprintf(stderr, "na_hamlib_bridge: rig_stream_open(type=%d, S16@48k/%dch): %s\n",
-            (int)type, channels, rigerror(r));
+    fprintf(stderr, "na_hamlib_bridge: rig_stream_open(type=%d, S16@%d/%dch): %s\n",
+            (int)type, rate, channels, rigerror(r));
     int n = rig_stream_caps_count(rig);
     for (int i = 0; i < n; i++) {
         const struct rig_stream_caps *c = rig_stream_caps_at(rig, i);
@@ -699,12 +798,15 @@ int main(int argc, char **argv) {
         rx_meter_free(&b.rxm);
         return 1;
     }
-    if (open_stream(b.rig, RIG_STREAM_TYPE_AUDIO_RX, channels, &b.rx) != RIG_OK) {
+    /* Before either open, because the rate is an input to both — and to na_server_set_audio_format
+     * below, which must name the same rate the streams carry (issue #84). */
+    const int rate = negotiate_rate(b.rig, want_tx);
+    if (open_stream(b.rig, RIG_STREAM_TYPE_AUDIO_RX, channels, rate, &b.rx) != RIG_OK) {
         rig_close(b.rig); rig_cleanup(b.rig); ring_free(&b.txring); rx_meter_free(&b.rxm);
         return 1;
     }
     if (want_tx) {
-        if (open_stream(b.rig, RIG_STREAM_TYPE_AUDIO_TX, channels, &b.tx) != RIG_OK) {
+        if (open_stream(b.rig, RIG_STREAM_TYPE_AUDIO_TX, channels, rate, &b.tx) != RIG_OK) {
             fprintf(stderr, "na_hamlib_bridge: TX stream unavailable — continuing RX-only\n");
             b.tx = NULL;
         }
@@ -730,7 +832,7 @@ int main(int argc, char **argv) {
         goto teardown_rig;
     }
     if (na_server_set_reliability_profile(b.srv, profile) != NA_OK ||
-        na_server_set_audio_format(b.srv, 48000, 16, channels) != NA_OK) {
+        na_server_set_audio_format(b.srv, rate, 16, channels) != NA_OK) {
         fprintf(stderr, "na_hamlib_bridge: server config: %s\n", na_strerror(na_last_error()));
         startup_failed = 1;
         goto teardown_all;
@@ -766,11 +868,11 @@ int main(int argc, char **argv) {
         goto teardown_all;
     }
 
-    printf("na_hamlib_bridge: model=%d %s -> naudio :%d  profile=%s  channels=%d  tx=%s\n",
+    printf("na_hamlib_bridge: model=%d %s -> naudio :%d  profile=%s  rate=%d  channels=%d  tx=%s\n",
            model, rig_file ? rig_file : "(local)", na_server_port(b.srv),
            profile == NA_RELIABILITY_UDP_WAN ? "wan" :
            profile == NA_RELIABILITY_UDP_LAN ? "lan" : "ft8",
-           channels, b.tx ? (use_ptt ? "on+ptt" : "on") : "off");
+           rate, channels, b.tx ? (use_ptt ? "on+ptt" : "on") : "off");
     fflush(stdout);   /* redirected to a file this sits in the buffer until the first health tick,
                        * landing AFTER any stderr diagnostic it is supposed to precede */
 
@@ -784,8 +886,13 @@ int main(int argc, char **argv) {
     int rx_short_reported = 0;
     /* Bytes per second the format handed to na_server_set_audio_format implies. Every byte the
      * bridge injects is charged against this, because naudio re-frames what it is given using
-     * exactly this layout — it does not resample or convert (naudio.h, na_server_set_audio_format). */
-    const double rx_nominal_bps = 48000.0 * 2.0 * (double)channels;
+     * exactly this layout — it does not resample or convert (naudio.h, na_server_set_audio_format).
+     *
+     * DERIVED FROM `rate`, NOT FROM A SECOND COPY OF 48000 (issue #84 item 2). This is the
+     * denominator of the "% of nominal" health figure — the number #21's measurement was read off
+     * — so a negotiated rate that did not reach here would leave the metric quietly reporting a
+     * shortfall or a surplus that is only the two constants disagreeing. */
+    const double rx_nominal_bps = (double)rate * 2.0 * (double)channels;
     while (!g_stop) {
         sleep_ms(200);
         if (++tick % 25 == 0) {   /* ~every 5s: RX health + roster, then TX loss */

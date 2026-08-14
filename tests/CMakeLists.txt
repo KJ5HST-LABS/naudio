@@ -12,7 +12,8 @@ add_executable(naudio_tests
     test_fec.cpp
     test_reorder.cpp
     test_control_reliability.cpp
-    test_ring_buffer.cpp)
+    test_ring_buffer.cpp
+    test_stream_rate.cpp)
 
 # Tests exercise the pure logic layer only — no PortAudio, no hardware.
 # gtest_main links gtest transitively; linking both would duplicate libgtest.
@@ -20,6 +21,13 @@ add_executable(naudio_tests
 # thread) needs pthread on Linux; harmless elsewhere.
 find_package(Threads REQUIRED)
 target_link_libraries(naudio_tests PRIVATE naudio_core GTest::gtest_main Threads::Threads)
+
+# tools/ is on the include path for ONE header: na_stream_rate.h, na_hamlib_bridge's
+# sample-rate negotiation policy (issue #84). It is deliberately not in include/naudio/ —
+# that tree is installed and ships upstream, and this is one tool's policy, not library
+# API. The header pulls in no hamlib and no naudio headers, so these arms build and run on
+# the whole CI matrix while the bridge that uses it stays opt-in and POSIX-only.
+target_include_directories(naudio_tests PRIVATE "${CMAKE_SOURCE_DIR}/tools")
 
 include(GoogleTest)
 
