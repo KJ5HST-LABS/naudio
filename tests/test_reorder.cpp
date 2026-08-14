@@ -98,6 +98,33 @@ TEST(PacketReorderBuffer, TimeoutForceFlush) {
     EXPECT_EQ(1, buf.gapsEmitted());
 }
 
+// TimeoutForceFlush above buffers exactly ONE packet, so it cannot tell "oldest arrival" from
+// "smallest sequence" — the two coincide. This arm separates them with the minimum that can:
+// two buffered packets whose sequence order is the REVERSE of their arrival order. Reading the
+// hold from the smallest sequence (arrivalTimes_.begin(), keyed by sequence) restarts seq 3's
+// hold when seq 2 arrives 5 ms later, and seq 3 stays buffered past the 10 ms it was promised.
+TEST(PacketReorderBuffer, HoldTimeoutMeasuresFromOldestArrivalNotSmallestSequence) {
+    Sink s;
+    PacketReorderBuffer buf(8, 10, s.emitter());  // 10 ms hold, window big enough not to flush
+    buf.insertAt(pkt(0), 1000);  // in order — emits, establishes nextExpected = 1
+    buf.insertAt(pkt(3), 1000);  // buffered, arrival t=1000 — the packet that waits longest
+    buf.insertAt(pkt(2), 1005);  // buffered, arrival t=1005 — but the SMALLEST sequence
+    ASSERT_EQ(1u, s.size());
+    ASSERT_EQ(2u, buf.bufferedCount());
+
+    // Negative control: at t=1009 seq 3 has waited 9 ms, still inside its hold. Without this an
+    // implementation that flushed on every check would satisfy the assertion that matters.
+    buf.checkTimeoutAt(1009);
+    EXPECT_EQ(1u, s.size());
+
+    // At t=1010 seq 3 has waited exactly its 10 ms and must go. Measuring from seq 2's arrival
+    // instead gives 1010 - 1005 = 5 ms and holds it — this is the assertion that dies.
+    buf.checkTimeoutAt(1010);
+    EXPECT_EQ((std::vector<std::string>{"0", "GAP", "2", "3"}), s.items);
+    EXPECT_EQ(1, buf.gapsEmitted());
+    EXPECT_EQ(0u, buf.bufferedCount());
+}
+
 TEST(PacketReorderBuffer, LatePacketDiscarded) {
     Sink s;
     PacketReorderBuffer buf(8, 30, s.emitter());

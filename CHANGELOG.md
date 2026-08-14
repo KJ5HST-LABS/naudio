@@ -23,6 +23,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `checkRetransmitsAt` gives an exhausted entry. naudio never sends a NACK, but it does handle a
   received one, so the budget was a peer's to spend without limit.
 
+- **The reorder buffer's hold timeout is measured from the oldest arrival, not the smallest
+  sequence.** `PacketReorderBuffer::checkTimeoutAt` read `arrivalTimes_.begin()`, and that map is
+  keyed by *sequence* — so `begin()` is the lowest sequence number, whose arrival time says nothing
+  about which packet has waited longest. Under decreasing-sequence arrivals every newly buffered
+  packet became the new `begin()` and restarted the hold of everything already buffered, so
+  `maxHoldMs` was not the maximum time a packet could be held: the real bound was
+  `(reorderBufferSize - 1) x reorderMaxHoldMs`, which is 280 ms on the `udpWan` preset against a
+  documented 40 ms. The size-triggered flush at `reorderBufferSize` was what ended the chain, not
+  the timeout. Head-of-line latency only; no packet was lost or misordered.
+
 - **Re-recording an already-pending control sequence no longer evicts an unrelated one.**
   `ControlReliability::recordSentAt` freed a slot before checking whether the sequence was already
   pending. A re-record replaces in place and adds no entry, so at capacity the eviction destroyed

@@ -52,9 +52,21 @@ void PacketReorderBuffer::checkTimeout() { checkTimeoutAt(nowMillis()); }
 void PacketReorderBuffer::checkTimeoutAt(std::int64_t nowMs) {
     if (buffer_.empty()) return;
     if (!arrivalTimes_.empty()) {
-        // The arrival time of the smallest buffered sequence (matches the
-        // ordered-map first-element (begin()) semantics — by key, not by time).
-        const std::int64_t oldestArrival = arrivalTimes_.begin()->second;
+        // The OLDEST ARRIVAL — a min over the values, not begin(). arrivalTimes_ is keyed by
+        // SEQUENCE, so begin() is the smallest sequence, whose arrival is unrelated to which
+        // packet has waited longest. Under decreasing-sequence arrivals each new packet became
+        // the new begin() and restarted the hold of every packet already buffered, so the header
+        // contract — "maxHoldMs is the max time to hold a packet" — did not hold: the true bound
+        // was (windowSize_ - 1) x maxHoldMs, since the size-triggered forceFlush at windowSize_
+        // is what finally ends the chain.
+        //
+        // The scan is bounded by windowSize_ entries for the same reason, so it is the same cost
+        // class as the map operations around it, and it needs no incrementally-maintained minimum
+        // that drainConsecutive's erases would have to keep correct.
+        std::int64_t oldestArrival = arrivalTimes_.begin()->second;
+        for (const auto& entry : arrivalTimes_) {
+            if (entry.second < oldestArrival) oldestArrival = entry.second;
+        }
         if (nowMs - oldestArrival >= maxHoldMs_) forceFlush();
     }
 }
