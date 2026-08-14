@@ -122,6 +122,59 @@ TEST(FormatProbe, Verify48kMismatchProducesIssueAndSuggestion) {
     EXPECT_FALSE(r.suggestions.empty());
 }
 
+// The coincidence hole: the exact-format probe FAILS, but the device's reported defaults happen to
+// equal the required rate AND channel count. Both mismatch pushes are diff-gated, so `issues` stays
+// empty and the old `formatSupported || issues.empty()` predicate reported the device ready — while
+// StreamOpener, which asks the same probe, refuses to open it. The guide printed "Ready: YES" for a
+// device that cannot be opened, which is the worst possible answer for on-air setup.
+TEST(FormatProbe, VerifyFailedProbeIsNotReadyEvenWhenDefaultsCoincide) {
+    FakeBackend be;  // nothing registered -> probeFormat is false for every format
+    FormatProbe probe(be);
+
+    auto d = info(9, "Coincidence CODEC", 48000, 2, 2);  // defaults EQUAL the required format
+    auto r = probe.verifyConfiguration(&d, fmt(48000, 16, 2), Direction::Capture);
+
+    EXPECT_FALSE(r.success) << "the exact-format probe failed; the device is not ready";
+    // The point of the arm: there is no mismatch to report, so `issues` alone cannot carry this.
+    EXPECT_TRUE(r.issues.empty()) << "no mismatch exists to describe — that is the trap";
+    EXPECT_EQ(r.actualSampleRate, 48000);
+    EXPECT_EQ(r.actualChannels, 2);
+    // And the verdict agrees with the opener that actually has to open it.
+    EXPECT_FALSE(probe.supports(d, fmt(48000, 16, 2), Direction::Capture));
+}
+
+// The playback direction has no mono fallback in StreamOpener at all, so a false "ready" there is
+// a hard open failure rather than a degraded one.
+TEST(FormatProbe, VerifyFailedProbeIsNotReadyOnPlaybackWhenDefaultsCoincide) {
+    FakeBackend be;
+    FormatProbe probe(be);
+
+    auto d = info(10, "Coincidence Sink", 48000, 2, 2);
+    auto r = probe.verifyConfiguration(&d, fmt(48000, 16, 2), Direction::Playback);
+    EXPECT_FALSE(r.success);
+    EXPECT_TRUE(r.issues.empty());
+}
+
+// The other half of the predicate. `success` requires the probe to pass AND no issues, and this is
+// the arm for the AND: a backend that waves through a DEGENERATE format (0 Hz) makes
+// `formatSupported` true while the rate analysis still cannot determine a rate. A probe pass alone
+// must not be enough to call such a device ready. Without this arm, `success = formatSupported`
+// alone passes every other test in the file.
+TEST(FormatProbe, VerifySupportedButDegenerateFormatIsNotReady) {
+    FakeBackend be;
+    FormatProbe probe(be);
+    const AudioFormat degenerate = fmt(0, 16, 2);  // 0 Hz — no rate can be determined
+    be.addSupportedFormat(11, Direction::Capture, degenerate);
+
+    auto d = info(11, "Zero Hz", 0, 2, 2);
+    auto r = probe.verifyConfiguration(&d, degenerate, Direction::Capture);
+
+    EXPECT_TRUE(probe.supports(d, degenerate, Direction::Capture)) << "premise: the probe passes";
+    EXPECT_FALSE(r.success) << "a probe pass alone must not report ready";
+    EXPECT_TRUE(hasIssueContaining(r, "Could not determine device sample rate"));
+    EXPECT_EQ(r.actualSampleRate, -1);
+}
+
 TEST(FormatProbe, VerifyChannelMismatchWhenRateMatches) {
     FakeBackend be;  // unsupported, but the device's default rate equals the required rate
     FormatProbe probe(be);

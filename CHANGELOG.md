@@ -19,6 +19,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   devices with their own ids. A genuine split pair can never overlap, which is what makes the
   overlap a safe discriminator.
 
+- **A device whose exact-format probe failed is no longer reported ready.** `verifyConfiguration`
+  decided `success = formatSupported || issues.empty()`, so a failed probe could still pass on the
+  second clause. When the probe fails the "detected" rate and channel count fall back to the
+  device's reported defaults, and both mismatch messages are only emitted when detected differs
+  from required — so a device that happens to default to exactly the required rate *and* channel
+  count produced no issues at all, and the empty list was read as success. The verification printed
+  "Ready: YES" for a device `StreamOpener` then refused to open, which is the worst possible answer
+  for setting up a station.
+
+  The probe is now a requirement rather than one of two ways to pass: `formatSupported && no
+  issues`. The two `&& !formatSupported` clauses on the mismatch branches were dead — the detected
+  values are copied from the required ones whenever the format is supported, so those branches
+  cannot be reached in that case — and re-adding one kills no test, which is how the deadness was
+  confirmed rather than argued. They are gone, with the invariant written down in their place.
+
 - **`na_audio_daemon` opens each direction on that direction's own backend id.** The daemon passed
   the merged record's `backendId` — the first-seen record's id — to both the server's capture
   device and the client's playback device, bypassing `backendIdFor()`. On a split capture-only +

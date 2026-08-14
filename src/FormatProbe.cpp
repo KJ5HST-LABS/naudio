@@ -59,7 +59,11 @@ VerificationResult FormatProbe::verifyConfiguration(const DeviceInfo* device,
     if (detectedSampleRate == 0) {
         detectedSampleRate = -1;  // Unknown
         result.issues.push_back("Could not determine device sample rate");
-    } else if (detectedSampleRate != format.sampleRate && !formatSupported) {
+    } else if (detectedSampleRate != format.sampleRate) {
+        // No `&& !formatSupported` guard: when the format IS supported the detected values are
+        // assigned from the required ones above, so this branch cannot be reached in that case.
+        // The guard was dead, and reading as if it were load-bearing is what hid the
+        // coincidental-match hole fixed at the `success` line below.
         result.issues.push_back("Sample rate mismatch: device is " +
                                 std::to_string(detectedSampleRate) + " Hz, required " +
                                 std::to_string(format.sampleRate) + " Hz");
@@ -83,7 +87,8 @@ VerificationResult FormatProbe::verifyConfiguration(const DeviceInfo* device,
         // device whose exact format probe FAILED can't be reported "ready" just because issues
         // is otherwise empty (success = formatSupported || issues.empty()).
         result.issues.push_back("Could not determine device channel count");
-    } else if (detectedChannels != format.channels && !formatSupported) {
+    } else if (detectedChannels != format.channels) {
+        // Same dead guard as the rate branch above; see the note there.
         result.issues.push_back("Channel mismatch: device has " +
                                 std::to_string(detectedChannels) + " channels, required " +
                                 std::to_string(format.channels));
@@ -91,7 +96,16 @@ VerificationResult FormatProbe::verifyConfiguration(const DeviceInfo* device,
 
     result.actualSampleRate = detectedSampleRate;
     result.actualChannels = detectedChannels;
-    result.success = formatSupported || result.issues.empty();
+    // The exact-format probe is the authority, so it is a REQUIREMENT, not one of two ways to
+    // pass. It used to be `formatSupported || issues.empty()`, which reported success for a
+    // device whose probe had FAILED whenever the fallback "detected" values happened to coincide
+    // with the required ones — both diff-gated issue pushes stay silent on a coincidence, leaving
+    // `issues` empty. A device defaulting to exactly 48 kHz / 2 ch that nonetheless rejects the
+    // exact format was reported ready, and StreamOpener then refused to open it.
+    //
+    // `issues.empty()` is kept as a second requirement so a degenerate request (a 0 Hz or
+    // 0-channel format the backend nevertheless waves through) cannot report ready either.
+    result.success = formatSupported && result.issues.empty();
     return result;
 }
 
