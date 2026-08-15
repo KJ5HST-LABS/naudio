@@ -778,12 +778,24 @@ RecvResult Socket::recv(void* buf, std::size_t len) {
     }
 }
 
+// Why the last sendAll() on this thread stopped — see Socket::lastSendStop() in the header for
+// why the reason has to be observable at all. thread_local rather than a member so that threads
+// sharing one Socket do not overwrite each other's answer, and so sizeof(Socket) is unchanged.
+namespace {
+thread_local Socket::SendStop g_lastSendStop = Socket::SendStop::Ok;
+}  // namespace
+
+Socket::SendStop Socket::lastSendStop() noexcept { return g_lastSendStop; }
+
 bool Socket::sendAll(const void* buf, std::size_t len) {
     // Held across the whole retry loop, including the sendTimeoutMs() getsockopt inside it — a
     // partial write that resumes on a reused descriptor would put this frame's tail on someone
     // else's connection.
     IoScope io(*this);
-    if (!io.entered()) return false;
+    if (!io.entered()) {
+        g_lastSendStop = SendStop::NotEntered;
+        return false;
+    }
     const socket_t h = io.handle();
     const char* p = static_cast<const char*>(buf);
     std::size_t left = len;
@@ -813,13 +825,22 @@ bool Socket::sendAll(const void* buf, std::size_t len) {
             // call pays no getsockopt at all; once fetched it is reused for the rest of the
             // call.
             if (budgetMs < 0) budgetMs = sendTimeoutMs(h);
-            if (budgetMs > 0 && elapsedMsSince(callStart) >= budgetMs) return false;
+            if (budgetMs > 0 && elapsedMsSince(callStart) >= budgetMs) {
+                // The ONE exit that means issue #70's guarantee fired. A build with the
+                // condition above removed can reach every other exit here but never this one,
+                // which is what makes the test assertion on it a real detector on platforms
+                // where the clock cannot separate the two (issue #88 item 6).
+                g_lastSendStop = SendStop::Budget;
+                return false;
+            }
             continue;
         }
         int e = lastErr();
         if (isInterrupted(e)) continue;
+        g_lastSendStop = SendStop::SendFailed;
         return false;
     }
+    g_lastSendStop = SendStop::Ok;
     return true;
 }
 

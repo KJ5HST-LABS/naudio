@@ -241,24 +241,39 @@ TEST(Socket, SendTimesOutWhenPeerStopsReading) {
 // the shipped arm on macOS/arm64 caught it in 1 of 3 runs, failing on `callMs 1631 vs 1600` —
 // a 31 ms margin on a tuned wall-clock threshold.
 //
-// WHERE THE DISCRIMINATION IS PROVEN, AND WHERE IT IS NOT. The arm now RUNS everywhere and
-// passes everywhere, but passing everywhere is not the same as detecting everywhere, and #74
-// is still open for the gap. Same M1 mutation, one run per platform on CI:
+// WHERE THE DISCRIMINATION USED TO STOP, AND WHY IT NO LONGER DOES (issue #88 item 6, from
+// #74). The arm RUNS everywhere and passes everywhere, and for a while that was all it did —
+// passing everywhere is not detecting everywhere. Same M1 mutation, one run per platform on CI,
+// back when every assertion here was derived from the clock:
 //
-//   platform            shipped   mutant           discriminates?
+//   platform            shipped   mutant           discriminated?
 //   macOS/arm64 local   ~300 ms   5088 ms rescue   YES (4 of 4, and 6 of 6 earlier)
 //   ubuntu-latest CI    0.25 s    5.06 s rescue    YES
 //   macos-latest CI     0.26 s    0.47 s PASSED    NO
 //   windows-latest CI   0.25 s    0.25 s PASSED    NO
 //
-// The mechanism of the two NOs is NOT the wedge — that stages correctly now on all four. It is
-// that an un-budgeted sendAll TERMINATES ITSELF quickly on those platforms: a deadline window
-// passes with no room freed, ::send returns zero progress, and sendAll fails on its own limb at
-// a few hundred ms. Both limbs then return false quickly, so no wall-clock-derived assertion
-// can separate them — which is a sharper statement of #74's problem than the issue has, and it
-// is why closing #74 on "the arm is un-gated now" would be wrong. What the arm still proves on
-// those two platforms is the premise plus a prompt bounded failure, which is real but is not
-// the budget.
+// The mechanism of the two NOs is NOT the wedge — that stages correctly on all four. It is that
+// an un-budgeted sendAll TERMINATES ITSELF quickly on those platforms: a deadline window passes
+// with no room freed, ::send returns zero progress, and sendAll fails on its own limb after a
+// few hundred ms. Both limbs then return false quickly, so NO WALL-CLOCK-DERIVED ASSERTION CAN
+// SEPARATE THEM, and no re-tune of the drain could have: the two outcomes genuinely take the
+// same time there.
+//
+// THE FIX WAS TO STOP ASSERTING ON TIME. Socket::lastSendStop() reports WHY the call ended, and
+// SendStop::Budget is written at exactly ONE statement in sendAll — the whole-call budget check
+// itself. A build with that check removed cannot produce Budget on any runner, whatever the
+// scheduler does, so the EXPECT_EQ on the reason near the end of this arm discriminates BY
+// CONSTRUCTION rather than by margin. That is what closes the gap the table above records.
+//
+// WHAT IS PROVEN LOCALLY AND WHAT IS NOT, because the distinction matters here: the single
+// assignment site is mechanically checkable (`git grep 'SendStop::Budget' src include` returns
+// one line) and the flipped-expectation control reddens this arm on demand, so the assertion is
+// live rather than vacuous. What was NOT reproduced locally is the CI failure mode itself —
+// widening kDrainIdleMs to 500 ms still ends this call at the budget on macOS/arm64, because
+// the first ::send always finds room in a 64 KiB buffer and so the budget check is always
+// reached. The zero-progress-from-the-first-send shape needs Winsock with SO_SNDBUF=0. The
+// platform-independence claim therefore rests on the single-assignment-site argument, not on a
+// local reproduction, and it is stated that way on purpose.
 //
 // A NEGATIVE CONTROL, so the drain rate is not read as arbitrary: doubling it to 64 KB every
 // 40 ms takes BOTH the shipped arm and the mutant green — the peer then consumes the payload
@@ -335,10 +350,14 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
     std::atomic<bool> sendOk{true};
     std::atomic<long> callMs{-1};
 
+    std::atomic<int> stopReason{-1};
     std::thread sender([&]() {
         sending.store(true);
         const auto t0 = std::chrono::steady_clock::now();
         sendOk.store(client.sendAll(big.data(), big.size()));
+        // Read HERE: lastSendStop is thread-local and answers for the calling thread, so it has
+        // to be captured on this thread and before anything else on it can call sendAll.
+        stopReason.store(static_cast<int>(Socket::lastSendStop()));
         callMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now() - t0)
                          .count());
@@ -404,6 +423,28 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
         << "the peer drained NOTHING while the send was running, so this arm measured a DEAD "
            "peer — the same thing SendTimesOutWhenPeerStopsReading already covers, and the "
            "budget was never what ended this call";
+
+    // THE ASSERTION THAT ACTUALLY DETECTS, AND THE ONLY ONE HERE THAT IS NOT WALL-CLOCK-DERIVED
+    // (issue #88 item 6, from #74). Everything above and below this line is a premise or a
+    // timing bound, and on two CI platforms the timing bounds provably cannot separate a
+    // budgeted call from an un-budgeted one: an un-budgeted sendAll TERMINATES ITSELF there in
+    // about the same time, measured mutant-vs-shipped at 0.25 s vs 0.25 s on windows-latest and
+    // 0.47 s vs 0.26 s on macos-latest. Both limbs return false quickly, so no threshold exists
+    // between them and the arm passed while detecting nothing on those runners.
+    //
+    // Socket::SendStop::Budget is set at exactly one statement in sendAll — the whole-call
+    // budget check itself — so a build with that check removed cannot produce it however the
+    // scheduler behaves. That makes this line platform-independent BY CONSTRUCTION rather than
+    // by tuning, which is the property the clock-based assertions could never have.
+    EXPECT_EQ(stopReason.load(), static_cast<int>(Socket::SendStop::Budget))
+        << "sendAll returned false for a reason OTHER than the whole-call budget (got "
+        << stopReason.load() << ", want " << static_cast<int>(Socket::SendStop::Budget)
+        << " = Budget; SendFailed=" << static_cast<int>(Socket::SendStop::SendFailed)
+        << ", NotEntered=" << static_cast<int>(Socket::SendStop::NotEntered)
+        << ", Ok=" << static_cast<int>(Socket::SendStop::Ok)
+        << "). SendFailed here means the peer's drain never freed room inside one deadline "
+           "window, so this call ended on the per-send timeout and issue #70's budget was "
+           "never consulted — the wedge staged, but the thing under test did not run.";
 
     // It waited (so the budget is doing the work, not an instant refusal) and it stopped
     // well inside the drip-feed's own timescale. Both bounds derive from kDeadlineMs.

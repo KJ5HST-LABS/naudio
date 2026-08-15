@@ -354,6 +354,31 @@ public:
     // this loops until the bytes are gone or a send fails, exactly as it always did.
     bool sendAll(const void* buf, std::size_t len);
 
+    // WHY the last sendAll() on THIS THREAD stopped. `false` from sendAll is three different
+    // events wearing one bit, and the difference is not cosmetic — it is the only thing that
+    // distinguishes "the whole-call budget ended a call that was making progress" (issue #70)
+    // from "the peer went quiet and one ::send timed out", which is a different guarantee.
+    //
+    // THIS EXISTS BECAUSE THE ALTERNATIVE WAS UNMEASURABLE (issue #88 item 6, from #74). The
+    // arm covering the budget could only assert on the CLOCK, and on two CI platforms an
+    // un-budgeted sendAll terminates itself just as fast as a budgeted one — measured, mutant
+    // and shipped both at ~0.25 s on windows-latest — so no wall-clock threshold could tell
+    // them apart and the arm passed while detecting nothing there. Asserting the REASON is
+    // platform-independent by construction: a build with the budget check removed cannot
+    // produce Budget on any runner, however the scheduler behaves.
+    //
+    // THREAD-LOCAL, and static rather than a member for two reasons: several threads may share
+    // one Socket (the writer bridge does), so per-object state would answer the wrong thread's
+    // question; and it keeps sizeof(Socket) unchanged, so this stays additive to a shipped
+    // header. Read it on the same thread that made the call, immediately after it returns.
+    enum class SendStop {
+        Ok,          // all bytes written
+        Budget,      // the whole-call send budget was spent — issue #70's guarantee
+        SendFailed,  // ::send failed or timed out with no room freed
+        NotEntered,  // the socket was closed/invalid before the first ::send
+    };
+    static SendStop lastSendStop() noexcept;
+
     // --- datagram I/O (UDP) ---
 
     // Receives one datagram, recording the sender endpoint. Honors the recv

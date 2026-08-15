@@ -42,6 +42,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `naudio/ControlReliability.hpp`.
 
 ### Added
+- **`Socket::lastSendStop()` (C++ API) — why the last `sendAll()` on this thread stopped, rather
+  than only whether it succeeded.** `sendAll` returns a bare `bool`, and `false` covers three
+  materially different events: the whole-call send budget was spent (issue #70's guarantee), a
+  `::send` failed or timed out with no room freed, or the socket was already closed. A caller that
+  needs to distinguish "the budget ended a call that was making progress" from "the peer went
+  quiet" previously could not, and neither could the test suite — which is what motivated this.
+  Static and thread-local rather than a member, so threads sharing one `Socket` (the writer bridge
+  does) each get their own answer and `sizeof(Socket)` is unchanged. Purely additive: `sendAll`'s
+  signature and behaviour are untouched, and the one in-tree call site is unaffected.
+
 - **`na_client_stats.socket_rx_drops` (`@since 0.3.0`) — the first counter for audio lost
   *locally*, in the kernel's socket receive buffer, before naudio ever sees it.** This was the
   one loss mode no field reported: a full receive buffer tail-drops, discarding the *newest*
