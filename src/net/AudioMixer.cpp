@@ -144,7 +144,7 @@ AudioMixer::TxResult AudioMixer::submitTxAudio(const std::string& clientId,
                     // while the onTxConflict listener is wired to an empty lambda
                     // (AudioStreamServer.cpp). So returning DeclinedRecovered rather than
                     // Rejected is what stops a repair from spending the client's single
-                    // per-episode TX_DENIED (spec :323) and silencing its next genuine one.
+                    // per-episode TX_DENIED (spec :325) and silencing its next genuine one.
                     // Skipping the notification matters for any OTHER listener a consumer
                     // installs, which is why both are done.
                     result = TxResult::DeclinedRecovered;

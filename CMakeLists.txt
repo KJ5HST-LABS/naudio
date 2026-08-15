@@ -723,6 +723,29 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
         message(STATUS "naudio: C99 header gate SKIPPED — ${CMAKE_C_COMPILER_ID} has no "
                        "-pedantic-errors equivalent (issue #45; Linux/macOS cover the header)")
     endif()
+
+    # Spec-citation gate: every `docs/audio-streaming-protocol-v1.md:NNN` in the tree must still
+    # resolve to a line carrying its registered anchor text. Issue #88 item 7 (from #78).
+    #
+    # These citations live in COMMENTS and one string literal, so nothing compiles them and nothing
+    # failed when they rotted. #73 broke seven at once — a single paragraph added to §2.2 shifted
+    # every line below it — and the suite passed 369/369 before and after. They were repaired by
+    # hand, twice (1313d0e, 06fa36a), which is the actual problem: the repair is a grep a human has
+    # to remember to run, and the grep cannot see two of the three citation shapes.
+    #
+    # That is not hypothetical either. Writing this gate found a citation the hand pass had missed
+    # for four days: src/net/AudioMixer.cpp's `(spec :325)` still read `:323`, correct when it was
+    # written and shifted +2 by that same #73 paragraph. No path-anchored grep can find it — it
+    # names no file — so it survived both repair commits and is fixed in the commit that adds this.
+    #
+    # Runs everywhere, unlike the two doc gates above: it is pure CMake text processing with no
+    # compiler and no shell, so there is no front end to gate on and no reason to skip Windows.
+    add_test(NAME naudio_spec_citations
+             COMMAND "${CMAKE_COMMAND}"
+                     "-DNA_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                     "-DNA_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/spec-citations"
+                     -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/spec-citations/check.cmake")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/spec-citations")
 endif()
 
 # ----------------------------------------------------------------------------

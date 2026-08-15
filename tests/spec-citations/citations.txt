@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# naudio — the registered set of line-number citations into docs/audio-streaming-protocol-v1.md.
+# Read by tests/spec-citations/check.cmake, driven by the `naudio_spec_citations` ctest arm.
+# Issue #88 item 7 (from #78).
+#
+# FORMAT, one entry per line:
+#
+#     <citing file, repo-relative> | <spec line or FROM-TO range> | <anchor>
+#
+# The anchor is a LITERAL substring (not a regex) that must appear on the cited line — or, for a
+# range, on at least one line within it. It is what makes a citation decidable: a line number alone
+# says nothing about whether it still points at the claim the comment makes about it.
+#
+# Anchors are deliberately ASCII-only. The spec is UTF-8 and full of em-dashes; an anchor that
+# carries one would compare a re-encoded string on a CRLF Windows checkout, and the gate would fail
+# for a reason that has nothing to do with a citation. Pick a plain-ASCII fragment of the line.
+#
+# An anchor may not contain `|` — the parser splits on it.
+#
+# THE ENTRY KEY IS (citing file, spec target) — NOT the citing line number. Recording where the
+# citation sits in its own file would make this manifest rot every time that file gained a line
+# above it, which is the exact disease the gate exists to catch (and which bit the commit that
+# documented it — L248). Several occurrences of the same target in one file collapse to one entry:
+# they assert the same thing, so they are one claim to keep true. tests/net/test_server.cpp cites
+# :325 three times and is registered once.
+#
+# THIS FILE IS NOT THE INVENTORY — the tree is. check.cmake scans the source tree, and every
+# citation it finds must appear here and vice versa. So a new citation added without a line here
+# FAILS rather than going silently uncovered, and an entry left behind after its citation is
+# deleted FAILS too. That set-equality is the half that closes the class; the anchors are the half
+# that catches drift.
+#
+# citing file                          | spec | anchor
+include/naudio/net/AudioMixer.hpp      | 325     | sent once per denial episode
+src/net/AudioMixer.cpp                 | 325     | sent once per denial episode
+src/net/AudioMixer.cpp                 | 328     | locally reconstructed frames
+src/net/AudioStreamServer.cpp          | 291-292 | heartbeat interval
+src/net/AudioStreamServer.cpp          | 552-553 | interval / timeout
+tests/net/test_mixer.cpp               | 323     | Preemption is strict-greater
+tests/net/test_mixer.cpp               | 325     | sent once per denial episode
+tests/net/test_mixer.cpp               | 328     | locally reconstructed frames
+tests/net/test_server.cpp              | 325     | sent once per denial episode
+tests/net/test_server.cpp              | 346     | session priority is fixed at
