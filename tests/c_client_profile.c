@@ -43,6 +43,13 @@
  * A preset wrongly left in the DEFAULT case is therefore caught by this file iff it differs in
  * reordering or adaptive jitter. One differing only in FEC or control-ARQ is NOT caught.
  *
+ * SECTION (7) APPLIES THE SAME TWO-KNOB INSTRUMENT to a different question (issue #11): not
+ * "did DEFAULT turn the layer off" but "did UDP_IQ apply its own preset rather than a neighbouring
+ * one". Same reach, so the same limits: it separates udpIq() from udpWan() and from any TCP-shaped
+ * config, and CANNOT separate it from udpLan() or udpFt8(). Section (5) gains the client-side half of
+ * NA_RELIABILITY_DUAL over the same period — that value aliases to TCP here, which the existing
+ * refusal probe pins directly.
+ *
  * Hardware-free: NULL backends on both ends, loopback UDP, no PortAudio, no radio.
  */
 #include "c_atomic_compat.h"
@@ -158,7 +165,9 @@ int main(void) {
         if (na_client_set_reliability_profile(probe, NA_RELIABILITY_DEFAULT) != NA_OK ||
             na_client_set_reliability_profile(probe, NA_RELIABILITY_UDP_LAN) != NA_OK ||
             na_client_set_reliability_profile(probe, NA_RELIABILITY_UDP_WAN) != NA_OK ||
-            na_client_set_reliability_profile(probe, NA_RELIABILITY_UDP_FT8) != NA_OK) {
+            na_client_set_reliability_profile(probe, NA_RELIABILITY_UDP_FT8) != NA_OK ||
+            na_client_set_reliability_profile(probe, NA_RELIABILITY_UDP_IQ)  != NA_OK ||
+            na_client_set_reliability_profile(probe, NA_RELIABILITY_DUAL)    != NA_OK) {
             return fail("a documented profile was rejected", probe, NULL);
         }
         if (na_client_set_reliability_profile(probe, (na_reliability_profile)99) != NA_ERR_INVALID) {
@@ -268,6 +277,19 @@ int main(void) {
                                         NA_TRANSPORT_TCP, 0, NA_RELIABILITY_DEFAULT)) {
         return fail("NA_RELIABILITY_DEFAULT did not reset the transport to TCP", NULL, srv);
     }
+    /* NA_RELIABILITY_DUAL aliases to TCP on the client (issue #11; the promise is stated on
+     * na_client_set_reliability_profile and on na_transport), so it cannot reach a UDP-only server
+     * either. READ THE NEXT SENTENCE BEFORE REUSING THIS TECHNIQUE: section (6) below records that
+     * the refusal probe is the WRONG instrument for a reliability claim, precisely because a preset
+     * with the transport wrong and every knob on is refused exactly like a correct reset. That
+     * warning does not apply here — the claim being pinned IS a transport claim, and nothing else.
+     * The DUAL preset's reliability half is inert on this side by the same aliasing, so there is no
+     * second half for this arm to under-report. What it catches is DUAL wired to a UDP preset, or
+     * to nothing; what it cannot catch is DUAL wired to plain TCP defaults, since both refuse. */
+    if (!assert_cannot_reach_udp_server(port, "UDP_WAN-then-DUAL",
+                                        NA_TRANSPORT_TCP, 0, NA_RELIABILITY_DUAL)) {
+        return fail("NA_RELIABILITY_DUAL did not alias to TCP on the client", NULL, srv);
+    }
 
     /* ---- (6) DEFAULT resets the RELIABILITY LAYER too, not merely the transport ---- */
 
@@ -286,8 +308,9 @@ int main(void) {
      * it directly.
      *
      * This is also the only public path that builds a UDP connection with NO reorder buffer: all
-     * three NA_RELIABILITY_UDP_* profiles configure one, so a C consumer reaches the
-     * reorder-free branch only by resetting with DEFAULT and re-selecting UDP. */
+     * four NA_RELIABILITY_UDP_* profiles configure one (UDP_IQ included — see section (7), which
+     * depends on that), so a C consumer reaches the reorder-free branch only by resetting with
+     * DEFAULT and re-selecting UDP. */
 
     g_rx_ok = 0;  /* section (3) left it set; this arm needs a reading of its own */
     na_stream_client *reset =
@@ -355,6 +378,97 @@ int main(void) {
     }
     na_client_disconnect(reset);
     na_client_destroy(reset);
+
+    /* ---- (7) NA_RELIABILITY_UDP_IQ applies its PRESET, not merely its transport (issue #11) ----
+     *
+     * Section (5)'s refusal probe and c_server_smoke.c's arm F both pin the transport a profile
+     * selects, and neither can say more: all four NA_RELIABILITY_UDP_* values select UDP, so a
+     * UDP_IQ case mis-wired to udpLan() or udpWan() satisfies every transport assertion in the
+     * suite. This arm is the one that separates them, and it uses the only two knobs of the four
+     * that have a client-side observable — the same two section (6) uses, for the same reason.
+     *
+     * THE FINGERPRINT IS THE PAIR, not either half:
+     *
+     *   sequence_gaps >= 0   a reorder buffer exists (udpIq sets reorderBufferSize = 8). Rules out
+     *                        a case wired to a TCP preset or to a default-constructed config, both
+     *                        of which build none — section (6) measures that as -1.
+     *   buffer_target_ms -1  NO adaptive-jitter estimator (udpIq sets adaptiveJitterEnabled=false).
+     *                        Rules out udpWan(), the one preset that turns it on. MEASURED both
+     *                        ways this session against this same UDP_WAN server: a UDP_WAN client
+     *                        reads buffer_target_ms 61, a UDP_IQ client reads -1.
+     *
+     * Neither half alone discriminates — udpLan() and udpFt8() would pass both — so this arm
+     * deliberately does NOT claim to identify udpIq() uniquely. WHAT IT CANNOT SEE, stated so that
+     * nobody reads more into a green run than is there:
+     *
+     *   - UDP_IQ vs UDP_LAN vs UDP_FT8 is INVISIBLE here. All three set reorderBufferSize = 8 and
+     *     leave adaptiveJitterEnabled false, so all three produce this arm's exact pair; udpWan is
+     *     the only one of the four that differs. MEASURED for UDP_FT8 (a UDP_FT8 client reads
+     *     sequence_gaps 0, buffer_target_ms -1 — identical); derived from the preset bodies for
+     *     UDP_LAN. The presets differ in buffer targets and
+     *     hold times, and the server overwrites the buffer values at handshake anyway
+     *     (ControlMessage::applyAudioConfigTo, src/ControlMessage.cpp:314) — so those fields say
+     *     nothing about which preset the CLIENT chose. adaptiveJitterEnabled and reorderBufferSize
+     *     are what survive that overwrite, which is exactly why the fingerprint is built on them.
+     *   - IQ'S DEFINING 192 kHz IS PINNED NOWHERE, on either side of the ABI. There is no public
+     *     accessor for the negotiated rate; issue #36 declined adding one, on the grounds that a
+     *     new na_* symbol on a Hamlib-bound ABI is too high a price for a test detector. Two
+     *     candidate observables were re-measured this session and BOTH are dead: total byte volume
+     *     (already recorded dead at c_server_smoke.c's section-6 comment) and the per-callback RX
+     *     chunk size, which is MTU-derived on UDP (1376 bytes at 48 kHz and at 192 kHz alike) and
+     *     inject-derived on TCP. Do not add a rate assertion here without first re-measuring that
+     *     it can fail; as of this session none can.
+     *
+     * The client is configured with the PROFILE ALONE — no na_client_set_transport — so reaching
+     * this UDP-only server is itself the transport half of the claim, exactly as in section (2). */
+
+    g_rx_ok = 0;
+    na_stream_client *iq = na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", port, "iq-cli");
+    if (iq == NULL) return fail("na_client_create (iq)", NULL, srv);
+    na_client_set_playback_device(iq, 0);
+    na_client_set_audio_cb(iq, on_rx_audio, NULL);
+    na_client_set_auto_reconnect(iq, 0);
+    if (na_client_set_reliability_profile(iq, NA_RELIABILITY_UDP_IQ) != NA_OK) {
+        return fail("na_client_set_reliability_profile(UDP_IQ) rejected", iq, srv);
+    }
+    if (na_client_connect(iq, err, (int)sizeof err) != NA_OK) {
+        fprintf(stderr, "  (%s)\n", err);
+        return fail("UDP_IQ alone did not select UDP — connect refused", iq, srv);
+    }
+
+    /* Gate on RX alone, for section (6)'s reason: earlier clients may not be reaped yet. Note the
+     * server here is UDP_WAN and this client is UDP_IQ, so the server sends parity packets this
+     * client discards (naudio.h states that mismatch cost on na_reliability_profile). Loopback is
+     * loss-free, so nothing needs recovering and audio flows regardless — which is the point being
+     * made: a profile mismatch degrades recovery silently rather than breaking the stream. */
+    int iqwaited = 0;
+    while (iqwaited < 3000 && !g_rx_ok) {
+        na_server_inject_audio(srv, RXBUF, (int)sizeof RXBUF);
+        sleep_ms(20);
+        iqwaited += 20;
+    }
+    if (!g_rx_ok) return fail("no RX reached the UDP_IQ client within budget", iq, srv);
+
+    {
+        na_client_stats iqs;
+        if (na_client_get_stats(iq, &iqs, sizeof iqs) != NA_OK) {
+            return fail("na_client_get_stats on the UDP_IQ client", iq, srv);
+        }
+        if (iqs.sequence_gaps < 0) {
+            fprintf(stderr, "  (sequence_gaps %lld — no reorder buffer)\n", iqs.sequence_gaps);
+            return fail("UDP_IQ built no reorder buffer — the preset was not applied", iq, srv);
+        }
+        if (iqs.buffer_target_ms != -1) {
+            fprintf(stderr, "  (buffer_target_ms %d — an adaptive-jitter estimator exists)\n",
+                    iqs.buffer_target_ms);
+            return fail("UDP_IQ enabled adaptive jitter — that is udpWan's preset, not udpIq's",
+                        iq, srv);
+        }
+        printf("c_client_profile: UDP_IQ preset applied — reorder on (sequence_gaps %lld), "
+               "adaptive jitter off (buffer_target_ms -1) (%d ms)\n", iqs.sequence_gaps, iqwaited);
+    }
+    na_client_disconnect(iq);
+    na_client_destroy(iq);
 
     na_server_stop(srv);
     na_server_destroy(srv);

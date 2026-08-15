@@ -689,6 +689,13 @@ extern "C" na_error_t na_client_set_reliability_profile(na_stream_client* client
             case NA_RELIABILITY_UDP_LAN: preset = naudio::AudioStreamConfig::udpLan(); break;
             case NA_RELIABILITY_UDP_WAN: preset = naudio::AudioStreamConfig::udpWan(); break;
             case NA_RELIABILITY_UDP_FT8: preset = naudio::AudioStreamConfig::udpFt8(); break;
+            case NA_RELIABILITY_UDP_IQ:  preset = naudio::AudioStreamConfig::udpIq();  break;
+            // Aliases to TCP once the transport is realised — see AudioStreamClient::createTransport
+            // (src/net/AudioStreamClient.cpp:94), which folds TransportType::Dual into the Tcp case. The
+            // preset is still applied wholesale here rather than being rewritten to tcpDefault():
+            // what the client ends up with should be dualDefault()'s settings on a TCP transport,
+            // which is exactly what the C++ path gives a caller who sets the same preset directly.
+            case NA_RELIABILITY_DUAL:    preset = naudio::AudioStreamConfig::dualDefault(); break;
             default:
                 setError(NA_ERR_INVALID);
                 return NA_ERR_INVALID;
@@ -1202,10 +1209,21 @@ extern "C" na_error_t na_server_set_reliability_profile(na_audio_server* server,
             case NA_RELIABILITY_UDP_LAN: preset = naudio::AudioStreamConfig::udpLan(); break;
             case NA_RELIABILITY_UDP_WAN: preset = naudio::AudioStreamConfig::udpWan(); break;
             case NA_RELIABILITY_UDP_FT8: preset = naudio::AudioStreamConfig::udpFt8(); break;
+            case NA_RELIABILITY_UDP_IQ:  preset = naudio::AudioStreamConfig::udpIq();  break;
+            case NA_RELIABILITY_DUAL:    preset = naudio::AudioStreamConfig::dualDefault(); break;
             default:
                 setError(NA_ERR_INVALID);
                 return NA_ERR_INVALID;
         }
+        // NA_RELIABILITY_UDP_IQ IS THE ONE PRESET THE EXCEPTION LIST BELOW MATERIALLY CHANGES, and
+        // it is a documented cost rather than a bug: udpIq() is the only preset that sets a sample
+        // rate (192 kHz), sampleRate is on the preserve list because na_server_set_audio_format owns
+        // it, so the rate is preserved out and the caller must pair the two calls. That pairing is
+        // spelled out on this function in naudio.h. Do NOT "fix" it by dropping sampleRate from the
+        // list: order-independence is the contract this list exists to keep, and a profile that
+        // silently overwrote a caller's explicit na_server_set_audio_format would break it for
+        // every profile to buy convenience in one.
+        //
         // The preset wins WHOLESALE and the EXCEPTION LIST is explicit, rather than the reverse.
         // Which way round this goes decides which mistake is silent, so it is worth being blunt
         // about: a field-by-field copy makes a knob added to a preset later default to NOT being

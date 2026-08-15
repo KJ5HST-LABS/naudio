@@ -42,6 +42,37 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `naudio/ControlReliability.hpp`.
 
 ### Added
+- **`NA_RELIABILITY_UDP_IQ` and `NA_RELIABILITY_DUAL` (`@since 0.3.0`) — the two
+  `AudioStreamConfig` presets a C consumer could not reach.** `na_reliability_profile` reached three
+  of the eight C++ preset factories (`udpLan`, `udpWan`, `udpFt8`) plus a default-constructed reset;
+  it now reaches five. The two added were capabilities rather than conveniences: SDR
+  **IQ streaming** (UDP, 10 ms framing, 60/30/200 ms buffers) was **not configurable from C at all**
+  — not even reconstructible, since the preset's buffer targets and framing have no individual C
+  setter — and **dual transport** was reachable only as a bare `na_server_set_transport` call that
+  left the buffer and reorder settings the preset pairs with it unapplied. Both are wired into the
+  client and server setters alike. Values are append-only and 0–3 are unchanged, so this is a
+  source- and binary-compatible addition; an older library rejects a newer value with
+  `NA_ERR_INVALID` rather than misapplying it.
+
+  Two contract details are documented on the enum and on the setters, because neither is guessable:
+  **`NA_RELIABILITY_UDP_IQ` does not apply its own defining 192 kHz.** Sample rate belongs to
+  `na_server_set_audio_format`, and the server's profile setter preserves the audio-format fields so
+  the two setters compose in either order — so IQ streaming is the one profile that needs both calls
+  (`na_server_set_audio_format(s, 192000, 16, ch)` alongside the profile). Dropping `sampleRate`
+  from that preserve list would have bought convenience in one profile at the cost of
+  order-independence in all of them. **`NA_RELIABILITY_DUAL` is a server-side capability:** a client
+  picks exactly one transport, so the value aliases to TCP on the client exactly as
+  `NA_TRANSPORT_DUAL` does, leaving its reorder settings inert there.
+
+  Coverage, with its limits stated rather than implied: `tests/c_server_smoke.c` gains ordering arms
+  E and F — E is the suite's only *(connect, connect)* expectation, since serving both transports on
+  one port is a claim no other profile can satisfy — and `tests/c_client_profile.c` gains section
+  (7), which pins UDP_IQ's preset by stats fingerprint (reorder engaged, adaptive jitter off) and
+  the client-side DUAL alias. What is **not** covered: IQ's 192 kHz is pinned nowhere, because the
+  negotiated sample rate has no observable through the public C ABI — issue #36 declined adding an
+  accessor, and both candidate detectors were re-measured and are dead (total byte volume, and the
+  RX callback's chunk size, which is MTU-derived at 1376 bytes on UDP whatever the rate).
+
 - **`Socket::lastSendStop()` (C++ API) — why the last `sendAll()` on this thread stopped, rather
   than only whether it succeeded.** `sendAll` returns a bare `bool`, and `false` covers three
   materially different events: the whole-call send budget was spent (issue #70's guarantee), a

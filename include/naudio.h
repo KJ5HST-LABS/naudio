@@ -357,22 +357,37 @@ typedef enum na_transport {
 
 /* Transport + reliability profile applied by na_client_set_reliability_profile and
  * na_server_set_reliability_profile: the transport, framing, and the FEC / reorder /
- * adaptive-jitter / control-ARQ knobs, as one named bundle. The three NA_RELIABILITY_UDP_* values
- * mirror the C++ AudioStreamConfig UDP presets; NA_RELIABILITY_DEFAULT mirrors a
- * default-constructed AudioStreamConfig — plain TCP with the whole reliability layer off, so it is
- * the reset rather than a UDP profile. Each setter documents below exactly which of its own
- * settings the profile replaces — the two are deliberately not identical, because the client and
- * the server own different settings.
+ * adaptive-jitter / control-ARQ knobs, as one named bundle. The four NA_RELIABILITY_UDP_* values
+ * mirror the C++ AudioStreamConfig UDP presets and NA_RELIABILITY_DUAL mirrors its dualDefault();
+ * NA_RELIABILITY_DEFAULT mirrors a default-constructed AudioStreamConfig — plain TCP with the
+ * whole reliability layer off, so it is the reset rather than a UDP profile. Each setter documents
+ * below exactly which of its own settings the profile replaces — the two are deliberately not
+ * identical, because the client and the server own different settings.
  *
  * BOTH ENDS MUST AGREE on the transport, and it is the profile that carries FEC: a server on
  * NA_RELIABILITY_UDP_WAN sends parity packets that a client left on any other profile receives and
- * discards, silently getting no loss recovery at all. */
+ * discards, silently getting no loss recovery at all.
+ *
+ * VALUES ARE APPEND-ONLY and 0-3 are frozen. A library older than a value you pass rejects it with
+ * NA_ERR_INVALID rather than misapplying it, so a caller that may load an older naudio should gate
+ * a newer value on na_version_number() — the same discipline the @since struct fields use. */
 typedef enum na_reliability_profile {
     NA_RELIABILITY_DEFAULT = 0,  /* Plain TCP defaults: no FEC / reorder / jitter / control-ARQ.    */
     NA_RELIABILITY_UDP_LAN = 1,  /* UDP, low-latency LAN buffers, reorder + control-ARQ.            */
     NA_RELIABILITY_UDP_WAN = 2,  /* UDP, Internet buffers: XOR FEC + adaptive jitter + reorder +    */
                                  /*   control-ARQ. The resilient remote-operating profile.          */
-    NA_RELIABILITY_UDP_FT8 = 3   /* UDP, FT8/digital: tight buffers, reorder + control-ARQ.         */
+    NA_RELIABILITY_UDP_FT8 = 3,  /* UDP, FT8/digital: tight buffers, reorder + control-ARQ.         */
+    NA_RELIABILITY_UDP_IQ  = 4,  /* UDP for SDR IQ (@since 0.3.0): 10 ms framing, wide 60/30/200 ms */
+                                 /*   buffers, reorder + control-ARQ, no FEC, no adaptive jitter.   */
+                                 /*   ITS DEFINING 192 kHz IS NOT APPLIED BY EITHER SETTER — pair   */
+                                 /*   it with na_server_set_audio_format(192000, 16, ch) on the     */
+                                 /*   server, which is the only end that decides the wire format.   */
+                                 /*   See na_server_set_reliability_profile.                        */
+    NA_RELIABILITY_DUAL    = 5   /* TCP+UDP served on ONE port (@since 0.3.0), with conservative    */
+                                 /*   FT8-ish buffers + reorder + control-ARQ. A SERVER-SIDE        */
+                                 /*   CAPABILITY: a client picks one transport, so this aliases to  */
+                                 /*   TCP on the client exactly as NA_TRANSPORT_DUAL does, leaving  */
+                                 /*   its reorder knobs inert there. See na_transport.              */
 } na_reliability_profile;
 
 /* Opaque streaming-client handle. Create with na_client_create, free with na_client_destroy. */
@@ -476,6 +491,16 @@ NA_EXPORT na_error_t na_client_set_transport(na_stream_client* client, na_transp
  * Unlike the server's setter this replaces the client's WHOLE transport/framing/reliability set,
  * including buffer targets: the na_client_* surface has no audio-format or max-clients setting of its
  * own to preserve, and the server pushes the negotiated format to the client during the handshake.
+ * That handshake is also why NA_RELIABILITY_UDP_IQ's 192 kHz does not need pairing HERE the way it
+ * does on the server: whatever rate the preset writes into a client is overwritten by the server's
+ * AUDIO_CONFIG before any audio flows, so selecting a rate on this side is not a thing a caller can
+ * usefully do.
+ *
+ * NA_RELIABILITY_DUAL SELECTS TCP ON THIS SIDE. Dual transport is a server capability — it serves
+ * TCP and UDP on one port and the client connects with whichever it picked — so a client is always
+ * on exactly one, and DUAL aliases to TCP here just as NA_TRANSPORT_DUAL does. The preset's reorder
+ * settings come along but sit inert, because TCP delivers in order and builds no reorder buffer. To
+ * put a client on the UDP half of a DUAL server, select a NA_RELIABILITY_UDP_* profile instead.
  *
  * MUST be called before na_client_connect — the reliability pipeline is built at connect, from the
  * config as it stands then. NA_ERR_INVALID on a NULL client, an unknown profile, or once connected. */
@@ -583,8 +608,15 @@ NA_EXPORT int na_client_server_tx_owner(na_stream_client* client, char* buf, int
  *
  *   NA_RELIABILITY_DEFAULT (TCP)  packets_/bytes_ + crc_errors only; every reliability
  *                                 counter below stays 0 (TCP has none of the subsystems).
- *   NA_RELIABILITY_UDP_LAN/_FT8   + packets_reordered. FEC is off in these profiles, so both
- *                                 FEC counters stay 0.
+ *   NA_RELIABILITY_DUAL           as NA_RELIABILITY_DEFAULT — this profile aliases to TCP on a
+ *                                 client (see na_client_set_reliability_profile), so its reorder
+ *                                 settings build nothing and no reliability counter moves.
+ *   NA_RELIABILITY_UDP_LAN/_FT8   + packets_reordered. FEC is off in all three, so both FEC
+ *   NA_RELIABILITY_UDP_IQ         counters stay 0; and none of them enables adaptive jitter, so
+ *                                 jitter_ms and buffer_target_ms stay unmeasured (-1) where _WAN
+ *                                 publishes them. That is what separates these three from _WAN
+ *                                 through this struct — it does NOT separate them from each
+ *                                 other, which no field here can.
  *   NA_RELIABILITY_UDP_WAN        + packets_recovered_by_fec, fec_blocks_unreconciled,
  *                                 jitter_ms, buffer_target_ms.
  *
@@ -925,6 +957,19 @@ NA_EXPORT na_error_t na_server_set_audio_format(na_audio_server* server, int sam
  * Selecting a UDP profile makes a separate na_server_set_transport call unnecessary. The two setters
  * both write the transport and the LAST ONE WINS, so calling na_server_set_transport afterwards
  * changes the transport while leaving the rest of the profile in force.
+ *
+ * NA_RELIABILITY_UDP_IQ NEEDS A PAIRED na_server_set_audio_format CALL, and this is the one place
+ * "leaves audio format untouched" costs something rather than buying composability. Sample rate is
+ * an audio-format field, so the 192 kHz that DEFINES the IQ preset is preserved out of it like any
+ * other — the profile delivers IQ framing and buffers at whatever rate the server already carries,
+ * 48 kHz by default. For SDR IQ streaming, call BOTH:
+ *
+ *     na_server_set_audio_format(s, 192000, 16, channels);
+ *     na_server_set_reliability_profile(s, NA_RELIABILITY_UDP_IQ);
+ *
+ * in either order — that is what composability means here. The server is the only end that decides
+ * the wire format: it advertises the negotiated format to each client in the handshake, so a client
+ * sets no rate of its own and needs no matching call.
  *
  * NA_ERR_INVALID on a NULL server / bad profile / after start. */
 NA_EXPORT na_error_t na_server_set_reliability_profile(na_audio_server* server,

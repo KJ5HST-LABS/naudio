@@ -30,7 +30,10 @@
  *   (5) the transport/profile ordering naudio.h promises — na_server_set_transport and
  *       na_server_set_reliability_profile both write the transport and the LAST ONE CALLED WINS —
  *       observed through which client kind can reach the resulting server, plus the reset the
- *       shared profile type promises: NA_RELIABILITY_DEFAULT really undoes a UDP profile;
+ *       shared profile type promises: NA_RELIABILITY_DEFAULT really undoes a UDP profile; and the
+ *       transport each of the two issue-#11 profiles selects — NA_RELIABILITY_DUAL serving BOTH
+ *       transports on one port (the only (connect, connect) expectation here) and
+ *       NA_RELIABILITY_UDP_IQ selecting UDP;
  *   (6) the other half of that promise — na_server_set_reliability_profile leaves the fields the
  *       other config setters own alone, so they compose in either order. Only max-clients is
  *       observable through the public ABI; the arm's own comment records what is not, and why.
@@ -148,6 +151,8 @@ static void sleep_ms(int ms) {
 #define ORD_PROFILE_THEN_TRANSPORT 1  /* profile(UDP_WAN) -> set_transport(TCP)  -> TCP serves */
 #define ORD_TRANSPORT_THEN_PROFILE 2  /* set_transport(TCP) -> profile(UDP_WAN)  -> UDP serves */
 #define ORD_PROFILE_THEN_DEFAULT   3  /* profile(UDP_WAN) -> profile(DEFAULT)    -> TCP serves */
+#define ORD_PROFILE_DUAL           4  /* profile(DUAL) alone                     -> BOTH serve */
+#define ORD_PROFILE_UDP_IQ         5  /* profile(UDP_IQ) alone                   -> UDP serves */
 
 /* Start a NULL-backend server on an ephemeral port with the two setters called in `order`.
  * Returns NULL (having already destroyed the handle) on any failure. */
@@ -159,6 +164,24 @@ static na_audio_server* ordering_server(int order, int* out_port) {
         return NULL;
     }
     int ok = 1;
+    /* The two single-profile arms take the early exit: neither composes with set_transport, and
+     * starting them from UDP_WAN would let a no-op setter inherit a UDP transport it never chose. */
+    if (order == ORD_PROFILE_DUAL || order == ORD_PROFILE_UDP_IQ) {
+        ok = na_server_set_reliability_profile(
+                 s, order == ORD_PROFILE_DUAL ? NA_RELIABILITY_DUAL : NA_RELIABILITY_UDP_IQ) == NA_OK;
+        if (!ok) {
+            fprintf(stderr, "FAIL: an ordering-arm config setter was rejected\n");
+            na_server_destroy(s);
+            return NULL;
+        }
+        if (na_server_start(s, err, (int)sizeof err) != NA_OK) {
+            fprintf(stderr, "FAIL: na_server_start (ordering arm) (%s)\n", err);
+            na_server_destroy(s);
+            return NULL;
+        }
+        *out_port = na_server_port(s);
+        return s;
+    }
     if (order == ORD_TRANSPORT_THEN_PROFILE)
         ok = ok && na_server_set_transport(s, NA_TRANSPORT_TCP) == NA_OK;
     ok = ok && na_server_set_reliability_profile(s, NA_RELIABILITY_UDP_WAN) == NA_OK;
@@ -376,6 +399,36 @@ int main(void) {
         if (na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_WAN) != NA_OK ||
             na_server_set_audio_format(cfg, 48000, 16, 1) != NA_OK) {
             fprintf(stderr, "FAIL: UDP_WAN + mono-S16 config setters rejected\n");
+            na_server_destroy(cfg);
+            return 1;
+        }
+        /* Every DOCUMENTED value of the enum must be accepted, so a value added to naudio.h without
+         * a matching case in the setter's switch is caught here rather than by a consumer. The two
+         * added for issue #11 are the reason this list is exhaustive instead of a single specimen. */
+        if (na_server_set_reliability_profile(cfg, NA_RELIABILITY_DEFAULT) != NA_OK ||
+            na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_LAN) != NA_OK ||
+            na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_FT8) != NA_OK ||
+            na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_IQ)  != NA_OK ||
+            na_server_set_reliability_profile(cfg, NA_RELIABILITY_DUAL)    != NA_OK ||
+            na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_WAN) != NA_OK) {
+            fprintf(stderr, "FAIL: a documented profile was rejected by the server setter\n");
+            na_server_destroy(cfg);
+            return 1;
+        }
+        /* The IQ pairing naudio.h documents on this setter: the two calls compose in EITHER order,
+         * which is the property that makes "pair them" honest advice rather than a sequencing trap.
+         * Neither the rate nor the profile is readable back through this ABI, so this asserts the
+         * calls are ACCEPTED both ways round, not that the rate survived — see arm F's comment. */
+        if (na_server_set_audio_format(cfg, 192000, 16, 1) != NA_OK ||
+            na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_IQ) != NA_OK ||
+            na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_IQ) != NA_OK ||
+            na_server_set_audio_format(cfg, 192000, 16, 1) != NA_OK) {
+            fprintf(stderr, "FAIL: the documented UDP_IQ + 192 kHz pairing was rejected\n");
+            na_server_destroy(cfg);
+            return 1;
+        }
+        if (na_server_set_audio_format(cfg, 48000, 16, 1) != NA_OK) {  /* restore for what follows */
+            fprintf(stderr, "FAIL: could not restore the mono-S16 format\n");
             na_server_destroy(cfg);
             return 1;
         }
@@ -764,7 +817,33 @@ int main(void) {
         !check_ordering_arm(ORD_TRANSPORT_THEN_PROFILE,
                             "C: set_transport(TCP) -> profile(UDP_WAN)", 1, 0) ||
         !check_ordering_arm(ORD_PROFILE_THEN_DEFAULT,
-                            "D: profile(UDP_WAN) -> profile(DEFAULT) [the reset]", 0, 1)) {
+                            "D: profile(UDP_WAN) -> profile(DEFAULT) [the reset]", 0, 1) ||
+        /* ARMS E AND F — the two profiles added for issue #11. Both are single-profile arms, so
+         * like arm D they answer for the profile setter alone with no set_transport in sight.
+         *
+         * ARM E IS THE ONLY (1, 1) EXPECTATION IN THIS FILE, and that is the whole point: DUAL's
+         * defining claim is that ONE port serves BOTH transports, and no other profile can satisfy
+         * it. UDP_WAN gives (1, 0) and DEFAULT gives (0, 1) — each fails E on the probe the other
+         * passes, so a DUAL case mis-wired to either preset is caught whichever way it went wrong.
+         * Note the existing arms already relied on DUAL being distinguishable this way (see the
+         * probe-ordering comment above: "only the UDP probe catches one that selected DUAL and left
+         * the server answering both") — before this arm, that shape was something the suite guarded
+         * AGAINST without anything asserting it is what NA_RELIABILITY_DUAL actually produces.
+         *
+         * ARM F pins UDP_IQ to the UDP transport. It is deliberately the WEAKER of the two claims:
+         * it cannot tell UDP_IQ from any other NA_RELIABILITY_UDP_* value, because all four select
+         * UDP and the transport is all this section can see. What it does catch is a case wired to
+         * a TCP preset or missing altogether. The preset-was-applied half is pinned on the client
+         * side instead, by stats fingerprint, in tests/c_client_profile.c section (7) — and IQ's
+         * defining 192 kHz is pinned NOWHERE, because sample rate has no observable through this
+         * ABI at all (issue #36, declined; re-measured this session and still true).
+         *
+         * NEITHER ARM PAYS THE 10 s UDP-REFUSAL COST the comment above warns about: both expect the
+         * UDP probe to CONNECT, so both probe it first and both return in milliseconds on green. */
+        !check_ordering_arm(ORD_PROFILE_DUAL,
+                            "E: profile(DUAL) alone [both transports, one port]", 1, 1) ||
+        !check_ordering_arm(ORD_PROFILE_UDP_IQ,
+                            "F: profile(UDP_IQ) alone [transport only]", 1, 0)) {
         return 1;
     }
 
