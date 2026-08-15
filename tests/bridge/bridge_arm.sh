@@ -35,6 +35,11 @@
 # does the same job without the trap.
 set -u
 
+# Deadlines: every probe invocation and every wait below is bounded (issue #88 item 2, from #41).
+# Sourced rather than exec'd, and deliberately NOT `timeout(1)` — see deadline.sh for why that
+# would silently disable the fault injection next door, and why macOS may not have it at all.
+. "$(dirname "${BASH_SOURCE[0]}")/deadline.sh"
+
 BRIDGE="${1:?usage: bridge_arm.sh <na_hamlib_bridge> <naudio_bridge_probe>}"
 PROBE="${2:?usage: bridge_arm.sh <na_hamlib_bridge> <naudio_bridge_probe>}"
 PORT="${NA_BRIDGE_ARM_PORT:-4599}"
@@ -82,17 +87,26 @@ run_arm () {
     if [ "$ready" -eq 0 ]; then
         echo "FAIL bridge_arm/$mode: the bridge never reported itself listening" >&2
         sed 's/^/    | /' "$log" >&2
-        kill -INT "$bpid" 2>/dev/null
-        wait "$bpid" 2>/dev/null
+        na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_arm/$mode bridge"
         return 2
     fi
 
-    "$PROBE" --port "$PORT" --seconds "$SECS" --expect "$expect"
-    prc=$?
+    # THE #41 HANG WAS HERE. `--seconds` is the probe's own idea of how long to RUN, not a promise
+    # about when it RETURNS: one wedged in a receive waits forever, and this arm waited with it for
+    # ~29 minutes. The deadline is the probe's own runtime plus a fixed margin for connect and
+    # teardown, so it scales with SECS rather than being a constant a longer arm silently outgrows.
+    na_run_deadline $(( SECS + NA_PROBE_MARGIN )) "bridge_arm/$mode probe" - \
+        "$PROBE" --port "$PORT" --seconds "$SECS" --expect "$expect"
+    prc=$NA_DEADLINE_RC
+    # Normalise the deadline status into this file's own 0/1/2 vocabulary. Letting 124 out would be
+    # actively misleading rather than merely untidy: 124 is what `timeout(1)` returns, and this
+    # arm's outer ctest TIMEOUT would report the same number — so a reader seeing 124 would conclude
+    # the job was killed from outside at exactly the moment the harness had in fact caught it
+    # itself. A wedged probe is the `*)` case below, which is 2.
+    [ "$prc" -eq 124 ] && prc=2
 
-    kill -INT "$bpid" 2>/dev/null
-    wait "$bpid" 2>/dev/null
-    bexit=$?
+    na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_arm/$mode bridge"
+    bexit=$NA_DEADLINE_RC
 
     # The bridge must also shut down cleanly on SIGINT — a supervisor reads a non-zero exit as a
     # crash, and three startup paths that exit 0 wrongly are already tracked as #16.
@@ -159,8 +173,7 @@ run_exit_code_arm () {
     if [ "$ready" -eq 0 ]; then
         echo "FAIL bridge_arm/exit-code: the port-holding bridge never reported itself listening" >&2
         sed 's/^/    | /' "$alog" >&2
-        kill -INT "$apid" 2>/dev/null
-        wait "$apid" 2>/dev/null
+        na_stop_pid "$apid" INT "$NA_STOP_DEADLINE" "bridge_arm/exit-code holder"
         return 2
     fi
 
@@ -174,17 +187,15 @@ run_exit_code_arm () {
         sleep 0.1
     done
     if [ "$exited" -eq 1 ]; then
-        wait "$bpid" 2>/dev/null
-        bexit=$?
+        na_wait_pid "$bpid" "$NA_STOP_DEADLINE" "bridge_arm/exit-code second bridge"
+        bexit=$NA_DEADLINE_RC
     else
-        kill -INT "$bpid" 2>/dev/null
-        wait "$bpid" 2>/dev/null
+        na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_arm/exit-code second bridge"
         bexit=-1
     fi
 
-    kill -INT "$apid" 2>/dev/null
-    wait "$apid" 2>/dev/null
-    aexit=$?
+    na_stop_pid "$apid" INT "$NA_STOP_DEADLINE" "bridge_arm/exit-code holder"
+    aexit=$NA_DEADLINE_RC
 
     # The holder is also the SIGINT control: an orderly shutdown must still be 0, or the fix for
     # this arm has been made by failing everything (issue #16's third acceptance item).
@@ -267,13 +278,14 @@ run_lapse_arm () {
     if [ "$ready" -eq 0 ]; then
         echo "FAIL bridge_arm/lapse: the bridge never reported itself listening" >&2
         sed 's/^/    | /' "$log" >&2
-        kill -INT "$bpid" 2>/dev/null
-        wait "$bpid" 2>/dev/null
+        na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_arm/lapse bridge"
         return 2
     fi
 
     # --seconds outlives the arm deliberately: the probe must still be transmitting when it is
-    # killed, so the channel is lost mid-transmission rather than released on its way out.
+    # killed, so the channel is lost mid-transmission rather than released on its way out. This one
+    # needs no na_run_deadline: it is BACKGROUNDED and every gate between here and the na_stop_pid
+    # that ends it is itself bounded, so its lifetime is already capped by the arm's own polls.
     "$PROBE" --port "$PORT" --seconds 60 --tx --expect content >"$plog" 2>&1 &
     ppid=$!
 
@@ -298,8 +310,8 @@ run_lapse_arm () {
         echo "  measure a lapse (harness fault, not a bridge defect)." >&2
         sed 's/^/    | /' "$log" >&2
         sed 's/^/    p /' "$plog" >&2
-        kill -9 "$ppid" 2>/dev/null; wait "$ppid" 2>/dev/null
-        kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        na_stop_pid "$ppid" KILL "$NA_STOP_DEADLINE" "bridge_arm/lapse probe"
+        na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_arm/lapse bridge"
         return 2
     fi
     # A client is provably present, so from here the ownership line's absence is a REGRESSION, not a
@@ -311,8 +323,7 @@ run_lapse_arm () {
         sleep 0.1
     done
 
-    kill -9 "$ppid" 2>/dev/null
-    wait "$ppid" 2>/dev/null
+    na_stop_pid "$ppid" KILL "$NA_STOP_DEADLINE" "bridge_arm/lapse probe"
 
     # Deadline past the 8 s connection timeout with room for a slow runner. Polling the log rather
     # than sleeping the worst case keeps the arm at about the timeout's length on a healthy machine.
@@ -322,9 +333,8 @@ run_lapse_arm () {
         sleep 0.1
     done
 
-    kill -INT "$bpid" 2>/dev/null
-    wait "$bpid" 2>/dev/null
-    bexit=$?
+    na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_arm/lapse bridge"
+    bexit=$NA_DEADLINE_RC
 
     arc=0
     if ! grep -q 'tx owner acquired' "$log" 2>/dev/null; then

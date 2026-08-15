@@ -837,6 +837,15 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
     # Two bridge arms both bind a fixed UDP port and both drive the same dummy backend, so they are
     # serialised rather than left to race a port bind under `ctest -j`.
     set_tests_properties(naudio_bridge_arm naudio_bridge_fault_arm PROPERTIES RESOURCE_LOCK bridge)
+
+    # OUTER backstop only (issue #88 item 2, from #41). The real deadlines live inside the harnesses
+    # — tests/bridge/deadline.sh — and that is deliberately where the work went: a harness deadline
+    # FAILS the arm with a diagnosis naming which probe or which bridge wedged, while this property
+    # only kills the job and prints a timeout. Both arms run in well under a minute on a healthy
+    # machine, so 600 s is far above any legitimate run and exists purely to bound a hang the
+    # harness itself somehow failed to catch. Note ctest's DEFAULT is 1500 s, which is what let #41
+    # sit for ~29 minutes before anyone intervened.
+    set_tests_properties(naudio_bridge_arm naudio_bridge_fault_arm PROPERTIES TIMEOUT 600)
     message(STATUS "naudio: naudio_bridge_fault_arm enabled (na_hamlib_bridge present)")
 endif()
 

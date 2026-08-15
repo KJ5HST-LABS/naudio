@@ -62,6 +62,11 @@
 # job without the trap.
 set -u
 
+# Deadlines: every probe invocation and every wait below is bounded (issue #88 item 2, from #41).
+# Sourced rather than exec'd, and deliberately NOT `timeout(1)` — see deadline.sh for why that
+# would silently disable the fault injection next door, and why macOS may not have it at all.
+. "$(dirname "${BASH_SOURCE[0]}")/deadline.sh"
+
 BRIDGE="${1:?usage: bridge_fault_arm.sh <na_hamlib_bridge> <naudio_bridge_probe> <failshim>}"
 PROBE="${2:?usage: bridge_fault_arm.sh <na_hamlib_bridge> <naudio_bridge_probe> <failshim>}"
 SHIM="${3:?usage: bridge_fault_arm.sh <na_hamlib_bridge> <naudio_bridge_probe> <failshim>}"
@@ -157,7 +162,7 @@ arm_rx_fail () {
     if ! wait_ready "$log" "$bpid"; then
         echo "FAIL bridge_fault_arm/rx-fail: the bridge never reported itself listening" >&2
         sed 's/^/    | /' "$log" >&2
-        kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_fault_arm/rx-fail bridge"
         return 2
     fi
 
@@ -169,7 +174,7 @@ arm_rx_fail () {
     done
 
     if [ "$exited" -eq 0 ]; then
-        kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_fault_arm/rx-fail bridge"
         assert_shim_loaded "$log" rx-fail || return 2
         # Before blaming the bridge. A read interposer that loaded without binding injects no fault,
         # so the bridge correctly stays up and this branch is reached — which is issue #39's exact
@@ -180,8 +185,8 @@ arm_rx_fail () {
         echo "  process up, the port open and the health line printing, with no audio moving." >&2
         return 1
     fi
-    wait "$bpid" 2>/dev/null
-    bexit=$?
+    na_wait_pid "$bpid" "$NA_STOP_DEADLINE" "bridge_fault_arm/rx-fail bridge"
+    bexit=$NA_DEADLINE_RC
 
     assert_shim_loaded "$log" rx-fail || return 2
     # Only rig_stream_read. This arm connects no client, so na_server_tx_owner never reports an
@@ -229,17 +234,20 @@ arm_tx () {
     if ! wait_ready "$log" "$bpid"; then
         echo "FAIL bridge_fault_arm/$arm: the bridge never reported itself listening" >&2
         sed 's/^/    | /' "$log" >&2
-        kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_fault_arm/$arm bridge"
         return 2
     fi
 
     # 6 s: one health tick (5 s) plus margin. --expect is deliberately NOT passed — this arm is
     # about the TX direction, and the RX source is `silence` precisely so the two cannot be
     # confused. bridge_arm.sh owns the RX content claim.
-    "$PROBE" --port "$PORT" --seconds 6 --tx >"$plog" 2>&1
-    prc=$?
+    # Bounded for the same reason as bridge_arm.sh's probe: --seconds bounds how long it RUNS,
+    # not how long it can BLOCK. A probe wedged in a receive here used to hang the whole suite.
+    na_run_deadline $(( 6 + NA_PROBE_MARGIN )) "bridge_fault_arm/$arm probe" "$plog" \
+        "$PROBE" --port "$PORT" --seconds 6 --tx
+    prc=$NA_DEADLINE_RC
 
-    kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+    na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_fault_arm/$arm bridge"
 
     assert_shim_loaded "$log" "$arm" || return 2
 
@@ -319,12 +327,14 @@ arm_tx_fail () {
     if ! wait_ready "$log" "$bpid"; then
         echo "FAIL bridge_fault_arm/tx-fail: the bridge never reported itself listening" >&2
         sed 's/^/    | /' "$log" >&2
-        kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_fault_arm/tx-fail bridge"
         return 2
     fi
 
     # 10 writes are allowed through first, so the bridge is genuinely carrying TX audio before the
     # fault. -S silence keeps the RX direction out of it; bridge_arm.sh owns the RX content claim.
+    # Backgrounded, so like the lapse probe next door it needs no na_run_deadline: the poll below is
+    # bounded and the na_stop_pid after it caps this probe's life regardless of what it is doing.
     "$PROBE" --port "$PORT" --seconds 6 --tx >"$plog" 2>&1 &
     ppid=$!
 
@@ -338,13 +348,13 @@ arm_tx_fail () {
     # SIGINT, and the probe installs no handler of its own — so `kill -INT` here would be a silent
     # no-op and this arm would pay the probe's full --seconds on every run. The bridge is immune to
     # that trap only because it installs a handler, which overrides the inherited disposition.
-    kill -TERM "$ppid" 2>/dev/null; wait "$ppid" 2>/dev/null
+    na_stop_pid "$ppid" TERM "$NA_STOP_DEADLINE" "bridge_fault_arm/tx-fail probe"
 
     if [ "$exited" -eq 1 ]; then
-        wait "$bpid" 2>/dev/null
-        bexit=$?
+        na_wait_pid "$bpid" "$NA_STOP_DEADLINE" "bridge_fault_arm/tx-fail bridge"
+        bexit=$NA_DEADLINE_RC
     else
-        kill -INT "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        na_stop_pid "$bpid" INT "$NA_STOP_DEADLINE" "bridge_fault_arm/tx-fail bridge"
         bexit=-1
     fi
 
