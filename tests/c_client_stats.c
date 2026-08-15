@@ -23,7 +23,8 @@
  *   (4) UDP_WAN, the same relay dropping nothing     -> it stays 0
  *   (5) UDP_WAN, one audio packet CORRUPTED per block -> crc_errors moves
  *   (6) UDP_WAN, a deliberately stalled audio callback -> queue_drops does NOT move
- *   (7) UDP_WAN, a consumer falling behind but still draining -> socket_rx_drops DOES (Linux only)
+ *   (7) UDP_WAN, a consumer falling behind but still draining -> socket_rx_drops is LIVE, and moves
+ *       if this host's receive buffer actually overflowed (Linux only)
  *
  * SINCE 0.2.0, arm (1) also covers the struct_size guard in BOTH directions — a caller declaring
  * MORE than the library writes (the tail is zero-filled, nothing past it touched) and a caller
@@ -39,8 +40,10 @@
  * counter to find. socket_rx_drops (0.3.0) answers exactly that last case, and arms (6) and (7)
  * are a matched pair rather than a repetition: the counter reads a live 0 under a HARD stall
  * (the consumer never drains past its own pre-drop backlog, so no stamped datagram is ever read)
- * and moves under a SOFTER one that keeps draining. Both readings are correct, and asserting only
- * the second would hide the lag that makes a 0 here mean "nothing reported yet", not "no loss".
+ * and CAN move under a SOFTER one that keeps draining — "can", because that also needs the host's
+ * receive buffer to overflow, which is not this test's to arrange (see arm (7)). Both readings are
+ * correct, and demanding the second is what made this arm fail CI: it turns the lag that makes a 0
+ * mean "nothing reported yet" into a test failure, which is the field's contract inverted.
  *
  * DROPPING AND CORRUPTING ARE DIFFERENT FAULTS, and the distinction is the whole reason crc_errors
  * sat at 0 through fourteen sessions of loss testing: a dropped datagram never arrives, so nothing
@@ -54,10 +57,17 @@
  * is what needs updating.
  *
  * ARM (7) IS LINUX-ONLY, guarded whole rather than asserted-and-skipped, so it costs macOS and
- * Windows no runtime at all. It is the one place socket_rx_drops is observed to MOVE end to end
- * through the public ABI; the Socket-level arms in tests/net/test_socket.cpp bound the mechanism
- * exactly, and the platform contract (-1 where there is no mechanism) is asserted on every
- * platform by arms (2) and (6).
+ * Windows no runtime at all. WHAT IT ASSERTS HARD IS THAT THE COUNTER IS LIVE — measured, never -1
+ * — which is deterministic on every host and is the only C-level detector for the wiring
+ * (enableReceiveDropCounter being called, the counter surviving the socket's move into the
+ * connection, the NAUDIO_HAVE_RXQ_OVFL feature test still firing). Whether the counter MOVES is
+ * reported but not required, because that needs the host's receive buffer to actually overflow and
+ * nothing reachable from `na_*` sizes that buffer: the same commit reads 443 in an ubuntu:24.04
+ * container and 0 on all four Linux CI jobs. Requiring the move is what made this arm fail CI on
+ * 37efaab, and it contradicted the field's own header contract — "Use it as evidence of loss, never
+ * as its absence". The Socket-level arms in tests/net/test_socket.cpp bound the MAGNITUDE, forcing
+ * overflow by shrinking the buffer rather than racing it, and the platform contract (-1 where there
+ * is no mechanism) is asserted on every platform by arms (2) and (6).
  *
  * Hardware-free: NULL backends on both ends, loopback UDP, no PortAudio, no radio.
  */
@@ -106,11 +116,20 @@ void naproxy_stop(void* handle);
  * UdpClientConnection's consecutive-error run — so the 20-error teardown threshold
  * (MAX_CONSECUTIVE_CRC_ERRORS) is never approached and the arm measures counting, not teardown. */
 #define STALL_CB_MS   100   /* how long the audio callback blocks in that arm */
-/* Arm (7), Linux-only. 20 ms against the 10 ms injection cadence falls behind about 4:1 — enough
- * to overflow the receive buffer, but slow enough that the consumer still reads THROUGH the
- * pre-drop backlog and reaches datagrams the kernel stamped. 100 ms (STALL_CB_MS) never does,
- * which is what arm (6) asserts. The packet count has to outlast filling the buffer AND draining
- * it once: measured, the counter first moves partway through this arm, not at its start. */
+/* Arm (7), Linux-only. 20 ms against the 10 ms injection cadence falls behind about 4:1, which is
+ * slow enough that the consumer still reads THROUGH the pre-drop backlog and reaches datagrams the
+ * kernel stamped — where a 100 ms hard stall (STALL_CB_MS) never does, which is what arm (6)
+ * asserts.
+ *
+ * WHAT THESE TWO NUMBERS DO NOT DO IS GUARANTEE AN OVERFLOW, and the arm no longer pretends they
+ * can. Whether a 4:1 backlog overflows depends on the RECEIVE BUFFER'S SIZE, which is the host's to
+ * choose (UdpClientTransport asks for setRecvBufferAtLeast(MAX_DATAGRAM_SIZE * 8) and "at least"
+ * leaves a larger host default in place). MEASURED both ways on the same commit: locally the arm
+ * reports 429 discards; on all four Linux CI jobs of run 31894226470 it reports 0, with 182 of 900
+ * datagrams read — the rest still QUEUED rather than dropped. Retuning these two constants cannot
+ * fix that, it can only relocate the race, because a larger backlog still loses to a larger buffer.
+ * See the arm itself for what is asserted hard (the counter is live) versus opportunistically (the
+ * magnitude, when the host's buffer happened to overflow). */
 #define DRAIN_CB_MS   20
 #define DRAIN_ARM_PACKETS 300
 
@@ -862,15 +881,66 @@ int main(void) {
         if (g_cb_calls <= 0) {
             return fail("the audio callback never ran in the draining arm", NULL, srv, NULL);
         }
-        if (draining.socket_rx_drops <= 0) {
-            fprintf(stderr, "  (socket_rx_drops %lld while the relay put %lld audio datagrams on "
-                            "the wire and the client read %lld over %ld callbacks — either the "
-                            "consumer no longer falls behind, or it now drains fast enough to "
-                            "avoid overflow; retune DRAIN_CB_MS / DRAIN_ARM_PACKETS)\n",
-                    draining.socket_rx_drops, g_relay_audio_seen, draining.packets_received,
-                    g_cb_calls);
-            return fail("socket_rx_drops did not move on a consumer that drains its backlog", NULL,
+        /* THE HARD ASSERTION IS THAT THE COUNTER IS LIVE, NOT THAT IT MOVED — and the distinction
+         * is this arm's whole history. It used to fail unless socket_rx_drops > 0, and that
+         * assertion is UNSTAGEABLE FROM THE C ABI. Worse, it asserted the negation of the contract
+         * this very field ships with. include/naudio.h says a 0 means "no drop has been reported to
+         * me YET", not "no audio was lost", and ends with the instruction this arm was breaking:
+         * "Use it as evidence of loss, never as its absence." Failing on a 0 is using its absence.
+         * A consumer falling behind produces drops only once the kernel's receive buffer
+         * is FULL, which is a question of CAPACITY, and nothing reachable from `na_*` sizes that
+         * buffer — UdpClientTransport picks it (setRecvBufferAtLeast, MAX_DATAGRAM_SIZE * 8) and
+         * "at least" means a host whose default already exceeds it keeps the larger default.
+         *
+         * MEASURED, CI run 31894226470 at 37efaab, all four Linux jobs: the relay put 900 audio
+         * datagrams on the wire, the client read 182, and socket_rx_drops read 0. Datagrams missing
+         * WITH a zero discard count means they were still QUEUED, not dropped — the runner's buffer
+         * simply held the backlog. Locally the same arm reads 429. Both are correct readings of a
+         * correct counter on differently-sized buffers.
+         *
+         * So the old assertion was a race against an unknown buffer size, and the retune its own
+         * failure message advertised (DRAIN_CB_MS / DRAIN_ARM_PACKETS) could only relocate that race
+         * — a bigger backlog still loses to a bigger buffer. Note the container is no help here and
+         * was actively misleading: an ubuntu:24.04 run PASSES this arm at 437/437, because a
+         * container reproduces the platform and not the host's socket-buffer tuning.
+         *
+         * What remains is split by what each half can actually guarantee:
+         *
+         *   HARD  — on Linux the field must be MEASURED, never -1. That is deterministic on every
+         *           machine, it is the end-to-end C-ABI wiring this arm exists for, and it reddens
+         *           if enableReceiveDropCounter() stops being called, if the counter stops
+         *           travelling with the descriptor across the move into the connection, or if the
+         *           feature test silently stops defining NAUDIO_HAVE_RXQ_OVFL.
+         *   SOFT  — if the buffer did overflow, the magnitude is bounded below (see the upper bound
+         *           immediately after). Reported either way, so a run that did not stage the
+         *           premise says so instead of passing silently.
+         *
+         * THE MAGNITUDE PROOF LIVES WHERE OVERFLOW CAN BE FORCED: Socket.ReceiveDropsReportsThe
+         * KernelsOwnDiscardCount (tests/net/test_socket.cpp:624) shrinks the receive buffer to 4096
+         * (:628) so the overflow is caused by CAPACITY rather than raced against it, then bounds the
+         * reading by an explicit identity instead of a bare "> 0". That arm also documents the
+         * residual this one could never have escaped: the last drop before a stream goes quiet is
+         * never reported, because a discard is only stamped onto a datagram queued AFTER it.
+         *
+         * Deleting this arm outright was considered and rejected. The -1 check below is a real
+         * detector — it is the only C-level arm that would catch enableReceiveDropCounter() no
+         * longer being called, the counter failing to travel with the descriptor across the move
+         * into the connection, or the NAUDIO_HAVE_RXQ_OVFL feature test silently going quiet. */
+        if (draining.socket_rx_drops < 0) {
+            fprintf(stderr, "  (socket_rx_drops %lld on Linux — the kernel counter is NOT enabled on "
+                            "the client socket; expected a measured value, -1 means unavailable)\n",
+                    draining.socket_rx_drops);
+            return fail("socket_rx_drops is unmeasured on Linux, where the mechanism exists", NULL,
                         srv, NULL);
+        }
+        if (draining.socket_rx_drops == 0) {
+            printf("c_client_stats: socket_rx_drops PREMISE NOT STAGED (not a failure) — 0 discards "
+                   "while the relay put %lld audio datagrams on the wire and the client read %lld "
+                   "over %ld callbacks. The backlog fit in this host's receive buffer, so nothing "
+                   "overflowed; the counter is live and correctly reports 0. Exact-magnitude "
+                   "coverage is Socket.ReceiveDropsReportsTheKernelsOwnDiscardCount, which forces "
+                   "overflow by shrinking the buffer instead of racing it.\n",
+                   g_relay_audio_seen, draining.packets_received, g_cb_calls);
         }
         /* Bounded ABOVE by a quantity the library never computes: the relay's own count of what
          * it put on the wire. The kernel cannot discard more datagrams than were sent to it, so a
@@ -879,7 +949,14 @@ int main(void) {
          * Deliberately NOT bounded below by (seen - received). Parity and control datagrams share
          * this socket while the relay counts only audio, and the drops after the last stampable
          * datagram are unobservable by construction — both push the true reading below that
-         * difference, in the honest direction. The lower bound stays "it moved". */
+         * difference, in the honest direction. The lower bound stays "it moved".
+         *
+         * This check runs UNCONDITIONALLY, including on the 0 path above, and that is deliberate:
+         * 0 is trivially within the bound, so leaving it in costs nothing and keeps the guard from
+         * acquiring a skip-path that a future edit could widen. What is now conditional is only the
+         * SUCCESS REPORT below, which must not claim the counter "moved end to end" on a run where
+         * it read 0 — announcing a proof the run did not produce is how a soft arm rots into a
+         * green one that means nothing. */
         if (draining.socket_rx_drops > g_relay_audio_seen + dr_parity) {
             fprintf(stderr, "  (socket_rx_drops %lld exceeds the %lld audio + %lld parity "
                             "datagrams the relay ever sent)\n",
@@ -887,10 +964,12 @@ int main(void) {
             return fail("socket_rx_drops reports more discards than datagrams sent", NULL, srv,
                         NULL);
         }
-        printf("c_client_stats: socket_rx_drops moved end to end — %lld discards reported against "
-               "%lld audio + %lld parity datagrams sent and %lld packets read\n",
-               draining.socket_rx_drops, g_relay_audio_seen, dr_parity,
-               draining.packets_received);
+        if (draining.socket_rx_drops > 0) {
+            printf("c_client_stats: socket_rx_drops moved end to end — %lld discards reported "
+                   "against %lld audio + %lld parity datagrams sent and %lld packets read\n",
+                   draining.socket_rx_drops, g_relay_audio_seen, dr_parity,
+                   draining.packets_received);
+        }
     }
 #endif
 
