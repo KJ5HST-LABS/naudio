@@ -205,7 +205,7 @@ if(NAUDIO_SANITIZE)
         # na_client_set_reliability_profile() (:684) and na_server_set_reliability_profile()
         # (:1191) switch on the parameter and reject the unknown value in `default:`. The check
         # therefore fires on precisely the code that is being defensive, and the tests that trip it
-        # exist to prove that defence works — c_abi_smoke.c:133 passes (na_error_t)(-999), and
+        # exist to prove that defence works — c_abi_smoke.c:166 passes (na_error_t)(-999), and
         # c_client_profile.c:164 passes (na_reliability_profile)99 to each of the two setters.
         #
         # MEASURED, not assumed: both arms PASS in the normal optimized build, so the `default:`
@@ -554,6 +554,22 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
     target_link_libraries(naudio_c_abi_smoke PRIVATE naudio)
     set_target_properties(naudio_c_abi_smoke PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME naudio_c_abi_smoke COMMAND naudio_c_abi_smoke)
+
+    # Issue #88 item 3 (from #60). Both arms below can report SKIPPED, and that is the point: this
+    # test used to narrate its own degradation on stdout, which ctest never shows for a passing
+    # test (`--output-on-failure` is used by every job), so the discriminating line reached no CI
+    # log ever. A skip is carried in the test RESULT and appears in the summary either way.
+    #
+    # 77 is the autotools convention and must stay in step with NA_SKIP_RC in tests/c_abi_smoke.c.
+    #
+    # The second arm exists rather than a flag on the first because the contract checks are
+    # device-independent: on a machine with 0 devices they still carry their full weight, and
+    # marking the whole test skipped there would discard real coverage in order to report the loss
+    # of some. It re-runs the same ~0.03 s binary and changes only the exit-code policy at the
+    # stride arm, so a run that cannot distinguish the caller's stride from the library's says so
+    # in the summary instead of passing.
+    add_test(NAME naudio_c_abi_stride COMMAND naudio_c_abi_smoke --require-stride)
+    set_tests_properties(naudio_c_abi_smoke naudio_c_abi_stride PROPERTIES SKIP_RETURN_CODE 77)
 
     # Networking C-ABI smoke: a PURE-C client (na_client_*) driving a full connect ->
     # RX-frame-via-callback -> disconnect against an in-process C++ AudioStreamServer over loopback,

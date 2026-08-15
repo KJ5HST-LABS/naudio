@@ -15,12 +15,33 @@
  *       still returned;
  *   (2) the na_error_t model — na_strerror is total, invalid-argument paths return NA_ERR_INVALID
  *       and set na_last_error(), and a successful call leaves na_last_error() == NA_OK;
- *   (3) the na_context lifecycle — create/enumerate/destroy on the real backend when one is
- *       available (tolerated-skip in a headless environment so CI without audio still passes).
+ *   (3) the na_context lifecycle — create/enumerate/destroy on the real backend.
  * Returns non-zero (failing the ctest) on any contract violation. The contract checks (1)+(2)
  * touch no hardware; (3) only exercises hardware paths when na_context_create() succeeds.
+ *
+ * TWO SILENT-EVIDENCE GAPS WERE CLOSED HERE (issue #88 item 3, from #60). Both had the same root:
+ * this test reported its own degradation on stdout, and ctest is invoked everywhere with
+ * `--output-on-failure`, which suppresses the output of PASSING tests. So the discriminating line
+ * appeared in no CI log, ever — the report existed and nothing could read it.
+ *
+ *   (a) A NULL na_context_create() used to print and `return 0`. src/naudio_c_api.cpp maps ANY
+ *       Pa_Initialize/backend-ctor failure to NULL, so a FetchContent PortAudio that compiled but
+ *       could not initialise took the identical green path as a healthy one. It now FAILS. An
+ *       environment that genuinely has no initialisable backend sets NAUDIO_ALLOW_NO_AUDIO_BACKEND,
+ *       which downgrades it to a ctest SKIP — deliberately not back to a silent pass, so the
+ *       concession is visible in the summary of every run that takes it.
+ *   (b) The stride arm is VACUOUS below 2 devices — with fewer, every stride collapses onto element
+ *       0 and the placement check cannot fail — and ubuntu CI was measured at 0 devices. The
+ *       precondition is now asserted by the separate `naudio_c_abi_stride` ctest arm
+ *       (`--require-stride`), which SKIPS rather than passing when it cannot be met. A skip is
+ *       reported in the ctest summary whether or not the run failed, which is exactly the property
+ *       the printf lacked.
+ *
+ * Exit codes: 0 pass, 1 contract violation, 77 skipped (ctest SKIP_RETURN_CODE, the autotools
+ * convention). 77 must stay in step with the SKIP_RETURN_CODE property in the root CMakeLists.txt.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "naudio.h"
@@ -39,7 +60,19 @@ _Static_assert(NA_VERSION_ENCODE(0, NA_VERSION_MAX_COMPONENT, NA_VERSION_MAX_COM
                    < NA_VERSION_ENCODE(1, 0, 0),
                "NA_VERSION_ENCODE: minor.patch must not carry into major");
 
-int main(void) {
+/* ctest's SKIP_RETURN_CODE. Kept as a named constant because it appears in three places here and
+ * once in CMakeLists.txt, and a bare 77 in any of them reads as a magic number. */
+#define NA_SKIP_RC 77
+
+int main(int argc, char** argv) {
+    /* --require-stride runs the identical body and changes only the EXIT-CODE POLICY at the stride
+     * arm: it turns "fewer than 2 devices, so the placement check proved nothing" into a ctest SKIP
+     * instead of a pass. It is a second registered arm rather than a flag on the first because the
+     * contract checks below are device-independent and must keep their full weight on a machine
+     * with no devices — reporting the whole test as skipped there would throw away real coverage
+     * to report the loss of some. The run costs ~0.03 s, so doing it twice is free. */
+    const int require_stride = (argc > 1 && strcmp(argv[1], "--require-stride") == 0);
+
     /* ---- (0) library version ----
      * These run FIRST, before any context exists, because that is part of the contract: both
      * accessors are infallible and callable before na_context_create. */
@@ -172,10 +205,33 @@ int main(void) {
 
     na_context* ctx = na_context_create();
     if (ctx == NULL) {
-        /* Headless / no audio backend: tolerated. The contract checks above already passed. */
-        printf("c_abi_smoke OK (no audio backend; context path skipped, error=%s, len=%d)\n",
-               na_strerror(na_last_error()), len);
-        return 0;
+        /* FAIL-CLOSED (was `return 0`). na_context_create returns NULL for a genuinely headless
+         * box AND for a PortAudio that built but cannot initialise — src/naudio_c_api.cpp funnels
+         * every Pa_Initialize/backend-ctor throw into the same NULL — and the second is a defect
+         * this suite otherwise reports as success. The evidence that the first case is rare rather
+         * than routine: #60 measured ubuntu CI at 0 DEVICES, which it could only do by having
+         * enumerated, which requires a context. A backend that initialises and offers nothing is
+         * the normal headless shape; a backend that will not initialise at all is not.
+         *
+         * An environment that really cannot initialise one declares it, and gets a SKIP rather than
+         * a pass: the concession then shows up in the ctest summary of every run that takes it,
+         * which is the whole complaint against the line this replaces. */
+        if (getenv("NAUDIO_ALLOW_NO_AUDIO_BACKEND") != NULL) {
+            printf("c_abi_smoke SKIP (no audio backend, allowed by NAUDIO_ALLOW_NO_AUDIO_BACKEND; "
+                   "error=%s, len=%d)\n",
+                   na_strerror(na_last_error()), len);
+            return NA_SKIP_RC;
+        }
+        fprintf(stderr,
+                "FAIL: na_context_create() returned NULL (error=%s).\n"
+                "  PortAudio did not initialise, so nothing below this line ran — including the\n"
+                "  only hardware-free proof in the suite that the linked PortAudio WORKS rather\n"
+                "  than merely having compiled.\n"
+                "  If this environment genuinely has no initialisable audio backend, set\n"
+                "  NAUDIO_ALLOW_NO_AUDIO_BACKEND=1 for it: the arm then reports SKIPPED, which is\n"
+                "  visible in the ctest summary, instead of passing silently as it used to.\n",
+                na_strerror(na_last_error()));
+        return 1;
     }
     /* The struct_size floor, with ctx/out/max all VALID so only the size can reject. Zero is the
      * case that matters: it is what a caller who forgets the parameter's meaning passes. */
@@ -258,6 +314,17 @@ int main(void) {
      * placement check above is vacuous and only the tail/overrun checks carry weight. */
     printf("c_abi_smoke: stride arm %s (%d device record(s), elem=%zu, sizeof=%zu)\n",
            m >= 2 ? "EXERCISED" : "NOT exercised -- needs 2+ devices", m, elem, sizeof(na_device));
+    /* ...and under --require-stride, ASSERT that precondition instead of narrating it. This printf
+     * has been correct since the arm was written and has never been readable: ctest runs with
+     * --output-on-failure everywhere, which prints nothing for a passing test. A SKIP is carried in
+     * the test RESULT, so it survives that. */
+    if (require_stride && m < 2) {
+        printf("c_abi_smoke SKIP (--require-stride: %d device record(s), need 2+ before the "
+               "placement check can distinguish the caller's stride from the library's)\n",
+               m);
+        na_context_destroy(ctx);
+        return NA_SKIP_RC;
+    }
 #undef PAD
 
     na_context_destroy(ctx);  /* must not crash; Pa_Terminate balances the create's Pa_Initialize */
