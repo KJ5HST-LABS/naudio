@@ -509,6 +509,40 @@ void AudioStreamServer::ClientSession::handleTxAudio(const std::vector<std::uint
         std::lock_guard<std::mutex> lock(server_->runMutex_);
         mixer = server_->mixer_;
     }
+    // KEEP THIS, AND DO NOT FILE A DETECTOR FOR IT AGAIN — it is undetectable BY CONSTRUCTION,
+    // and the reason is worth more than the branch. Issue #68 (folded into #88 as item 1's
+    // neighbour, item 4) asked for an arm that reddens when this line becomes `if (false)`, on
+    // the premise that it protects "a TX frame arriving after stopSharedAudio() releases mixer_
+    // but before the session's receive thread winds down". That premise no longer describes this
+    // tree: the window is closed twice over, by two independent gates.
+    //
+    //   1. receiveLoop is the ONLY caller of this function (:452) and re-tests
+    //      server_->running_.load() every iteration (:439).
+    //   2. stop() clears running_ FIRST (:772), then runs teardownSessions() — whose join
+    //      barrier waits for activeThreads_ == 0, i.e. for every runLoop/writerLoop/receiveLoop
+    //      thread to have EXITED (:760-763) — and only then calls stopSharedAudio() (:775) to
+    //      null mixer_. So no receive thread is alive when mixer_ is released.
+    //
+    // The issue #57 straggler does not reach here either: admitted between the two teardown
+    // passes, its runLoop -> performHandshake -> receiveOnePacket loop is gated on the same
+    // already-false running_ (:288), so the handshake fails at once and it leaves via
+    // leaveRoster(). And start() refuses re-entry while running_ (:720), so initializeSharedAudio's
+    // own failure-path stopSharedAudio() (:859) cannot fire with sessions alive.
+    //
+    // MEASURED at d253f55, not reasoned: an instrumented full suite entered this function 23,038
+    // times with ZERO null-mixer arrivals, and the whole suite is 438/438 GREEN with this line
+    // mutated to `if (false)`. Both numbers are the SAME fact — there is no test to write here,
+    // because there is no supported call sequence that reaches the branch.
+    //
+    // What it still covers is CALLER MISUSE: a start() racing an in-flight stop() can leave
+    // running_ true with mixer_ null (running_ goes true at :736, mixer_ is not built until :829),
+    // and that path can std::terminate on the acceptThread_ reassignment before it ever gets here.
+    // So this is defence-in-depth against a caller error, not against the teardown race.
+    //
+    // It stays because it is one branch and it becomes load-bearing the instant either gate above
+    // moves — and NOTHING would catch that, which is exactly why deleting an unreachable guard is
+    // the wrong trade. If you reorder stop(), or drop receiveLoop's running_ test, this line is
+    // what stands between that change and a null dereference on the receive thread.
     if (!mixer) return;
 
     // Issue #65, closed here: the provenance carried on the ReceiveResult reaches the
