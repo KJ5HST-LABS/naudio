@@ -509,13 +509,21 @@ jobs:
           ./build/tools/na_hamlib_bridge -h 2>&1 | grep -q '^usage: .*na_hamlib_bridge' \
             || { echo "::error::na_hamlib_bridge built but will not run"; exit 1; }
 
-      - name: Run the bridge on Linux (naudio_bridge_arm + naudio_bridge_fault_arm)
+      - name: Run the bridge arms on Linux (including netrigctl, -m 2)
         run: |
-          # Both arms are registered ONLY when na_hamlib_bridge exists as a target, which is what
+          # Every arm here is registered ONLY when na_hamlib_bridge exists as a target, which is what
           # makes them worth running here: the fault arm LD_PRELOADs naudio_failshim to force
           # rig_stream_read/write to fail, and its ELF half had never been compiled anywhere.
+          #
+          # THE PATTERN MUST BE WIDENED FOR EVERY NEW ARM WHOSE NAME IS NOT naudio_bridge*, AND
+          # THAT IS NOT HYPOTHETICAL. naudio_netrigctl_arm landed matching neither `-R naudio_bridge`
+          # nor the assertion loop below, so it registered on this runner — the configure log said
+          # `naudio_netrigctl_arm enabled` — and then never executed, while this job stayed green and
+          # the run count silently stayed at 3. Registered is not run; the loop below is what turns
+          # that distinction into a failure, which is exactly why it asserts on NAMES.
           set +e
-          ctest --test-dir build -R naudio_bridge --output-on-failure > bridge-ctest.log 2>&1
+          ctest --test-dir build -R 'naudio_bridge|naudio_netrigctl' --output-on-failure \
+            > bridge-ctest.log 2>&1
           rc=$?
           set -e
           cat bridge-ctest.log
@@ -525,7 +533,8 @@ jobs:
           # that matches nothing prints "No tests were found!!!" and exits 0. That is the identical
           # failure this job's binary check exists to catch, one layer down — a silently skipped
           # bridge registers no arms, so an exit-code check reports green having run nothing.
-          for t in naudio_bridge_probe_selftest naudio_bridge_arm naudio_bridge_fault_arm; do
+          for t in naudio_bridge_probe_selftest naudio_bridge_arm naudio_bridge_fault_arm \
+                   naudio_netrigctl_arm; do
             grep -qE "Test +#[0-9]+: ${t} +\.+ +Passed" bridge-ctest.log \
               || { echo "::error::${t} did not run, or did not pass"; exit 1; }
           done
