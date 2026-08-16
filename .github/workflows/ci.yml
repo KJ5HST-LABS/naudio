@@ -56,6 +56,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The external-consumer gate's version-skew arm pins OLD headers out of git
+          # history (git show v0.4.0:include/naudio.h, and a pre-0.4.0-append commit).
+          # actions/checkout defaults to a depth-1 clone with no tags, where every pin
+          # fails to resolve — the arm would then report SKIPPED on every run and the
+          # gate it provides would silently never execute. This repo is ~220 commits,
+          # so full history costs approximately nothing. Issue #32 / #88 item 1.
+          fetch-depth: 0
 
       - name: Install PortAudio (Linux)
         if: runner.os == 'Linux'
