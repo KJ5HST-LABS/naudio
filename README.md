@@ -124,10 +124,11 @@ languages) and the demo source.
 
 Read this if you package naudio, or link it as a shared library you did not build yourself.
 
-**Source compatibility is promised; binary compatibility begins at the first tag.** Nothing has been
-tagged, `SOVERSION` is `0`, and no released consumer exists — so the C ABI is still free to change
-shape. The rules below are what it commits to *from* the first tagged release, and the mechanism
-they rest on is already in place.
+**Source compatibility is promised; binary compatibility begins at the first tag — and that tag is
+now cut.** `v0.4.0` is the first tagged release, so the rules below are what the C ABI commits to
+from here rather than an intention. `SOVERSION` is `0` and tracks the major version, so every `0.x`
+release shares one soname — which is exactly why the declared-size mechanism described below, and
+not a soname bump, is what keeps an appended field from breaking an already-compiled consumer.
 
 **Every caller-allocated struct tells the library how large the caller believes it to be.** Without
 that, appending a single field to a future release would make the library read or write past the end

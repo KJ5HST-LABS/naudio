@@ -5,6 +5,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.4.0] — 2026-08-16
+
+**The first tagged release, and the point at which the binary-compatibility promise in
+`README.md` § "Binary compatibility" starts binding.** Everything below shipped untagged before
+this date; the tag is what makes it something a consumer can pin and a packager can rely on.
+`SOVERSION` is `0` and tracks the major version, so every `0.x` release shares one soname — the
+declared-size (`struct_size`) mechanism, not a soname bump, is what keeps an appended field from
+breaking an already-compiled consumer.
+
 ### Added
 - **`na_client_stats.fec_pending_discarded` (`@since 0.4.0`) — audio packets dropped from a pending
   FEC block without ever having been offered to a parity: repair capacity that expired.** It is the
@@ -573,8 +584,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
     by the caller's element size, and `na_device`'s layout itself is unchanged.
   In every direction the library honours the caller's declared size as a hard bound: a shorter
   caller keeps its un-allocated tail untouched, and a longer one has its extra bytes zero-filled
-  (stats, and each device element) or ignored (callbacks). Nothing has
-  been tagged and `SOVERSION` is still 0, so no released consumer exists to break.
+  (stats, and each device element) or ignored (callbacks). Nothing had
+  been tagged when this break was taken and `SOVERSION` was still 0, so no released consumer
+  existed to break.
   Consumers that bind the ABI by hand rather than through the header — the Python, Java and Rust
   example clients — need the new argument at their `na_enumerate` call sites; their `na_device`
   layouts are byte-for-byte unchanged.
