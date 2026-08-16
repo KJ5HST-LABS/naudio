@@ -181,6 +181,14 @@ public:
     // mechanism is not portable and why no derived estimate stands in for it).
     virtual std::int64_t socketReceiveDrops() const { return -1; }
 
+    // Audio packets dropped from a PENDING FEC block without ever being offered to a parity —
+    // repair capacity that expired, and NOT audio loss: the decoder emits each packet to the
+    // application on arrival and only then caches a copy, so this counts copies leaving the
+    // cache. -1 on every transport with no FEC decoder, which is all of them but a UDP
+    // connection on an FEC-enabled profile. FecDecoder::pendingPacketsDiscarded owns the
+    // trigger list; do not restate it here (issue #55's lesson about duplicated cause lists).
+    virtual std::int64_t fecPendingPacketsDiscarded() const { return -1; }
+
     // Whether packetsLost() / packetsOutOfOrder() / packetLossRate() are actually
     // MEASURED on this connection. When false they are unavailable, and a consumer
     // must not read their 0 as "nothing was lost".

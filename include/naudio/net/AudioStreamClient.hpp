@@ -117,6 +117,16 @@ struct ClientStats {
     // per-socket equivalent. See Socket::enableReceiveDropCounter for why no derived
     // estimate stands in for it.
     std::int64_t socketReceiveDrops = -1;
+
+    // Audio packets dropped from a PENDING FEC block without ever being offered to a parity —
+    // repair capacity that expired, NOT audio loss. The decoder emits every packet to the
+    // application on arrival and only then caches a copy for FEC, so what this counts is copies
+    // leaving that cache; the audio itself was already delivered.
+    //
+    // -1 == unmeasured, and here that is a PROFILE statement: only udpWan enables FEC, so this
+    // is a reading on that profile alone. See FecDecoder::pendingPacketsDiscarded for the
+    // triggers — do not restate them, they have gone stale once already (issue #55).
+    std::int64_t fecPendingDiscarded = -1;
 };
 
 // Client for connecting to an AudioStreamServer.

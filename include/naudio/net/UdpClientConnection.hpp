@@ -282,7 +282,7 @@ public:
     // offering them to a parity — repair opportunities lost to arrival stalls or to
     // the retention cap. Never a loss of audio: those packets were emitted on
     // arrival. -1 when FEC is off. See FecDecoder::pendingPacketsDiscarded.
-    std::int64_t fecPendingPacketsDiscarded() const;
+    std::int64_t fecPendingPacketsDiscarded() const override;
 
     // The decoder's pending idle bound, derived in initPipeline from the negotiated
     // stream shape (issue #47); -1 when FEC is off. Exposed so a test can pin the

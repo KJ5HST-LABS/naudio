@@ -1093,6 +1093,10 @@ ClientStats AudioStreamClient::stats() const {
     // there is nothing to gate on. Unlike sequenceGaps this one is unmeasured on most platforms
     // rather than on most profiles — the mechanism is Linux-only (Socket::receiveDrops).
     s.socketReceiveDrops = conn->socketReceiveDrops();
+    // Same shape again, and unmeasured on a PROFILE basis like sequenceGaps rather than on a
+    // platform basis like the line above: the connection returns -1 wherever no FEC decoder
+    // exists, which is every profile but udpWan.
+    s.fecPendingDiscarded = conn->fecPendingPacketsDiscarded();
     return s;
 }
 
