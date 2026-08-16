@@ -77,6 +77,19 @@ RIGPORT="${NA_NETRIGCTL_ARM_RIGPORT:-5599}"
 NAPORT="${NA_NETRIGCTL_ARM_PORT:-4601}"
 SECS="${NA_NETRIGCTL_ARM_SECONDS:-6}"
 
+# 127.0.0.1 AND NOT `localhost`, MEASURED ON A DUAL-STACK RUNNER. `localhost` resolves to ::1 first
+# on ubuntu-latest, where nothing is listening: libhamlib's TCP control connection survives it
+# ("connect to localhost:5599 failed, (trying next interface)") and goes on to negotiate caps and a
+# 1420 B payload budget, so the control plane looks entirely healthy — but the UDP data-plane
+# subscribe then never receives its ACK, and `rig_stream_open` fails after three 1666 ms attempts.
+# The arm's first real run on Linux is what surfaced it; macOS resolves localhost to 127.0.0.1 and
+# never showed it.
+#
+# It also removes a defect in this harness that was wrong regardless of address family: the
+# readiness gate below probed 127.0.0.1 while the bridge was told `localhost`, so the gate was not
+# testing the endpoint the bridge would actually use. One name for both is the point.
+RIGHOST="${NA_NETRIGCTL_ARM_HOST:-127.0.0.1}"
+
 # The same floor the bridge's own alarm uses before it will believe a ratio. Below this the run is
 # too short to have measured anything and `gaps=0` means nothing.
 MIN_READS=50
@@ -97,7 +110,7 @@ workdir=$(mktemp -d)
 cleanup() { rm -rf "$workdir"; na_harness_guard "netrigctl_arm"; }
 trap cleanup EXIT
 
-echo "netrigctl_arm: $BRIDGE -m 2 -> $(basename "$RIGCTLD") :$RIGPORT, naudio :$NAPORT, ${SECS}s probe"
+echo "netrigctl_arm: $BRIDGE -m 2 -> $(basename "$RIGCTLD") $RIGHOST:$RIGPORT, naudio :$NAPORT, ${SECS}s probe"
 "$RIGCTLD" --version 2>&1 | sed -n '1s/^/  peer: /p'
 
 # A TCP connect, not a sleep. rigctld prints nothing on startup worth gating on, and a constant sleep
@@ -108,7 +121,7 @@ rigctld_ready () {
     local i
     for i in $(seq 1 100); do
         if ! kill -0 "$1" 2>/dev/null; then return 1; fi
-        if (exec 3<>"/dev/tcp/127.0.0.1/$RIGPORT") 2>/dev/null; then
+        if (exec 3<>"/dev/tcp/$RIGHOST/$RIGPORT") 2>/dev/null; then
             exec 3<&- 3>&-
             return 0
         fi
@@ -131,7 +144,7 @@ run_arm () {
     "$RIGCTLD" -m 1 -t "$RIGPORT" -C stream_mode=tone >"$rlog" 2>&1 &
     rpid=$!
     if ! rigctld_ready "$rpid"; then
-        echo "FAIL netrigctl_arm/c$channels: rigctld never accepted a connection on :$RIGPORT" >&2
+        echo "FAIL netrigctl_arm/c$channels: rigctld never accepted a connection on $RIGHOST:$RIGPORT" >&2
         sed 's/^/    r /' "$rlog" >&2
         na_stop_pid "$rpid" INT "$NA_STOP_DEADLINE" "netrigctl_arm/c$channels rigctld"
         return 2
@@ -140,7 +153,7 @@ run_arm () {
     # -x (RX only) deliberately. This arm is about the RX framing signature, and TX over netrigctl
     # has its own hazard that would confound it: an over-budget write is rejected outright with
     # -RIG_EIO, and a dead worker stops the bridge (tools/na_hamlib_bridge.c, tx_thread).
-    "$BRIDGE" -m 2 -r "localhost:$RIGPORT" -p "$NAPORT" -c "$channels" -x >"$log" 2>&1 &
+    "$BRIDGE" -m 2 -r "$RIGHOST:$RIGPORT" -p "$NAPORT" -c "$channels" -x >"$log" 2>&1 &
     bpid=$!
     ready=0
     for _ in $(seq 1 150); do
