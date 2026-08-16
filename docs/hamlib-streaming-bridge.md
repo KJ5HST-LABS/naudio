@@ -30,24 +30,27 @@ If `build/tools/na_hamlib_bridge` does not exist afterwards, the build **skipped
 
 ## Why a special libhamlib
 
-The bridge is written against Hamlib's `rig_stream_*` API, which arrives with
+The bridge is written against Hamlib's `rig_stream_*` API, which arrived with
 **[Hamlib PR #2116](https://github.com/Hamlib/Hamlib/pull/2116)** ("Add data streaming subsystem for
-audio and I/Q") and is not in any released Hamlib. A stock package is 4.x and has no streaming at
-all:
+audio and I/Q"), **merged upstream on 2026-08-15**. It is in Hamlib `master` but **not in any
+released Hamlib** — those are different things, and the distinction is why this page still exists. A
+stock package is 4.x and has no streaming at all:
 
 | libhamlib on your `PKG_CONFIG_PATH` | `rig_stream_*` | Result of `-DNAUDIO_BUILD_HAMLIB_BRIDGE=ON` |
 |---|---|---|
 | Homebrew / apt (4.x) | absent | CMake warning, **no binary**, build otherwise succeeds |
-| PR #2116 branch (`5.0.0~git`) | present | `na_hamlib_bridge` is built |
+| Hamlib `master`, built from source (`5.0.0~git`) | present | `na_hamlib_bridge` is built |
 
 `tools/CMakeLists.txt` gates the target on a `check_symbol_exists(rig_stream_open …)` rather than on
 a version number, so a wrong libhamlib can never break the rest of the build — it just quietly
 produces no bridge. That is deliberate, and it is also why the failure looks like a broken flag
 instead of a missing dependency.
 
-Because the API is still in review it moves, so that presence gate is not enough on its own: two
-further checks detect *which* revision you have and compile the matching code, rather than assuming
-the newest shape. Both are capability checks, never version comparisons.
+The API moved twice during review and can still move now that it is in `master`, so that presence
+gate is not enough on its own: two further checks detect *which* revision you have and compile the
+matching code, rather than assuming the newest shape. They also remain necessary because a prefix
+built before the merge is still perfectly usable — the checks describe revisions, not a timeline.
+Both are capability checks, never version comparisons.
 
 | Check | Arrived in | What it selects |
 |---|---|---|
@@ -58,29 +61,56 @@ The second is a struct-field change, so `check_symbol_exists` cannot see it — 
 of that commit exports identical symbols, and the mismatch would surface only as a compile error.
 `check_struct_has_member` is used instead.
 
+> ⚠️ **Refreshing a prefix in place? Delete your build directory.** CMake **caches** `check_*`
+> results and does not re-run them when the header underneath changes. An existing build tree
+> therefore keeps compiling the code path selected for the *old* libhamlib against the *new*
+> headers, and fails with something that reads like a naudio bug:
+>
+> ```
+> na_hamlib_bridge.c: error: no member named 'channels_min' in 'struct rig_stream_caps'
+> ```
+>
+> Measured, not hypothesised — this is exactly what happened on 2026-08-16 when the prefix was
+> refreshed from the pre-merge fork commit to upstream `master` under an existing tree. The cached
+> values were `NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST:INTERNAL=` and
+> `NAUDIO_HAMLIB_HAS_STREAM_CONV:INTERNAL=` — both empty, both correct for the *previous* prefix.
+> `rm -rf build` and reconfigure; the same probes then report `Success`.
+>
+> **Because the default ref is a moving branch, this is the normal consequence of re-running the
+> build script, not an exceptional one.** Note also that a plain `cmake -S . -B build` after
+> deleting the tree does **not** re-enable the bridge — `-DNAUDIO_BUILD_HAMLIB_BRIDGE=ON` lived in
+> the cache you just deleted, so pass it again.
+
 ### Provenance
 
 | | |
 |---|---|
-| Repository | `https://github.com/mikaelnousiainen/Hamlib.git` — the head repository of PR #2116 |
-| Branch | `streaming-subsystem-pr` |
-| Verified at | commits `2ef1e1d`, `961093f2`, and `b538567b` — the bridge builds and runs against all three |
+| Repository | `https://github.com/Hamlib/Hamlib.git` — upstream, since PR #2116 merged |
+| Branch | `master` |
+| Verified at | commits `2ef1e1d`, `961093f2` and `b538567b` on the pre-merge fork branch, and upstream `master` after the merge — the bridge builds and runs against all of them |
 | Reports as | `pkg-config --modversion hamlib` → `5.0.0~git` |
 
-PR #2116 is **open**, so the branch head moves as review continues — and naudio tracks that head
-deliberately rather than pinning a commit. That is a decision, not an oversight (issue #81): the
-streaming API is new, naudio follows where upstream takes it, and noticing a move early is worth
-more than a build that cannot be surprised. The cost is accepted with it — an upstream rename can
-turn the `hamlib-bridge` CI job red without any naudio commit, and twice now it has.
+naudio tracks upstream `master`'s head rather than pinning a commit. That is a decision, not an
+oversight (issue #81): the streaming API is new, naudio follows where upstream takes it, and
+noticing a move early is worth more than a build that cannot be surprised. The cost is accepted with
+it — an upstream change can turn the `hamlib-bridge` CI job red without any naudio commit, and twice
+now it has.
 
 The countermeasure is not a pin, it is that nothing here assumes a shape: the capability checks
 above compile whichever revision you actually have, so a moving head produces a *diagnosed* build
 rather than a broken one. Pin with `--ref <commit>` if you need a reproducible build of your own.
 
-**When #2116 merges,** the streaming API lands in Hamlib proper and the fork branch may be deleted.
-At that point the defaults become `--repo https://github.com/Hamlib/Hamlib.git --ref master`, which
-keeps the tracking property and removes the deleted-branch risk. The script's fetch failure names
-this case explicitly, so a red run diagnoses itself.
+**This page previously pointed at `mikaelnousiainen/Hamlib` @ `streaming-subsystem-pr`,** the PR
+author's fork, and said that when #2116 merged the defaults should become upstream `master`. **That
+happened on 2026-08-15 and the defaults were changed on 2026-08-16.** The reason for moving promptly
+rather than waiting: a merged PR's branch is deletion-eligible, and it was naudio's only source for
+this dependency — so the fork was a single point of failure for the `hamlib-bridge` job the moment
+the merge landed. Repointing keeps the tracking property and removes that risk. The fork remains a
+valid `--repo` if you need its history; nothing about the build requires it.
+
+**Until a Hamlib *release* ships the streaming API, this script is still required.** Merged into
+`master` is not packaged by a distro, so `apt install libhamlib-dev` will keep producing a 4.x
+without `rig_stream_*` for some time yet.
 
 ---
 
@@ -108,7 +138,7 @@ different tool with the same name, and Hamlib's `./bootstrap` already knows to r
 tools/build-streaming-hamlib.sh
 ```
 
-It fetches the PR branch (a depth-1 fetch, so it does not clone Hamlib's full history), bootstraps,
+It fetches upstream `master` (a depth-1 fetch, so it does not clone Hamlib's full history), bootstraps,
 configures, builds, installs, and then verifies the result the same way naudio's build will. Budget
 a few minutes and ~120 MB under the prefix — the whole run took 35 s on an 18-core Apple M5 Max, and
 Hamlib's ~200 backends parallelise well, so expect that figure to scale with core count.
@@ -117,8 +147,8 @@ Hamlib's ~200 backends parallelise well, so expect that figure to scale with cor
 |---|---|---|
 | `--prefix DIR` | `$HOME/.local/hamlib-streaming` | Install prefix. **Must be durable** — see below. |
 | `--src DIR` | `<prefix>/src` | Where the checkout lives. Re-running updates it in place. |
-| `--ref REF` | `streaming-subsystem-pr` | Branch, tag, or commit. Use a commit to pin. |
-| `--repo URL` | PR #2116's head repository | Override for a fork or mirror. |
+| `--ref REF` | `master` | Branch, tag, or commit. Use a commit to pin. |
+| `--repo URL` | `https://github.com/Hamlib/Hamlib.git` | Override for a fork or mirror. |
 | `--jobs N` | detected CPU count | Parallel `make` jobs. |
 
 <details>
@@ -127,8 +157,8 @@ Hamlib's ~200 backends parallelise well, so expect that figure to scale with cor
 ```bash
 prefix="$HOME/.local/hamlib-streaming"
 
-git clone --depth 1 --branch streaming-subsystem-pr \
-    https://github.com/mikaelnousiainen/Hamlib.git "$prefix/src"
+git clone --depth 1 --branch master \
+    https://github.com/Hamlib/Hamlib.git "$prefix/src"
 cd "$prefix/src"
 
 ./bootstrap

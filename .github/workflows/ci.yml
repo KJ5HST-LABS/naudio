@@ -443,23 +443,29 @@ jobs:
           # is itself an assertion: if it is wrong or short, the next step fails.
           # portaudio19-dev is naudio's own dependency, as in build-and-test.
 
-      - name: "Build a streaming-capable libhamlib (Hamlib PR #2116) from source"
+      - name: "Build a streaming-capable libhamlib (Hamlib PR #2116, merged) from source"
         # Quoted: an unquoted '#' after a space starts a YAML comment, which silently truncates
         # this step's name in the Actions UI.
         run: tools/build-streaming-hamlib.sh --prefix "${{ runner.temp }}/hamlib-streaming"
-        # Tracks the PR branch HEAD rather than pinning a commit: #2116 is open, and noticing when
+        # Tracks upstream Hamlib/Hamlib @ master HEAD rather than pinning a commit. Noticing when
         # the streaming API moves out from under the bridge is exactly what this job is worth.
         # docs/hamlib-streaming-bridge.md records that choice and how to pin instead (--ref) — it
         # owns the decision; this comment only restates it.
         #
-        # The cost of tracking a third-party branch is that an upstream force-push, a rename, or a
-        # deleted branch turns this job red for reasons outside naudio. That cost has now been paid
-        # TWICE (961093f2 changed behaviour silently, b538567b broke the build), and the decision
-        # was re-taken deliberately in #81: keep tracking. naudio follows upstream while the
-        # streaming API is still forming, and a red run here is the loud, early notice that it
-        # moved. What absorbs the churn is that nothing assumes a shape — tools/CMakeLists.txt
-        # capability-checks each revision and compiles the matching code, so the usual outcome of
-        # a move is a diagnosed build, not a broken one.
+        # It tracked the PR author's FORK BRANCH until 2026-08-16. #2116 merged on 2026-08-15, which
+        # made the fork branch deletion-eligible while it was naudio's only source for the
+        # dependency — the risk #81 was opened on. Repointing at upstream master KEEPS the tracking
+        # property and removes that risk, which is what #81's own body called "strictly better
+        # post-merge"; #81 item 1's "keep the fork" ruling rested on master not yet having the API,
+        # and that premise expired at the merge.
+        #
+        # The cost of tracking any moving head is that an upstream change turns this job red for
+        # reasons outside naudio. That cost has been paid TWICE (961093f2 changed behaviour
+        # silently, b538567b broke the build) and is accepted deliberately: naudio follows upstream
+        # while the streaming API is still forming, and a red run here is the loud, early notice
+        # that it moved. What absorbs the churn is that nothing assumes a shape —
+        # tools/CMakeLists.txt capability-checks each revision and compiles the matching code, so
+        # the usual outcome of a move is a diagnosed build, not a broken one.
         #
         # This step dominates the job's wall clock. Every figure here was measured by running these
         # steps verbatim in an ubuntu:24.04 amd64 container held to 4 CPUs, the runner's shape:

@@ -6,11 +6,13 @@
 # build-streaming-hamlib.sh — build and install a streaming-capable libhamlib.
 #
 # na_hamlib_bridge needs a libhamlib that exposes the rig_stream_* API (Hamlib
-# 5.0+ / PR #2116). No released Hamlib has it yet: a stock Homebrew/apt libhamlib
-# is 4.x, so -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON produces no binary and only a CMake
-# warning. This script builds the dependency that makes the flag work.
+# 5.0+, PR #2116, merged upstream 2026-08-15). No RELEASED Hamlib has it yet: a
+# stock Homebrew/apt libhamlib is 4.x, so -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON
+# produces no binary and only a CMake warning. This script builds the dependency
+# that makes the flag work. It stays necessary until a Hamlib release ships the
+# API — merged into master is not the same as packaged by a distro.
 #
-# It fetches the PR branch, builds it into a DURABLE prefix, installs it, and
+# It fetches upstream master, builds it into a DURABLE prefix, installs it, and
 # verifies the result the same way naudio's build does (a compile+link probe on
 # rig_stream_open). It does NOT configure naudio for you — that would rewrite an
 # existing build tree's cached hamlib path as a side effect. It prints the exact
@@ -19,8 +21,8 @@
 # Usage:  tools/build-streaming-hamlib.sh [options]
 #   --prefix DIR   install prefix        (default: $HOME/.local/hamlib-streaming)
 #   --src DIR      source checkout       (default: <prefix>/src)
-#   --ref REF      branch, tag or commit (default: streaming-subsystem-pr)
-#   --repo URL     git remote            (default: PR #2116's head repository)
+#   --ref REF      branch, tag or commit (default: master)
+#   --repo URL     git remote            (default: upstream Hamlib/Hamlib)
 #   --jobs N       parallel make jobs    (default: detected CPU count)
 #   -h, --help
 #
@@ -32,10 +34,18 @@
 #
 set -euo pipefail
 
-# PR #2116 "Add data streaming subsystem for audio and I/Q" is filed against
-# Hamlib/Hamlib from this fork; the branch is the PR head, so it tracks review.
-default_repo="https://github.com/mikaelnousiainen/Hamlib.git"
-default_ref="streaming-subsystem-pr"
+# PR #2116 "Add data streaming subsystem for audio and I/Q" MERGED into
+# Hamlib/Hamlib on 2026-08-15, so the streaming API now lives upstream and this
+# tracks master rather than the PR author's fork branch (issue #81, item 1).
+#
+# The tracking property is deliberate and unchanged — naudio follows where the
+# streaming API goes, and a red hamlib-bridge job is the loud, early notice that
+# it moved. What repointing removes is the risk that made #81 urgent: a merged
+# PR's fork branch is deletion-eligible, and it was naudio's only source for the
+# dependency. Nothing here assumes a struct shape; tools/CMakeLists.txt
+# capability-checks the installed revision and compiles the matching code.
+default_repo="https://github.com/Hamlib/Hamlib.git"
+default_ref="master"
 
 prefix="$HOME/.local/hamlib-streaming"
 src=""
@@ -122,15 +132,19 @@ else
 fi
 if ! git -C "$src" fetch --quiet --depth 1 origin "$ref"; then
   die "could not fetch '$ref' from $repo
-    This reads like a network blip and usually is not. The default ref is a live PR branch on a
-    FORK, so the likeliest causes are, in order:
-      1. PR #2116 merged and the fork branch was deleted. The streaming API is then in
-         Hamlib upstream: --repo https://github.com/Hamlib/Hamlib.git --ref master
-      2. The branch was force-pushed and the commit you pinned is gone. Pass a branch name,
-         or a commit that still exists: --ref $default_ref
+    This reads like a network blip and sometimes is. The default is now upstream
+    Hamlib/Hamlib @ master (PR #2116 merged 2026-08-15), so the likeliest causes are:
+      1. You passed --ref streaming-subsystem-pr, the PRE-MERGE default. That branch lives on
+         the PR author's fork and is deletion-eligible now that the PR is merged. The streaming
+         API is upstream: drop the flag, or --repo https://github.com/mikaelnousiainen/Hamlib.git
+         if you specifically need the fork's history.
+      2. You pinned a commit that is gone, or one that upstream never had (a fork-only sha).
+         Pass a branch name, or a commit reachable from upstream: --ref $default_ref
       3. A mirror that refuses to serve a bare commit (GitHub allows it; many mirrors do not).
+      4. Genuine network or DNS failure — the one case where retrying is the right move.
     Check which: git ls-remote --heads $repo $default_ref
-    An empty result means the branch is gone — case 1. See docs/hamlib-streaming-bridge.md."
+    An empty result for upstream master means something is wrong with the remote, not the ref.
+    See docs/hamlib-streaming-bridge.md."
 fi
 git -C "$src" checkout --quiet --detach FETCH_HEAD
 head_sha="$(git -C "$src" rev-parse --short HEAD)"
@@ -140,8 +154,10 @@ if ! [ -f "$src/include/hamlib/rig.h" ]; then
   die "$src does not look like a Hamlib checkout (no include/hamlib/rig.h)"
 fi
 if ! grep -q 'rig_stream_open' "$src/include/hamlib/rig.h"; then
-  die "'$ref' has no rig_stream_open in include/hamlib/rig.h — wrong branch?
-    The streaming API arrives with Hamlib PR #2116; the default ref is $default_ref."
+  die "'$ref' has no rig_stream_open in include/hamlib/rig.h — wrong ref?
+    The streaming API arrived with Hamlib PR #2116, merged upstream 2026-08-15. A ref that
+    predates that merge (an older tag, a 4.x branch, or a release tarball) will not have it.
+    The default ref is $default_ref on $default_repo."
 fi
 
 # ---------------------------------------------------------------------------
@@ -218,4 +234,19 @@ Confirm the target was really enabled — CMake only WARNS when it skips it:
 The prefix above is recorded as an absolute path in build/CMakeCache.txt. Moving
 or deleting it breaks every later rebuild of the bridge; re-run this script or
 reconfigure from scratch if that happens.
+
+IF YOU JUST REFRESHED AN EXISTING PREFIX IN PLACE, DELETE YOUR BUILD DIRECTORY.
+naudio detects which streaming revision you have with CMake check_* probes, and
+CMake CACHES those results — it does not re-run them when the header underneath
+changes. So an existing build tree keeps compiling the code path chosen for the
+OLD libhamlib against the NEW headers, and you get errors like
+
+  na_hamlib_bridge.c: error: no member named 'channels_min' in
+                             'struct rig_stream_caps'
+
+which look like a naudio bug and are not. Since the default ref is a moving
+branch, this is now the NORMAL consequence of re-running this script:
+
+  rm -rf build && PKG_CONFIG_PATH=$pkgdir \\
+    cmake -S . -B build -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON
 EOF

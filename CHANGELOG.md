@@ -5,7 +5,34 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+- **`tools/build-streaming-hamlib.sh` now builds Hamlib from upstream `Hamlib/Hamlib` @ `master`,
+  not from PR #2116's fork branch.** The streaming subsystem
+  ([PR #2116](https://github.com/Hamlib/Hamlib/pull/2116)) **merged upstream on 2026-08-15**, so
+  `rig_stream_*` now lives in Hamlib proper. The old defaults pointed at
+  `mikaelnousiainen/Hamlib` @ `streaming-subsystem-pr` — a merged PR's branch, which is
+  deletion-eligible and was naudio's only source for the dependency. Repointing keeps the
+  deliberate tracking property (naudio follows where the streaming API goes, and a red
+  `hamlib-bridge` CI job is the early notice that it moved) while removing that single point of
+  failure. Pass `--repo`/`--ref` to override; the fork remains valid if you need its history.
+
+  **This does not mean a packaged libhamlib will work.** Merged into `master` is not shipped in a
+  release — `apt`/Homebrew still deliver 4.x with no `rig_stream_*`, so this script stays required
+  until a Hamlib release carries the API.
+
+  Verified against upstream `master` (`0839c03`) rather than argued: the script builds and installs
+  it, `check_struct_has_member(struct rig_stream_caps, channels)` reports **Success** (the exact
+  probe that discriminates the post-`b538567b` channel-list shape), `na_hamlib_bridge` is produced
+  as a **binary**, and all three bridge arms — `naudio_bridge_probe_selftest`, `naudio_bridge_arm`,
+  `naudio_bridge_fault_arm` — pass against it.
+
+- **The script and `docs/hamlib-streaming-bridge.md` now warn that refreshing a prefix in place
+  requires deleting the build directory.** CMake caches `check_*` results and does not re-run them
+  when the header underneath changes, so an existing tree keeps compiling the code path chosen for
+  the *previous* libhamlib and fails with `no member named 'channels_min' in
+  'struct rig_stream_caps'` — which reads like a naudio bug and is not. Now that the default ref is
+  a moving branch, this is the normal consequence of re-running the script rather than an
+  exceptional one. Documented from a measured occurrence, not a hypothesis.
 
 ## [0.4.0] — 2026-08-16
 
