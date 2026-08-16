@@ -36,7 +36,7 @@ include/naudio/net/AudioMixer.hpp      | 325     | sent once per denial episode
 src/net/AudioMixer.cpp                 | 325     | sent once per denial episode
 src/net/AudioMixer.cpp                 | 328     | locally reconstructed frames
 src/net/AudioStreamServer.cpp          | 291-292 | heartbeat interval
-src/net/AudioStreamServer.cpp          | 552-553 | interval / timeout
+src/net/AudioStreamServer.cpp          | 576-577 | interval / timeout
 tests/net/test_mixer.cpp               | 323     | Preemption is strict-greater
 tests/net/test_mixer.cpp               | 325     | sent once per denial episode
 tests/net/test_mixer.cpp               | 328     | locally reconstructed frames

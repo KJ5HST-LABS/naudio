@@ -1,7 +1,7 @@
 # net-audio Audio Streaming Protocol — Specification v1
 
 **Status:** Stable / frozen wire contract (`0xAF01`, version byte = 1).
-**Spec version:** 1.0 (2026-06-27).
+**Spec version:** 1.1 (2026-08-15) — §8.4 only: `CONNECT_REQUEST` became a critical (ARQ'd) control type. Frame layout, type numbering and CRC semantics are unchanged, so the `0xAF01` v1 wire contract and every golden vector still hold; see §8.4 and §11.
 **Scope:** The *audio* half of a radio-streaming toolkit.
 **Provenance:** This document is the normative, field-by-field definition of the `0xAF01` audio wire. Every normative value here is implemented and pinned by the language-neutral golden-vector conformance suite (see §12), so the wire is byte-deterministic and independently checkable. Where the toolkit *plan* describes capabilities that are **not** in the v1 wire, they are isolated in §13 (Proposed extensions) and are explicitly **non-normative**.
 
@@ -411,8 +411,32 @@ Sequence comparison is **unsigned 32-bit** (so the field wraps cleanly).
 Reliable delivery for *critical* control messages over UDP.
 
 - **Tracking ring:** the last **16** critical control packets (keyed by frame sequence; oldest evicted on overflow).
-- **Critical types** (tracked / ACK-required): `CONNECT_ACCEPT, CONNECT_REJECT, AUDIO_CONFIG, STREAM_START, STREAM_STOP, STREAM_PAUSE, STREAM_RESUME, TX_GRANTED, TX_DENIED, TX_PREEMPTED, TX_RELEASED, CLIENTS_UPDATE, DISCONNECT`.
-- **Non-critical** (never ARQ'd, to avoid ACK-of-ACK loops): `HEARTBEAT, HEARTBEAT_ACK, LATENCY_PROBE, LATENCY_RESPONSE, STATS_UPDATE, ERROR, CONNECT_REQUEST, NACK, CONTROL_ACK`.
+- **Critical types** (tracked / ACK-required): `CONNECT_REQUEST, CONNECT_ACCEPT, CONNECT_REJECT, AUDIO_CONFIG, STREAM_START, STREAM_STOP, STREAM_PAUSE, STREAM_RESUME, TX_GRANTED, TX_DENIED, TX_PREEMPTED, TX_RELEASED, CLIENTS_UPDATE, DISCONNECT`.
+- **Non-critical** (never ARQ'd, to avoid ACK-of-ACK loops): `HEARTBEAT, HEARTBEAT_ACK, LATENCY_PROBE, LATENCY_RESPONSE, STATS_UPDATE, ERROR, NACK, CONTROL_ACK`.
+
+> **Spec 1.1 — `CONNECT_REQUEST` moved from non-critical to critical.** In spec 1.0 it was the only
+> message in the connection-establishment exchange that was **not** retransmitted: `CONNECT_ACCEPT`,
+> `CONNECT_REJECT` and `AUDIO_CONFIG` all were. The asymmetry was not deliberate and it was
+> one-sided in the worst direction — a lost *server* reply recovered in one 500 ms interval, while a
+> lost *client* request could not be recovered at all and cost the caller the whole connect timeout
+> followed by a failed connect. A client opening a session over a lossy link is exactly the moment
+> the ARQ layer exists for.
+>
+> **This is a §11 "minor, backward compatible" extension, not a version-byte change.** No frame
+> layout, type number, field offset or CRC semantic moves; the golden vectors are unaffected. The
+> two mixed-version behaviours are bounded and benign, and neither can strand a connection:
+>
+> - **New sender, old receiver.** The old receiver does not treat `CONNECT_REQUEST` as critical, so
+>   it never returns a `CONTROL_ACK`. The new sender retransmits until its 3-attempt budget is
+>   spent, then drops the pending entry and carries on — at most **two extra datagrams**, and the
+>   duplicates reach an *already-established* session (the receiver demultiplexes by sender
+>   endpoint), where an unexpected `CONNECT_REQUEST` is ignored like any other unhandled control.
+> - **Old sender, new receiver.** The new receiver ACKs a request the old sender is not tracking.
+>   An unsolicited `CONTROL_ACK` names a sequence with no pending entry and is discarded, which is
+>   the same path a duplicate ACK has always taken.
+>
+> ACK-of-ACK is still avoided: `CONTROL_ACK` and `NACK` remain non-critical, so nothing here
+> acknowledges an acknowledgement.
 - **ACK:** receiver replies `CONTROL_ACK(seq)`; sender clears the pending entry.
 - **NACK:** `NACK(seq)` triggers immediate retransmission of the stored packet.
 - **Timeout retransmit:** default timeout **500 ms**; max **3 attempts** total (the initial send counts as attempt 1 → up to **2 retransmits**), then drop.

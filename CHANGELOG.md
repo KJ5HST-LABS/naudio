@@ -5,6 +5,35 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **`CONNECT_REQUEST` is now an ARQ-protected control message, so a client's handshake survives a
+  lost datagram** (spec 1.1, §8.4). It was the only message in the connection-establishment
+  exchange that was *not* retransmitted — `CONNECT_ACCEPT`, `CONNECT_REJECT` and `AUDIO_CONFIG` all
+  were — and the asymmetry ran the wrong way: a lost **server** reply recovered in one 500 ms
+  retransmit interval, while a lost **client** request could not be recovered at all and cost the
+  caller the entire 10 s connect timeout followed by a failed `connect()`. Opening a session over a
+  lossy link is exactly what the ARQ layer exists for. Measured end to end with one request dropped:
+  connect now succeeds in **506–508 ms** (one retransmit interval), against a 10.5 s failure before.
+
+  **Marking the type critical was necessary but not sufficient**, and the second half is the part
+  worth knowing about: `recordSent` only makes an entry *pending*, and the retransmit sweep's only
+  pump was the heartbeat loop — which does not start until after the handshake has already
+  returned. The handshake also spent its whole wait parked in a single blocking receive, so nothing
+  could have run a sweep even if one had been scheduled. `AudioStreamClient::performHandshake` now
+  waits in slices and runs the sweep between them, via a new `ClientConnection::pumpControlRetransmits`
+  (defaulted to a no-op — TCP is a reliable ordered stream and has no control-ARQ). Without that,
+  the enum change would have been inert in precisely the way `DISCONNECT` still is.
+
+  **Wire compatibility: this is a §11 minor, backward-compatible extension, not a version-byte
+  change.** No frame layout, type number, field offset or CRC semantic moves, and the golden vectors
+  are untouched. Mixed-version behaviour is bounded and cannot strand a connection: a new sender
+  against an old receiver gets no `CONTROL_ACK`, spends its 3-attempt budget, and carries on — at
+  most two extra datagrams, delivered to an already-established session where an unexpected
+  `CONNECT_REQUEST` hits the control switch's `default:` and is ignored; an old sender against a new
+  receiver gets an ACK it is not tracking, which `onAckReceived` discards with no side effect. Both
+  paths were read and verified rather than assumed. `CONTROL_ACK` and `NACK` remain non-critical, so
+  nothing acknowledges an acknowledgement.
+
 ### Fixed
 - **Control-message retransmission is no longer disrupted by a system clock step.**
   `ControlReliability` was the one reliability component timed by the wall clock, while

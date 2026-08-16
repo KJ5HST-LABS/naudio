@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "naudio/AudioStreamConfig.hpp"
+#include "naudio/ControlReliability.hpp"  // DEFAULT_TIMEOUT_MS — the handshake-ARQ arms' bound
 #include "naudio/DeviceBackend.hpp"
 #include "naudio/FakeBackend.hpp"  // FakePlaybackStream
 #include "naudio/Stream.hpp"
@@ -157,6 +158,105 @@ AudioStreamConfig injectOnlyServerConfig() {
     AudioStreamConfig c{};
     c.maxClients = 4;
     c.txIdleTimeoutMs = 5000;  // keep TX granted through a test
+    return c;
+}
+
+// A one-hop UDP relay that DROPS the first `dropFirstN` client->server CONNECT_REQUEST datagrams
+// and forwards everything else verbatim (issue #29 option 4).
+//
+// Deliberately not tests/client_stats_proxy.cpp: that relay exists to serve the pure-C stats arms,
+// drops server->client AUDIO_RX only, and says in its own header comment that dropping control
+// traffic "would break the handshake" — which was TRUE when it was written and is the very claim
+// under test here. Extending it would have put a control-dropping mode into a fixture three C
+// tests depend on, to be used by neither.
+//
+// It parses rather than counting datagrams: the client's first packet is its CONNECT_REQUEST
+// today, but an arm that silently stops testing retransmission the day a client sends anything
+// earlier is worse than no arm. Matching on the type means this either drops a CONNECT_REQUEST or
+// drops nothing.
+class ConnectRequestDroppingRelay {
+public:
+    // Binds an ephemeral loopback port relaying to 127.0.0.1:serverPort. Returns false if the
+    // socket could not be bound.
+    bool start(std::uint16_t serverPort, int dropFirstN) {
+        serverPort_ = serverPort;
+        dropRemaining_.store(dropFirstN);
+        sock_ = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+        if (!sock_.valid()) return false;
+        const int room = static_cast<int>(AudioPacket::HEADER_SIZE + AudioPacket::MAX_PAYLOAD +
+                                          AudioPacket::CRC_SIZE + 64);
+        sock_.setRecvBufferAtLeast(room);
+        sock_.setSendBufferAtLeast(room);
+        port_ = sock_.localPort();
+        worker_ = std::thread([this]() { loop(); });
+        return port_ != 0;
+    }
+
+    ~ConnectRequestDroppingRelay() { stop(); }
+
+    void stop() {
+        if (!worker_.joinable()) return;
+        stop_.store(true);
+        worker_.join();
+        sock_.close();
+    }
+
+    std::uint16_t port() const { return port_; }
+    long long connectRequestsSeen() const { return seen_.load(); }
+    long long connectRequestsDropped() const { return dropped_.load(); }
+
+private:
+    static bool isConnectRequest(const std::uint8_t* data, std::size_t n) {
+        const std::optional<AudioPacket> pkt = AudioPacket::deserialize(data, n);
+        if (!pkt || pkt->packetType() != PacketType::Control) return false;
+        const std::optional<ControlMessage> msg = ControlMessage::deserialize(pkt->payload());
+        return msg && msg->messageType() == ControlType::ConnectRequest;
+    }
+
+    void loop() {
+        std::vector<std::uint8_t> buf(AudioPacket::HEADER_SIZE + AudioPacket::MAX_PAYLOAD +
+                                      AudioPacket::CRC_SIZE + 64);
+        std::string clientHost;
+        std::uint16_t clientPort = 0;
+        sock_.setRecvTimeout(50);  // so stop_ is observed promptly at teardown
+        while (!stop_.load()) {
+            const RecvFromResult rr = sock_.recvFrom(buf.data(), buf.size());
+            if (rr.status == IoStatus::TimedOut) continue;
+            if (rr.status != IoStatus::Ok) break;
+
+            if (rr.senderPort == serverPort_) {
+                if (clientPort == 0) continue;  // no client endpoint latched yet
+                sock_.sendTo(buf.data(), rr.bytes, clientHost, clientPort);
+                continue;
+            }
+            clientHost = rr.senderHost;
+            clientPort = rr.senderPort;
+            if (isConnectRequest(buf.data(), rr.bytes)) {
+                seen_.fetch_add(1);
+                if (dropRemaining_.load() > 0) {
+                    dropRemaining_.fetch_sub(1);
+                    dropped_.fetch_add(1);
+                    continue;  // the induced loss
+                }
+            }
+            sock_.sendTo(buf.data(), rr.bytes, "127.0.0.1", serverPort_);
+        }
+    }
+
+    Socket sock_;
+    std::uint16_t serverPort_ = 0;
+    std::uint16_t port_ = 0;
+    std::thread worker_;
+    std::atomic<bool> stop_{false};
+    std::atomic<int> dropRemaining_{0};
+    std::atomic<long long> seen_{0};
+    std::atomic<long long> dropped_{0};
+};
+
+// A client config with control-ARQ actually enabled. The existing UDP arm above uses a default
+// AudioStreamConfig, where controlReliabilityEnabled is FALSE — so it exercises none of this.
+AudioStreamConfig arqClientConfig() {
+    AudioStreamConfig c = AudioStreamConfig::udpLan();  // Udp + controlReliabilityEnabled
     return c;
 }
 
@@ -458,6 +558,140 @@ TEST(Client, GateE2eUdpTransport) {
     EXPECT_FALSE(client.isConnected());
     EXPECT_TRUE(waitForServerCount(server, 0, 2000));
 
+    server.stop();
+}
+
+// --- Handshake control-ARQ (issue #29 option 4) -------------------------------------------------
+//
+// Before this, ConnectRequest was the ONLY message in the connection-establishment exchange that
+// was not retransmitted — ConnectAccept, ConnectReject and AudioConfig all were. So a single lost
+// client datagram cost the caller the entire kConnectTimeoutMs (10 s) and returned a failed
+// connect, while the identical loss in the server->client direction recovered in one retransmit
+// interval. These two arms are the pair: one shows the loss is survived, the other shows the relay
+// is capable of causing the failure it claims to.
+//
+// WHAT MAKES THIS A REAL ARM RATHER THAN A RESTATEMENT OF THE ENUM. Marking the type critical only
+// makes it PENDING; the sweep still has to run, and its usual pump belongs to the heartbeat loop,
+// which does not exist until after the handshake returns. Reverting EITHER half — the enum entry in
+// ControlReliability::isCriticalType, or the sliced wait in AudioStreamClient's
+// receiveWhilePumpingArq — reddens the first arm. That two-sided sensitivity is the point: a
+// pending entry nobody sweeps is exactly the inert state ControlType::Disconnect is in, and it is
+// the defect issue #29 was filed to report.
+
+TEST(Client, GateHandshakeSurvivesALostConnectRequest) {
+    AudioStreamConfig scfg = injectOnlyServerConfig();
+    scfg.transportType = TransportType::Udp;
+    AudioStreamServer server{0, scfg};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    ConnectRequestDroppingRelay relay;
+    ASSERT_TRUE(relay.start(static_cast<std::uint16_t>(server.port()), 1))
+        << "relay could not bind";
+
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", relay.port()};
+    ASSERT_TRUE(client.setConfig(arqClientConfig()));
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setAutoReconnect(false);  // the retransmit must do the work, not a reconnect
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = client.connect(&err);
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+
+    EXPECT_TRUE(ok) << "connect failed after its CONNECT_REQUEST was dropped once — the request "
+                       "was not retransmitted (err: "
+                    << err << ")";
+    EXPECT_EQ(relay.connectRequestsDropped(), 1)
+        << "the relay did not drop a CONNECT_REQUEST, so this arm induced no fault at all";
+    EXPECT_GE(relay.connectRequestsSeen(), 2)
+        << "only " << relay.connectRequestsSeen()
+        << " CONNECT_REQUEST(s) reached the relay — the client never resent one, so the connect "
+           "above (if it passed) did not pass for the reason this arm claims";
+
+    // It recovered via the ARQ timeout, not by outlasting the connect window. The lower bound is
+    // the retransmit interval itself; the upper is far below kConnectTimeoutMs (10000), so a
+    // regression that "passes" by simply waiting out the whole window still reddens here.
+    //
+    // MEASURED so nobody has to re-derive the margins before deciding whether these bounds are
+    // tight: 5 of 5 runs on macOS/arm64 landed at 506-508 ms — one DEFAULT_TIMEOUT_MS (500) plus
+    // about 7 ms of loopback and handshake. So the lower bound sits at ~2x below the observed
+    // value and the upper at ~10x above it, and neither is near the lattice the measurement lands
+    // on. The lossless control below measures 2 ms, which is what makes the lower bound a real
+    // discriminator rather than a formality.
+    EXPECT_GE(elapsedMs, ControlReliability::DEFAULT_TIMEOUT_MS / 2);
+    EXPECT_LT(elapsedMs, 5000)
+        << "connect took " << elapsedMs
+        << " ms — that is the connect window elapsing, not a retransmit recovering";
+
+    client.disconnect();
+    relay.stop();
+    server.stop();
+}
+
+// THE CONTROL, and it is not optional. The arm above asserts that a dropped CONNECT_REQUEST is
+// survived; on its own that is satisfied just as well by a relay which never dropped anything.
+// This one runs the identical path with the drop count at 0 and requires the SAME success — so the
+// two together say the fault was induced and recovered, rather than never induced. It also pins the
+// cost of the extra hop: a lossless relay must not push the connect past the retransmit interval,
+// or the bound in the arm above would be measuring the relay instead of the ARQ.
+TEST(Client, HandshakeThroughALosslessRelayIsUnaffected) {
+    AudioStreamConfig scfg = injectOnlyServerConfig();
+    scfg.transportType = TransportType::Udp;
+    AudioStreamServer server{0, scfg};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    ConnectRequestDroppingRelay relay;
+    ASSERT_TRUE(relay.start(static_cast<std::uint16_t>(server.port()), 0));
+
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", relay.port()};
+    ASSERT_TRUE(client.setConfig(arqClientConfig()));
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setAutoReconnect(false);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(client.connect(&err)) << err;
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+
+    EXPECT_EQ(relay.connectRequestsDropped(), 0);
+    EXPECT_EQ(relay.connectRequestsSeen(), 1)
+        << "the client sent more than one CONNECT_REQUEST with nothing dropped";
+
+    // WHAT THIS ARM DOES NOT COVER, AND WHERE IT IS COVERED INSTEAD. A lossless connect completes
+    // in ~2 ms, far inside the 500 ms retransmit interval, so the count above is read before any
+    // retransmit could fire either way — it cannot tell an acknowledged request from a
+    // tracked-but-never-ACKed one, and the latter would add two wasted datagrams to EVERY
+    // connection.
+    //
+    // The obvious repair — sleep past the interval and re-read — was WRITTEN, MEASURED, AND
+    // REJECTED. It is vacuous at any sleep under ~3 s: after connect the sweep's only pump is the
+    // heartbeat loop, which ticks every kHeartbeatCheckIntervalMs (3000 ms), so a request due for
+    // retransmit at 500 ms is not swept until the next tick. Proved by mutation: a receiver
+    // patched to never ACK a CONNECT_REQUEST SURVIVED the 800 ms version of this check. Making it
+    // real costs ~4 s of suite time to pin a two-datagram waste.
+    //
+    // ControlReliability.GeneratesAnAckForAConnectRequest settles the same claim at the unit level,
+    // deterministically and in microseconds, and that mutation kills it. Do not re-add a sleeping
+    // version here without first checking it against the 3000 ms pump interval.
+    // MEASURED at 2 ms, 5 of 5 — so the extra relay hop is free and this bound carries ~250x
+    // headroom. It is deliberately loose rather than tight: what it has to catch is a handshake
+    // that has quietly become retransmit-driven even with nothing dropped, and that costs a whole
+    // DEFAULT_TIMEOUT_MS, not a few milliseconds.
+    EXPECT_LT(elapsedMs, ControlReliability::DEFAULT_TIMEOUT_MS)
+        << "a lossless handshake took " << elapsedMs << " ms";
+
+    client.disconnect();
+    relay.stop();
     server.stop();
 }
 
