@@ -931,13 +931,13 @@ extern "C" int na_client_server_tx_owner(na_stream_client* client, char* buf, in
 // Field-wise, not byte-wise, for the mirror of the reason copyCallerStruct above is byte-wise:
 // this side has no second na_client_stats to copy from, only a differently-shaped C++ struct.
 //
-// 0.2.0 appended the first post-v1 field and 0.3.0 the second, so the guard this comment once
-// described in the future tense is now below and load-bearing: EVERY post-v1 field is written only
-// if the CALLER's declared size reaches it, each against its OWN version's constant rather than
-// against the newest. The floor check rejects anything under v1 and nothing more, which is the
-// whole point -- a v1-compiled consumer is exactly who this scheme exists to keep working, and it
-// is still entitled to call a 0.3.0 library with `sizeof` its own shorter struct. A v2-compiled
-// one is entitled to the same, and gets sequence_gaps but not socket_rx_drops.
+// 0.2.0 appended the first post-v1 field, 0.3.0 the second and 0.4.0 the third, so the guard this
+// comment once described in the future tense is now below and load-bearing: EVERY post-v1 field is
+// written only if the CALLER's declared size reaches it, each against its OWN version's constant
+// rather than against the newest. The floor check rejects anything under v1 and nothing more, which
+// is the whole point -- a v1-compiled consumer is exactly who this scheme exists to keep working,
+// and it is still entitled to call a 0.4.0 library with `sizeof` its own shorter struct. A
+// v2-compiled one is entitled to the same, and gets sequence_gaps but neither field after it.
 
 extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_stats* out,
                                           std::size_t struct_size) {
@@ -978,6 +978,9 @@ extern "C" na_error_t na_client_get_stats(na_stream_client* client, na_client_st
         }
         if (struct_size >= NA_CLIENT_STATS_SIZE_V3) {
             out->socket_rx_drops = static_cast<long long>(s.socketReceiveDrops);
+        }
+        if (struct_size >= NA_CLIENT_STATS_SIZE_V4) {
+            out->fec_pending_discarded = static_cast<long long>(s.fecPendingDiscarded);
         }
         return NA_OK;
     });

@@ -76,7 +76,7 @@ extern "C" {
  * CMakeLists.txt, so they cannot drift from the SONAME or from naudio.pc's Version.
  */
 #define NAUDIO_VERSION_MAJOR 0
-#define NAUDIO_VERSION_MINOR 3
+#define NAUDIO_VERSION_MINOR 4
 #define NAUDIO_VERSION_PATCH 0
 
 /* The largest value NA_VERSION_ENCODE accepts for minor and for patch. Above it a lower component
@@ -785,6 +785,37 @@ typedef struct na_client_stats {
      * Counts DATAGRAMS, so it counts every packet type sharing the socket — audio, parity
      * and control alike — exactly as sequence_gaps counts every sequence slot. */
     long long socket_rx_drops;
+
+    /* @since 0.4.0 — read it only when na_version_number() >= NA_VERSION_ENCODE(0, 4, 0);
+     * an older library zero-fills this slot and that 0 is fill, not a measurement.
+     *
+     * Audio packets dropped from a PENDING FEC block without ever having been offered to a
+     * parity — repair capacity that expired. -1 when FEC is off (every profile but
+     * NA_RELIABILITY_UDP_WAN, and TCP), 0 before connect.
+     *
+     * THIS IS NOT AUDIO LOSS, and that is the whole contract. The decoder emits every audio
+     * packet to the application ON ARRIVAL and only then stores a copy in the pending block, so
+     * the block is a repair CACHE and never a delivery queue. What this counts is copies thrown
+     * out of that cache — the audio itself was already delivered, in order, and is unaffected.
+     * A consumer that reads this as a loss meter will double-count against sequence_gaps.
+     *
+     * WHAT IT IS FOR. It is the missing half of the answer to "why is packets_recovered_by_fec
+     * zero while everything else looks healthy?" — the question that took two sessions to answer
+     * on this project before the counter existed (issue #43, via #47 and #53). A non-zero
+     * reading says the decoder was holding block members it never got to use, so the repair
+     * opportunity was lost upstream of any decision it made. It is a sibling of
+     * fec_blocks_unreconciled, not a residue of packets_recovered_by_fec: that one counts blocks
+     * the decoder DECLINED to reconcile, this one counts material it never got to weigh.
+     *
+     * TWO MECHANISMS REACH IT and the counter cannot tell them apart — deliberately, because a
+     * consumer's response to both is the same (the parity stream is not keeping up with the
+     * audio): the pending block idling out, and the retention cap evicting its oldest slot.
+     * FecDecoder::pendingPacketsDiscarded owns the full trigger list; do not restate it here.
+     *
+     * IT DOES NOT IMPLY A DECLINE. Only the cap-eviction mechanism also moves
+     * fec_blocks_unreconciled; the idle timeout moves this alone. Reading one from the other in
+     * either direction is wrong. */
+    long long fec_pending_discarded;
 } na_client_stats;
 
 /* The size of na_client_stats in the FIRST published ABI, and the floor na_client_get_stats
@@ -807,6 +838,12 @@ typedef struct na_client_stats {
  * size-as-a-parameter scheme exists to prevent. */
 #define NA_CLIENT_STATS_SIZE_V3 \
     (offsetof(na_client_stats, socket_rx_drops) + sizeof(long long))
+
+/* The size through the last field added in 0.4.0, repeating the same shape for the same reason:
+ * V3 is not redefined, so a consumer already compiled against the 0.3.0 header keeps passing a
+ * size the library still accepts and still fills exactly as far as it promised. */
+#define NA_CLIENT_STATS_SIZE_V4 \
+    (offsetof(na_client_stats, fec_pending_discarded) + sizeof(long long))
 
 /* Fill *out with a snapshot of the client's counters. Safe to call from any thread at any
  * time, including while streaming and before connect (which yields connected == 0 and
