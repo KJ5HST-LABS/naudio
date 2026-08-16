@@ -92,7 +92,10 @@ case "$(uname -s)" in
 esac
 
 workdir=$(mktemp -d)
-cleanup() { rm -rf "$workdir"; }
+# na_harness_guard turns "this script died partway" into a harness fault instead of a pass. The
+# measurement that motivates it, and its negative controls, live in deadline.sh — deliberately in
+# one place rather than restated here (Learning 118).
+cleanup() { rm -rf "$workdir"; na_harness_guard "bridge_fault_arm"; }
 trap cleanup EXIT
 
 rc=0
@@ -416,4 +419,5 @@ arm_tx_fail                                        || { a=$?; [ "$rc" -eq 0 ] &&
 if [ "$rc" -eq 0 ]; then
     echo "bridge_fault_arm: OK — a dead RX or TX worker stops the bridge, and short writes counted"
 fi
+na_harness_done
 exit "$rc"

@@ -38,6 +38,67 @@
 # in two places drifts from itself (Learning 118), and the two would drift in exactly the way #41's
 # own citations did.
 
+# ---------------------------------------------------------------- the completion sentinel
+#
+# A SECOND WAY A HARNESS REPORTS NOTHING, AND THIS ONE REPORTS *SUCCESS*. The deadlines above catch
+# an arm that never returns. They do not catch an arm that dies halfway — and on the shell these
+# harnesses actually run under, dying halfway is scored as a PASS.
+#
+# MEASURED, on /bin/bash 3.2.57 (macOS's system bash, and what the macos-latest runner has). A
+# `set -u` abort does not report the same way everywhere, and the difference is the whole problem:
+#
+#     unbound name inside  $(( ... ))   ->  shell aborts, exit status **0**
+#     unbound name inside  "$VAR"       ->  shell aborts, exit status 1
+#
+# Both stop the script dead — the lines after never run and the trailing `exit "$rc"` is never
+# reached — but the arithmetic one is scored by ctest, which reads only that status, as **Passed**.
+# It is not function-related (it reproduces at top level too); the arithmetic context is the
+# discriminator. Every harness here is `set -u` and every one of them does arithmetic on a variable:
+# `$(( SECS + NA_PROBE_MARGIN ))`, `$(( secs * 10 ))`, `$(( gaps * 2 ))`. One renamed environment
+# variable in any of those turns an arm into a green no-op.
+#
+# NOT A HYPOTHETICAL, AND NOT A TOY. It was found when a mutation of netrigctl_arm.sh failed to
+# source THIS FILE, died on `$(( SECS + NA_PROBE_MARGIN ))` with NA_PROBE_MARGIN unset, printed no
+# verdict, and exited **0** (issue #88 item 8). Note the first diagnosis of it was WRONG — a
+# small probe reproduced the 0 and the conclusion drawn was "inside a function", which the control
+# refuted: the same mutation applied to the shipped bridge_arm.sh exits 1, because that injection
+# site was a plain expansion. The rule above is what survived the control.
+#
+# The countermeasure is version-independent, which matters because it could not be measured on
+# bash 5 — no bash 5 exists on the machine where this was written, so whether that shell shares the
+# behaviour is UNKNOWN rather than ruled out. Either way the rule is the same: an arm's exit status
+# is trustworthy only if the arm reached its own verdict. So the arm SAYS SO explicitly, and the
+# EXIT trap turns "no verdict" into a harness fault instead of a pass. That also covers the whole
+# class rather than this one member of it — a `command not found`, a failed `cd`, an early `return`
+# down a path nobody tested all end the same way.
+#
+# Usage — every harness that sources this file:
+#     cleanup () { rm -rf "$workdir"; na_harness_guard "netrigctl_arm"; }
+#     trap cleanup EXIT
+#     ...
+#     na_harness_done      # immediately before the harness's own exit
+#     exit "$rc"
+#
+# Proved in all three directions before being trusted (Learning 222): it returns 2 on an abort, 0 on
+# a clean run, and passes a genuine failure through as 1 rather than clobbering it — and it was run
+# against a deliberately-aborted copy of each of the three harnesses, not only against a probe.
+NA_HARNESS_VERDICT_REACHED=0
+
+# Call immediately before the harness's own `exit`.
+na_harness_done () { NA_HARNESS_VERDICT_REACHED=1; }
+
+# Call from the EXIT trap, after any cleanup. Exits 2 if the harness never reached its verdict.
+# `exit` from inside an EXIT trap DOES set the shell's status (verified); a bare `return` would not.
+na_harness_guard () {
+    if [ "$NA_HARNESS_VERDICT_REACHED" -eq 0 ]; then
+        echo "FAIL ${1:-harness}: exited WITHOUT reaching its own verdict — it did not run to a" >&2
+        echo "  pass or a fail, it died partway. On bash 3.2 a set -u abort inside a function" >&2
+        echo "  exits 0, so without this guard ctest would have recorded this run as PASSED." >&2
+        echo "  Look above for an 'unbound variable' or 'command not found' line." >&2
+        exit 2
+    fi
+}
+
 # Deadlines in seconds. GENEROUS ON PURPOSE. A deadline tight enough to turn a slow-but-correct run
 # into a red arm costs more than it saves, and tightness is not where the win is: bounded at all is
 # the win. 60 s against ~29 minutes is the difference between a diagnosis and a hung job, and 45 s

@@ -57,7 +57,10 @@ if [ ! -x "$PROBE" ]; then
 fi
 
 workdir=$(mktemp -d)
-cleanup() { rm -rf "$workdir"; }
+# na_harness_guard turns "this script died partway" into a harness fault instead of a pass. The
+# measurement that motivates it, and its negative controls, live in deadline.sh — deliberately in
+# one place rather than restated here (Learning 118).
+cleanup() { rm -rf "$workdir"; na_harness_guard "bridge_arm"; }
 trap cleanup EXIT
 
 rc=0
@@ -387,4 +390,5 @@ if [ "$rc" -eq 0 ]; then
     echo "bridge_arm: OK — content on tone, silence on silence, a failed startup exits non-zero," \
          "and a lost TX channel names its cause"
 fi
+na_harness_done
 exit "$rc"
