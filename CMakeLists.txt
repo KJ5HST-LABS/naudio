@@ -850,9 +850,45 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
                           "$<TARGET_FILE:na_hamlib_bridge>"
                           "$<TARGET_FILE:naudio_bridge_probe>"
                           "$<TARGET_FILE:naudio_failshim>")
-    # Two bridge arms both bind a fixed UDP port and both drive the same dummy backend, so they are
-    # serialised rather than left to race a port bind under `ctest -j`.
-    set_tests_properties(naudio_bridge_arm naudio_bridge_fault_arm PROPERTIES RESOURCE_LOCK bridge)
+
+    # netrigctl arm (issue #88 item 8) — the ONLY arm that drives `-m 2`. Every other bridge arm
+    # runs the dummy backend in-process, so the `\stream_open` round trip over a wire had no
+    # automated coverage at all; #21 sat open for a month after its cause was gone because of it.
+    #
+    # NO_DEFAULT_PATH IS LOAD-BEARING, NOT TIDINESS. The arm must run the rigctld belonging to the
+    # SAME prefix as the libhamlib na_hamlib_bridge links, and a search that falls through to the
+    # system PATH finds a distro 4.x rigctld with no streaming subsystem whatsoever — the arm would
+    # then fail at `\stream_caps` and read as a naudio regression. Worse is the near miss: a second
+    # hand-built prefix on PATH gives a version-skewed peer, and a bridge older than 961093f2
+    # against a newer rigctld does not degrade, it refuses to open the stream (see the harness's
+    # own diagnosis for that case). Pinning the search to HAMLIB_PREFIX makes the peer's version a
+    # property of the prefix the operator chose, which is the only version relationship the bridge
+    # documents.
+    #
+    # Registered only if it is actually found, and announced when it is not, for the same reason
+    # the arms above are: a gate that silently fails to register reports the same green as one that
+    # passed (Learning 9's shape in the test registry rather than in the build).
+    find_program(NAUDIO_RIGCTLD rigctld HINTS "${HAMLIB_PREFIX}/bin" NO_DEFAULT_PATH)
+    if(NAUDIO_RIGCTLD)
+        add_test(NAME naudio_netrigctl_arm
+                 COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/bridge/netrigctl_arm.sh"
+                              "$<TARGET_FILE:na_hamlib_bridge>"
+                              "${NAUDIO_RIGCTLD}"
+                              "$<TARGET_FILE:naudio_bridge_probe>")
+        message(STATUS "naudio: naudio_netrigctl_arm enabled (rigctld ${NAUDIO_RIGCTLD})")
+    else()
+        message(STATUS "naudio: naudio_netrigctl_arm SKIPPED — no rigctld in ${HAMLIB_PREFIX}/bin, "
+                       "so the -m 2 path has no peer to talk to (issue #88 item 8)")
+    endif()
+
+    # The bridge arms bind fixed ports and all drive a dummy backend, so they are serialised rather
+    # than left to race a port bind under `ctest -j`. The netrigctl arm binds a second (TCP) port of
+    # its own for rigctld and is held under the same lock for the same reason.
+    set(NAUDIO_BRIDGE_ARMS naudio_bridge_arm naudio_bridge_fault_arm)
+    if(NAUDIO_RIGCTLD)
+        list(APPEND NAUDIO_BRIDGE_ARMS naudio_netrigctl_arm)
+    endif()
+    set_tests_properties(${NAUDIO_BRIDGE_ARMS} PROPERTIES RESOURCE_LOCK bridge)
 
     # OUTER backstop only (issue #88 item 2, from #41). The real deadlines live inside the harnesses
     # — tests/bridge/deadline.sh — and that is deliberately where the work went: a harness deadline
@@ -861,7 +897,8 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
     # machine, so 600 s is far above any legitimate run and exists purely to bound a hang the
     # harness itself somehow failed to catch. Note ctest's DEFAULT is 1500 s, which is what let #41
     # sit for ~29 minutes before anyone intervened.
-    set_tests_properties(naudio_bridge_arm naudio_bridge_fault_arm PROPERTIES TIMEOUT 600)
+    set_tests_properties(${NAUDIO_BRIDGE_ARMS} PROPERTIES TIMEOUT 600)
+    unset(NAUDIO_BRIDGE_ARMS)
     message(STATUS "naudio: naudio_bridge_fault_arm enabled (na_hamlib_bridge present)")
 endif()
 

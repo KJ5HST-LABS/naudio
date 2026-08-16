@@ -6,6 +6,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Changed
+- **`na_hamlib_bridge`'s periodic RX health line now carries `reads=`, the denominator of the gap
+  signature.** It reads
+  `rx: clients=1 gaps=418 reads=419 link_loss=0 overruns=0 underruns=0`, where it previously
+  omitted the read count. A bare `gaps=418` is not interpretable: 418 gaps over 419 reads is the
+  two ends disagreeing about how many bytes make a frame, while 418 over 40000 is ordinary packet
+  loss. The bridge already printed that ratio inside its one-time mis-framing warning; putting it
+  on every tick lets an operator — or an automated arm — apply the same test without waiting for
+  the warning to fire, and without trusting the warning to be the only thing that can see the
+  fault. Both counters are cumulative since the stream opened, so the ratio is the one the bridge's
+  own alarm tests.
+
 - **`tools/build-streaming-hamlib.sh` now builds Hamlib from upstream `Hamlib/Hamlib` @ `master`,
   not from PR #2116's fork branch.** The streaming subsystem
   ([PR #2116](https://github.com/Hamlib/Hamlib/pull/2116)) **merged upstream on 2026-08-15**, so

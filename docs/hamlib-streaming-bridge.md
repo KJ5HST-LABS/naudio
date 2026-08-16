@@ -523,8 +523,15 @@ the right rate, with perfect parity and `gaps=0` — it is indistinguishable fro
 every counter the bridge prints. Any check of this path has to look at the samples themselves;
 peak amplitude over a window is enough.
 
-Not verified, and not claimed: real hardware, this `-m 2` path on Linux — CI compiles and runs the
-bridge on Linux, but only against `-m 1` — and a link with a non-1500 MTU. FEC recovery under
+**This path now has an automated arm: `naudio_netrigctl_arm`** (`tests/bridge/netrigctl_arm.sh`,
+issue [#88](https://github.com/KJ5HST-LABS/naudio/issues/88) item 8). It stands up `rigctld -m 1`,
+runs the bridge over `-m 2` at both `-c 1` and `-c 2`, and fails on the gap-per-read signature
+described under "Version floor" below. It is registered wherever `na_hamlib_bridge` is — so the
+Linux `hamlib-bridge` CI job now drives `-m 2`, which nothing did before. The paragraph above is
+exactly why the arm requires a naudio client to receive *non-silent* audio before it will believe
+any gap counter: a silent source satisfies every other check on this page.
+
+Not verified, and not claimed: real hardware, and a link with a non-1500 MTU. FEC recovery under
 induced loss is covered below, on the `-m 1` path.
 
 ---
@@ -651,6 +658,13 @@ health ticks each; `-c 1` held 0 gaps on every combination that opened at all. U
 bridge nevertheless delivers full, correctly-framed stereo from it (a naudio client read
 **429112/430080 non-zero samples** off that run: populated stereo, not mono padded with silence).
 
+**This table is now gated rather than merely recorded.** `naudio_netrigctl_arm` is the automated
+form of its top and bottom rows, and it was driven RED against a `9f412fe` prefix before it was
+trusted: `-c 2` failed at **836 gaps over 837 RX reads** (41% of nominal) while `-c 1` passed at
+**0 gaps over 841** on that same old libhamlib — so the arm detects the channel-specific fault, not
+"this libhamlib is too old for anything". Until it existed, an upstream revert would have falsified
+this section, and the bridge's compile-time advice with it, in silence.
+
 ### What was wrong before `961093f2`
 
 `\stream_open` carried only *type*, *format* and *sample rate* — there was **no channels field on
@@ -678,9 +692,13 @@ the floor is on the client side and why an old peer still works.
 A gap counter climbing at roughly one gap per received read while `link_loss` stays `0`:
 
 ```
-  rx: clients=0 gaps=421 link_loss=0 overruns=0 underruns=0
-  rx: audio 79662 B/s of 192000 expected (41%)
+  rx: clients=1 gaps=418 reads=419 link_loss=0 overruns=0 underruns=0
+  rx: audio 79160 B/s of 192000 expected (41%)
 ```
+
+`reads` is the denominator, and it is on the line so the ratio is readable without arithmetic: 418
+gaps over 419 reads is mis-framing; 418 over 40000 would be ordinary loss. (Re-measured 2026-08-16
+against a `9f412fe` bridge and peer — the same run `naudio_netrigctl_arm` is driven RED by.)
 
 That is not packet loss. The two ends disagree about how many bytes make a frame: the sender
 advances the wire timestamp by its own frame size, the receiver expects `payload_len` divided by

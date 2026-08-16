@@ -903,8 +903,19 @@ int main(int argc, char **argv) {
             struct rig_stream_stats st;
             int have_st = (rig_stream_get_stats(b.rig, b.rx, &st) == RIG_OK);
             if (have_st) {
-                printf("  rx: clients=%d gaps=%u link_loss=%u overruns=%u underruns=%u\n",
-                       na_server_client_count(b.srv), st.gaps, st.link_loss,
+                /* `reads` is the DENOMINATOR of the gap signature, and it is on this line for the
+                 * same reason the warning below prints it: a bare `gaps=421` is unreadable. 421
+                 * gaps over 842 reads is the two ends disagreeing about frame size; 421 over 40000
+                 * is ordinary loss. Both are cumulative since rx_meter_start, so the ratio they
+                 * form is the same one the alarm below tests.
+                 *
+                 * The warning states that ratio ONCE, when it fires. This states it every tick, so
+                 * an observer can apply the test itself instead of trusting the bridge's own
+                 * detector to be the only thing in the world that can see the fault — which is
+                 * what tests/bridge/netrigctl_arm.sh does, and why that arm does not go green when
+                 * the alarm's condition is what breaks. Issue #88 item 8. */
+                printf("  rx: clients=%d gaps=%u reads=%llu link_loss=%u overruns=%u underruns=%u\n",
+                       na_server_client_count(b.srv), st.gaps, rx_reads, st.link_loss,
                        st.overruns, st.underruns);
             }
             /* Delivered rate, reported but never used as the alarm: it reflects how fast the
