@@ -830,6 +830,15 @@ bool Socket::sendAll(const void* buf, std::size_t len) {
                 // condition above removed can reach every other exit here but never this one,
                 // which is what makes the test assertion on it a real detector on platforms
                 // where the clock cannot separate the two (issue #88 item 6).
+                //
+                // REACHED ON POSIX ONLY, in practice. This whole branch sits inside `n > 0`,
+                // because a partial write is the event that re-arms a fresh SO_SNDTIMEO and so
+                // is what #70 exists to bound. Winsock reports no byte count on a timed-out
+                // blocking send, so a wedged Windows call never presents a partial write and
+                // exits via SendFailed below instead — the call is still bounded by one
+                // deadline (budgetMs IS sendTimeoutMs, so the two limits are the same number),
+                // but this line does not run and the test arm cannot detect a mutant there.
+                // Measured on windows-latest 2026-08-15; see tests/net/test_socket.cpp.
                 g_lastSendStop = SendStop::Budget;
                 return false;
             }

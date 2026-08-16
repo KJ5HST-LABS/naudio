@@ -434,8 +434,53 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
     //
     // Socket::SendStop::Budget is set at exactly one statement in sendAll — the whole-call
     // budget check itself — so a build with that check removed cannot produce it however the
-    // scheduler behaves. That makes this line platform-independent BY CONSTRUCTION rather than
-    // by tuning, which is the property the clock-based assertions could never have.
+    // scheduler behaves. That makes the POSIX expectation below immune to scheduling, which is
+    // the property the clock-based assertions could never have.
+    //
+    // IT DOES NOT MAKE IT PLATFORM-INDEPENDENT, and an earlier revision of this comment claimed
+    // it did. windows-latest DISPROVED that on the first CI run that reached it (2026-08-15, run
+    // 31915528485): got SendFailed, want Budget. The claim was wrong about WHICH exit a wedged
+    // Winsock socket takes, not about the single assignment site, which still holds.
+    //
+    // WHY WINDOWS CANNOT REACH THE BUDGET EXIT HERE. sendAll checks the whole-call budget only
+    // AFTER a partial write — inside the `n > 0` branch — because a partial write is the event
+    // that re-arms a fresh SO_SNDTIMEO and so is the thing #70 exists to bound. The budget value
+    // IS sendTimeoutMs(), so the whole-call limit and the per-send limit are THE SAME NUMBER;
+    // whichever is consulted first ends the call. On Linux/macOS the kernel send buffer takes
+    // data immediately, so partial writes happen early, the budget check is reached, and it
+    // fires. On Winsock the arm must disable send buffering outright to wedge at all (see the
+    // SO_SNDBUF note at the top), and a blocking ::send then spends the entire deadline window
+    // inside ONE call — so the per-send timeout returns first and the budget is never consulted.
+    //
+    // MEASURED, and every other assertion in this arm passed on that run: sendOk false (the
+    // socket really wedged), drainedDuringCall > 0 (the peer was alive and bytes moved), and the
+    // call ended in 244 ms against a 200 ms deadline. So ISSUE #70's GUARANTEE HELD ON WINDOWS —
+    // the call was bounded by one deadline, not by N — and SendFailed is an ACCURATE report
+    // there: a ::send did time out. What Windows loses is the ability to tell a slow-but-live
+    // peer from a dead one, because Winsock reports no byte count on a timed-out blocking send.
+    // That is a platform limit on the information available, not a defect in sendAll, and it is
+    // why na_client/Socket consumers on Windows must not read SendFailed as "the peer is gone".
+    //
+    // CONSEQUENCE FOR DETECTION, stated plainly rather than left for the next reader to find:
+    // THIS ARM DETECTS THE #70 MUTANT ON POSIX ONLY. Deleting the budget check changes nothing
+    // observable on Windows, because the branch is unreachable here. The Windows expectation
+    // below is still SPECIFIC — SendFailed, not "any reason" — so it keeps catching Ok (the
+    // wedge failed to stage) and NotEntered (the socket was already closed), which is the
+    // difference between a narrowed assertion and a vacuous one. Do NOT relax it to a range.
+#ifdef _WIN32
+    EXPECT_EQ(stopReason.load(), static_cast<int>(Socket::SendStop::SendFailed))
+        << "on Winsock this call must end on the PER-SEND timeout (SendFailed="
+        << static_cast<int>(Socket::SendStop::SendFailed) << "), because send buffering is off "
+           "here and one blocking ::send consumes the whole deadline window without ever "
+           "reporting the partial write that would reach the budget check. Got "
+        << stopReason.load() << ". Ok=" << static_cast<int>(Socket::SendStop::Ok)
+        << " would mean the wedge did not stage; NotEntered="
+        << static_cast<int>(Socket::SendStop::NotEntered)
+        << " would mean the socket was already closed; Budget="
+        << static_cast<int>(Socket::SendStop::Budget)
+        << " would mean Winsock started reporting partial writes on a timed-out send, which "
+           "would be GOOD NEWS — swap this arm to the POSIX expectation if you see it.";
+#else
     EXPECT_EQ(stopReason.load(), static_cast<int>(Socket::SendStop::Budget))
         << "sendAll returned false for a reason OTHER than the whole-call budget (got "
         << stopReason.load() << ", want " << static_cast<int>(Socket::SendStop::Budget)
@@ -445,6 +490,7 @@ TEST(Socket, SendAllStopsAtItsBudgetWhenThePeerOnlyTrickles) {
         << "). SendFailed here means the peer's drain never freed room inside one deadline "
            "window, so this call ended on the per-send timeout and issue #70's budget was "
            "never consulted — the wedge staged, but the thing under test did not run.";
+#endif
 
     // It waited (so the budget is doing the work, not an instant refusal) and it stopped
     // well inside the drip-feed's own timescale. Both bounds derive from kDeadlineMs.

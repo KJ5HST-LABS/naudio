@@ -79,6 +79,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `::send` failed or timed out with no room freed, or the socket was already closed. A caller that
   needs to distinguish "the budget ended a call that was making progress" from "the peer went
   quiet" previously could not, and neither could the test suite — which is what motivated this.
+  **On Windows that distinction is still unavailable, and the accessor says so rather than
+  guessing:** the budget is consulted only after a partial write, and Winsock reports no byte
+  count on a timed-out blocking send, so a wedged call returns `SendFailed` having made progress
+  it could not report. The call remains bounded by one deadline — issue #70's guarantee holds on
+  every platform — but `Budget` is effectively POSIX-only, which the header now states.
   Static and thread-local rather than a member, so threads sharing one `Socket` (the writer bridge
   does) each get their own answer and `sizeof(Socket)` is unchanged. Purely additive: `sendAll`'s
   signature and behaviour are untouched, and the one in-tree call site is unaffected.

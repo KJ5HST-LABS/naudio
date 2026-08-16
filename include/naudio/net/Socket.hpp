@@ -377,6 +377,13 @@ public:
         SendFailed,  // ::send failed or timed out with no room freed
         NotEntered,  // the socket was closed/invalid before the first ::send
     };
+    // ON WINDOWS, Budget IS EFFECTIVELY UNREACHABLE — do not read SendFailed there as "the peer
+    // is gone". The budget is consulted only after a partial write (that being the event which
+    // re-arms a fresh SO_SNDTIMEO), and Winsock reports no byte count on a timed-out blocking
+    // send, so a wedged call returns via the per-send path having made unreported progress. The
+    // call is still bounded by one deadline — #70's guarantee holds — but a slow-but-live peer
+    // and a dead one are indistinguishable on that platform, because the information needed to
+    // tell them apart is not in the API. Measured 2026-08-15; POSIX reports Budget as documented.
     static SendStop lastSendStop() noexcept;
 
     // --- datagram I/O (UDP) ---
