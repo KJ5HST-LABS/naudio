@@ -102,6 +102,20 @@ public:
     // Non-const because the UDP implementation piggybacks a control-retransmit
     // pass (which sends) on this poll; the TCP implementation is a pure check.
     virtual bool shouldSendHeartbeat() = 0;
+
+    // Runs ONE control-ARQ retransmit sweep, resending any critical control whose timeout has
+    // expired. Defaulted rather than pure virtual — unlike trySendControl above, where a
+    // plausible default would silently reinstate the bug: TCP is a reliable ordered stream and
+    // has no control-ARQ at all, so doing nothing is the CORRECT behaviour there, not a
+    // placeholder waiting for an override. Same shape as the UDP-only statistics defaults below.
+    //
+    // Exists because the sweep's other pump — shouldSendHeartbeat — is reached only from the
+    // heartbeat loop, and that loop is gated on connected_, which is not set until AFTER
+    // performHandshake returns. So a critical control sent DURING the handshake has no pump at
+    // all unless something calls this. That gap is why ControlType::Disconnect is tracked and
+    // never actually resent, and it would have made ConnectRequest inert in the same way
+    // (issue #29 option 4).
+    virtual void pumpControlRetransmits() {}
     virtual bool isConnectionTimedOut() const = 0;
     virtual std::int64_t timeSinceLastReceive() const = 0;
 

@@ -121,6 +121,20 @@ std::optional<ControlMessage> ControlReliability::generateAck(const AudioPacket&
 
 bool ControlReliability::isCriticalType(ControlType type) {
     switch (type) {
+        // The client's half of the handshake (issue #29 option 4). Every OTHER message in the
+        // connection-establishment exchange was already critical — ConnectAccept, ConnectReject,
+        // AudioConfig — so a lost server reply recovered in one retransmit interval while a lost
+        // CLIENT request cost the caller the whole na_client_connect timeout and a failed connect.
+        // That asymmetry is the thing being removed; it is not a frame-format change.
+        //
+        // BEING CRITICAL IS NECESSARY BUT NOT SUFFICIENT, and the other half is easy to lose:
+        // recordSent only makes an entry PENDING. Something must run the sweep, and the sweep's
+        // usual pump (shouldSendHeartbeat) belongs to the heartbeat loop, which does not start
+        // until after the handshake has already returned. AudioStreamClient::performHandshake
+        // therefore waits in slices and calls ClientConnection::pumpControlRetransmits between
+        // them. Delete that and this line silently does nothing — which is exactly how
+        // ControlType::Disconnect came to be tracked-but-never-resent, the defect #29 reported.
+        case ControlType::ConnectRequest:
         case ControlType::ConnectAccept:
         case ControlType::ConnectReject:
         case ControlType::AudioConfig:

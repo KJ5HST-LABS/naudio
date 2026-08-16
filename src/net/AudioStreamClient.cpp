@@ -41,6 +41,44 @@ std::int64_t nowNanos() {
         .count();
 }
 
+// How long one handshake receive parks before the control-ARQ sweep gets a turn (issue #29
+// option 4). Bounded well below ControlReliability::DEFAULT_TIMEOUT_MS (500 ms) so a retransmit
+// goes out within about one slice of falling due, rather than up to a whole timeout late.
+constexpr int kHandshakeSliceMs = 100;
+
+// Waits up to timeoutMs for one packet, in slices, running the control-ARQ sweep between them.
+// Total timeout semantics are unchanged from the single blocking receivePacket this replaces —
+// only the parking is broken up.
+//
+// WHY IT HAS TO BE SLICED AT ALL. The handshake runs on the caller's thread, before connected_ is
+// set and therefore before the heartbeat loop that normally pumps the sweep exists. One blocking
+// receivePacket(kConnectTimeoutMs) parks the only thread that could resend the CONNECT_REQUEST for
+// the entire connect window — so marking that message critical would make it pending and never
+// resend it, which is precisely the state ControlType::Disconnect is in and precisely what
+// issue #29 reported. The enum entry and this loop are one change in two files.
+//
+// steady_clock DELIBERATELY, not this file's nowMillis(), which reads system_clock: a wall-clock
+// step mid-handshake would either expire this loop at once or park it far past its deadline.
+// ControlReliability carried exactly that bug and it is fixed in this release — do not reintroduce
+// it here.
+ReceiveResult receiveWhilePumpingArq(const std::shared_ptr<ClientConnection>& connection,
+                                     int timeoutMs) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now())
+                                   .count();
+        if (remaining <= 0) return ReceiveResult::noData();
+        const int slice = static_cast<int>(std::min<std::int64_t>(remaining, kHandshakeSliceMs));
+        ReceiveResult r = connection->receivePacket(slice);
+        // A closed peer is an ANSWER, not a timeout: return it instead of spinning out the rest
+        // of the window on a connection that is already gone. Dropping this would turn a prompt
+        // "connection refused" into a full kConnectTimeoutMs stall.
+        if (r.hasPacket() || r.closed) return r;
+        connection->pumpControlRetransmits();
+    }
+}
+
 }  // namespace
 
 AudioStreamClient::AudioStreamClient(std::string serverHost, std::uint16_t serverPort,
@@ -225,7 +263,7 @@ bool AudioStreamClient::performHandshake(const std::shared_ptr<ClientConnection>
         return false;
     }
 
-    ReceiveResult r = connection->receivePacket(kConnectTimeoutMs);
+    ReceiveResult r = receiveWhilePumpingArq(connection, kConnectTimeoutMs);
     if (!r.hasPacket()) {
         notifyError("local", "Handshake timeout");
         return false;
@@ -257,7 +295,7 @@ bool AudioStreamClient::performHandshake(const std::shared_ptr<ClientConnection>
                 }
             }
         }
-        r = connection->receivePacket(kConnectTimeoutMs);
+        r = receiveWhilePumpingArq(connection, kConnectTimeoutMs);
     }
     return false;
 }

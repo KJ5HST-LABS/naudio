@@ -251,6 +251,9 @@ public:
 
     // --- Heartbeat / timeout ---
     bool shouldSendHeartbeat() override;
+    // The same sweep shouldSendHeartbeat piggybacks on, reachable on its own so the handshake
+    // can run it before the heartbeat loop exists (issue #29 option 4).
+    void pumpControlRetransmits() override { checkControlRetransmits(); }
     bool isConnectionTimedOut() const override {
         return nowMs() - lastReceiveTime_.load() > UDP_CONNECTION_TIMEOUT_MS;
     }

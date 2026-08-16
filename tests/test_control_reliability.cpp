@@ -52,7 +52,59 @@ TEST(ControlReliability, NonCriticalTypesAreNotTracked) {
     EXPECT_FALSE(ControlReliability::isCriticalType(ControlType::StatsUpdate));
     EXPECT_FALSE(ControlReliability::isCriticalType(ControlType::Nack));
     EXPECT_FALSE(ControlReliability::isCriticalType(ControlType::ControlAck));
-    EXPECT_FALSE(ControlReliability::isCriticalType(ControlType::ConnectRequest));
+    // ConnectRequest MOVED to the critical set in issue #29 option 4 and is asserted in the arm
+    // below. It was listed here originally as the deliberate odd-one-out — the only
+    // connection-establishment message that was not protected — so this deletion is the contract
+    // change itself, not a test being loosened to fit the code.
+    //
+    // The four kept above are non-critical for reasons that have not changed: Heartbeat and
+    // HeartbeatAck are self-repairing (the next one is along in an interval), LatencyProbe and
+    // StatsUpdate are advisory, and Nack/ControlAck are the ARQ machinery itself — tracking those
+    // would have an acknowledgement demand an acknowledgement.
+}
+
+// The other side of the line above: every message that establishes a connection is now
+// retransmitted, in BOTH directions. Before issue #29 option 4 the client's opening request was
+// the sole exception, so a single lost datagram cost the caller the entire na_client_connect
+// timeout and returned a failure, while a lost reply from the server recovered in one retransmit
+// interval. Asserted as a set rather than as one value so that removing any of the four reddens.
+TEST(ControlReliability, EveryHandshakeMessageIsCritical) {
+    EXPECT_TRUE(ControlReliability::isCriticalType(ControlType::ConnectRequest));
+    EXPECT_TRUE(ControlReliability::isCriticalType(ControlType::ConnectAccept));
+    EXPECT_TRUE(ControlReliability::isCriticalType(ControlType::ConnectReject));
+    EXPECT_TRUE(ControlReliability::isCriticalType(ControlType::AudioConfig));
+}
+
+// Critical is only half of it: recordSent has to actually make the request pending, or the sweep
+// has nothing to resend. This is the unit-level half of the claim; the end-to-end half — that
+// something PUMPS that sweep during a handshake — is in tests/net/test_client_handshake_arq.cpp,
+// because a pending entry nobody sweeps is exactly the inert state ControlType::Disconnect is in.
+TEST(ControlReliability, RecordSentTracksAConnectRequest) {
+    ControlReliability r = reliability();
+    r.recordSentAt(controlPacket(1, ControlMessage::connectRequest("cli", 1)), 1000);
+    EXPECT_EQ(1u, r.pendingCount());
+}
+
+// The RECEIVER's half, and the only cheap place to pin it. Being tracked makes a request
+// retransmittable; being acknowledged is what stops the timer. Without this, a CONNECT_REQUEST
+// could be tracked-but-never-ACKed and every single connection would pay two wasted datagrams —
+// and no end-to-end arm would see it, because after connect the sweep is pumped only by the
+// heartbeat loop's 3000 ms tick, so any affordable sleep in an e2e test finishes before the first
+// sweep. That was measured, not assumed: an 800 ms delayed check in
+// Client.HandshakeThroughALosslessRelayIsUnaffected SURVIVED a receiver patched to withhold this
+// ACK. This arm kills that same mutation instantly.
+//
+// It is also the interop probe for issue #29 option 4 in miniature: a peer that does not treat
+// CONNECT_REQUEST as critical returns nullopt here, which is exactly what an older server does.
+TEST(ControlReliability, GeneratesAnAckForAConnectRequest) {
+    ControlReliability r = reliability();
+    const std::optional<ControlMessage> ack =
+        r.generateAck(controlPacket(7, ControlMessage::connectRequest("cli", 1)));
+    ASSERT_TRUE(ack.has_value())
+        << "no CONTROL_ACK for a CONNECT_REQUEST — the sender will retransmit it until its "
+           "attempt budget is spent, on every connection";
+    EXPECT_EQ(ack->messageType(), ControlType::ControlAck);
+    EXPECT_EQ(ack->parseControlAckSequence(), 7);
 }
 
 TEST(ControlReliability, RecordSentTracksCriticalControls) {
