@@ -5,6 +5,35 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **`na_client_stats.fec_pending_discarded` (`@since 0.4.0`) — audio packets dropped from a pending
+  FEC block without ever having been offered to a parity: repair capacity that expired.** It is the
+  missing half of the answer to *"why is `packets_recovered_by_fec` zero while every other counter
+  looks healthy?"* — the question that took two sessions to resolve on this project before the
+  counter existed at all. A non-zero reading says the decoder was holding block members it never got
+  to weigh, so the opportunity was lost upstream of any decision it made. A **sibling** of
+  `fec_blocks_unreconciled`, not a residue of `packets_recovered_by_fec`: that counts blocks the
+  decoder *declined*, this counts material it never got to decline on.
+
+  **It is not audio loss**, and the name invites exactly that misreading. The decoder emits every
+  audio packet to the application **on arrival** and only then caches a copy for FEC, so the pending
+  block is a repair cache and this counts copies leaving it — the audio itself was already
+  delivered, in order. Read as a loss meter it double-counts against `sequence_gaps`. It also does
+  not imply a decline: only the retention-cap mechanism also moves `fec_blocks_unreconciled`, while
+  the idle timeout moves this alone. `-1` where no FEC decoder exists (every profile but
+  `NA_RELIABILITY_UDP_WAN`, and TCP).
+
+  Observed moving through the public C ABI **before** this contract was written: a relay dropping
+  every parity leaves no block able to complete, giving **409 discards against 0** on the identical
+  lossless path, with 455 audio packets still delivered. The paired arms are in
+  `tests/c_client_stats.c` — asserted as a comparison rather than as `> 0`, because the counter can
+  move on a clean run too when the trailing partial block idles out. Version accordingly moves
+  0.3.0 → 0.4.0, and `NA_CLIENT_STATS_SIZE_V4` joins V1/V2/V3 rather than V3 being redefined.
+
+- **`ClientConnection::fecPendingPacketsDiscarded()` and `ClientStats::fecPendingDiscarded`** — the
+  C++ path behind that field. `FecDecoder` has counted the event since the retention-policy work;
+  nothing carried it up to a consumer.
+
 ### Changed
 - **`CONNECT_REQUEST` is now an ARQ-protected control message, so a client's handshake survives a
   lost datagram** (spec 1.1, §8.4). It was the only message in the connection-establishment

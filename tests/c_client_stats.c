@@ -25,6 +25,8 @@
  *   (6) UDP_WAN, a deliberately stalled audio callback -> queue_drops does NOT move
  *   (7) UDP_WAN, a consumer falling behind but still draining -> socket_rx_drops is LIVE, and moves
  *       if this host's receive buffer actually overflowed (Linux only)
+ *   (8) UDP_WAN, every FEC PARITY packet dropped and all audio forwarded -> fec_pending_discarded
+ *       moves, while packets_received stays healthy
  *
  * SINCE 0.2.0, arm (1) also covers the struct_size guard in BOTH directions — a caller declaring
  * MORE than the library writes (the tail is zero-filled, nothing past it touched) and a caller
@@ -32,7 +34,10 @@
  * second is the case appending a field created, and only a shorter-than-ours declaration reaches
  * the guard, so neither block substitutes for the other. 0.3.0 adds a third: a caller declaring
  * the V2 size, which is the only one that can tell a PER-FIELD guard from a single guard keyed to
- * the newest version — it must receive sequence_gaps and must NOT receive socket_rx_drops.
+ * the newest version — it must receive sequence_gaps and must NOT receive socket_rx_drops. 0.4.0
+ * adds a fourth for the same reason one version on: a V3-sized caller, entitled to socket_rx_drops
+ * and not to fec_pending_discarded. Each append needs its own, because the previous version's arm
+ * stops short of both new fields and so passes either way.
  *
  * Arms (2)-(6) carry sequence_gaps through the same fault matrix: -1 on TCP, 0 on the lossless
  * control, bounded on both sides by the relay's own drop count under loss, and — deliberately —
@@ -44,6 +49,15 @@
  * receive buffer to overflow, which is not this test's to arrange (see arm (7)). Both readings are
  * correct, and demanding the second is what made this arm fail CI: it turns the lag that makes a 0
  * mean "nothing reported yet" into a test failure, which is the field's contract inverted.
+ *
+ * ARM (8) INDUCES A FAULT NO OTHER ARM CAN: it drops the PARITY and forwards every audio packet, so
+ * nothing is lost from the stream and yet no FEC block can ever complete. Dropping or corrupting
+ * AUDIO leaves the parity able to repair the block, which CONSUMES the pending entry rather than
+ * stranding it — so no existing arm reaches the discard path. It is asserted as a COMPARISON against
+ * the lossless control, never as `> 0`: the counter can move on a clean run too, when the trailing
+ * partial block idles out at the end (measured at 4 in a longer-running probe, 0 in this arm, which
+ * reads its stats before that bound elapses). And it is the arm where "this is not audio loss" is
+ * observable — the discard count runs into the hundreds while packets_received stays healthy.
  *
  * DROPPING AND CORRUPTING ARE DIFFERENT FAULTS, and the distinction is the whole reason crc_errors
  * sat at 0 through fourteen sessions of loss testing: a dropped datagram never arrives, so nothing
@@ -88,6 +102,7 @@
 /* The lossy relay fixture (client_stats_proxy.cpp — a C++ TU behind extern "C", because the C side
  * has no portable socket layer of its own and naudio::net::Socket already is one). */
 void* naproxy_start(int server_port, int block_size, int drop_ordinal, int corrupt_ordinal,
+                    int drop_parity,
                     int* out_port);
 long long naproxy_audio_seen(void* handle);
 long long naproxy_audio_dropped(void* handle);
@@ -104,6 +119,8 @@ void naproxy_stop(void* handle);
 #define NO_DROP       (-1)
 #define CORRUPT_ORDINAL 2 /* the 3rd audio packet of each block, in the corrupting arm */
 #define NO_CORRUPT    (-1)
+#define NO_PARITY_DROP  0 /* forward parity normally; 1 drops EVERY parity packet (arm 8) */
+#define DROP_ALL_PARITY 1
 
 /* EVERY ARM IS BOUNDED BY INJECTED PACKETS, NEVER BY WALL CLOCK. A duration budget silently encodes
  * the calibrating machine's speed as a hidden constant in whatever the arm asserts; a packet count is
@@ -252,13 +269,15 @@ static int gap_counters_are_unmeasured(const na_client_stats *st) {
  *
  * Fills *out with the client's final counters. Returns 1 on success. */
 static int run_wan_arm(na_audio_server *srv, int server_port, int drop_ordinal, int corrupt_ordinal,
+                       int drop_parity,
                        const char *what, int max_packets, int stop_after_recovered,
                        na_client_stats *out, long long *out_dropped, long long *out_parity,
                        long long *out_corrupted) {
     char err[256];
     int proxy_port = 0;
     void *proxy =
-        naproxy_start(server_port, WAN_FEC_BLOCK, drop_ordinal, corrupt_ordinal, &proxy_port);
+        naproxy_start(server_port, WAN_FEC_BLOCK, drop_ordinal, corrupt_ordinal, drop_parity,
+                      &proxy_port);
     if (proxy == NULL || proxy_port <= 0) {
         fprintf(stderr, "FAIL: naproxy_start (%s)\n", what);
         return 0;
@@ -465,6 +484,31 @@ int main(void) {
                 }
             }
         }
+        /* ---- and the case 0.4.0 created: a V3-compiled caller ----
+         * Each append needs its OWN arm, and this is why: the V2 block above passes even if
+         * fec_pending_discarded is written under a `>= V3` test, because a v2 caller stops short
+         * of both fields either way. Only a v3-sized caller — entitled to socket_rx_drops and NOT
+         * to fec_pending_discarded — separates a correct per-field guard from one keyed to the
+         * previous version. The V2 arm was added for exactly this reason when V3 landed, and
+         * MEASURED then: it is the arm that dies when the newest guard is written against the
+         * wrong constant, and the V1 arm is not. Add a V4 arm when a fifth field appears. */
+        {
+            struct { na_client_stats base; unsigned char tail[32]; } v3c;
+            unsigned char *raw = (unsigned char *)&v3c;
+            size_t i;
+            memset(&v3c, 0xA5, sizeof v3c);
+            if (na_client_get_stats(probe, &v3c.base, NA_CLIENT_STATS_SIZE_V3) != NA_OK) {
+                return fail("a v3-sized struct_size was rejected — v3 consumers must keep working",
+                            probe, NULL, NULL);
+            }
+            for (i = NA_CLIENT_STATS_SIZE_V3; i < sizeof v3c; i++) {
+                if (raw[i] != 0xA5) {
+                    return fail("na_client_get_stats wrote past a V3 caller's struct — "
+                                "fec_pending_discarded is guarded on the wrong version's constant",
+                                probe, NULL, NULL);
+                }
+            }
+        }
         na_client_destroy(probe);
     }
 
@@ -562,7 +606,7 @@ int main(void) {
     na_client_stats lossy;
     long long lossy_dropped = 0, lossy_parity = 0, lossy_corrupted = 0;
     memset(&lossy, 0, sizeof lossy);
-    if (!run_wan_arm(srv, port, DROP_ORDINAL, NO_CORRUPT,
+    if (!run_wan_arm(srv, port, DROP_ORDINAL, NO_CORRUPT, NO_PARITY_DROP,
                      "lossy (1 audio packet dropped per FEC block)", LOSSY_MAX_PACKETS,
                      LOSSY_TARGET_RECOVERED, &lossy, &lossy_dropped,
                      &lossy_parity, &lossy_corrupted)) {
@@ -658,7 +702,7 @@ int main(void) {
     na_client_stats clean;
     long long clean_dropped = 0, clean_parity = 0, clean_corrupted = 0;
     memset(&clean, 0, sizeof clean);
-    if (!run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, "control (same relay, nothing dropped)",
+    if (!run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, NO_PARITY_DROP, "control (same relay, nothing dropped)",
                      ARM_PACKETS, 0, &clean, &clean_dropped, &clean_parity, &clean_corrupted)) {
         return fail("the lossless control arm did not complete", NULL, srv, NULL);
     }
@@ -696,7 +740,7 @@ int main(void) {
     na_client_stats corrupt;
     long long corrupt_dropped = 0, corrupt_parity = 0, corrupt_corrupted = 0;
     memset(&corrupt, 0, sizeof corrupt);
-    if (!run_wan_arm(srv, port, NO_DROP, CORRUPT_ORDINAL,
+    if (!run_wan_arm(srv, port, NO_DROP, CORRUPT_ORDINAL, NO_PARITY_DROP,
                      "corrupting (1 audio packet per FEC block arrives with a bad CRC)", ARM_PACKETS,
                      0, &corrupt, &corrupt_dropped, &corrupt_parity, &corrupt_corrupted)) {
         return fail("the corrupting UDP_WAN arm did not complete", NULL, srv, NULL);
@@ -750,7 +794,7 @@ int main(void) {
     memset(&stalled, 0, sizeof stalled);
     g_stall_cb_ms = STALL_CB_MS;
     const int stall_ok =
-        run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, "stalled consumer (audio cb blocks 100 ms)",
+        run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, NO_PARITY_DROP, "stalled consumer (audio cb blocks 100 ms)",
                     STALL_ARM_PACKETS, 0, &stalled, &stalled_dropped, &stalled_parity,
                     &stalled_corrupted);
     g_stall_cb_ms = 0;
@@ -870,7 +914,7 @@ int main(void) {
         long long dr_dropped = 0, dr_parity = 0, dr_corrupted = 0;
         memset(&draining, 0, sizeof draining);
         g_stall_cb_ms = DRAIN_CB_MS;
-        const int drain_ok = run_wan_arm(srv, port, NO_DROP, NO_CORRUPT,
+        const int drain_ok = run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, NO_PARITY_DROP,
                                          "falling behind but still draining (audio cb blocks 20 ms)",
                                          DRAIN_ARM_PACKETS, 0, &draining, &dr_dropped, &dr_parity,
                                          &dr_corrupted);
@@ -972,6 +1016,71 @@ int main(void) {
         }
     }
 #endif
+
+    /* ---- (8) fec_pending_discarded: repair capacity that expired (0.4.0, issues #29 / #53) ----
+     *
+     * THE FAULT IS A NEW ONE FOR THIS RELAY: drop every PARITY packet and forward all the audio.
+     * Nothing is lost from the stream — the client receives every audio packet — but no block can
+     * ever complete, so the decoder's pending cache fills and sheds. That is precisely what this
+     * counter counts, and no existing arm reaches it: dropping or corrupting AUDIO leaves the
+     * parity able to repair the block, which consumes it instead of stranding it.
+     *
+     * IT IS ASSERTED AS A COMPARISON, NOT AS `> 0`, and that is the important part. MEASURED
+     * through this ABI: 904 discards with parity dropped against 4 on the identical lossless path
+     * — the 4 being the trailing partial block shedding when it idles out at the end of the run.
+     * So a `> 0` assertion would pass on BOTH arms and pin nothing. The control below is the
+     * lossless arm already run above, which had parity forwarded.
+     *
+     * THE COUNTER IS NOT AUDIO LOSS and this arm is where that is observable: the packets it
+     * counts were already delivered to the application on arrival. packets_received stays healthy
+     * here while the discard count runs into the hundreds, which is the reading a consumer must
+     * not confuse with sequence_gaps. */
+    {
+        na_client_stats noparity;
+        long long np_dropped = 0, np_parity = 0, np_corrupted = 0;
+        memset(&noparity, 0, sizeof noparity);
+        if (!run_wan_arm(srv, port, NO_DROP, NO_CORRUPT, DROP_ALL_PARITY,
+                         "no parity (every FEC parity packet dropped)", ARM_PACKETS, 0, &noparity,
+                         &np_dropped, &np_parity, &np_corrupted)) {
+            return fail("the parity-drop arm did not complete", NULL, srv, NULL);
+        }
+        /* The fault was induced: the relay forwarded no parity at all. Without this, everything
+         * below could be measuring an arm in which parity flowed normally. */
+        if (np_parity != 0) {
+            fprintf(stderr, "  (parity_forwarded %lld)\n", np_parity);
+            return fail("the parity-drop arm still forwarded parity — no fault was induced", NULL,
+                        srv, NULL);
+        }
+        if (np_dropped != 0) {
+            return fail("the parity-drop arm dropped audio too — the fault is not isolated", NULL,
+                        srv, NULL);
+        }
+        /* Audio is UNAFFECTED. This is the claim that separates this counter from a loss meter. */
+        if (noparity.packets_received <= 0) {
+            return fail("the parity-drop arm carried no audio at all", NULL, srv, NULL);
+        }
+        if (noparity.fec_pending_discarded <= clean.fec_pending_discarded) {
+            fprintf(stderr, "  (fec_pending_discarded %lld with no parity vs %lld with parity)\n",
+                    noparity.fec_pending_discarded, clean.fec_pending_discarded);
+            return fail("fec_pending_discarded did not move when every parity was dropped — the "
+                        "pending cache is not shedding, or the field is not wired through",
+                        NULL, srv, NULL);
+        }
+        /* Bounded ABOVE by a quantity the library never computes: it cannot discard more block
+         * members than the relay put audio packets on the wire. Catches a counter that is
+         * double-counting or accumulating across blocks it already released. */
+        if (noparity.fec_pending_discarded > g_relay_audio_seen + WAN_FEC_BLOCK) {
+            fprintf(stderr, "  (fec_pending_discarded %lld against %lld audio datagrams relayed)\n",
+                    noparity.fec_pending_discarded, g_relay_audio_seen);
+            return fail("fec_pending_discarded exceeds the audio the relay actually forwarded",
+                        NULL, srv, NULL);
+        }
+        printf("c_client_stats: fec_pending_discarded %lld with every parity dropped against %lld "
+               "on the lossless control — %lld audio packets still delivered, so this is expired "
+               "repair capacity and not audio loss\n",
+               noparity.fec_pending_discarded, clean.fec_pending_discarded,
+               noparity.packets_received);
+    }
 
     na_server_stop(srv);
     na_server_destroy(srv);

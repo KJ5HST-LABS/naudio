@@ -48,6 +48,7 @@ struct Proxy {
     int blockSize = 5;
     int dropOrdinal = 2;     // which audio packet within each block to drop (0-based)
     int corruptOrdinal = -1;  // which to corrupt instead; < 0 corrupts nothing
+    bool dropParity = false;  // drop EVERY parity packet, leaving no block able to complete
 
     std::thread worker;
     std::atomic<bool> stop{false};
@@ -97,6 +98,9 @@ void relayLoop(Proxy* p) {
                     p->audioCorrupted.fetch_add(1);
                 }
             } else if (pkt && pkt->packetType() == naudio::PacketType::FecParity) {
+                // Dropped BEFORE the forwarded counter moves, so parity_forwarded == 0 is the
+                // test's evidence that this fault was actually induced — no extra accessor.
+                if (p->dropParity) continue;
                 p->parityForwarded.fetch_add(1);
             }
             p->sock.sendTo(buf.data(), rr.bytes, clientHost, clientPort);
@@ -119,7 +123,7 @@ extern "C" {
 // disable that fault (both < 0 is the lossless, uncorrupted control arm — same extra hop, nothing
 // touched). Writes the bound port to *out_port. Returns an opaque handle, or nullptr on failure.
 void* naproxy_start(int server_port, int block_size, int drop_ordinal, int corrupt_ordinal,
-                    int* out_port) {
+                    int drop_parity, int* out_port) {
     if (server_port <= 0 || server_port > 65535 || block_size <= 0) return nullptr;
     auto* p = new Proxy();
     p->sock = naudio::net::Socket::bindUdp("127.0.0.1", 0, false, nullptr);
@@ -139,6 +143,7 @@ void* naproxy_start(int server_port, int block_size, int drop_ordinal, int corru
     p->blockSize = block_size;
     p->dropOrdinal = drop_ordinal;        // < 0 never matches an ordinal -> lossless
     p->corruptOrdinal = corrupt_ordinal;  // < 0 never matches an ordinal -> uncorrupted
+    p->dropParity = (drop_parity != 0);
     if (out_port != nullptr) *out_port = p->sock.localPort();
     p->worker = std::thread(relayLoop, p);
     return p;
