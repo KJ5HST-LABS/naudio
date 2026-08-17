@@ -139,20 +139,29 @@ which lives in `na_hamlib_bridge -k` and is blocked with path B.
 
 ### 5. The soak, and the drift verdict
 
-Run for hours, capturing the health output with a timestamp on every line:
+**Use `capture-probe`, not `hardware`, for the drift soak.** The two modes report different things,
+and only one of them carries a cumulative fault counter:
+
+| mode | periodic line | drift evidence |
+|---|---|---|
+| `capture-probe` | `t= 5s  frames=…  L=… dBFS  R=… dBFS  overflows=N` | **`overflows`, cumulative** — the counter the tail-growth test needs |
+| `hardware` | `t= 5s  rx=… B  … B/s (…%)  L=… dBFS  conn=N` | a rate, not a counter; the daemon prints its own `steady-rate` verdict at the end |
+
+So the multi-hour drift run is:
 
 ```bash
-./build/tools/na_audio_daemon --mode hardware --capture-id <N> --duration-ms 0 2>&1 \
-  | while IFS= read -r l; do printf '%s %s\n' "$(date +%s)" "$l"; done > soak.log
-```
-
-Then take the verdict:
-
-```bash
+./build/tools/na_audio_daemon --mode capture-probe --capture-id <N> --duration-ms 0 > soak.log 2>&1
 tests/bridge/health_drift.sh soak.log
 ```
 
-See the next section for what it decides and why.
+No timestamping wrapper is needed here — the daemon stamps its own `t=` on every line and the
+analyser reads it, so elapsed is reported as measured. (The epoch-prefix idiom below is for the
+bridge, whose health lines carry no clock.)
+
+Run `--mode hardware` as well, for the network hop and the remote listen — just read its
+`steady-rate` line for that half rather than expecting a counter verdict.
+
+See the next section for what the analyser decides and why.
 
 ---
 
@@ -188,14 +197,19 @@ health ticks is a fault, not a pass.
 asserted on by nothing — each either has a sharper detector elsewhere or is an input to the on-air
 test rather than a fault in it.
 
-**Timestamp the capture.** With epoch-prefixed lines the elapsed time is read from the log and
+**Two sources are understood:** the bridge's `rx:`/`tx:` health lines, and `na_audio_daemon
+--mode capture-probe`'s `t=… overflows=…` line. The daemon source needs no timestamping wrapper —
+it stamps its own clock. Both are covered by the gate below, because the daemon path is the one
+that can be pointed at a radio today and would otherwise be the untested half.
+
+**Timestamp the bridge capture.** With epoch-prefixed lines the elapsed time is read from the log and
 labelled `(measured)`; without them it is inferred from the nominal 5 s cadence and labelled as
 such — and an inferred clock cannot see a stalled producer, because it keeps counting. The verdict
 itself is computed from sample order, so it survives a missing clock; only the per-hour figures need
 one.
 
 The analyser is gated by `naudio_health_drift` (`--selftest`), which runs on every POSIX build and
-drives flat, sustained, timestamped and truncated logs through the real code path. That gate exists
+drives flat, sustained, timestamped, daemon-format and truncated logs through the real code path. That gate exists
 because a detector that spends its life reporting "no drift" is indistinguishable from a broken one
 unless something shows it can fire.
 

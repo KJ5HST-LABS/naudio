@@ -47,9 +47,17 @@
 # an absence that was never a measurement (CLAUDE.md L222). Same reason the empty-input case is a
 # fault and not a pass.
 #
-# ELAPSED TIME. Health lines carry no timestamp, so per-hour figures need one of two sources:
+# TWO INPUT FORMATS. This reads na_hamlib_bridge health lines (`rx:`/`tx:`) AND na_audio_daemon
+# --mode capture-probe lines (`t=Ns ... overflows=N`). The second is not an afterthought: the bridge
+# cannot be pointed at a radio at all until an upstream backend implements streaming
+# (docs/on-air-verification.md), so the daemon is the only source that carries REAL hardware today,
+# and an analyser that understood only the bridge would be an instrument for the blocked path alone.
+# The daemon source stamps its own `t=` clock, so it never needs the epoch-prefix capture below.
+#
+# ELAPSED TIME (bridge source). Health lines carry no timestamp, so per-hour figures need one of
+# two sources:
 #   1. Preferred — the capture prefixes each line with an epoch second, which is what the runbook in
-#      docs/hamlib-streaming-bridge.md does. Rates are then real wall clock, and a STALLED bridge
+#      docs/on-air-verification.md does. Rates are then real wall clock, and a STALLED bridge
 #      (ticks stop arriving) is visible as a widening gap.
 #   2. Fallback — no timestamps, so elapsed is inferred as tick_index * --nominal-tick-s (5 s, the
 #      bridge's 25 x 200 ms cadence). This is LABELLED "inferred" in the output, because it assumes
@@ -68,10 +76,15 @@
 # --selftest proves the detector can SPEAK before any radio is attached, and is registered as
 # naudio_health_drift so it runs on every build. It is the positive control: a detector for a fault
 # that has never been shown to fire is indistinguishable from a detector that is broken, and this
-# one will spend most of its life reporting "no drift". It drives three synthetic logs through the
-# real code path -- flat (must pass), sustained (must be caught, and must NAME the right counter),
-# truncated (must be a fault, not a pass) -- so all three verdicts are exercised, not just the
-# happy one.
+# one will spend most of its life reporting "no drift". It drives FIVE synthetic logs through the
+# real code path -- flat (must pass), sustained (must be caught, and must NAME the right counter
+# while NOT flagging the one that never moved), the runbook's timestamped capture (must read the
+# clock as measured, not inferred), na_audio_daemon's own capture-probe format (the only source
+# that can be pointed at a radio today), and truncated (must be a FAULT, not a pass) -- so every
+# verdict is exercised, not just the happy one.
+#
+# Verified by mutation rather than by its own green: stubbing the tail-growth computation to return
+# 0 reddens 4 of the 9 assertions.
 set -uo pipefail
 
 MIN_TICKS=8
@@ -129,6 +142,23 @@ analyse() {
         }
         next
     }
+    # na_audio_daemon --mode capture-probe, a DIFFERENT program with a different line:
+    #   "  t= 5s  frames=240000  L=-42.3 dBFS  R=-inf dBFS  overflows=0"
+    # It is here because the daemon is the only one of the two that can be pointed at a radio today
+    # (docs/on-air-verification.md), so an analyser that understood only the bridge would serve only
+    # the blocked path. Two gifts from this format: `overflows` is cumulative, exactly like the
+    # bridge counters, and `t=` is an elapsed clock the producer itself stamped — so this source
+    # never needs the epoch-prefix capture, and never falls back to an inferred cadence.
+    /t=[0-9]+s/ && /overflows=/ {
+        n_dm++
+        for (i = 1; i <= NF; i++) {
+            if (split($i, kv, "=") == 2) {
+                if (kv[1] == "overflows") oflow[n_dm] = kv[2] + 0
+                if (kv[1] == "t")         { sub(/s$/, "", kv[2]); dm_t[n_dm] = kv[2] + 0 }
+            }
+        }
+        next
+    }
     /tx: short=/ {
         n_tx++
         for (i = 1; i <= NF; i++) {
@@ -143,6 +173,33 @@ analyse() {
         next
     }
     END {
+        # --- na_audio_daemon capture-probe source (no bridge health lines at all) ---
+        if (n_rx == 0 && n_dm > 0) {
+            if (n_dm < min_ticks) {
+                printf "health_drift: FAULT — %d capture-probe tick(s), need at least %d for a tail quartile\n", n_dm, min_ticks > "/dev/stderr"
+                exit 2
+            }
+            elapsed = dm_t[n_dm] - dm_t[1]
+            hours = (elapsed > 0) ? elapsed / 3600.0 : 0
+            printf "health_drift: %d capture-probe ticks, elapsed %ds (measured, from the daemon t= clock)\n", n_dm, elapsed
+            printf "\n  %-16s %10s %10s %12s   %s\n", "counter", "first", "last", "tail-growth", "verdict"
+            printf "  %-16s %10s %10s %12s   %s\n", "----------------", "-------", "-------", "-----------", "-------"
+            g = rate_tail("overflows", oflow, n_dm)
+            f = oflow[1]; l = oflow[n_dm]
+            if (g > 0)      v = "SUSTAINED — still climbing in the final quarter"
+            else if (l > f) v = "settled (grew early, flat in the tail)"
+            else            v = "clean"
+            printf "  %-16s %10d %10d %12d   %s\n", "overflows", f, l, g, v
+            if (hours > 0 && l > f) printf "  %-16s %s%.1f/hour over the whole run\n", "", "        ~", (l - f) / hours
+            if (g > 0) {
+                printf "\nhealth_drift: SUSTAINED DRIFT — capture overflows are still climbing at the end.\n"
+                printf "  The capture device is producing faster than naudio drains it, and it is not settling.\n"
+                exit 1
+            }
+            printf "\nhealth_drift: no sustained drift — capture overflows are flat in the final quarter.\n"
+            exit 0
+        }
+
         if (n_rx < min_ticks) {
             printf "health_drift: FAULT — %d RX health tick(s), need at least %d for a tail quartile\n", n_rx, min_ticks > "/dev/stderr"
             printf "  a soak that ended early must not read as \"no drift\" — this is fail-closed by design\n" > "/dev/stderr"
@@ -234,7 +291,18 @@ selftest() {
         done
     } > "$work/ts.log"
 
-    # (4) TRUNCATED: a soak that died after 3 ticks. Must be a FAULT (2), never a pass.
+    # (4) na_audio_daemon capture-probe format, sustained overflow growth. This is the ONLY source
+    #     that can be pointed at a radio today, so it is the case most likely to be used in anger
+    #     and the one it would be most embarrassing to get wrong. Its clock is the daemon's own
+    #     `t=`, so it must report `measured` without any epoch prefixing.
+    {
+        for i in $(seq 1 12); do
+            printf '  t=%2ds  frames=%-9d  L=-42.3 dBFS  R=-inf dBFS  overflows=%d\n' \
+                   $((i * 300)) $((i * 14400000)) $((i * 3))
+        done
+    } > "$work/daemon.log"
+
+    # (5) TRUNCATED: a soak that died after 3 ticks. Must be a FAULT (2), never a pass.
     {
         for i in 1 2 3; do
             echo "  rx: clients=1 gaps=0 reads=$((i * 429)) link_loss=0 overruns=0 underruns=0"
@@ -273,6 +341,15 @@ selftest() {
         echo "  [ok]   ...and reads elapsed from the timestamps (3300s measured, not inferred)"
     else
         echo "  [FAIL] timestamps present but elapsed not taken from them"; cat "$work/ts.out"; fails=$((fails + 1))
+    fi
+
+    analyse "$work/daemon.log" > "$work/daemon.out" 2>&1; rc=$?
+    if [ "$rc" -eq 1 ]; then echo "  [ok]   daemon probe  -> 1 (drift detected in na_audio_daemon's own format)"
+    else echo "  [FAIL] daemon probe  -> $rc, want 1"; cat "$work/daemon.out"; fails=$((fails + 1)); fi
+    if grep -q 'elapsed 3300s (measured, from the daemon' "$work/daemon.out"; then
+        echo "  [ok]   ...and takes elapsed from the daemon's own t= clock"
+    else
+        echo "  [FAIL] daemon clock not read from t="; cat "$work/daemon.out"; fails=$((fails + 1))
     fi
 
     analyse "$work/short.log" > "$work/short.out" 2>&1; rc=$?
