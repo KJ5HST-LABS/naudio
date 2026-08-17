@@ -684,6 +684,25 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
     set_target_properties(naudio_bridge_probe PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME naudio_bridge_probe_selftest COMMAND naudio_bridge_probe --selftest)
 
+    # On-air soak analyser (issue #12 item 3) — the same discipline one level up. #12 asks for
+    # "no unbounded drift in overruns/underruns over a multi-hour run", which is a claim about a
+    # TREND in a log nobody reads line by line, so it needs an instrument rather than an eyeball.
+    # The instrument will spend its whole life reporting "no drift", which is exactly the shape
+    # CLAUDE.md L222 warns about: a detector that has never been shown to fire is indistinguishable
+    # from a broken one. --selftest is the positive control — it drives synthetic flat, sustained,
+    # timestamped and truncated logs through the real code path and asserts all four verdicts,
+    # including that a truncated soak is a FAULT and not a pass, and that the counter which did not
+    # move is not flagged.
+    #
+    # Registered unconditionally on POSIX: it parses text and needs no libhamlib, no PortAudio and
+    # no radio, so it is verified on every build long before any hardware is attached. NOT WIN32
+    # only because it is bash. The analyser it gates is run BY HAND during the on-air session —
+    # see docs/hamlib-streaming-bridge.md § "On-air verification".
+    if(NOT WIN32)
+        add_test(NAME naudio_health_drift
+                 COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/bridge/health_drift.sh" --selftest)
+    endif()
+
     # Documentation honesty gate: extract every ```c / ```cpp
     # fenced block from README.md and compile each (-fsyntax-only) against the
     # in-tree headers, so a documented example that stops matching the real C ABI /
