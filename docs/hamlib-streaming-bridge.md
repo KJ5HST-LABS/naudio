@@ -487,6 +487,13 @@ asks for 48 kHz exactly as it always did.
 > resample bit and a client receiving clean content at 24 kHz. **No rig has run this.** The dummy
 > backend advertises 48 kHz natively, so no hardware-free path exercises a negotiated rate; issue
 > [#12](https://github.com/KJ5HST-LABS/naudio/issues/12) is still the open on-air check.
+>
+> **And it cannot be closed by attaching a radio to this bridge today.** Measured against upstream
+> master `0839c03`: **1 of 313 Hamlib models advertises `stream_caps`, and it is the Dummy** —
+> no real radio backend implements the streaming subsystem, and `netrigctl` only relays a remote
+> backend that does not have it either. See
+> [`on-air-verification.md`](on-air-verification.md) for the measurement, the one-command
+> re-check, and the device-layer path that a radio *can* verify in the meantime.
 
 ### Over a remote `rigctld` (`-m 2`)
 

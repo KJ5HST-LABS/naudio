@@ -8,6 +8,7 @@
 - **Wire spec:** **[docs/audio-streaming-protocol-v1.md](docs/audio-streaming-protocol-v1.md)** — the frozen `0xAF01` v1 contract.
 - **Protocols overview:** **[docs/protocols.md](docs/protocols.md)** — the `0xAF01` network audio wire format at a glance.
 - **Conformance:** **[conformance/README.md](conformance/README.md)** — language-neutral golden vectors that pin every normative value in the wire spec.
+- **On-air verification:** **[docs/on-air-verification.md](docs/on-air-verification.md)** — what a real radio can and cannot verify today, and the procedure for the part it can.
 
 
 ---
@@ -316,6 +317,15 @@ consumer. The byte-identity tell for a correctly received stream is
 - **Virtual-device paths not runtime-verified.** With no BlackHole/VB-CABLE installed in CI,
   `bestVirtual` selection and the virtual-mismatch report are unit-tested only, with limited local hardware testing; enumeration + the
   probe primitive **are** runtime-exercised on real Core Audio via `na_audio_daemon --list-devices`.
+- **The Hamlib streaming bridge cannot be pointed at a radio yet, and that is upstream.** Measured
+  against Hamlib master `0839c03`: **1 of 313 models advertises `stream_caps`, and it is the Dummy.**
+  No real radio backend implements the audio-streaming subsystem `na_hamlib_bridge` is built on, and
+  `netrigctl` only relays a remote backend that does not have it either — so the bridge's
+  real-backend behaviour (format negotiation against real caps, `-k` keying around TX bursts, a
+  short write from a radio that will not take a full buffer) is **unverified**, not merely untested.
+  The device layer *can* be verified with a radio today via its USB-audio interface; both the
+  measurement and that procedure are in
+  **[docs/on-air-verification.md](docs/on-air-verification.md)**.
 - **No IP multicast; IPv4 only.** RX fan-out to multiple clients is **unicast replication** (O(N)
   egress), not IP multicast, and the transport is IPv4 (`AF_INET`) only. Fan-out should not be read as
   a multicast group.
