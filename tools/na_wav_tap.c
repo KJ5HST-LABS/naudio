@@ -131,19 +131,22 @@ static void usage(void) {
         "  --port N     server port (default 4533)\n"
         "  --seconds S  record length (default 15, one FT8 period)\n"
         "  --out F      output WAV, %d Hz mono (default tap.wav)\n"
-        "  --align15    wait for a wall-clock 15 s boundary before recording (FT8/FT4 periods)\n",
+        "  --align15    wait for a wall-clock 15 s boundary before recording (FT8/FT4 periods)\n"
+        "  --tcp        use TCP instead of the UDP_WAN profile — the discriminating run when\n"
+        "               UDP is short: TCP retransmits, so loss shows up as delay, not absence\n",
         OUT_RATE);
 }
 
 int main(int argc, char **argv) {
     const char *host = "127.0.0.1", *out = "tap.wav";
-    int port = 4533, seconds = 15, align = 0;
+    int port = 4533, seconds = 15, align = 0, use_tcp = 0;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--host")    && i + 1 < argc) host    = argv[++i];
         else if (!strcmp(argv[i], "--port")    && i + 1 < argc) port    = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out")     && i + 1 < argc) out     = argv[++i];
         else if (!strcmp(argv[i], "--align15")) align = 1;
+        else if (!strcmp(argv[i], "--tcp")) use_tcp = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(); return 0; }
         else { fprintf(stderr, "unknown option: %s\n", argv[i]); usage(); return 2; }
     }
@@ -164,7 +167,13 @@ int main(int argc, char **argv) {
      * difference is invisible. Across a real LAN it was measured at 33.7 / 48.3 / 33.1 % of the
      * audio arriving, against 100.1 % for a loopback client on the same server at the same time.
      * The profile selects the transport as part of itself, so no separate call is needed. */
-    na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN);
+    /* --tcp is the DISCRIMINATING experiment, not a feature. TCP retransmits, so if a link is
+     * merely lossy TCP arrives complete (late, but complete) while UDP does not. Same audio, same
+     * server, same tap: TCP ~100% and UDP ~33% means the path is dropping datagrams; BOTH at ~33%
+     * means the shortfall is not loss at all and the search moves elsewhere entirely. */
+    if (use_tcp) na_client_set_reliability_profile(c, NA_RELIABILITY_DEFAULT);
+    else         na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN);
+    fprintf(stderr, "na_wav_tap: profile %s\n", use_tcp ? "DEFAULT (TCP)" : "UDP_WAN (FEC+reorder+jitter)");
     na_client_set_playback_device(c, 0);   /* required even on NULL — see the header note */
 
     char err[256] = {0};
@@ -204,8 +213,42 @@ int main(int argc, char **argv) {
     t.armed = 0;
     unsigned long long got = t.bytes - before;
 
+    /* Read the client's own accounting BEFORE disconnecting — `connected` goes 0 after, and every
+     * field with it. A delivered-byte percentage says audio went missing; only these say WHERE.
+     * The distinctions that matter on a lossy link:
+     *   packets_recovered_by_fec  the reliability layer earning its place
+     *   socket_rx_drops           the network delivered it and the KERNEL buffer dropped it —
+     *                             a local receive problem, not a path problem
+     *   crc_errors                arrived corrupted rather than late
+     *   jitter_ms / buffer_target_ms  whether the adaptive buffer is tracking the link
+     * Note -1 means NOT MEASURED, never zero: packets_lost / packet_loss_rate / sequence_gaps are
+     * unmeasured on every UDP profile, because the gap tracker only runs with no reorder buffer. */
+    na_client_stats st;
+    memset(&st, 0, sizeof st);
+    int have_stats = (na_client_get_stats(c, &st, sizeof st) == NA_OK);
+
     na_client_disconnect(c);   /* joins the worker: no callback can be in flight after this */
     na_client_destroy(c);
+
+    if (have_stats) {
+        fprintf(stderr,
+            "na_wav_tap: client stats — connected=%d\n"
+            "  packets_received      %lld        bytes_received  %lld\n"
+            "  packets_recovered_fec %lld        fec_unreconciled %lld\n"
+            "  packets_reordered     %lld        crc_errors      %d\n"
+            "  socket_rx_drops       %lld        queue_drops     %lld\n"
+            "  jitter_ms             %.1f        buffer_target_ms %d\n"
+            "  packets_lost          %lld (-1 = not measured on a UDP profile)\n",
+            st.connected,
+            st.packets_received, st.bytes_received,
+            st.packets_recovered_by_fec, st.fec_blocks_unreconciled,
+            st.packets_reordered, st.crc_errors,
+            st.socket_rx_drops, st.queue_drops,
+            st.jitter_ms, st.buffer_target_ms,
+            st.packets_lost);
+    } else {
+        fprintf(stderr, "na_wav_tap: na_client_get_stats failed — no diagnosis available\n");
+    }
 
     double bps = (double)got / (double)seconds, want = (double)SRC_RATE * 2.0 * 2.0;
     fprintf(stderr, "na_wav_tap: %llu bytes in %d s = %.0f B/s (expect %.0f, %.1f%%)\n",
