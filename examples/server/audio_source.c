@@ -198,6 +198,8 @@ static void usage(void) {
         "  --port N          listen port; 0 = OS-assigned ephemeral (default 4533)\n"
         "  --capture-id N    capture device id to broadcast (default: first capture device)\n"
         "  --transport T     tcp (default) | udp\n"
+        "  --reliability P   lan | wan  (UDP profiles: FEC/reorder/jitter). Omitted = bare\n"
+        "                    transport, which across a real network loses audio\n"
         "  --test-tone       hardware-free: broadcast a deterministic sawtooth (no device)\n"
         "  --max-clients N   maximum simultaneous clients (default 4)\n"
         "  --seconds N       run time; 0 = until Ctrl-C (default 0)\n"
@@ -212,6 +214,7 @@ int main(int argc, char** argv) {
     int          test_tone   = 0;
     int          max_clients = 4;
     long long    seconds     = 0;     // 0 = until Ctrl-C
+    int          reliability = -1;    // -1 => bare transport (unchanged default)
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -222,6 +225,12 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--seconds") == 0)     seconds = atoll(NEED_VAL("--seconds"));
         else if (strcmp(a, "--test-tone") == 0)   test_tone = 1;
         else if (strcmp(a, "--list-devices") == 0) return list_devices();
+        else if (strcmp(a, "--reliability") == 0) {
+            const char* r = NEED_VAL("--reliability");
+            if      (strcmp(r, "lan") == 0) reliability = NA_RELIABILITY_UDP_LAN;
+            else if (strcmp(r, "wan") == 0) reliability = NA_RELIABILITY_UDP_WAN;
+            else { fprintf(stderr, "error: invalid --reliability '%s' (lan|wan)\n", r); return 2; }
+        }
         else if (strcmp(a, "--transport") == 0) {
             const char* t = NEED_VAL("--transport");
             if      (strcmp(t, "tcp") == 0) transport = NA_TRANSPORT_TCP;
@@ -266,7 +275,15 @@ int main(int argc, char** argv) {
     cbs.on_client_disconnected = on_client_disconnected;
     cbs.on_error               = on_error;
     na_server_set_callbacks(server, &cbs, NULL);
-    na_server_set_transport(server, transport);
+    /* FEC parity only goes on the wire if the SERVER selects a profile that emits it, so a client
+     * asking for UDP_WAN against a bare-transport server still recovers nothing. Both ends must
+     * agree — see docs/hamlib-streaming-bridge.md, "A client built on the C ABI must select the
+     * profile too". Default stays plain transport so this example's existing behaviour is
+     * unchanged; --reliability opts in. */
+    if (reliability >= 0)
+        na_server_set_reliability_profile(server, (na_reliability_profile)reliability);
+    else
+        na_server_set_transport(server, transport);
     na_server_set_max_clients(server, max_clients);
     if (!test_tone) {
         if (na_server_set_capture_device(server, capture_id) != NA_OK) {

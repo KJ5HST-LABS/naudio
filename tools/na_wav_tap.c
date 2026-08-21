@@ -158,7 +158,13 @@ int main(int argc, char **argv) {
     na_stream_client *c = na_client_create(NA_CLIENT_BACKEND_NULL, host, port, "na_wav_tap");
     if (!c) { fprintf(stderr, "na_wav_tap: na_client_create failed\n"); free(t.out); return 1; }
     na_client_set_audio_cb(c, on_rx, &t);
-    na_client_set_transport(c, NA_TRANSPORT_UDP);
+    /* NOT na_client_set_transport(NA_TRANSPORT_UDP): that sets the transport and NOTHING else,
+     * leaving FEC, reordering, adaptive jitter and control-ARQ off — a trap documented in
+     * docs/hamlib-streaming-bridge.md and one this tool walked straight into. On loopback the
+     * difference is invisible. Across a real LAN it was measured at 33.7 / 48.3 / 33.1 % of the
+     * audio arriving, against 100.1 % for a loopback client on the same server at the same time.
+     * The profile selects the transport as part of itself, so no separate call is needed. */
+    na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN);
     na_client_set_playback_device(c, 0);   /* required even on NULL — see the header note */
 
     char err[256] = {0};
