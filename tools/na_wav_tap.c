@@ -216,13 +216,24 @@ int main(int argc, char **argv) {
      * measured) — pitch is then correct and the recording is simply short of wall time, which may
      * still decode. A real radio should sit at ~100 %%: the 2026-08-21 on-air runs measured
      * 100.0 %% exactly, so a shortfall against a RIG is a genuine finding, not background. */
-    if (bps < want * 0.9 || bps > want * 1.1)
-        fprintf(stderr, "na_wav_tap: WARNING delivered %.1f%% of the 48000/16/2 nominal rate.\n"
-                        "  Over nominal or wildly off => not S16LE stereo @48k, and this file's "
-                        "%d Hz header is wrong (it will not decode).\n"
-                        "  Under nominal => the producer is not keeping up; pitch is right but the "
-                        "recording is short of wall time. Off a real rig, investigate.\n",
+    /* Print ONLY the branch that applies. The first version of this listed both possibilities in
+     * one message, and the first person to hit it read the wrong half as the verdict — a diagnostic
+     * that makes the reader choose between two explanations has not diagnosed anything. */
+    if (bps > want * 1.1) {
+        fprintf(stderr, "na_wav_tap: WARNING delivered %.1f%% of nominal — ABOVE it, so this stream "
+                        "is not S16LE stereo @48k.\n"
+                        "  The %d Hz WAV header is therefore wrong and the file will not decode.\n",
                 100.0 * bps / want, OUT_RATE);
+    } else if (bps < want * 0.9) {
+        fprintf(stderr, "na_wav_tap: WARNING delivered %.1f%% of nominal — BELOW it, so audio went "
+                        "missing in transit.\n"
+                        "  Pitch is still correct and the file may decode; it is short of wall time.\n"
+                        "  Across a network this is loss on the hop. On loopback it means the "
+                        "producer is not keeping up (this project's synthetic sources habitually do "
+                        "not: --test-tone ~75%%, the Hamlib dummy ~83%%). Off a real rig at ~100%%, "
+                        "a shortfall is a genuine finding.\n",
+                100.0 * bps / want);
+    }
 
     if (write_wav(out, t.out, t.n) != 0) {
         fprintf(stderr, "na_wav_tap: writing %s failed\n", out);
