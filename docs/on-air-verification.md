@@ -163,6 +163,73 @@ Run `--mode hardware` as well, for the network hop and the remote listen — jus
 
 See the next section for what the analyser decides and why.
 
+**Note the daemon block-buffers stdout when redirected** (4 KB chunks) where the bridge flushes on
+every tick. The file therefore lags and its last line is usually truncated mid-write. Both are
+harmless — the analyser skips an incomplete line rather than reading it as a sample with a missing
+counter, and a clean exit flushes the rest — but do not watch the file expecting it to keep up.
+
+### 6. Make "intelligible" objective: decode it
+
+For a digital mode, "intelligible" does not have to be a judgement. If audio carried end to end
+through naudio still **decodes**, the pipeline preserved the information, and the decode names
+callsigns that either are or are not really on the air.
+
+`na_wav_tap` is a normal naudio client driving only the public C ABI. It records what the **client**
+receives — not an internal buffer — as the 12 kHz mono WAV the WSJT-X decoders read:
+
+```bash
+# with the server from step 3 running, on the client machine:
+./build/tools/na_wav_tap --host <radio-host> --port 4533 --seconds 15 --align15 --out period.wav
+jt9 -8 -p 15 period.wav
+```
+
+`--align15` waits for a wall-clock 15 s boundary, which is where FT8 periods start; without it the
+file straddles two periods and decodes nothing.
+
+**Run the negative control, every time.** A decoder that has not been shown to stay silent is not
+evidence when it speaks:
+
+```bash
+sox -n -r 12000 -c 1 -b 16 silence.wav trim 0.0 15.0
+jt9 -8 -p 15 silence.wav        # must print NOTHING
+```
+
+**Measured 2026-08-21**, a Yaesu (CAT ID `0840`) on 14.074 MHz USB, audio crossing a naudio UDP
+wire — six decodes across five consecutive periods, +15 dB down to −25 dB:
+
+```
+000000  15 -0.6 2857 ~  W9IKE VE3GLN FN25
+000000  -8 -0.0 1212 ~  RA9J KD4SN EM77
+000000 -19 -0.0 1073 ~  RA9J KD4SN EM77
+000000 -20  1.3 1940 ~  KD8VYT AB0LR -17
+000000 -23  1.3 1940 ~  AA3NI AB0LR -24
+000000 -25 -0.0 1727 ~  CQ AD9GE EM69
+```
+
+`na_wav_tap` also asserts the wire format rather than assuming it: it measures the delivered byte
+rate against the 192000 B/s that 48000/16/2 implies. Off the rig this read **exactly 100.0 %**. Note
+that synthetic sources do not — `na_audio_source --test-tone` measures 75.8 %, the Hamlib dummy
+~83 %, a loopback dummy ~70 % — so a shortfall is expected from a generator and is a real finding
+from a radio.
+
+> ### ⚠ Do not "control" this with a naive direct capture — it produces garbage that looks fine
+>
+> The obvious control is to record the same period straight off the codec, bypassing naudio, and
+> compare decodes. Attempted with `ffmpeg -f avfoundation`, it decoded **nothing** in five periods,
+> at every window offset and on both channels, while naudio's path decoded every time.
+>
+> **That was the control being broken, not naudio being better**, and the statistic that would have
+> caught it is not the one you reach for. RMS matched naudio's within 4 %, so by level the capture
+> looked perfect. The spectrum gave it away: `sox … -n stat` reported a rough frequency of
+> **10813 Hz** for the direct capture against **1505 Hz** for naudio's — and a receiver with a 3 kHz
+> filter cannot put its dominant energy at 10.8 kHz. The decode DFs (1073–2857 Hz) agree with
+> naudio's figure and not the control's.
+>
+> Two traps worth carrying: `-ac 1` **averages L+R**, and this rig's channels are not identical
+> (L −35.5 dBFS vs R −31.8 dBFS measured), so a downmix is not the left channel the tap reads; and
+> avfoundation's device indices are its own, unrelated to naudio's `--list-devices` ids. If you want
+> this control, validate it by spectrum before trusting a null result from it.
+
 ---
 
 ## The drift analyser
@@ -263,7 +330,7 @@ answer to *"what is the rig's actual format, and what does the bridge do if it i
 
 | # | acceptance item | status |
 |---|---|---|
-| 1 | RX audio from a real rig reaches a remote client, intelligibly | **Path A** covers this for the device layer. Not coverable through the bridge until a backend exists |
+| 1 | RX audio from a real rig reaches a remote client, intelligibly | **Demonstrated on the device layer, 2026-08-21** — six FT8 decodes off 14.074 MHz through a naudio UDP wire, with a silence control. **Caveat: the hop was loopback**, so the "remote client" half needs a second machine. Not coverable through the bridge until a backend exists |
 | 2 | TX from a remote client is transmitted, `-k` keying the rig | **Blocked.** PTT alone is checkable with `rigctl`; the keying/TX-audio interaction is bridge-only |
 | 3 | A multi-hour run shows no unbounded drift | **Instrumented and gated** — `health_drift.sh`, usable on either path |
 | 4 | The rig's actual stream format is written down | **Blocked** for a real rig — the bridge prints it, but cannot open one |

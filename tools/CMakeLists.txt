@@ -16,6 +16,27 @@ if(NAUDIO_BUILD_APPS)
 endif()
 
 # ----------------------------------------------------------------------------
+# na_wav_tap: record what a naudio CLIENT receives, as a WAV a decoder can read.
+#
+# The evidence tool for issue #12 item 1 ("RX audio ... is intelligible"). Judged by ear that item
+# leaves no artifact and cannot be re-checked by anyone who was not present; for a digital mode it
+# becomes objective — audio carried end to end through naudio either still decodes to real
+# callsigns or it does not. See docs/on-air-verification.md.
+#
+# Unlike na_audio_daemon above, this links the PUBLIC hidden-visibility `naudio` (the na_* C ABI)
+# and nothing else, deliberately: the file it writes is then what a third-party consumer of the
+# shipped contract receives, not what an internal buffer held. Pure C, same posture as
+# na_hamlib_bridge.
+#
+# POSIX-only (clock_gettime / usleep / sleep), so gated like the examples rather than by
+# NAUDIO_BUILD_APPS alone.
+# ----------------------------------------------------------------------------
+if(NAUDIO_BUILD_APPS AND NOT WIN32)
+    add_executable(na_wav_tap na_wav_tap.c)
+    target_link_libraries(na_wav_tap PRIVATE naudio)
+endif()
+
+# ----------------------------------------------------------------------------
 # na_hamlib_bridge: optional Hamlib-streaming (PR #2116) <-> naudio bridge.
 #
 # Re-originates a rig_stream_* audio stream onto naudio's FEC-native wire for the
