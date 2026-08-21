@@ -10,7 +10,9 @@
 # (which exports only the na_* C ABI).
 # ----------------------------------------------------------------------------
 
-if(NAUDIO_BUILD_APPS)
+# NOT WIN32 is the gate that used to sit on this whole directory in the top-level CMakeLists: the
+# daemon is a live-PortAudio hardware smoke that Windows CI never runs. It stays excluded there.
+if(NAUDIO_BUILD_APPS AND NOT WIN32)
     add_executable(na_audio_daemon na_audio_daemon.cpp)
     target_link_libraries(na_audio_daemon PRIVATE naudio_net naudio_pa)
 endif()
@@ -31,7 +33,10 @@ endif()
 # POSIX-only (clock_gettime / usleep / sleep), so gated like the examples rather than by
 # NAUDIO_BUILD_APPS alone.
 # ----------------------------------------------------------------------------
-if(NAUDIO_BUILD_APPS AND NOT WIN32)
+# Builds on Windows too, unlike everything else in here — see the note in the top-level
+# CMakeLists. It opens no device, so there is nothing platform-specific to exclude, and the
+# remote end of an on-air check is frequently the operator's spare Windows box.
+if(NAUDIO_BUILD_APPS)
     add_executable(na_wav_tap na_wav_tap.c)
     target_link_libraries(na_wav_tap PRIVATE naudio)
 endif()
@@ -54,7 +59,7 @@ endif()
 # ----------------------------------------------------------------------------
 option(NAUDIO_BUILD_HAMLIB_BRIDGE
        "Build the Hamlib streaming <-> naudio bridge (needs libhamlib with rig_stream_*)" OFF)
-if(NAUDIO_BUILD_HAMLIB_BRIDGE)
+if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
     # Every skip below is a WARNING, not an error: the flag is opt-in and the rest
     # of the build stays green. That makes the skip easy to scroll past, so each
     # one says where to get the missing dependency.

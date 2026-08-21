@@ -48,7 +48,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
+
+/* Portability. This tool is useful on Windows precisely because it needs no audio device: it is
+ * the CLIENT end of an on-air check whose server is the machine with the radio, so the remote
+ * half of issue #12 item 1 ("a REMOTE naudio client") is often a Windows box. Only three POSIX
+ * facilities were in the way — a millisecond sleep, a whole-second sleep, and a wall clock with
+ * sub-second resolution — so they are wrapped rather than the tool being kept POSIX-only. */
+#if defined(_WIN32)
+#  include <windows.h>
+   static void na_sleep_ms(unsigned ms) { Sleep(ms); }
+   /* Wall clock as seconds + nanoseconds. FILETIME counts 100 ns ticks from 1601-01-01; the
+    * constant below is the offset to the Unix epoch. Only the SECONDS are used for the 15 s
+    * alignment and only the sub-second part gates the boundary, so precision here is ample. */
+   static void na_wall_now(long long *sec, long *nsec) {
+       FILETIME ft; ULARGE_INTEGER u;
+       GetSystemTimeAsFileTime(&ft);
+       u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+       unsigned long long t = u.QuadPart - 116444736000000000ULL;   /* -> 100 ns since 1970 */
+       *sec  = (long long)(t / 10000000ULL);
+       *nsec = (long)((t % 10000000ULL) * 100ULL);
+   }
+#else
+#  include <unistd.h>
+   static void na_sleep_ms(unsigned ms) { usleep(ms * 1000u); }
+   static void na_wall_now(long long *sec, long *nsec) {
+       struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+       *sec = (long long)ts.tv_sec; *nsec = (long)ts.tv_nsec;
+   }
+#endif
 
 #define SRC_RATE 48000
 #define DECIM    4
@@ -146,9 +173,8 @@ int main(int argc, char **argv) {
      * time into the measured window makes the byte-rate assertion below fire on a healthy stream
      * (measured: 75.8 %% of nominal on an 8 s run armed immediately after connect). */
     {
-        struct timespec ts = {0, 20000000L};
         int waited = 0;
-        while (t.bytes == 0 && waited < 5000) { nanosleep(&ts, NULL); waited += 20; }
+        while (t.bytes == 0 && waited < 5000) { na_sleep_ms(20); waited += 20; }
         if (t.bytes == 0) {
             fprintf(stderr, "na_wav_tap: no audio within 5 s of connecting — nothing written\n");
             na_client_disconnect(c); na_client_destroy(c); free(t.out); return 1;
@@ -158,17 +184,17 @@ int main(int argc, char **argv) {
 
     if (align) {
         for (;;) {
-            struct timespec now;
-            clock_gettime(CLOCK_REALTIME, &now);
-            if (now.tv_sec % 15 == 0 && now.tv_nsec < 60000000L) break;
-            usleep(20000);
+            long long sec; long nsec;
+            na_wall_now(&sec, &nsec);
+            if (sec % 15 == 0 && nsec < 60000000L) break;
+            na_sleep_ms(20);
         }
         fprintf(stderr, "na_wav_tap: 15 s boundary reached, recording\n");
     }
 
     unsigned long long before = t.bytes;
     t.armed = 1;
-    sleep((unsigned)seconds);
+    na_sleep_ms((unsigned)seconds * 1000u);
     t.armed = 0;
     unsigned long long got = t.bytes - before;
 

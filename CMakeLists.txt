@@ -784,17 +784,20 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
 endif()
 
 # ----------------------------------------------------------------------------
-# tools/ — na_audio_daemon: the hardware-smoke driver. Deliberately OUTSIDE
-# naudio_core/naudio: an exerciser (it runs the real AudioStreamServer /
-# AudioStreamClient over a live PortAudio device) rather than an audio primitive
-# (keeps the core pure + portable). Added last so it can reuse the
-# GoogleTest targets configured by the tests block. Excluded on Windows — the
-# Windows CI job builds the libraries + C ABI + tests lib-only; the daemon is a
-# hardware smoke CI never runs.
+# tools/ — the exercisers. Deliberately OUTSIDE naudio_core/naudio: they drive the real
+# AudioStreamServer / AudioStreamClient rather than being audio primitives, which keeps the core
+# pure + portable. Added last so they can reuse the GoogleTest targets configured by the tests
+# block.
+#
+# The WIN32 exclusion used to sit HERE, on the whole directory, and its stated reason was entirely
+# about na_audio_daemon — "the daemon is a hardware smoke CI never runs". That reason does not
+# generalise to the directory: na_wav_tap opens no device at all (NA_CLIENT_BACKEND_NULL) and is
+# most useful on Windows precisely because issue #12 item 1 wants a REMOTE client, which is
+# whatever machine the operator has spare. So the gate moved INWARD, per target, in tools/. The
+# Windows-excluded set is unchanged — the daemon and the Hamlib bridge are still guarded there —
+# this only stops a device-free client tool from being excluded by association.
 # ----------------------------------------------------------------------------
-if(NOT WIN32)
-    add_subdirectory(tools)
-endif()
+add_subdirectory(tools)
 
 # ----------------------------------------------------------------------------
 # Daemon argument gate (issue #63) — na_audio_daemon's main() has no injection seam, so driving

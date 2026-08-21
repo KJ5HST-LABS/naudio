@@ -545,3 +545,51 @@ jobs:
         with:
           name: hamlib-bridge-ctest-log
           path: bridge-ctest.log
+
+  windows-wav-tap:
+    name: windows na_wav_tap exe (the remote end of the #12 on-air check)
+    runs-on: windows-latest
+    # Separate from the `windows` job on purpose. That one guards issue #61 (find_package on MSVC,
+    # no PortAudio target in the installed export) and is deliberately lib-only with
+    # NAUDIO_BUILD_APPS=OFF; this needs APPS=ON, so bolting it on would have meant changing that
+    # job's configure line and putting a shipping gate at risk to produce a convenience binary.
+    #
+    # WHY A WINDOWS BINARY AT ALL. Issue #12 item 1 wants RX audio reaching a REMOTE naudio client.
+    # The remote machine is whatever the operator has spare, and here that is Windows. na_wav_tap
+    # opens no audio device (NA_CLIENT_BACKEND_NULL), so it needs nothing from the platform beyond
+    # sockets — it records what the client RECEIVES, which is exactly the evidence the item wants,
+    # and the WAV can be decoded anywhere afterwards.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (apps on, tests off — this job builds one binary)
+        run: cmake -S . -B build -DNAUDIO_BUILD_APPS=ON -DNAUDIO_BUILD_TESTS=OFF
+
+      - name: Build na_wav_tap
+        run: cmake --build build --config RelWithDebInfo --target na_wav_tap -j
+
+      - name: Collect the exe and the DLL it needs
+        shell: pwsh
+        run: |
+          # naudio is a SHARED target, so the exe cannot run without naudio.dll beside it. Collect
+          # by search rather than by a hard-coded path: the multi-config generator puts artifacts
+          # under a per-config subdirectory and that layout is not worth pinning here.
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $exe = Get-ChildItem -Path build -Recurse -Filter na_wav_tap.exe | Select-Object -First 1
+          if (-not $exe) { Write-Output "::error::na_wav_tap.exe was not produced"; exit 1 }
+          Copy-Item $exe.FullName dist/
+          Get-ChildItem -Path build -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName dist/ -Force }
+          Get-ChildItem dist | Format-Table Name, Length
+
+          # Prove it is a runnable image and not merely a file that got linked: --help exits 0 and
+          # touches no socket. A binary that cannot start is the failure this job exists to catch,
+          # and it would otherwise be discovered by the operator on the far machine.
+          & "dist/na_wav_tap.exe" --help
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::na_wav_tap.exe --help exited $LASTEXITCODE"; exit 1 }
+          Write-Output "na_wav_tap.exe runs on windows-latest"
+
+      - name: Upload the Windows client
+        uses: actions/upload-artifact@v4
+        with:
+          name: na_wav_tap-windows-x64
+          path: dist/
