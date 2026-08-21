@@ -149,13 +149,17 @@ analyse() {
     # the blocked path. Two gifts from this format: `overflows` is cumulative, exactly like the
     # bridge counters, and `t=` is an elapsed clock the producer itself stamped — so this source
     # never needs the epoch-prefix capture, and never falls back to an inferred cadence.
-    /t=[0-9]+s/ && /overflows=/ {
+    /t=[ ]*[0-9]+s/ && /overflows=/ {
+        # The clock is written with "t=%2llds", so ticks 1-9 arrive as "t= 1s" — a SPACE inside the
+        # field. Field-splitting on whitespace therefore breaks "t=" away from "1s" and loses the
+        # first nine samples of every real log, which is exactly what happened: 121 ticks in the
+        # file, 111 parsed. Match against the whole line instead of trusting field boundaries.
         n_dm++
-        for (i = 1; i <= NF; i++) {
-            if (split($i, kv, "=") == 2) {
-                if (kv[1] == "overflows") oflow[n_dm] = kv[2] + 0
-                if (kv[1] == "t")         { sub(/s$/, "", kv[2]); dm_t[n_dm] = kv[2] + 0 }
-            }
+        if (match(line, /t=[ ]*[0-9]+s/)) {
+            v = substr(line, RSTART, RLENGTH); gsub(/[^0-9]/, "", v); dm_t[n_dm] = v + 0
+        }
+        if (match(line, /overflows=[0-9]+/)) {
+            v = substr(line, RSTART, RLENGTH); gsub(/[^0-9]/, "", v); oflow[n_dm] = v + 0
         }
         next
     }
@@ -296,9 +300,12 @@ selftest() {
     #     and the one it would be most embarrassing to get wrong. Its clock is the daemon's own
     #     `t=`, so it must report `measured` without any epoch prefixing.
     {
-        for i in $(seq 1 12); do
+        # Ticks 1-9 MUST be present and MUST use the real "%2lld" padding ("t= 1s"), because that
+        # is what every real capture-probe log opens with and a field-split parser silently drops
+        # them. Measured against a live 121-tick log: the pre-fix parser saw 111.
+        for i in $(seq 1 14); do
             printf '  t=%2ds  frames=%-9d  L=-42.3 dBFS  R=-inf dBFS  overflows=%d\n' \
-                   $((i * 300)) $((i * 14400000)) $((i * 3))
+                   "$i" $((i * 48000)) $((i * 3))
         done
     } > "$work/daemon.log"
 
@@ -346,10 +353,18 @@ selftest() {
     analyse "$work/daemon.log" > "$work/daemon.out" 2>&1; rc=$?
     if [ "$rc" -eq 1 ]; then echo "  [ok]   daemon probe  -> 1 (drift detected in na_audio_daemon's own format)"
     else echo "  [FAIL] daemon probe  -> $rc, want 1"; cat "$work/daemon.out"; fails=$((fails + 1)); fi
-    if grep -q 'elapsed 3300s (measured, from the daemon' "$work/daemon.out"; then
+    if grep -q 'elapsed 13s (measured, from the daemon' "$work/daemon.out"; then
         echo "  [ok]   ...and takes elapsed from the daemon's own t= clock"
     else
         echo "  [FAIL] daemon clock not read from t="; cat "$work/daemon.out"; fails=$((fails + 1))
+    fi
+    # CARDINALITY: all 14 ticks, including the nine space-padded ones. This is the assertion that
+    # would have caught the original parser, and no verdict-shaped check would have.
+    if grep -q '^health_drift: 14 capture-probe ticks' "$work/daemon.out"; then
+        echo "  [ok]   ...and parses all 14 ticks, including the space-padded t= 1s..t= 9s"
+    else
+        echo "  [FAIL] tick count wrong — space-padded clock samples dropped"
+        grep '^health_drift:' "$work/daemon.out"; fails=$((fails + 1))
     fi
 
     analyse "$work/short.log" > "$work/short.out" 2>&1; rc=$?
