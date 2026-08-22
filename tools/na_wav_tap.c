@@ -21,12 +21,18 @@
  * NA_CLIENT_BACKEND_NULL: RX is still delivered to the audio callback but no device is opened, so
  * the file is what naudio DELIVERED rather than what some sound card then did to it.
  *
- * FORMAT. naudio carries S16LE stereo at 48 kHz here; WSJT-X decoders want 12 kHz mono. This takes
- * the LEFT channel and decimates 4:1 behind a 4-sample box average — crude, but the receiver's own
- * filter is ~3 kHz wide so there is nothing near the 6 kHz Nyquist to alias down. That 48k/16/2
- * assumption is ASSERTED, not trusted: the delivered byte rate is measured and a run that is not
- * within 10 % of 192000 B/s says so loudly, because the failure mode otherwise is a WAV that is
- * silently wrong-pitched and simply never decodes.
+ * FORMAT. The rate and channel count come from na_client_get_audio_format AFTER connect — the
+ * negotiated format the server declared in AUDIO_CONFIG, i.e. the format of the PCM this client's
+ * callback actually receives. (This tool used to hardcode 48000/16/2, which mislabels the WAV the
+ * day the server is provisioned lower — e.g. na_audio_source --rate 12000 --channels 1 for a
+ * constrained link. Measured before the fix: against a 12 kHz mono server it exited 0 while
+ * writing a mangled file and blaming the network.) Channel 0 is taken, and when the negotiated
+ * rate is an integer multiple of 12000 it is decimated to the 12 kHz the WSJT-X decoders want,
+ * behind an N-sample box average — crude, but the receiver's own filter is ~3 kHz wide so there
+ * is nothing near Nyquist to alias down. Any other rate is written as-is at the negotiated rate.
+ * The delivered byte rate is still measured against what the negotiated format implies: a stream
+ * that disagrees with its own AUDIO_CONFIG says so loudly rather than producing a silently
+ * wrong-pitched WAV.
  *
  * ALIGNMENT. --align15 waits for a wall-clock 15 s boundary before recording, which is what FT8
  * periods start on. Without it the decoder must find the signal by its own time search and a file
@@ -73,9 +79,8 @@
    }
 #endif
 
-#define SRC_RATE 48000
-#define DECIM    4
-#define OUT_RATE (SRC_RATE / DECIM)
+/* The decoders' rate. When the negotiated rate divides by it, output goes there. */
+#define WSJTX_RATE 12000
 
 typedef struct {
     short *out;
@@ -84,6 +89,8 @@ typedef struct {
     int acc_n;
     long acc;
     int armed;
+    int src_channels;   /* negotiated, set before arming; 2 * this = bytes per sample-frame */
+    int decim;          /* box-average factor; 1 = passthrough */
 } tap;
 
 /* Fires on the receive worker thread. Keep it allocation-free and non-blocking. */
@@ -91,11 +98,12 @@ static void on_rx(const unsigned char *pcm, size_t n, void *user) {
     tap *t = (tap *)user;
     t->bytes += n;
     if (!t->armed) return;
-    for (size_t i = 0; i + 3 < n; i += 4) {          /* S16LE stereo: take channel 0 */
+    size_t step = (size_t)t->src_channels * 2;       /* S16LE frames: take channel 0 */
+    for (size_t i = 0; i + step <= n; i += step) {
         short l = (short)((unsigned short)pcm[i] | ((unsigned short)pcm[i + 1] << 8));
         t->acc += l;
-        if (++t->acc_n == DECIM) {
-            if (t->n < t->cap) t->out[t->n++] = (short)(t->acc / DECIM);
+        if (++t->acc_n == t->decim) {
+            if (t->n < t->cap) t->out[t->n++] = (short)(t->acc / t->decim);
             t->acc = 0;
             t->acc_n = 0;
         }
@@ -108,13 +116,13 @@ static void put32(FILE *f, unsigned v) {
 }
 static void put16(FILE *f, unsigned v) { fputc((int)(v & 255), f); fputc((int)((v >> 8) & 255), f); }
 
-static int write_wav(const char *path, const short *s, size_t n) {
+static int write_wav(const char *path, const short *s, size_t n, unsigned rate) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     unsigned data = (unsigned)(n * 2);
     fwrite("RIFF", 1, 4, f); put32(f, 36 + data); fwrite("WAVE", 1, 4, f);
     fwrite("fmt ", 1, 4, f); put32(f, 16); put16(f, 1); put16(f, 1);
-    put32(f, OUT_RATE); put32(f, OUT_RATE * 2); put16(f, 2); put16(f, 16);
+    put32(f, rate); put32(f, rate * 2); put16(f, 2); put16(f, 16);
     fwrite("data", 1, 4, f); put32(f, data);
     fwrite(s, 2, n, f);
     return fclose(f) == 0 ? 0 : -1;
@@ -126,11 +134,12 @@ static void usage(void) {
         "  --host H     naudio server (default 127.0.0.1)\n"
         "  --port N     server port (default 4533)\n"
         "  --seconds S  record length (default 15, one FT8 period)\n"
-        "  --out F      output WAV, %d Hz mono (default tap.wav)\n"
+        "  --out F      output WAV, mono at %d Hz when the negotiated rate divides by it\n"
+        "               (48k/24k/12k do), else at the negotiated rate (default tap.wav)\n"
         "  --align15    wait for a wall-clock 15 s boundary before recording (FT8/FT4 periods)\n"
         "  --tcp        use TCP instead of the UDP_WAN profile — the discriminating run when\n"
         "               UDP is short: TCP retransmits, so loss shows up as delay, not absence\n",
-        OUT_RATE);
+        WSJTX_RATE);
 }
 
 int main(int argc, char **argv) {
@@ -148,14 +157,14 @@ int main(int argc, char **argv) {
     }
     if (seconds <= 0 || port <= 0 || port > 65535) { usage(); return 2; }
 
+    /* The record buffer is sized from the NEGOTIATED format, which exists only after connect —
+     * so allocation moves below. Until t.armed is set the callback only counts bytes, and it
+     * never touches t.out while unarmed, so connecting first is safe. */
     tap t;
     memset(&t, 0, sizeof t);
-    t.cap = (size_t)OUT_RATE * (size_t)(seconds + 2);
-    t.out = (short *)calloc(t.cap, sizeof(short));
-    if (!t.out) { fprintf(stderr, "na_wav_tap: out of memory\n"); return 2; }
 
     na_stream_client *c = na_client_create(NA_CLIENT_BACKEND_NULL, host, port, "na_wav_tap");
-    if (!c) { fprintf(stderr, "na_wav_tap: na_client_create failed\n"); free(t.out); return 1; }
+    if (!c) { fprintf(stderr, "na_wav_tap: na_client_create failed\n"); return 1; }
     na_client_set_audio_cb(c, on_rx, &t);
     /* NOT na_client_set_transport(NA_TRANSPORT_UDP): that sets the transport and NOTHING else,
      * leaving FEC, reordering, adaptive jitter and control-ARQ off — a trap documented in
@@ -190,6 +199,36 @@ int main(int argc, char **argv) {
         na_client_destroy(c); free(t.out); return 1;
     }
     fprintf(stderr, "na_wav_tap: connected to %s:%d\n", host, port);
+
+    /* The negotiated format — what the server's AUDIO_CONFIG declared and what the callback's
+     * PCM is actually in. Post-connect by contract (before connect this getter reports only the
+     * local placeholder). @since 0.5.0; the hardcoded 48000/16/2 this replaces is the reason a
+     * 12 kHz-provisioned server used to produce a mangled file with exit code 0. */
+    int src_rate = 0, src_bits = 0, src_channels = 0;
+    if (na_client_get_audio_format(c, &src_rate, &src_bits, &src_channels) != NA_OK ||
+        src_rate <= 0 || src_bits != 16 || (src_channels != 1 && src_channels != 2)) {
+        fprintf(stderr, "na_wav_tap: unusable negotiated format %d Hz / %d-bit / %d ch\n",
+                src_rate, src_bits, src_channels);
+        na_client_disconnect(c); na_client_destroy(c); return 1;
+    }
+    int decim    = (src_rate % WSJTX_RATE == 0) ? src_rate / WSJTX_RATE : 1;
+    int out_rate = src_rate / decim;
+    fprintf(stderr, "na_wav_tap: negotiated %d Hz / 16-bit / %d ch -> %d Hz mono WAV "
+                    "(channel 0, %d:1 box decimation)\n",
+            src_rate, src_channels, out_rate, decim);
+    if (out_rate != WSJTX_RATE)
+        fprintf(stderr, "na_wav_tap: note: %d Hz does not divide by %d — the WAV is correct at "
+                        "%d Hz but the WSJT-X decoders expect %d Hz\n",
+                src_rate, WSJTX_RATE, out_rate, WSJTX_RATE);
+
+    t.cap = (size_t)out_rate * (size_t)(seconds + 2);
+    t.out = (short *)calloc(t.cap, sizeof(short));
+    if (!t.out) {
+        fprintf(stderr, "na_wav_tap: out of memory\n");
+        na_client_disconnect(c); na_client_destroy(c); return 2;
+    }
+    t.src_channels = src_channels;   /* both set before t.armed — on_rx reads them only armed */
+    t.decim = decim;
 
     /* Wait for audio to actually flow before timing anything. A client that has just connected
      * spends up to a couple of seconds before the first datagram arrives, and counting that dead
@@ -258,7 +297,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "na_wav_tap: na_client_get_stats failed — no diagnosis available\n");
     }
 
-    double bps = (double)got / (double)seconds, want = (double)SRC_RATE * 2.0 * 2.0;
+    double bps = (double)got / (double)seconds,
+           want = (double)src_rate * 2.0 * (double)src_channels;
     fprintf(stderr, "na_wav_tap: %llu bytes in %d s = %.0f B/s (expect %.0f, %.1f%%)\n",
             got, seconds, bps, want, 100.0 * bps / want);
     if (got == 0) {
@@ -266,8 +306,9 @@ int main(int argc, char **argv) {
         free(t.out); return 1;
     }
     /* Two different faults land here and they need different reactions, so name both rather than
-     * assert one. A rate far OVER or a non-multiple pattern means the stream is not 48000/16/2 and
-     * the file is wrong-pitched — it will never decode. A rate UNDER nominal usually means the
+     * assert one. Nominal is now what the NEGOTIATED format implies, so a rate far OVER it means
+     * the stream disagrees with the server's own AUDIO_CONFIG — a protocol violation, and the
+     * file is wrong-pitched. A rate UNDER nominal usually means the
      * producer is not keeping up (this project's synthetic sources habitually do not: the Hamlib
      * dummy runs ~83 %% of nominal, a loopback dummy ~70 %%, na_audio_source --test-tone 75.8 %%
      * measured) — pitch is then correct and the recording is simply short of wall time, which may
@@ -278,9 +319,9 @@ int main(int argc, char **argv) {
      * that makes the reader choose between two explanations has not diagnosed anything. */
     if (bps > want * 1.1) {
         fprintf(stderr, "na_wav_tap: WARNING delivered %.1f%% of nominal — ABOVE it, so this stream "
-                        "is not S16LE stereo @48k.\n"
+                        "disagrees with the %d Hz / %d ch its own AUDIO_CONFIG declared.\n"
                         "  The %d Hz WAV header is therefore wrong and the file will not decode.\n",
-                100.0 * bps / want, OUT_RATE);
+                100.0 * bps / want, src_rate, src_channels, out_rate);
     } else if (bps < want * 0.9) {
         fprintf(stderr, "na_wav_tap: WARNING delivered %.1f%% of nominal — BELOW it, so audio went "
                         "missing in transit.\n"
@@ -292,12 +333,12 @@ int main(int argc, char **argv) {
                 100.0 * bps / want);
     }
 
-    if (write_wav(out, t.out, t.n) != 0) {
+    if (write_wav(out, t.out, t.n, (unsigned)out_rate) != 0) {
         fprintf(stderr, "na_wav_tap: writing %s failed\n", out);
         free(t.out); return 2;
     }
     fprintf(stderr, "na_wav_tap: wrote %s — %zu samples @ %d Hz mono (%.1f s)\n",
-            out, t.n, OUT_RATE, (double)t.n / OUT_RATE);
+            out, t.n, out_rate, (double)t.n / out_rate);
     free(t.out);
     return 0;
 }
