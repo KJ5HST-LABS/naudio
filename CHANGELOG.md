@@ -26,6 +26,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   unchanged.
 
 ### Added
+- **Wire spec revision 1.2: per-subscription RX format negotiation is specified** (approved
+  2026-08-22; `docs/audio-streaming-protocol-v1.md` §6.2.1). A client MAY append a 5-byte format
+  request to `CONNECT_REQUEST` (`requestedRate` u32 + `requestedLayout` u8: NATIVE /
+  MONO_DOWNMIX / LEFT_ONLY / RIGHT_ONLY); the server grants exactly or answers native, and
+  replies with a 15-byte `AUDIO_CONFIG` (+`grantedLayout`) only on requesting connections — every
+  v1 peer sees byte-identical traffic, which the v1 parsers' prefix-only behavior guarantees
+  (measured, and pinned by tolerance vectors). Scope: RX only, rate + channel layout only,
+  reduction only; the wire version byte stays 1 (§11 minor extension). Golden vectors for the
+  1.2 forms are authored in `conformance/vectors/vectors-v1_2.ini` (not yet loaded by the
+  suite). **The spec is ahead of the code here by design:** the reference implementation is
+  issue #91 Phase B (B2–B5); no runtime behavior changes in this entry.
+
 - **`na_audio_source` and `na_audio_daemon` gain `--rate`/`--channels`** (8000–192000 Hz,
   divisible by 50 for an exact 20 ms frame; 1 or 2 channels) — static provisioning for a
   constrained link: 12 kHz mono is 192 kbps on the wire against the default 48 kHz stereo's

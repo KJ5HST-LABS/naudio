@@ -12,6 +12,11 @@ round-trip-against-self.
 import struct, zlib, os, sys
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else "vectors.ini"
+# Spec 1.2 (§6.2.1) vectors go to a SEPARATE file: the C++ harness loads vectors.ini in full
+# with a 0-skipped gate, so extended-form vectors may not enter it before the reference
+# implementation encodes them (issue #91 Phase B wires this file into the loaded suite).
+OUT_V12 = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
+    os.path.dirname(OUT) or ".", "vectors-v1_2.ini")
 
 def h(b: bytes) -> str:
     return b.hex()
@@ -66,6 +71,17 @@ def ctrl_connect_request(version, name, config=None, info=None) -> bytes:
     out += bytes([len(ci)]) + ci
     return bytes(out)
 
+def ctrl_connect_request_v12(version, name, config, info, req_rate, req_layout) -> bytes:
+    # Spec 1.2 (§6.2.1): the v1 message + a 5-byte appended format request
+    # (requestedRate u32 BE, requestedLayout u8). v1 parsers ignore the tail (prefix-only).
+    return ctrl_connect_request(version, name, config, info) + struct.pack('>IB', req_rate,
+                                                                           req_layout)
+
+def ctrl_audio_config_v12(sr, bits, ch, frame_ms, tgt, mn, mx, granted_layout) -> bytes:
+    # Spec 1.2 (§6.2.1): the 14-byte form + grantedLayout u8 (15 bytes). Sent only on a
+    # connection whose CONNECT_REQUEST carried a format request.
+    return ctrl_audio_config(sr, bits, ch, frame_ms, tgt, mn, mx) + bytes([granted_layout])
+
 def ctrl_latency(type_byte, ts) -> bytes:
     return bytes([type_byte]) + struct.pack('>q', ts)  # i64 BE timestamp
 
@@ -89,6 +105,10 @@ def ctrl_clients_update(client_count, max_clients, tx_owner, client_ids, info_ma
 records = []
 def rec(name, **kv):
     records.append((name, kv))
+
+records_v12 = []
+def rec12(name, **kv):
+    records_v12.append((name, kv))
 
 # ---- CRC known-answer ----
 rec("crc-kat-check", kind="crc32", inputHex=h(b"123456789"),
@@ -214,6 +234,68 @@ rec("jitter-empty", kind="jitter", minMs=20, maxMs=200, multiplier="3.0",
 rec("jitter-first-packet", kind="jitter", minMs=20, maxMs=200, multiplier="3.0",
     packets=1, expectedTargetMs=20, expectedPacketCount=1)
 
+# ---- spec 1.2 vectors (§6.2.1) -- SEPARATE FILE, not loaded by the suite until Phase B ----
+#
+# kind = control_v12       encode vectors: same schema as `control`, plus requestedRate /
+#                          requestedLayout (CONNECT_REQUEST) or grantedLayout (AUDIO_CONFIG).
+# kind = control_decode_v1 tolerance vectors: payloadHex is fed to a *v1* decoder; the expected*
+#                          fields are the v1 VIEW it must extract, ignoring the extension tail.
+#                          These pin the compatibility-matrix row "1.2 client -> v1 server".
+
+_cr12_min = ctrl_connect_request_v12(1, "W1AW-client", None, None, 12000, 1)
+rec12("control-connect-request-v12-format", kind="control_v12", controlType=0x01,
+      protocolVersion=1, clientName="W1AW-client", requestedRate=12000, requestedLayout=1,
+      expectedPayloadHex=h(_cr12_min))
+
+_cr12_full = ctrl_connect_request_v12(1, "W1AW-client", (100, 40, 300),
+                                      ("W1AW", "Hiram", "Newington CT"), 12000, 2)
+rec12("control-connect-request-v12-full", kind="control_v12", controlType=0x01,
+      protocolVersion=1, clientName="W1AW-client", hasConfig=1,
+      bufferTargetMs=100, bufferMinMs=40, bufferMaxMs=300,
+      infoCallsign="W1AW", infoName="Hiram", infoLocation="Newington CT",
+      requestedRate=12000, requestedLayout=2,
+      expectedPayloadHex=h(_cr12_full))
+
+# requestedRate=0 + requestedLayout=0 asks for native unchanged; the extended AUDIO_CONFIG
+# reply is the tell that the server speaks 1.2 at all (the "1.2 probe", §6.2.1).
+rec12("control-connect-request-v12-probe", kind="control_v12", controlType=0x01,
+      protocolVersion=1, clientName="W1AW-client", requestedRate=0, requestedLayout=0,
+      expectedPayloadHex=h(ctrl_connect_request_v12(1, "W1AW-client", None, None, 0, 0)))
+
+_ac12_grant = ctrl_audio_config_v12(12000, 16, 1, 20, 100, 40, 300, 1)
+rec12("control-audioconfig-v12-granted", kind="control_v12", controlType=0x04,
+      sampleRate=12000, bitsPerSample=16, channels=1, frameDurationMs=20,
+      bufferTargetMs=100, bufferMinMs=40, bufferMaxMs=300, grantedLayout=1,
+      expectedPayloadHex=h(_ac12_grant))
+
+# Declined: native fields + grantedLayout=0, still the 15-byte form (the server understood
+# the request and answered native -- distinct from a v1 server's 14-byte reply).
+rec12("control-audioconfig-v12-declined-native", kind="control_v12", controlType=0x04,
+      sampleRate=48000, bitsPerSample=16, channels=2, frameDurationMs=20,
+      bufferTargetMs=100, bufferMinMs=40, bufferMaxMs=300, grantedLayout=0,
+      expectedPayloadHex=h(ctrl_audio_config_v12(48000, 16, 2, 20, 100, 40, 300, 0)))
+
+# v1 view of the full 1.2 request: buffer prefs + ClientInfo extracted, the 5-byte tail ignored.
+rec12("control-decode-v1-view-of-v12-request", kind="control_decode_v1", controlType=0x01,
+      payloadHex=h(_cr12_full),
+      expectedBufferTargetMs=100, expectedBufferMinMs=40, expectedBufferMaxMs=300,
+      expectedCallsign="W1AW", expectedName="Hiram", expectedLocation="Newington CT",
+      expectedIsFormatRequest=1, expectedIgnoredTailBytes=5)
+
+# v1 view of the 15-byte AUDIO_CONFIG: the 14-byte prefix; the appended byte ignored.
+rec12("control-decode-v1-view-of-v12-audioconfig", kind="control_decode_v1", controlType=0x04,
+      payloadHex=h(_ac12_grant),
+      expectedSampleRate=12000, expectedBitsPerSample=16, expectedChannels=1,
+      expectedFrameDurationMs=20, expectedBufferTargetMs=100, expectedBufferMinMs=40,
+      expectedBufferMaxMs=300, expectedIgnoredTailBytes=1)
+
+# A trailing run SHORTER than 5 bytes is not a format request (§6.2.1): v1 fields intact,
+# tail ignored by v1 AND 1.2 decoders alike.
+rec12("control-connect-request-v12-neg-short-tail", kind="control_decode_v1", controlType=0x01,
+      payloadHex=h(ctrl_connect_request(1, "W1AW-client", config=(100, 40, 300)) + b"\x2e\xe0"),
+      expectedBufferTargetMs=100, expectedBufferMinMs=40, expectedBufferMaxMs=300,
+      expectedIsFormatRequest=0, expectedIgnoredTailBytes=2)
+
 # ---- emit INI ----
 os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
 with open(OUT, "w") as f:
@@ -227,7 +309,22 @@ with open(OUT, "w") as f:
             f.write("%s = %s\n" % (k, v))
         f.write("\n")
 
+with open(OUT_V12, "w") as f:
+    f.write("# net-audio audio streaming protocol -- spec 1.2 (SS6.2.1) golden vectors\n")
+    f.write("# GENERATED by tools/gen_vectors.py. NOT loaded by the conformance suite yet:\n")
+    f.write("# the harness runs vectors.ini with a 0-skipped gate, so these join the loaded\n")
+    f.write("# suite together with the reference implementation (issue #91 Phase B).\n")
+    f.write("# kind=control_v12: encode vectors. kind=control_decode_v1: the v1 decoder's\n")
+    f.write("# required VIEW of an extended payload (tolerance -- SS6.2.1 / SS11).\n")
+    f.write("# See conformance/README.md for the per-kind field schema.\n\n")
+    for name, kv in records_v12:
+        f.write("[%s]\n" % name)
+        for k, v in kv.items():
+            f.write("%s = %s\n" % (k, v))
+        f.write("\n")
+
 print("wrote %d vectors to %s" % (len(records), OUT))
+print("wrote %d spec-1.2 vectors to %s" % (len(records_v12), OUT_V12))
 # sanity echo of the heartbeat frame for the report
 print("heartbeat-seq5 frameHex =", h(frame(0x03, 5, 0, 0, b"")))
 print("audioconfig payload     =", h(ac))
