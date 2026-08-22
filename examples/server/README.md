@@ -49,6 +49,19 @@ build/examples/na_audio_source --capture-id 3 --port 4533
 
 With no `--capture-id`, the first capture-capable device is selected automatically.
 
+**Fit a constrained link (lower the wire rate):**
+
+```sh
+build/examples/na_audio_source --test-tone --reliability wan --rate 12000 --channels 1
+```
+
+The default format costs 1.536 Mbps on the wire (48 kHz / 16-bit / stereo); `--rate 12000
+--channels 1` is 192 kbps — 8× less, and still covers SSB (≤3 kHz) and FT8 (≤3.1 kHz audio).
+The format is **server-wide**: every connected client gets it (per-client negotiation is
+issue #91 Phase B). naudio does not resample, so in capture mode the device must support
+the requested rate or the start fails with the device error — a silent fallback would ship
+wrong-rate audio labeled with the declared rate.
+
 ## Options
 
 ```
@@ -57,6 +70,9 @@ With no `--capture-id`, the first capture-capable device is selected automatical
 --transport T     tcp (default) | udp
 --reliability P   lan | wan  (UDP profiles: FEC/reorder/jitter). UDP/DUAL needs
                   one: a bare start is refused since 0.5.0
+--rate HZ         server-wide sample rate, 8000..192000, divisible by 50 for an
+                  exact 20 ms frame (default 48000); naudio does NOT resample
+--channels N      1 (mono) | 2 (stereo, default); server-wide, like --rate
 --test-tone       hardware-free: broadcast a deterministic tone (no device)
 --max-clients N   maximum simultaneous clients (default 4)
 --seconds N       run time; 0 = until Ctrl-C (default 0)

@@ -44,29 +44,33 @@
 #include "naudio.h"  // the only audio header — pure C, no C++
 
 // ---- Audio format ------------------------------------------------------------------------
-// The server's default network-audio format (matches AudioStreamConfig's defaults). The
-// test-tone frames are generated in exactly this format so a client decodes them cleanly.
-#define SAMPLE_RATE   48000
+// Defaults match AudioStreamConfig's (48 kHz / 16-bit / stereo). --rate/--channels declare a
+// lower server-wide format via na_server_set_audio_format — 12 kHz mono is 192 kbps on the
+// wire against 1.536 Mbps for the default, which is what fits a constrained link (issue #91).
+// naudio does not resample: in capture mode the device is opened at exactly this format (the
+// start fails loudly if it cannot be), and in test-tone mode the frames are generated in it.
+#define DEFAULT_RATE  48000
 #define BITS          16
-#define CHANNELS      2
+#define DEFAULT_CHANNELS 2
 #define FRAME_MS      20
-#define SAMPLES_PER_FRAME (SAMPLE_RATE * FRAME_MS / 1000)        // 960 sample-frames
-#define INT16_PER_FRAME   (SAMPLES_PER_FRAME * CHANNELS)         // 1920 int16 values
-#define BYTES_PER_FRAME   (INT16_PER_FRAME * (BITS / 8))         // 3840 bytes
+// Frame geometry is computed from the effective rate/channels in main(): at the defaults,
+// 960 sample-frames -> 1920 int16 values -> 3840 bytes per 20 ms frame.
 
 // ---- Test-tone sawtooth ------------------------------------------------------------------
 // A deterministic 16-bit sawtooth, regenerated identically for every frame so the stream is
 // byte-for-byte reproducible no matter when a client connects: each frame's first samples are
 // always -15000, -14743, -14486, -14229, ... which is `68 c5 69 c6 6a c7 6b c8` as little-
-// endian PCM. An interop client can assert that exact first frame.
+// endian PCM. An interop client can assert that exact first frame. The phase resets to 0 at
+// every frame, so those first 8 bytes are the same at EVERY rate/channel setting — the
+// fingerprint identifies the tone, not the format (the minimum --rate keeps a frame >= 8 bytes).
 #define SAW_STEP  257
 #define SAW_MOD   30000
 #define SAW_BIAS  15000
 
-// Fill `frame` (BYTES_PER_FRAME bytes) with one period-reset sawtooth frame, little-endian.
-static void fill_tone_frame(unsigned char* frame) {
+// Fill `frame` (n_int16 * 2 bytes) with one period-reset sawtooth frame, little-endian.
+static void fill_tone_frame(unsigned char* frame, int n_int16) {
     long phase = 0;  // (j * SAW_STEP) % SAW_MOD, advanced without overflow
-    for (int j = 0; j < INT16_PER_FRAME; j++) {
+    for (int j = 0; j < n_int16; j++) {
         int16_t  sample = (int16_t)(phase - SAW_BIAS);
         uint16_t u      = (uint16_t)sample;
         frame[j * 2]     = (unsigned char)(u & 0xFF);          // low byte first (LE)
@@ -76,10 +80,8 @@ static void fill_tone_frame(unsigned char* frame) {
     }
 }
 
-// First-frame fingerprint as lowercase hex (the first up-to-8 bytes), for a self-check log.
-static void tone_first_frame_hex(char* out /* >= 17 bytes */) {
-    unsigned char frame[BYTES_PER_FRAME];
-    fill_tone_frame(frame);
+// First-frame fingerprint as lowercase hex (the first 8 bytes), for a self-check log.
+static void tone_first_frame_hex(const unsigned char* frame, char* out /* >= 17 bytes */) {
     for (int i = 0; i < 8; i++) sprintf(out + i * 2, "%02x", frame[i]);
     out[16] = '\0';
 }
@@ -193,6 +195,7 @@ static int default_capture_id(void) {
 static void usage(void) {
     fprintf(stderr,
         "usage: na_audio_source [--port N] [--capture-id N] [--transport tcp|udp]\n"
+        "                       [--rate HZ] [--channels 1|2]\n"
         "                       [--test-tone] [--max-clients N] [--seconds N]\n"
         "       na_audio_source --list-devices\n\n"
         "  --port N          listen port; 0 = OS-assigned ephemeral (default 4533)\n"
@@ -200,6 +203,11 @@ static void usage(void) {
         "  --transport T     tcp (default) | udp\n"
         "  --reliability P   lan | wan  (UDP profiles: FEC/reorder/jitter). UDP/DUAL needs\n"
         "                    one: a bare start is refused since 0.5.0\n"
+        "  --rate HZ         server-wide sample rate, 8000..192000, divisible by 50 for an\n"
+        "                    exact 20 ms frame (default 48000). naudio does NOT resample: in\n"
+        "                    capture mode the device must support this rate or the start\n"
+        "                    fails. 12000 mono = 192 kbps on the wire vs 1536 kbps default\n"
+        "  --channels N      1 (mono) | 2 (stereo, default). Server-wide, like --rate\n"
         "  --test-tone       hardware-free: broadcast a deterministic sawtooth (no device)\n"
         "  --max-clients N   maximum simultaneous clients (default 4)\n"
         "  --seconds N       run time; 0 = until Ctrl-C (default 0)\n"
@@ -215,6 +223,9 @@ int main(int argc, char** argv) {
     int          max_clients = 4;
     long long    seconds     = 0;     // 0 = until Ctrl-C
     int          reliability = -1;    // -1 => bare transport (unchanged default)
+    int          rate        = DEFAULT_RATE;
+    int          channels    = DEFAULT_CHANNELS;
+    int          format_set  = 0;     // only call na_server_set_audio_format when asked
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -223,6 +234,8 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--capture-id") == 0)  capture_id = atoi(NEED_VAL("--capture-id"));
         else if (strcmp(a, "--max-clients") == 0) max_clients = atoi(NEED_VAL("--max-clients"));
         else if (strcmp(a, "--seconds") == 0)     seconds = atoll(NEED_VAL("--seconds"));
+        else if (strcmp(a, "--rate") == 0)        { rate = atoi(NEED_VAL("--rate")); format_set = 1; }
+        else if (strcmp(a, "--channels") == 0)    { channels = atoi(NEED_VAL("--channels")); format_set = 1; }
         else if (strcmp(a, "--test-tone") == 0)   test_tone = 1;
         else if (strcmp(a, "--list-devices") == 0) return list_devices();
         else if (strcmp(a, "--reliability") == 0) {
@@ -241,6 +254,23 @@ int main(int argc, char** argv) {
         else { fprintf(stderr, "unknown option: %s\n", a); usage(); return 2; }
         #undef NEED_VAL
     }
+
+    // The bounds keep a 20 ms frame exact ((rate * FRAME_MS) % 1000 == 0 <=> divisible by 50)
+    // and at least 8 bytes long (the fingerprint's read); na_server_set_audio_format re-validates
+    // rate > 0 and channels 1|2 but knows nothing about this tool's frame cadence.
+    if (rate < 8000 || rate > 192000 || (rate * FRAME_MS) % 1000 != 0) {
+        fprintf(stderr, "error: invalid --rate %d (8000..192000, divisible by 50)\n", rate);
+        return 2;
+    }
+    if (channels != 1 && channels != 2) {
+        fprintf(stderr, "error: invalid --channels %d (1|2)\n", channels);
+        return 2;
+    }
+
+    // Frame geometry for the effective format (at the defaults: 960 / 1920 / 3840).
+    const int samples_per_frame = rate * FRAME_MS / 1000;
+    const int int16_per_frame   = samples_per_frame * channels;
+    const int bytes_per_frame   = int16_per_frame * (BITS / 8);
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -285,6 +315,17 @@ int main(int argc, char** argv) {
     else
         na_server_set_transport(server, transport);
     na_server_set_max_clients(server, max_clients);
+    /* Server-wide: EVERY client gets this format (per-client negotiation does not exist yet —
+     * issue #91 Phase B). It survives a profile call in either order, so the placement relative
+     * to na_server_set_reliability_profile above is not load-bearing. */
+    if (format_set) {
+        if (na_server_set_audio_format(server, rate, BITS, channels) != NA_OK) {
+            fprintf(stderr, "error: na_server_set_audio_format(%d, %d, %d): %s\n",
+                    rate, BITS, channels, na_strerror(na_last_error()));
+            na_server_destroy(server);
+            return 1;
+        }
+    }
     if (!test_tone) {
         if (na_server_set_capture_device(server, capture_id) != NA_OK) {
             fprintf(stderr, "error: na_server_set_capture_device(%d): %s\n",
@@ -297,36 +338,56 @@ int main(int argc, char** argv) {
     char err[256];
     if (na_server_start(server, err, (int)sizeof err) != NA_OK) {
         fprintf(stderr, "error: na_server_start failed: %s\n", err);
+        if (format_set && !test_tone)
+            fprintf(stderr, "hint: the capture device may not support %d Hz / %d ch — naudio "
+                            "does not resample. Pick a rate the device supports, or --test-tone.\n",
+                    rate, channels);
         na_server_destroy(server);
         return 1;
     }
 
     const int bound_port = na_server_port(server);
-    const char* transport_name = transport == NA_TRANSPORT_TCP ? "tcp" : "udp";
+    // The EFFECTIVE transport: a --reliability profile selects UDP as part of itself, so echoing
+    // the --transport flag would misreport exactly the runs the profile flag exists for (the same
+    // latent misreport the 0.5.0 example sweep fixed in the clients).
+    const char* transport_name =
+        reliability >= 0 ? "udp" : (transport == NA_TRANSPORT_TCP ? "tcp" : "udp");
 
     // Machine-readable on STDOUT so a harness with --port 0 can learn the ephemeral port.
     printf("LISTENING port=%d\n", bound_port);
     fflush(stdout);
 
+    // The tone frame is identical every frame — generate once, sized for the effective format.
+    unsigned char* frame = NULL;
+    if (test_tone) {
+        frame = (unsigned char*)malloc((size_t)bytes_per_frame);
+        if (frame == NULL) {
+            fprintf(stderr, "error: out of memory\n");
+            na_server_destroy(server);
+            return 1;
+        }
+        fill_tone_frame(frame, int16_per_frame);
+    }
+
     if (test_tone) {
         char hex[17];
-        tone_first_frame_hex(hex);
-        fprintf(stderr, "[source] test-tone source on %s:%d (max %d clients); "
-                        "tone_first_frame_hex=%s\n", transport_name, bound_port, max_clients, hex);
+        tone_first_frame_hex(frame, hex);
+        fprintf(stderr, "[source] test-tone source on %s:%d (%d Hz / %d ch, max %d clients); "
+                        "tone_first_frame_hex=%s\n", transport_name, bound_port, rate, channels,
+                max_clients, hex);
         fprintf(stderr, "[source] connect a client, e.g. "
                         "na_c_play_to_speakers --backend system --playback-id N --host 127.0.0.1 --port %d\n",
                 bound_port);
     } else {
-        fprintf(stderr, "[source] capturing device id=%d -> broadcasting on %s:%d (max %d clients)\n",
-                capture_id, transport_name, bound_port, max_clients);
+        fprintf(stderr, "[source] capturing device id=%d (%d Hz / %d ch) -> broadcasting on "
+                        "%s:%d (max %d clients)\n",
+                capture_id, rate, channels, transport_name, bound_port, max_clients);
     }
     fprintf(stderr, "[source] running %s ...\n",
             seconds > 0 ? "for a fixed time" : "until Ctrl-C");
 
     // Run loop. Test-tone injects one frame every FRAME_MS (the library captures + broadcasts
     // automatically in capture mode, so there we just wait). A periodic status line shows life.
-    unsigned char frame[BYTES_PER_FRAME];
-    if (test_tone) fill_tone_frame(frame);  // identical every frame — generate once
 
     const long long start    = now_ms();
     const long long deadline = seconds > 0 ? start + seconds * 1000 : 0;
@@ -335,7 +396,7 @@ int main(int argc, char** argv) {
 
     while (!g_stop && (deadline == 0 || now_ms() < deadline)) {
         if (test_tone) {
-            if (na_server_inject_audio(server, frame, BYTES_PER_FRAME) != NA_OK) {
+            if (na_server_inject_audio(server, frame, bytes_per_frame) != NA_OK) {
                 fprintf(stderr, "[source] inject failed: %s\n", na_strerror(na_last_error()));
                 break;
             }
@@ -364,5 +425,6 @@ int main(int argc, char** argv) {
            test_tone ? "test-tone" : "capture");
 
     na_server_destroy(server);  // stop + join workers + drain dispatch thread, then free
+    free(frame);
     return 0;
 }
