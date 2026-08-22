@@ -26,6 +26,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   unchanged.
 
 ### Added
+- **`na_client_request_format` / `na_client_get_granted_rx_layout`** (issue #91 B4; @since
+  0.5.0 — gate on `na_version_number()`): the client half of spec 1.2. Request a reduced RX
+  format before connecting (`NA_RX_LAYOUT_NATIVE` / `MONO_DOWNMIX` / `LEFT_ONLY` /
+  `RIGHT_ONLY`; rate 0 keeps native); the server grants exactly or answers native, the granted
+  format lands in `na_client_get_audio_format`, and the layout getter keeps the §6.2.1
+  detection semantics distinct — `NA_OK` means the server *answered* (the requested layout =
+  granted; `NATIVE` + native fields = understood and declined), `NA_ERR_UNSUPPORTED` means no
+  extended reply exists (no request, not connected, or a pre-1.2 server that ignored the
+  request and streams native — measured against a real pre-B1 build). An auto-reconnect
+  renews the request; an unservable request never fails the connection.
+
 - **The server implements spec 1.2: per-subscription RX format grants** (issue #91 B3). A
   connection whose `CONNECT_REQUEST` carries a §6.2.1 format request is granted **exactly or
   answered native** — integer divisors of the native rate (48 kHz → 24/16/12/8 k) with the
