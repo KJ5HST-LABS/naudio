@@ -8,10 +8,12 @@
 
 #include <algorithm>  // std::remove, in removeStreamListener
 #include <chrono>
+#include <cstring>  // std::memcpy, in enqueueConvertedRxAudio
 #include <deque>
 #include <utility>
 
 #include "naudio/ControlMessage.hpp"
+#include "naudio/FormatConversion.hpp"  // §6.2.1 per-subscription RX conversion
 // CONNECTION_TIMEOUT_MS, which the outbound backlog cap is derived from. Reached
 // transitively via TcpServerTransport below, but a transitive include is not a contract.
 #include "naudio/net/AudioProtocolHandler.hpp"
@@ -84,7 +86,15 @@ public:
         // false when the backlog is at its cap, and false here is what AudioBroadcaster
         // documents as "remove me" (AudioBroadcaster.hpp:49-50). Issue #56 — do not restore
         // the unconditional `return true` this replaced.
-        return enqueueRxAudio(std::vector<std::uint8_t>(data + offset, data + offset + length));
+        //
+        // A subscription granted a reduced RX format (§6.2.1) is converted here, per
+        // subscription, BEFORE the enqueue — everything downstream (the writer, the
+        // connection's chunking, sequence numbers, FEC parity) then operates on what THIS
+        // connection is actually sent, which is exactly the per-connection framing the
+        // spec's grant rules require. Native subscribers keep the byte-identical path above.
+        if (grantedLayout_ == 0 && !decimator_.has_value())
+            return enqueueRxAudio(std::vector<std::uint8_t>(data + offset, data + offset + length));
+        return enqueueConvertedRxAudio(data + offset, length);
     }
     std::string targetId() const override { return clientId_; }
 
@@ -136,6 +146,9 @@ private:
     void enqueueControl(ControlMessage message);
     // False means the outbound backlog is at its cap and this session should be removed.
     bool enqueueRxAudio(std::vector<std::uint8_t> data);
+    // Converts native fan-out bytes to this subscription's granted format (§6.2.1) and
+    // enqueues the result. Fan-out thread only. Same false-means-remove contract.
+    bool enqueueConvertedRxAudio(const std::uint8_t* data, std::size_t length);
 
     AudioStreamServer* server_;  // back-pointer; the server outlives every session
     const std::string clientId_;
@@ -143,6 +156,20 @@ private:
     const std::int64_t connectTimeMs_;
 
     AudioStreamConfig sessionConfig_;
+
+    // --- Spec 1.2 (§6.2.1) per-subscription RX format state ---
+    // Written once in performHandshake (the run thread) BEFORE this session is registered
+    // with the broadcaster; read afterwards only by receiveRxAudio (the fan-out thread) and
+    // the AUDIO_CONFIG send. addTarget's own mutex publishes them, so no lock is needed.
+    bool formatRequested_ = false;    // request tail present -> the reply is the 15-byte form
+    std::uint8_t grantedLayout_ = 0;  // RxLayout wire byte actually granted (0 = native)
+    std::optional<Decimator> decimator_;  // engaged iff the granted rate is below native
+    // Conversion scratch (fan-out thread only): aligned copy of the native input, the
+    // channel-reduced intermediate, and the decimated output.
+    std::vector<std::int16_t> convIn_;
+    std::vector<std::int16_t> convScratch_;
+    std::vector<std::int16_t> convOut_;
+
     std::atomic<bool> closed_{false};
     std::atomic<bool> streaming_{false};
     std::atomic<std::int64_t> measuredLatencyMs_{0};
@@ -197,7 +224,11 @@ private:
     // 7.68e9 and overflows, and the cast to size_t would then yield an effectively infinite
     // cap that disables this guard on a shipped preset with no diagnostic. This project
     // passes no warning flags, so nothing would report it.
-    const std::size_t outQueueMaxBytes_;
+    // Not const since spec 1.2: a subscription granted a reduced RX format (§6.2.1) has a
+    // lower byte rate, and runLoop re-derives the cap from the granted format right after the
+    // handshake — before the writer thread or any fan-out exists — so the cap stays exactly
+    // CONNECTION_TIMEOUT_MS worth of THIS subscription's audio.
+    std::size_t outQueueMaxBytes_;
 
     // Pacing for the run loop's heartbeat/stats wait (woken immediately on close()).
     std::mutex runStopMutex_;
@@ -282,6 +313,51 @@ bool AudioStreamServer::ClientSession::enqueueRxAudio(std::vector<std::uint8_t> 
     return true;
 }
 
+bool AudioStreamServer::ClientSession::enqueueConvertedRxAudio(const std::uint8_t* data,
+                                                               std::size_t length) {
+    // Native PCM in, this subscription's granted format out (§6.2.1). Runs on the fan-out
+    // thread only; conversion state carries across calls (the decimator's FIR history), so
+    // the output is the same byte stream whatever chunking the broadcaster uses.
+    const AudioStreamConfig& native = server_->config_;
+    const int nativeCh = native.channels;
+    const std::size_t nativeFrameBytes = static_cast<std::size_t>(nativeCh) * sizeof(std::int16_t);
+    const std::size_t frames = length / nativeFrameBytes;  // #20: fan-out is whole-frame aligned
+    if (frames == 0) return true;
+
+    // Aligned int16 view of the borrowed bytes (a reinterpret_cast would assume alignment).
+    convIn_.resize(frames * static_cast<std::size_t>(nativeCh));
+    std::memcpy(convIn_.data(), data, frames * nativeFrameBytes);
+
+    // Channel reduction first (it halves the decimator's work), then decimation.
+    const std::int16_t* stage = convIn_.data();
+    std::size_t stageFrames = frames;
+    int stageChannels = nativeCh;
+    if (grantedLayout_ != 0) {
+        convScratch_.resize(frames);
+        if (grantedLayout_ == static_cast<std::uint8_t>(RxLayout::MonoDownmix)) {
+            downmixToMono(stage, frames, convScratch_.data());
+        } else {
+            const int channel =
+                (grantedLayout_ == static_cast<std::uint8_t>(RxLayout::RightOnly)) ? 1 : 0;
+            selectChannel(stage, frames, nativeCh, channel, convScratch_.data());
+        }
+        stage = convScratch_.data();
+        stageChannels = 1;
+    }
+    if (decimator_.has_value()) {
+        convOut_.resize(decimator_->outputFramesFor(stageFrames) *
+                        static_cast<std::size_t>(stageChannels));
+        stageFrames = decimator_->process(stage, stageFrames, convOut_.data());
+        stage = convOut_.data();
+    }
+    if (stageFrames == 0) return true;  // a short chunk can decimate to nothing; not backlog
+
+    const auto* outBytes = reinterpret_cast<const std::uint8_t*>(stage);
+    const std::size_t outLen =
+        stageFrames * static_cast<std::size_t>(stageChannels) * sizeof(std::int16_t);
+    return enqueueRxAudio(std::vector<std::uint8_t>(outBytes, outBytes + outLen));
+}
+
 std::optional<AudioPacket> AudioStreamServer::ClientSession::receiveOnePacket(int totalTimeoutMs) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(totalTimeoutMs);
@@ -320,6 +396,42 @@ bool AudioStreamServer::ClientSession::performHandshake() {
         std::lock_guard<std::mutex> lock(infoMutex_);
         clientInfo_ = info;
     }
+
+    // Spec 1.2 (§6.2.1): a format request is granted EXACTLY or answered native — never a
+    // partial or substituted grant. An unservable request never rejects the connection.
+    if (auto freq = msg->parseConnectRequestFormatRequest()) {
+        formatRequested_ = true;
+        const AudioStreamConfig& native = server_->config_;
+        // Requested rate: 0 keeps the native rate (factor 1). Otherwise it must be a
+        // positive integer divisor of the native rate whose samplesPerFrame stays integral,
+        // AND a divisor the Decimator implements — any other divisor is declined-to-native,
+        // which the spec permits ("MAY decline any request for any reason").
+        bool rateOk = true;
+        int factor = 1;
+        if (freq->sampleRate != 0) {
+            const auto rate = static_cast<std::int64_t>(freq->sampleRate);
+            rateOk = rate > 0 && rate <= native.sampleRate && native.sampleRate % rate == 0 &&
+                     (rate * native.frameDurationMs) % 1000 == 0;
+            if (rateOk) {
+                factor = static_cast<int>(native.sampleRate / rate);
+                rateOk = Decimator::supportsFactor(factor);
+            }
+        }
+        // Layouts 1-3 reduce native stereo to one channel; unknown layout bytes decline.
+        const bool layoutOk = freq->layout == 0 || (freq->layout <= 3 && native.channels == 2);
+        // The conversion units are int16-only; a non-16-bit native (e.g. a future IQ form)
+        // declines any request that would actually change the stream.
+        const bool changes = factor != 1 || freq->layout != 0;
+        if (rateOk && layoutOk && (!changes || native.bitsPerSample == 16)) {
+            grantedLayout_ = freq->layout;
+            sessionConfig_.sampleRate = native.sampleRate / factor;
+            const int convChannels = (freq->layout != 0) ? 1 : native.channels;
+            sessionConfig_.channels = convChannels;
+            if (factor > 1) decimator_.emplace(factor, convChannels);
+        }
+        // Declined: grantedLayout_ stays 0 and sessionConfig_ keeps the native format
+        // fields, so the 15-byte reply states native + layout 0 — "understood, declined".
+    }
     return true;
 }
 
@@ -344,8 +456,20 @@ void AudioStreamServer::ClientSession::runLoop() {
         return;
     }
 
-    // Send config + accept directly (awaited before any RX audio is registered).
-    if (!connection_->sendControl(ControlMessage::audioConfig(sessionConfig_)) ||
+    // A granted reduced format lowers this subscription's byte rate; re-derive the backlog
+    // cap from the granted config so it stays CONNECTION_TIMEOUT_MS worth of THIS stream.
+    // Safe here: the writer thread and the broadcaster registration are both below.
+    outQueueMaxBytes_ = static_cast<std::size_t>(
+        static_cast<std::int64_t>(sessionConfig_.bytesPerSecond()) *
+        AudioProtocolHandler::CONNECTION_TIMEOUT_MS / 1000);
+
+    // Send config + accept directly (awaited before any RX audio is registered). A
+    // connection whose CONNECT_REQUEST carried a format request gets the 15-byte extended
+    // form — and ONLY such a connection (§6.2.1): every v1 client sees the exact v1 bytes.
+    const ControlMessage configMsg =
+        formatRequested_ ? ControlMessage::audioConfigV12(sessionConfig_, grantedLayout_)
+                         : ControlMessage::audioConfig(sessionConfig_);
+    if (!connection_->sendControl(configMsg) ||
         !connection_->sendControl(ControlMessage::connectAccept())) {
         leaveRoster();
         return;

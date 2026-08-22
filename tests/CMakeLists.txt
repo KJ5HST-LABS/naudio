@@ -84,6 +84,9 @@ add_executable(naudio_net_tests
     net/test_broadcaster.cpp
     net/test_mixer.cpp
     net/test_server.cpp
-    net/test_client_e2e.cpp)
+    net/test_client_e2e.cpp
+    net/test_format_negotiation.cpp
+    # The lossy-relay fixture (shared with the C stats test's own target).
+    client_stats_proxy.cpp)
 target_link_libraries(naudio_net_tests PRIVATE naudio_net GTest::gtest_main Threads::Threads)
 gtest_discover_tests(naudio_net_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT})
