@@ -13,7 +13,8 @@ add_executable(naudio_tests
     test_reorder.cpp
     test_control_reliability.cpp
     test_ring_buffer.cpp
-    test_stream_rate.cpp)
+    test_stream_rate.cpp
+    test_format_conversion.cpp)
 
 # Tests exercise the pure logic layer only — no PortAudio, no hardware.
 # gtest_main links gtest transitively; linking both would duplicate libgtest.

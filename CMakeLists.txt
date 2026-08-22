@@ -254,7 +254,8 @@ add_library(naudio_core STATIC
     src/ControlReliability.cpp
     src/PacketReorderBuffer.cpp
     src/JitterEstimator.cpp
-    src/AudioRingBuffer.cpp)
+    src/AudioRingBuffer.cpp
+    src/FormatConversion.cpp)
 # BUILD/INSTALL_INTERFACE split: the build tree sees the source-tree
 # include/, the installed export sees the install prefix's includedir — without
 # this, install(EXPORT naudioTargets) would bake an absolute build-tree path into
