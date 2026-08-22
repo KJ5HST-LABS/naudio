@@ -31,6 +31,10 @@ using naudio::selectChannel;
 
 namespace {
 
+// MSVC's <cmath> does not provide M_PI without _USE_MATH_DEFINES; use a
+// local constant (same literal) so the tone tests build everywhere.
+constexpr double kPi = 3.14159265358979323846;
+
 // The language-neutral deterministic noise source (matches the Python
 // reference's lcg()).
 std::vector<std::int16_t> lcg(std::uint32_t seed, std::size_t count) {
@@ -331,7 +335,7 @@ TEST(Decimator, PassbandToneSurvives) {
     std::vector<std::int16_t> in(kFrames);
     for (std::size_t i = 0; i < kFrames; ++i)
         in[i] = static_cast<std::int16_t>(std::lround(
-            16000.0 * std::sin(2.0 * M_PI * 1000.0 * static_cast<double>(i) / 48000.0)));
+            16000.0 * std::sin(2.0 * kPi * 1000.0 * static_cast<double>(i) / 48000.0)));
     Decimator d(4, 1);
     const std::vector<std::int16_t> out = runAll(d, in);
     ASSERT_EQ(1200u, out.size());
@@ -348,7 +352,7 @@ TEST(Decimator, StopbandToneIsRejected) {
     std::vector<std::int16_t> in(kFrames);
     for (std::size_t i = 0; i < kFrames; ++i)
         in[i] = static_cast<std::int16_t>(std::lround(
-            16000.0 * std::sin(2.0 * M_PI * 9000.0 * static_cast<double>(i) / 48000.0)));
+            16000.0 * std::sin(2.0 * kPi * 9000.0 * static_cast<double>(i) / 48000.0)));
     Decimator d(4, 1);
     const std::vector<std::int16_t> out = runAll(d, in);
     ASSERT_EQ(1200u, out.size());
