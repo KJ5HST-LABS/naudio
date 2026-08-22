@@ -586,8 +586,12 @@ and with every `AudioRx` dropped the client received nothing and the probe's sil
 
 `na_client_set_transport(c, NA_TRANSPORT_UDP)` sets the transport and **nothing else** — it leaves
 FEC, reordering, adaptive jitter and control-ARQ off, so a client configured that way receives every
-parity packet the bridge sends and discards it. Use **`na_client_set_reliability_profile`** instead;
-it selects the transport as part of the profile, so no separate `na_client_set_transport` call is
+parity packet the bridge sends and discards it. **Since 0.5.0
+([#92](https://github.com/KJ5HST-LABS/naudio/issues/92)) that composition no longer connects:**
+`na_client_connect` (and `na_server_start`, for a UDP or DUAL server) refuses a UDP configuration
+with every reliability component off, naming both remedies in the error, unless
+`NA_RELIABILITY_UDP_BARE` requested it explicitly. Use **`na_client_set_reliability_profile`**; it
+selects the transport as part of the profile, so no separate `na_client_set_transport` call is
 needed:
 
 ```c
@@ -595,7 +599,9 @@ na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN);   /* match the bri
 ```
 
 Measured on the same bridge, the same injector and the same probe binary, 12 s per arm, each arm
-against **its own** no-loss control:
+against **its own** no-loss control. (The bare arm predates the 0.5.0 gate; reproducing it now
+requires the explicit `NA_RELIABILITY_UDP_BARE` opt-in, which is byte-for-byte the same
+composition.)
 
 | Client configuration | Delivered under 1-in-5 loss | Recovered |
 |---|---|---|
@@ -605,12 +611,6 @@ against **its own** no-loss control:
 The four unrecovered packets are the fixed in-flight depth of the reorder/FEC pipeline at cutoff, not
 a leak — the same residual of 4 that holds across both 12- and 30-second runs while recoveries scale
 with duration.
-
-> **Planned change** ([#92](https://github.com/KJ5HST-LABS/naudio/issues/92)): an upcoming release
-> will refuse `na_client_connect` / `na_server_start` on a UDP configuration with every reliability
-> component off unless bare UDP is explicitly requested, so the first row of the table above will
-> fail loudly at connect instead of silently discarding parity. The explicit opt-in keeps the
-> bare-transport measurement arm reproducible.
 
 The earlier arm table was taken with a client built directly on `naudio::net::UdpClientConnection`,
 because at the time the C ABI could not enable the reliability layer at all. Nothing needs that

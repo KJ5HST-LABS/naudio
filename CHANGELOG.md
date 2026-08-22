@@ -5,7 +5,28 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **A no-reliability UDP configuration is refused at `na_client_connect` / `na_server_start`**
+  (server: UDP or DUAL). `na_client_set_transport(NA_TRANSPORT_UDP)` alone leaves FEC, reordering,
+  adaptive jitter and control-ARQ all off — a composition that discards every parity packet, cost
+  about two thirds of the audio on a real link, and is indistinguishable from health on loss-free
+  loopback, where it is always first "verified". It now fails loudly — on loopback too — with both
+  remedies in the error, before any network contact, and the handle recovers once the config is
+  fixed. TCP is never gated; any configuration with a reliability component enabled is untouched;
+  profile composition (last-writer-wins) is unchanged. **Migration: add one call** —
+  `na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN)` (or another `NA_RELIABILITY_UDP_*`
+  profile) on clients, `na_server_set_reliability_profile(...)` on servers — or request bare UDP
+  explicitly with `NA_RELIABILITY_UDP_BARE`. This is the behavior change that makes the release
+  **0.5.0**.
+
 ### Added
+- **`NA_RELIABILITY_UDP_BARE`** (enum value 6, append-only; `AudioStreamConfig::udpBare()` on the
+  C++ side) — UDP with no reliability layer, by explicit request: byte-for-byte the composition
+  `set_transport(UDP)` alone used to produce, kept reachable so measurement-control baselines (a
+  deliberately unprotected arm) stay reproducible under the new gate. An older library rejects
+  value 6 with `NA_ERR_INVALID` per the enum's documented append discipline; gate on
+  `na_version_number()`.
+
 - **`na_wav_tap`** — records what a naudio *client* receives, as a 12 kHz mono WAV that the WSJT-X
   decoders read. It is a normal client driving only the public C ABI
   (`na_client_create` / `na_client_set_audio_cb` / `na_client_connect`) on
