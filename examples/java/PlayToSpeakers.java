@@ -71,6 +71,9 @@ public final class PlayToSpeakers {
     static final int NA_CLIENT_BACKEND_NULL   = 1;
     static final int NA_TRANSPORT_TCP         = 0;
     static final int NA_TRANSPORT_UDP         = 1;
+    static final int NA_RELIABILITY_UDP_LAN   = 1;
+    static final int NA_RELIABILITY_UDP_WAN   = 2;
+    static final int NA_RELIABILITY_UDP_FT8   = 3;
     static final int NA_CAP_PLAYBACK          = 1;
     static final int NA_CAP_DUPLEX            = 2;
     static final int MAX_DEVICES              = 128;
@@ -98,8 +101,9 @@ public final class PlayToSpeakers {
 
     // ---- downcall handles for the na_* functions this example uses ---------------------------
     static MethodHandle naStrerror, naLastError, naContextCreate, naContextDestroy, naEnumerate,
-            naClientCreate, naClientDestroy, naClientSetTransport, naClientSetPlaybackDevice,
-            naClientSetAudioCb, naClientConnect, naClientDisconnect, naClientIsConnected;
+            naClientCreate, naClientDestroy, naClientSetTransport, naClientSetReliabilityProfile,
+            naClientSetPlaybackDevice, naClientSetAudioCb, naClientConnect, naClientDisconnect,
+            naClientIsConnected;
 
     static void bind(SymbolLookup lib) {
         naStrerror               = dh(lib, "na_strerror",                   FunctionDescriptor.of(ADDRESS, JAVA_INT));
@@ -112,6 +116,7 @@ public final class PlayToSpeakers {
         naClientCreate           = dh(lib, "na_client_create",            FunctionDescriptor.of(ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, ADDRESS));
         naClientDestroy          = dh(lib, "na_client_destroy",           FunctionDescriptor.ofVoid(ADDRESS));
         naClientSetTransport     = dh(lib, "na_client_set_transport",     FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
+        naClientSetReliabilityProfile = dh(lib, "na_client_set_reliability_profile", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         naClientSetPlaybackDevice= dh(lib, "na_client_set_playback_device", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         naClientSetAudioCb       = dh(lib, "na_client_set_audio_cb",      FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
         naClientConnect          = dh(lib, "na_client_connect",           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
@@ -276,13 +281,16 @@ public final class PlayToSpeakers {
 
     static void usage() {
         log("usage: java PlayToSpeakers.java [--host H] [--port N] [--name S] [--playback-id N]\n"
-                + "                                [--transport tcp|udp] [--seconds N] [--backend system|null]\n"
+                + "                                [--transport tcp|udp] [--reliability lan|wan|ft8]\n"
+                + "                                [--seconds N] [--backend system|null]\n"
                 + "       java PlayToSpeakers.java --list-devices\n\n"
                 + "  --host H          server host (default 127.0.0.1)\n"
                 + "  --port N          server port (default 4533)\n"
                 + "  --name S          this client's name in the server roster (default na-java-client)\n"
                 + "  --playback-id N   output device id to play on (default: first output device)\n"
                 + "  --transport T     tcp (default) | udp\n"
+                + "  --reliability P   lan | wan | ft8  (UDP profiles: FEC/reorder/jitter/control-ARQ).\n"
+                + "                    Omitted = bare transport, which across a real network loses audio\n"
                 + "  --seconds N       run time; 0 = until Ctrl-C (default 0)\n"
                 + "  --backend B       system (default; plays RX to the output device) or\n"
                 + "                    null (hardware-free; RX is received but not played)\n"
@@ -299,6 +307,8 @@ public final class PlayToSpeakers {
         int    playbackId  = -1;              // -1 => auto-select the first output device (SYSTEM)
         int    transport   = NA_TRANSPORT_TCP;
         double seconds     = 0;               // 0 = until Ctrl-C
+        int    reliability = -1;              // -1 => bare transport (unchanged default)
+        String profileLabel = null;           // "udp+lan" etc. when --reliability is given
         boolean listOnly   = false;
         String libPath     = null;
 
@@ -323,6 +333,13 @@ public final class PlayToSpeakers {
                     if (t.equals("tcp")) transport = NA_TRANSPORT_TCP;
                     else if (t.equals("udp")) transport = NA_TRANSPORT_UDP;
                     else { log("error: invalid --transport '" + t + "' (tcp|udp)"); System.exit(2); }
+                }
+                case "--reliability" -> {
+                    String r = need(args, ++i, "--reliability");
+                    if (r.equals("lan")) { reliability = NA_RELIABILITY_UDP_LAN; profileLabel = "udp+lan"; }
+                    else if (r.equals("wan")) { reliability = NA_RELIABILITY_UDP_WAN; profileLabel = "udp+wan"; }
+                    else if (r.equals("ft8")) { reliability = NA_RELIABILITY_UDP_FT8; profileLabel = "udp+ft8"; }
+                    else { log("error: invalid --reliability '" + r + "' (lan|wan|ft8)"); System.exit(2); }
                 }
                 case "-h", "--help" -> { usage(); System.exit(0); }
                 default -> { log("unknown option: " + a); usage(); System.exit(2); }
@@ -380,11 +397,21 @@ public final class PlayToSpeakers {
             // na_client_callbacks event struct — the single function pointer is all the demo needs.
             int rc;
             rc = (int) naClientSetAudioCb.invokeExact(client, rxStub, MemorySegment.NULL);
-            rc = (int) naClientSetTransport.invokeExact(client, transport);
+            // A profile selects UDP AND enables the loss-recovery layer (FEC / reorder / adaptive
+            // jitter / control-ARQ); na_client_set_transport alone leaves every component off — a
+            // misconfiguration a real network punishes and loopback cannot show. See
+            // docs/hamlib-streaming-bridge.md, "A client built on the C ABI must select the profile
+            // too". Default stays bare transport so this example's existing behaviour is unchanged;
+            // --reliability opts in.
+            if (reliability >= 0)
+                rc = (int) naClientSetReliabilityProfile.invokeExact(client, reliability);
+            else
+                rc = (int) naClientSetTransport.invokeExact(client, transport);
             rc = (int) naClientSetPlaybackDevice.invokeExact(client, playbackId);  // REQUIRED for RX
 
             String backendName   = backend == NA_CLIENT_BACKEND_SYSTEM ? "system" : "null";
-            String transportName = transport == NA_TRANSPORT_TCP ? "tcp" : "udp";
+            String transportName = profileLabel != null ? profileLabel
+                                 : transport == NA_TRANSPORT_TCP ? "tcp" : "udp";
 
             MemorySegment errbuf = arena.allocate(256);
             rc = (int) naClientConnect.invokeExact(client, errbuf, 256);

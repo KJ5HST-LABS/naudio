@@ -194,13 +194,16 @@ static int default_playback_id(void) {
 static void usage(void) {
     fprintf(stderr,
         "usage: play_to_speakers [--host H] [--port N] [--name S] [--playback-id N]\n"
-        "                        [--transport tcp|udp] [--seconds N] [--backend system|null]\n"
+        "                        [--transport tcp|udp] [--reliability lan|wan|ft8] [--seconds N]\n"
+        "                        [--backend system|null]\n"
         "       play_to_speakers --list-devices\n\n"
         "  --host H          server host (default 127.0.0.1)\n"
         "  --port N          server port (default 4533)\n"
         "  --name S          this client's name in the server roster (default na-cpp-client)\n"
         "  --playback-id N   output device id to play on (default: first output device)\n"
         "  --transport T     tcp (default) | udp\n"
+        "  --reliability P   lan | wan | ft8  (UDP profiles: FEC/reorder/jitter/control-ARQ).\n"
+        "                    Omitted = bare transport, which across a real network loses audio\n"
         "  --seconds N       run time; 0 = until Ctrl-C (default 0)\n"
         "  --backend B       system (default; plays RX to the output device) or\n"
         "                    null (hardware-free; RX is received but not played)\n"
@@ -216,6 +219,8 @@ int main(int argc, char** argv) {
     int         playback_id = -1;    // -1 => auto-select the first output device (SYSTEM)
     na_transport transport  = NA_TRANSPORT_TCP;
     long long   seconds     = 0;     // 0 = until Ctrl-C
+    int         reliability = -1;    // -1 => bare transport (unchanged default)
+    const char* profile_label = NULL;  // "udp+lan" etc. when --reliability is given
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -237,6 +242,13 @@ int main(int argc, char** argv) {
             if      (strcmp(t, "tcp") == 0) transport = NA_TRANSPORT_TCP;
             else if (strcmp(t, "udp") == 0) transport = NA_TRANSPORT_UDP;
             else { fprintf(stderr, "error: invalid --transport '%s' (tcp|udp)\n", t); return 2; }
+        }
+        else if (strcmp(a, "--reliability") == 0) {
+            const char* r = NEED_VAL("--reliability");
+            if      (strcmp(r, "lan") == 0) { reliability = NA_RELIABILITY_UDP_LAN; profile_label = "udp+lan"; }
+            else if (strcmp(r, "wan") == 0) { reliability = NA_RELIABILITY_UDP_WAN; profile_label = "udp+wan"; }
+            else if (strcmp(r, "ft8") == 0) { reliability = NA_RELIABILITY_UDP_FT8; profile_label = "udp+ft8"; }
+            else { fprintf(stderr, "error: invalid --reliability '%s' (lan|wan|ft8)\n", r); return 2; }
         }
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(); return 0; }
         else { fprintf(stderr, "unknown option: %s\n", a); usage(); return 2; }
@@ -283,11 +295,20 @@ int main(int argc, char** argv) {
     cbs.on_clients_update = ev_clients_update;
     na_client_set_callbacks(client, &cbs, NULL);
     na_client_set_audio_cb(client, on_rx_audio, &stats);
-    na_client_set_transport(client, transport);
+    // A profile selects UDP AND enables the loss-recovery layer (FEC / reorder / adaptive jitter /
+    // control-ARQ); na_client_set_transport alone leaves every component off — a misconfiguration
+    // a real network punishes and loopback cannot show. See docs/hamlib-streaming-bridge.md,
+    // "A client built on the C ABI must select the profile too". Default stays bare transport so
+    // this example's existing behaviour is unchanged; --reliability opts in.
+    if (reliability >= 0)
+        na_client_set_reliability_profile(client, (na_reliability_profile)reliability);
+    else
+        na_client_set_transport(client, transport);
     na_client_set_playback_device(client, playback_id);  // REQUIRED for RX
 
     const char* backend_name   = backend == NA_CLIENT_BACKEND_SYSTEM ? "system" : "null";
-    const char* transport_name = transport == NA_TRANSPORT_TCP ? "tcp" : "udp";
+    const char* transport_name = profile_label ? profile_label
+                               : transport == NA_TRANSPORT_TCP ? "tcp" : "udp";
 
     char err[256];
     if (na_client_connect(client, err, (int)sizeof err) != NA_OK) {

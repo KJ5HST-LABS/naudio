@@ -101,6 +101,9 @@ NA_CLIENT_BACKEND_SYSTEM = 0
 NA_CLIENT_BACKEND_NULL = 1
 NA_TRANSPORT_TCP = 0
 NA_TRANSPORT_UDP = 1
+NA_RELIABILITY_UDP_LAN = 1
+NA_RELIABILITY_UDP_WAN = 2
+NA_RELIABILITY_UDP_FT8 = 3
 
 
 class NaDevice(C.Structure):
@@ -168,6 +171,7 @@ def bind(lib):
     lib.na_client_create.restype = C.c_void_p
     lib.na_client_destroy.argtypes = [C.c_void_p]
     lib.na_client_set_transport.argtypes = [C.c_void_p, C.c_int]
+    lib.na_client_set_reliability_profile.argtypes = [C.c_void_p, C.c_int]
     lib.na_client_set_playback_device.argtypes = [C.c_void_p, C.c_int]
     lib.na_client_set_audio_cb.argtypes = [C.c_void_p, NA_AUDIO_CB, C.c_void_p]
     lib.na_client_set_callbacks.argtypes = [C.c_void_p, C.POINTER(NaClientCallbacks), C.c_void_p]
@@ -237,6 +241,9 @@ def main():
                     help="output device id to play on; -1 (default) auto-picks the first one")
     ap.add_argument("--transport", choices=["tcp", "udp"], default="tcp",
                     help="tcp (default) | udp")
+    ap.add_argument("--reliability", choices=["lan", "wan", "ft8"],
+                    help="UDP reliability profile (FEC/reorder/jitter/control-ARQ); omitted = "
+                         "bare transport, which across a real network loses audio")
     ap.add_argument("--seconds", type=float, default=0.0,
                     help="run time; 0 (default) = until Ctrl-C")
     ap.add_argument("--backend", choices=["system", "null"], default="system",
@@ -317,10 +324,22 @@ def main():
         # Configure BEFORE connect — the worker threads read callbacks/config once streaming starts.
         lib.na_client_set_callbacks(client, C.byref(cbs), None)
         lib.na_client_set_audio_cb(client, audio_cb, None)
-        lib.na_client_set_transport(client, transport)
+        # A profile selects UDP AND enables the loss-recovery layer (FEC / reorder / adaptive
+        # jitter / control-ARQ); na_client_set_transport alone leaves every component off — a
+        # misconfiguration a real network punishes and loopback cannot show. See
+        # docs/hamlib-streaming-bridge.md, "A client built on the C ABI must select the profile
+        # too". Default stays bare transport so this example's existing behaviour is unchanged;
+        # --reliability opts in.
+        if args.reliability:
+            profile = {"lan": NA_RELIABILITY_UDP_LAN, "wan": NA_RELIABILITY_UDP_WAN,
+                       "ft8": NA_RELIABILITY_UDP_FT8}[args.reliability]
+            lib.na_client_set_reliability_profile(client, profile)
+        else:
+            lib.na_client_set_transport(client, transport)
         lib.na_client_set_playback_device(client, playback_id)  # REQUIRED for RX
 
         backend_name = "system" if backend == NA_CLIENT_BACKEND_SYSTEM else "null"
+        transport_name = f"udp+{args.reliability}" if args.reliability else args.transport
 
         errbuf = C.create_string_buffer(256)
         rc = lib.na_client_connect(client, errbuf, len(errbuf))
@@ -331,7 +350,7 @@ def main():
         verb = "playing" if backend == NA_CLIENT_BACKEND_SYSTEM else "receiving"
         span = f"for {args.seconds:g}s" if args.seconds > 0 else "until Ctrl-C"
         log(f"connected to {args.host}:{args.port} (backend={backend_name}, "
-            f"transport={args.transport}); {verb} {span} ...")
+            f"transport={transport_name}); {verb} {span} ...")
 
         # Monitor loop: a per-second throughput meter so you can see audio arriving.
         start = time.monotonic()
@@ -373,7 +392,7 @@ def main():
     passed = frames > 0 and nonzero > 0
 
     log("\n=== play to speakers — summary ===")
-    log(f"  server         : {args.host}:{args.port} ({args.transport})")
+    log(f"  server         : {args.host}:{args.port} ({transport_name})")
     log(f"  rx             : {frames} frames, {rx_bytes} bytes ({nonzero} non-zero)")
     log(f"  throughput     : avg {avg_bps} B/s over {elapsed * 1000:.0f} ms")
     log(f"  first_frame_hex: {first_hex or '(none)'}")

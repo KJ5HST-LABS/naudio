@@ -54,6 +54,9 @@ const NA_CLIENT_BACKEND_SYSTEM: c_int = 0;
 const NA_CLIENT_BACKEND_NULL: c_int = 1;
 const NA_TRANSPORT_TCP: c_int = 0;
 const NA_TRANSPORT_UDP: c_int = 1;
+const NA_RELIABILITY_UDP_LAN: c_int = 1;
+const NA_RELIABILITY_UDP_WAN: c_int = 2;
+const NA_RELIABILITY_UDP_FT8: c_int = 3;
 const NA_CAP_PLAYBACK: c_int = 1;
 const NA_CAP_DUPLEX: c_int = 2;
 const MAX_DEVICES: usize = 128;
@@ -109,6 +112,7 @@ extern "C" {
     ) -> *mut NaClient;
     fn na_client_destroy(client: *mut NaClient);
     fn na_client_set_transport(client: *mut NaClient, transport: c_int) -> c_int;
+    fn na_client_set_reliability_profile(client: *mut NaClient, profile: c_int) -> c_int;
     fn na_client_set_playback_device(client: *mut NaClient, backend_id: c_int) -> c_int;
     fn na_client_set_audio_cb(client: *mut NaClient, cb: NaAudioCb, user: *mut c_void) -> c_int;
     fn na_client_connect(client: *mut NaClient, errbuf: *mut c_char, errlen: c_int) -> c_int;
@@ -264,13 +268,16 @@ fn default_playback_id() -> i32 {
 fn usage() {
     log(
         "usage: play_to_speakers [--host H] [--port N] [--name S] [--playback-id N]\n\
-         \x20                       [--transport tcp|udp] [--seconds N] [--backend system|null]\n\
+         \x20                       [--transport tcp|udp] [--reliability lan|wan|ft8] [--seconds N]\n\
+         \x20                       [--backend system|null]\n\
          \x20      play_to_speakers --list-devices\n\n\
          \x20 --host H          server host (default 127.0.0.1)\n\
          \x20 --port N          server port (default 4533)\n\
          \x20 --name S          this client's name in the server roster (default na-rust-client)\n\
          \x20 --playback-id N   output device id to play on (default: first output device)\n\
          \x20 --transport T     tcp (default) | udp\n\
+         \x20 --reliability P   lan | wan | ft8  (UDP profiles: FEC/reorder/jitter/control-ARQ).\n\
+         \x20                   Omitted = bare transport, which across a real network loses audio\n\
          \x20 --seconds N       run time; 0 = until Ctrl-C (default 0)\n\
          \x20 --backend B       system (default; plays RX to the output device) or\n\
          \x20                   null (hardware-free; RX is received but not played)\n\
@@ -310,6 +317,8 @@ fn run() -> i32 {
     let mut playback_id: i32 = -1; // -1 => auto-select the first output device (SYSTEM)
     let mut transport = NA_TRANSPORT_TCP;
     let mut seconds: f64 = 0.0; // 0 = until Ctrl-C
+    let mut reliability: c_int = -1; // -1 => bare transport (unchanged default)
+    let mut profile_label: Option<&'static str> = None; // "udp+lan" etc. when --reliability is given
 
     let mut i = 0;
     while i < args.len() {
@@ -339,6 +348,18 @@ fn run() -> i32 {
                         return 2;
                     }
                 };
+            }
+            "--reliability" => {
+                let r = need(&args, &mut i, "--reliability");
+                match r.as_str() {
+                    "lan" => { reliability = NA_RELIABILITY_UDP_LAN; profile_label = Some("udp+lan"); }
+                    "wan" => { reliability = NA_RELIABILITY_UDP_WAN; profile_label = Some("udp+wan"); }
+                    "ft8" => { reliability = NA_RELIABILITY_UDP_FT8; profile_label = Some("udp+ft8"); }
+                    _ => {
+                        log(&format!("error: invalid --reliability '{r}' (lan|wan|ft8)"));
+                        return 2;
+                    }
+                }
             }
             "--transport" => {
                 let t = need(&args, &mut i, "--transport");
@@ -403,14 +424,24 @@ fn run() -> i32 {
 
     // Configure BEFORE connect — the worker threads read callbacks/config once streaming starts.
     // RX-only: register just the audio sink and skip the na_client_callbacks event struct.
+    // A profile selects UDP AND enables the loss-recovery layer (FEC / reorder / adaptive jitter /
+    // control-ARQ); na_client_set_transport alone leaves every component off — a misconfiguration
+    // a real network punishes and loopback cannot show. See docs/hamlib-streaming-bridge.md,
+    // "A client built on the C ABI must select the profile too". Default stays bare transport so
+    // this example's existing behaviour is unchanged; --reliability opts in.
     unsafe {
         na_client_set_audio_cb(client, on_rx_audio, &stats as *const RxStats as *mut c_void);
-        na_client_set_transport(client, transport);
+        if reliability >= 0 {
+            na_client_set_reliability_profile(client, reliability);
+        } else {
+            na_client_set_transport(client, transport);
+        }
         na_client_set_playback_device(client, playback_id); // REQUIRED for RX
     }
 
     let backend_name = if backend == NA_CLIENT_BACKEND_SYSTEM { "system" } else { "null" };
-    let transport_name = if transport == NA_TRANSPORT_TCP { "tcp" } else { "udp" };
+    let transport_name =
+        profile_label.unwrap_or(if transport == NA_TRANSPORT_TCP { "tcp" } else { "udp" });
 
     let mut errbuf = [0 as c_char; 256];
     let rc = unsafe { na_client_connect(client, errbuf.as_mut_ptr(), errbuf.len() as c_int) };
