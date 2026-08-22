@@ -76,7 +76,7 @@ extern "C" {
  * CMakeLists.txt, so they cannot drift from the SONAME or from naudio.pc's Version.
  */
 #define NAUDIO_VERSION_MAJOR 0
-#define NAUDIO_VERSION_MINOR 4
+#define NAUDIO_VERSION_MINOR 5
 #define NAUDIO_VERSION_PATCH 0
 
 /* The largest value NA_VERSION_ENCODE accepts for minor and for patch. Above it a lower component
