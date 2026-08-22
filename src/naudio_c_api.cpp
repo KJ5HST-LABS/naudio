@@ -571,6 +571,11 @@ extern "C" na_stream_client* na_client_create(na_client_backend backend, const c
             std::string(host), static_cast<std::uint16_t>(port),
             name != nullptr ? std::string(name) : std::string("naudio-client"));
         c->client->setBackend(c->backend.get());
+        // The NULL backend opens no playback device, so the id is defaulted here and
+        // na_client_set_playback_device becomes OPTIONAL on it (@since 0.5.0) — before this,
+        // connect demanded a value it would never use, the one wart the hardware-free backend
+        // had. A later explicit set simply overwrites the default.
+        if (backend == NA_CLIENT_BACKEND_NULL) c->client->setPlaybackDevice(0);
 
         c->glue = std::make_unique<CClientListener>(c.get());
         c->client->addStreamListener(c->glue.get());
@@ -888,6 +893,44 @@ extern "C" int na_client_is_streaming(na_stream_client* client) {
     NA_GUARD_VAL(NA_ERR_BACKEND, 0, {
         if (client == nullptr) { setError(NA_ERR_INVALID); return 0; }  // doc: 0 on NULL
         return client->client->isStreaming() ? 1 : 0;
+    });
+}
+
+// ---- Introspection (@since 0.5.0) ------------------------------------------------------
+// Both read the client's CURRENT config under its own mutex (AudioStreamClient::config() locks),
+// which is also where the handshake writes the server's AUDIO_CONFIG — so post-connect the
+// format getter reports the NEGOTIATED format, not the local placeholder. The reliability
+// getter is unaffected by the handshake: AUDIO_CONFIG carries format/buffer fields only.
+
+static int reliabilityComponents(const naudio::AudioStreamConfig& cfg) {
+    int m = 0;
+    if (cfg.fecEnabled) m |= NA_RELIABILITY_COMPONENT_FEC;
+    if (cfg.reorderBufferSize > 0) m |= NA_RELIABILITY_COMPONENT_REORDER;
+    if (cfg.adaptiveJitterEnabled) m |= NA_RELIABILITY_COMPONENT_ADAPTIVE_JITTER;
+    if (cfg.controlReliabilityEnabled) m |= NA_RELIABILITY_COMPONENT_CONTROL_ARQ;
+    return m;
+}
+
+extern "C" na_error_t na_client_get_reliability(na_stream_client* client, int* components) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr || components == nullptr) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        *components = reliabilityComponents(client->client->config());
+        return NA_OK;
+    });
+}
+
+extern "C" na_error_t na_client_get_audio_format(na_stream_client* client, int* sample_rate,
+                                                 int* bits_per_sample, int* channels) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        const naudio::AudioStreamConfig cfg = client->client->config();
+        if (sample_rate != nullptr) *sample_rate = cfg.sampleRate;
+        if (bits_per_sample != nullptr) *bits_per_sample = cfg.bitsPerSample;
+        if (channels != nullptr) *channels = cfg.channels;
+        return NA_OK;
     });
 }
 
@@ -1450,6 +1493,36 @@ extern "C" int na_server_max_clients(na_audio_server* server) {
         // truth pre-start; the running server's config() is an identical copy of it).
         return server->server ? server->server->config().maxClients
                               : server->pendingConfig.maxClients;
+    });
+}
+
+// ---- Introspection (@since 0.5.0) — the na_server_max_clients pattern, extended -----------
+// The accessor issue #36 declined until it was wanted for consumer-facing reasons; the 0.5.0
+// introspection set is that reason. It is also what makes the profile setter's four-field
+// exception list testable end to end: format set -> profile applied -> format read back.
+
+extern "C" na_error_t na_server_get_audio_format(na_audio_server* server, int* sample_rate,
+                                                 int* bits_per_sample, int* channels) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        const naudio::AudioStreamConfig cfg =
+            server->server ? server->server->config() : server->pendingConfig;
+        if (sample_rate != nullptr) *sample_rate = cfg.sampleRate;
+        if (bits_per_sample != nullptr) *bits_per_sample = cfg.bitsPerSample;
+        if (channels != nullptr) *channels = cfg.channels;
+        return NA_OK;
+    });
+}
+
+extern "C" na_error_t na_server_get_reliability(na_audio_server* server, int* components) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr || components == nullptr) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        *components = reliabilityComponents(server->server ? server->server->config()
+                                                           : server->pendingConfig);
+        return NA_OK;
     });
 }
 

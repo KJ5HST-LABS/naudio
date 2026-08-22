@@ -21,10 +21,6 @@
  * NA_CLIENT_BACKEND_NULL: RX is still delivered to the audio callback but no device is opened, so
  * the file is what naudio DELIVERED rather than what some sound card then did to it.
  *
- *   NOTE the NULL backend still requires na_client_set_playback_device(). connect() checks the id
- *   unconditionally (src/net/AudioStreamClient.cpp), which the "hardware-free" wording on the enum
- *   does not say. The id is never opened as a device on this backend.
- *
  * FORMAT. naudio carries S16LE stereo at 48 kHz here; WSJT-X decoders want 12 kHz mono. This takes
  * the LEFT channel and decimates 4:1 behind a 4-sample box average — crude, but the receiver's own
  * filter is ~3 kHz wide so there is nothing near the 6 kHz Nyquist to alias down. That 48k/16/2
@@ -174,7 +170,19 @@ int main(int argc, char **argv) {
     if (use_tcp) na_client_set_reliability_profile(c, NA_RELIABILITY_DEFAULT);
     else         na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN);
     fprintf(stderr, "na_wav_tap: profile %s\n", use_tcp ? "DEFAULT (TCP)" : "UDP_WAN (FEC+reorder+jitter)");
-    na_client_set_playback_device(c, 0);   /* required even on NULL — see the header note */
+    /* Read the components BACK rather than trusting the call above — the assertion this tool
+     * lacked when it ran a whole on-air session with every component silently off (@since 0.5.0).
+     * On TCP all four read 0: the transport itself orders and retransmits. */
+    {
+        int comps = 0;
+        na_client_get_reliability(c, &comps);
+        fprintf(stderr, "na_wav_tap: reliability components: fec=%d reorder=%d jitter=%d arq=%d\n",
+                (comps & NA_RELIABILITY_COMPONENT_FEC) != 0,
+                (comps & NA_RELIABILITY_COMPONENT_REORDER) != 0,
+                (comps & NA_RELIABILITY_COMPONENT_ADAPTIVE_JITTER) != 0,
+                (comps & NA_RELIABILITY_COMPONENT_CONTROL_ARQ) != 0);
+    }
+    /* No na_client_set_playback_device: optional on the NULL backend since 0.5.0. */
 
     char err[256] = {0};
     if (na_client_connect(c, err, (int)sizeof err) != NA_OK) {

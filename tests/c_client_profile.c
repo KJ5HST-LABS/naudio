@@ -470,14 +470,14 @@ int main(void) {
      *     (ControlMessage::applyAudioConfigTo, src/ControlMessage.cpp:314) — so those fields say
      *     nothing about which preset the CLIENT chose. adaptiveJitterEnabled and reorderBufferSize
      *     are what survive that overwrite, which is exactly why the fingerprint is built on them.
-     *   - IQ'S DEFINING 192 kHz IS PINNED NOWHERE, on either side of the ABI. There is no public
-     *     accessor for the negotiated rate; issue #36 declined adding one, on the grounds that a
-     *     new na_* symbol on a Hamlib-bound ABI is too high a price for a test detector. Two
-     *     candidate observables were re-measured this session and BOTH are dead: total byte volume
-     *     (already recorded dead at c_server_smoke.c's section-6 comment) and the per-callback RX
-     *     chunk size, which is MTU-derived on UDP (1376 bytes at 48 kHz and at 192 kHz alike) and
-     *     inject-derived on TCP. Do not add a rate assertion here without first re-measuring that
-     *     it can fail; as of this session none can.
+     *   - IQ'S DEFINING 192 kHz IS NOT PINNED BY THIS ARM. Historical note: it was pinned
+     *     NOWHERE until 0.5.0 — issue #36 had declined a getter, and the two candidate wire
+     *     observables were measured dead (total byte volume, per-callback RX chunk size: both
+     *     recorded at c_server_smoke.c's comments). Since 0.5.0 the getters exist:
+     *     the server-side 192 kHz pairing is pinned by c_server_smoke.c's introspection
+     *     section via na_server_get_audio_format, and the client's NEGOTIATED format path by
+     *     section (8b) below via na_client_get_audio_format. This arm's fingerprint stays
+     *     counter-based on purpose — it pins the preset's reliability half, not the rate.
      *
      * The client is configured with the PROFILE ALONE — no na_client_set_transport — so reaching
      * this UDP-only server is itself the transport half of the claim, exactly as in section (2). */
@@ -529,6 +529,111 @@ int main(void) {
     }
     na_client_disconnect(iq);
     na_client_destroy(iq);
+
+    /* ---- (8) the 0.5.0 introspection getters (issue #92 option (c)) ----
+     *
+     * (8a) na_client_get_reliability reads the CURRENT config as a component bitmask — the
+     *      assertion every networked tool lacked when one ran a whole on-air session with the
+     *      loss-recovery layer silently off: "did I actually configure it?" answered by the
+     *      library rather than by trusting one's own earlier call. Probed server-free across
+     *      profiles whose component sets differ pairwise, so a getter hardwired to any constant
+     *      fails at least two arms.
+     * (8b) na_client_get_audio_format reports the NEGOTIATED format once connected: a second
+     *      server carries a deliberately non-default 12000/16/1, and the getter must flip from
+     *      the local 48000/16/2 placeholder to the server's value across connect. The client
+     *      also NEVER calls na_client_set_playback_device — the 0.5.0 NULL-backend relaxation
+     *      is load-bearing in this arm, not incidental: pre-0.5.0 this connect failed with
+     *      "Playback device not configured". */
+    {
+        int comps = -1;
+        na_stream_client *p =
+            na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", 4533, "introspect-probe");
+        if (p == NULL) return fail("na_client_create (introspect)", NULL, srv);
+        if (na_client_get_reliability(NULL, &comps) != NA_ERR_INVALID ||
+            na_client_get_reliability(p, NULL) != NA_ERR_INVALID ||
+            na_client_get_audio_format(NULL, NULL, NULL, NULL) != NA_ERR_INVALID) {
+            return fail("introspection NULL contracts not NA_ERR_INVALID", p, srv);
+        }
+        if (na_client_get_reliability(p, &comps) != NA_OK || comps != 0) {
+            fprintf(stderr, "  (default components 0x%x)\n", comps);
+            return fail("default (TCP) config components != 0", p, srv);
+        }
+        if (na_client_set_reliability_profile(p, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+            na_client_get_reliability(p, &comps) != NA_OK ||
+            comps != (NA_RELIABILITY_COMPONENT_FEC | NA_RELIABILITY_COMPONENT_REORDER |
+                      NA_RELIABILITY_COMPONENT_ADAPTIVE_JITTER |
+                      NA_RELIABILITY_COMPONENT_CONTROL_ARQ)) {
+            fprintf(stderr, "  (WAN components 0x%x)\n", comps);
+            return fail("UDP_WAN components != FEC|REORDER|JITTER|ARQ", p, srv);
+        }
+        if (na_client_set_reliability_profile(p, NA_RELIABILITY_UDP_LAN) != NA_OK ||
+            na_client_get_reliability(p, &comps) != NA_OK ||
+            comps != (NA_RELIABILITY_COMPONENT_REORDER | NA_RELIABILITY_COMPONENT_CONTROL_ARQ)) {
+            fprintf(stderr, "  (LAN components 0x%x)\n", comps);
+            return fail("UDP_LAN components != REORDER|ARQ", p, srv);
+        }
+        if (na_client_set_reliability_profile(p, NA_RELIABILITY_UDP_BARE) != NA_OK ||
+            na_client_get_reliability(p, &comps) != NA_OK || comps != 0) {
+            fprintf(stderr, "  (BARE components 0x%x)\n", comps);
+            return fail("UDP_BARE components != 0 (BARE would not be bare)", p, srv);
+        }
+        na_client_destroy(p);
+        printf("c_client_profile: reliability bitmask discriminates DEFAULT/WAN/LAN/BARE (8a)\n");
+    }
+
+    {
+        int rate = 0, bits = 0, chan = 0;
+        na_audio_server *fsrv = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+        if (fsrv == NULL) return fail("na_server_create (format)", NULL, srv);
+        if (na_server_set_audio_format(fsrv, 12000, 16, 1) != NA_OK ||
+            na_server_set_reliability_profile(fsrv, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+            na_server_start(fsrv, err, (int)sizeof err) != NA_OK) {
+            fprintf(stderr, "  (%s)\n", err);
+            na_server_destroy(fsrv);
+            return fail("format-server setup/start", NULL, srv);
+        }
+        na_stream_client *fc = na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1",
+                                                na_server_port(fsrv), "format-cli");
+        if (fc == NULL) {
+            na_server_stop(fsrv);
+            na_server_destroy(fsrv);
+            return fail("na_client_create (format)", NULL, srv);
+        }
+        na_client_set_auto_reconnect(fc, 0);
+        /* DELIBERATELY no na_client_set_playback_device — see the section comment. */
+        if (na_client_set_reliability_profile(fc, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+            na_client_get_audio_format(fc, &rate, &bits, &chan) != NA_OK ||
+            rate != 48000 || bits != 16 || chan != 2) {
+            fprintf(stderr, "  (pre-connect %d/%d/%d)\n", rate, bits, chan);
+            na_client_destroy(fc);
+            na_server_stop(fsrv);
+            na_server_destroy(fsrv);
+            return fail("pre-connect format is not the local 48000/16/2 placeholder", NULL, srv);
+        }
+        if (na_client_connect(fc, err, (int)sizeof err) != NA_OK) {
+            fprintf(stderr, "  (%s)\n", err);
+            na_client_destroy(fc);
+            na_server_stop(fsrv);
+            na_server_destroy(fsrv);
+            return fail("format client connect (this is ALSO the playback-relaxation arm)",
+                        NULL, srv);
+        }
+        if (na_client_get_audio_format(fc, &rate, &bits, &chan) != NA_OK ||
+            rate != 12000 || bits != 16 || chan != 1) {
+            fprintf(stderr, "  (post-connect %d/%d/%d)\n", rate, bits, chan);
+            na_client_disconnect(fc);
+            na_client_destroy(fc);
+            na_server_stop(fsrv);
+            na_server_destroy(fsrv);
+            return fail("negotiated format did not reach na_client_get_audio_format", NULL, srv);
+        }
+        na_client_disconnect(fc);
+        na_client_destroy(fc);
+        na_server_stop(fsrv);
+        na_server_destroy(fsrv);
+        printf("c_client_profile: negotiated 12000/16/1 read back post-connect; no playback "
+               "device ever set (8b)\n");
+    }
 
     na_server_stop(srv);
     na_server_destroy(srv);

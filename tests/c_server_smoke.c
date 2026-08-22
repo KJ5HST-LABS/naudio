@@ -418,8 +418,9 @@ int main(void) {
         }
         /* The IQ pairing naudio.h documents on this setter: the two calls compose in EITHER order,
          * which is the property that makes "pair them" honest advice rather than a sequencing trap.
-         * Neither the rate nor the profile is readable back through this ABI, so this asserts the
-         * calls are ACCEPTED both ways round, not that the rate survived — see arm F's comment. */
+         * This spot asserts the calls are ACCEPTED both ways round; that the rate SURVIVED each
+         * order is asserted by the introspection section below via na_server_get_audio_format —
+         * readable back through this ABI since 0.5.0 (issue #36's reopen clause, satisfied). */
         if (na_server_set_audio_format(cfg, 192000, 16, 1) != NA_OK ||
             na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_IQ) != NA_OK ||
             na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_IQ) != NA_OK ||
@@ -835,9 +836,10 @@ int main(void) {
          * it cannot tell UDP_IQ from any other NA_RELIABILITY_UDP_* value, because all four select
          * UDP and the transport is all this section can see. What it does catch is a case wired to
          * a TCP preset or missing altogether. The preset-was-applied half is pinned on the client
-         * side instead, by stats fingerprint, in tests/c_client_profile.c section (7) — and IQ's
-         * defining 192 kHz is pinned NOWHERE, because sample rate has no observable through this
-         * ABI at all (issue #36, declined; re-measured this session and still true).
+         * side instead, by stats fingerprint, in tests/c_client_profile.c section (7). IQ's
+         * defining 192 kHz — unpinnable before 0.5.0 (issue #36 had declined the accessor; every
+         * wire observable measured dead) — is pinned by the introspection section below via
+         * na_server_get_audio_format.
          *
          * NEITHER ARM PAYS THE 10 s UDP-REFUSAL COST the comment above warns about: both expect the
          * UDP probe to CONNECT, so both probe it first and both return in milliseconds on green. */
@@ -915,6 +917,98 @@ int main(void) {
         }
         printf("c_server_smoke: bare UDP and DUAL starts refused with both remedies; explicit "
                "BARE starts (#92)\n");
+    }
+
+    /* ---- the 0.5.0 introspection getters, and the detector issue #36 was promised ----
+     *
+     * #36 measured (S29) that deleting `pc.sampleRate = rate;` from the profile setter's
+     * exception list left EVERY test green — three of the four preserved fields had no
+     * observable through this ABI. Its decline said: "Reopen if na_server_get_audio_format is
+     * ever wanted for consumer-facing reasons — the detector then comes free and this becomes a
+     * one-arm addition." This is that arm. It asserts, IN BOTH ORDERS, that the format survives
+     * a profile call — so #36's exact measured mutation now goes red here — and it pins the IQ
+     * 192 kHz pairing readback, the consumer case #36's second comment recorded when
+     * NA_RELIABILITY_UDP_IQ landed. The reliability bitmask is asserted across three
+     * pairwise-different presets so a constant-valued getter cannot pass. */
+    {
+        int rate = 0, bits = 0, chan = 0, comps = -1;
+        na_audio_server *is = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+        if (is == NULL) {
+            fprintf(stderr, "FAIL: na_server_create (introspection)\n");
+            return 1;
+        }
+        if (na_server_get_audio_format(NULL, &rate, &bits, &chan) != NA_ERR_INVALID ||
+            na_server_get_reliability(NULL, &comps) != NA_ERR_INVALID ||
+            na_server_get_reliability(is, NULL) != NA_ERR_INVALID) {
+            fprintf(stderr, "FAIL: introspection NULL contracts\n");
+            na_server_destroy(is);
+            return 1;
+        }
+        if (na_server_get_audio_format(is, &rate, &bits, &chan) != NA_OK ||
+            rate != 48000 || bits != 16 || chan != 2) {
+            fprintf(stderr, "FAIL: default format not 48000/16/2 (%d/%d/%d)\n", rate, bits, chan);
+            na_server_destroy(is);
+            return 1;
+        }
+        /* Order A — format, then profile: the exception list must carry the format THROUGH the
+         * profile call. This is the arm that catches #36's measured silent regression. */
+        if (na_server_set_audio_format(is, 12000, 16, 1) != NA_OK ||
+            na_server_set_reliability_profile(is, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+            na_server_get_audio_format(is, &rate, &bits, &chan) != NA_OK ||
+            rate != 12000 || bits != 16 || chan != 1) {
+            fprintf(stderr, "FAIL: format did not survive format->profile (%d/%d/%d) — the "
+                            "exception list dropped a field (#36's silent regression, now loud)\n",
+                    rate, bits, chan);
+            na_server_destroy(is);
+            return 1;
+        }
+        /* Order B — profile, then format: the later format call must win over the preset. */
+        if (na_server_set_reliability_profile(is, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+            na_server_set_audio_format(is, 16000, 16, 2) != NA_OK ||
+            na_server_get_audio_format(is, &rate, &bits, &chan) != NA_OK ||
+            rate != 16000 || bits != 16 || chan != 2) {
+            fprintf(stderr, "FAIL: format did not survive profile->format (%d/%d/%d)\n",
+                    rate, bits, chan);
+            na_server_destroy(is);
+            return 1;
+        }
+        /* The IQ pairing readback — #36's recorded consumer case: a caller pairing UDP_IQ with
+         * its defining 192 kHz can now read back that the pairing took effect. Both orders. */
+        if (na_server_set_audio_format(is, 192000, 16, 1) != NA_OK ||
+            na_server_set_reliability_profile(is, NA_RELIABILITY_UDP_IQ) != NA_OK ||
+            na_server_get_audio_format(is, &rate, NULL, NULL) != NA_OK || rate != 192000 ||
+            na_server_set_reliability_profile(is, NA_RELIABILITY_UDP_IQ) != NA_OK ||
+            na_server_set_audio_format(is, 192000, 16, 1) != NA_OK ||
+            na_server_get_audio_format(is, &rate, NULL, NULL) != NA_OK || rate != 192000) {
+            fprintf(stderr, "FAIL: the IQ 192 kHz pairing is not readable back (rate %d)\n", rate);
+            na_server_destroy(is);
+            return 1;
+        }
+        /* Reliability bitmask across pairwise-different presets. */
+        if (na_server_get_reliability(is, &comps) != NA_OK ||
+            comps != (NA_RELIABILITY_COMPONENT_REORDER | NA_RELIABILITY_COMPONENT_CONTROL_ARQ)) {
+            fprintf(stderr, "FAIL: UDP_IQ components != REORDER|ARQ (0x%x)\n", comps);
+            na_server_destroy(is);
+            return 1;
+        }
+        if (na_server_set_reliability_profile(is, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+            na_server_get_reliability(is, &comps) != NA_OK ||
+            comps != (NA_RELIABILITY_COMPONENT_FEC | NA_RELIABILITY_COMPONENT_REORDER |
+                      NA_RELIABILITY_COMPONENT_ADAPTIVE_JITTER |
+                      NA_RELIABILITY_COMPONENT_CONTROL_ARQ)) {
+            fprintf(stderr, "FAIL: UDP_WAN components != FEC|REORDER|JITTER|ARQ (0x%x)\n", comps);
+            na_server_destroy(is);
+            return 1;
+        }
+        if (na_server_set_reliability_profile(is, NA_RELIABILITY_UDP_BARE) != NA_OK ||
+            na_server_get_reliability(is, &comps) != NA_OK || comps != 0) {
+            fprintf(stderr, "FAIL: UDP_BARE components != 0 (0x%x)\n", comps);
+            na_server_destroy(is);
+            return 1;
+        }
+        na_server_destroy(is);  /* never started — clean create/destroy */
+        printf("c_server_smoke: format survives profile calls in both orders, IQ 192 kHz pairing "
+               "reads back, bitmask discriminates (#36 detector live)\n");
     }
 
     printf("c_server_smoke OK (port=%d, client RX byte-identical, roster=1, TX-extract frames=%d "

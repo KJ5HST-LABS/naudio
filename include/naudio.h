@@ -476,9 +476,11 @@ NA_EXPORT void na_client_destroy(na_stream_client* client);
 
 /* --- Configuration (set BEFORE na_client_connect; each returns NA_ERR_INVALID on a NULL client) --- */
 
-/* The local playback device id (REQUIRED for RX — connect fails without it). The NULL backend
- * accepts any id. Call before connect: the reconnect worker re-reads this on every attempt, so
- * NA_ERR_INVALID once connect has been attempted. */
+/* The local playback device id. REQUIRED for RX on the SYSTEM backend — connect fails without
+ * it. OPTIONAL on the NULL backend since 0.5.0: that backend never opens a device, so an unset
+ * id defaults to 0 at create (before 0.5.0, connect demanded a value it would never use — the
+ * one wart the hardware-free backend had). Call before connect: the reconnect worker re-reads
+ * this on every attempt, so NA_ERR_INVALID once connect has been attempted. */
 NA_EXPORT na_error_t na_client_set_playback_device(na_stream_client* client, int backend_id);
 /* The local capture device id (OPTIONAL — only needed for TX). Call before connect
  * (NA_ERR_INVALID afterwards), for the same reason as the playback device.
@@ -607,6 +609,39 @@ NA_EXPORT void na_client_disconnect(na_stream_client* client);
 NA_EXPORT int na_client_is_connected(na_stream_client* client);
 /* 1 if streaming, else 0 (also 0 on NULL). */
 NA_EXPORT int na_client_is_streaming(na_stream_client* client);
+
+/* --- Introspection (@since 0.5.0 — gate on na_version_number() >= NA_VERSION_ENCODE(0,5,0)) ---
+ *
+ * The read-back half of the config setters above, added with the 0.5.0 bare-UDP gate so a
+ * consumer or a harness can ASSERT what it configured instead of trusting that it did — the
+ * lesson of the misconfiguration that gate exists for: a client that cannot see its own
+ * reliability state reports healthy on loopback while discarding every parity packet. */
+
+/* Bitmask flags for na_client_get_reliability / na_server_get_reliability (@since 0.5.0). */
+#define NA_RELIABILITY_COMPONENT_FEC             (1 << 0)
+#define NA_RELIABILITY_COMPONENT_REORDER         (1 << 1)
+#define NA_RELIABILITY_COMPONENT_ADAPTIVE_JITTER (1 << 2)
+#define NA_RELIABILITY_COMPONENT_CONTROL_ARQ     (1 << 3)
+
+/* @since 0.5.0. Write the reliability components the CURRENT config enables into *components as
+ * a bitmask of the NA_RELIABILITY_COMPONENT_* flags. 0 means bare — no loss recovery at all,
+ * the composition the connect gate refuses on UDP unless NA_RELIABILITY_UDP_BARE requested it.
+ * Readable before and after connect: the handshake's AUDIO_CONFIG rewrites the audio format,
+ * never these knobs, so the value reflects what the pipeline was (or will be) built from.
+ * NA_ERR_INVALID on a NULL client or NULL components. */
+NA_EXPORT na_error_t na_client_get_reliability(na_stream_client* client, int* components);
+
+/* @since 0.5.0. Read the client's audio format. Any out-pointer may be NULL to skip that field.
+ *
+ * WHOSE FORMAT THIS IS DEPENDS ON WHEN YOU CALL. Before connect it is the local config's
+ * placeholder (48000/16/2 unless a preset changed it), which carries no information about the
+ * server. During the handshake the server pushes the negotiated format (AUDIO_CONFIG overwrites
+ * these three fields), so once na_client_connect has returned NA_OK this reports the format of
+ * the PCM the audio callback actually delivers — the value a recorder or resampler needs. A WAV
+ * tap that hardcoded 48000 writes mislabeled files the day the server is provisioned lower;
+ * this getter is the fix. NA_ERR_INVALID on a NULL client. */
+NA_EXPORT na_error_t na_client_get_audio_format(na_stream_client* client, int* sample_rate,
+                                                int* bits_per_sample, int* channels);
 
 /* --- Server roster (from the server's CLIENTS_UPDATE; -1 / empty before the first update) --- */
 NA_EXPORT int na_client_server_client_count(na_stream_client* client);
@@ -1153,6 +1188,20 @@ NA_EXPORT na_error_t na_server_inject_audio(na_audio_server* server, const unsig
 NA_EXPORT int na_server_client_count(na_audio_server* server);
 /* The configured maximum client count (> 0), or -1 on NULL / error. */
 NA_EXPORT int na_server_max_clients(na_audio_server* server);
+/* @since 0.5.0. The configured audio wire format — the read-back of na_server_set_audio_format,
+ * reporting what the server advertises to every client at handshake (pendingConfig pre-start;
+ * the running server's identical copy after — the na_server_max_clients pattern). Any
+ * out-pointer may be NULL to skip that field. This is the accessor issue #36 declined until it
+ * was wanted for consumer-facing reasons; the 0.5.0 introspection set is that reason — a caller
+ * pairing NA_RELIABILITY_UDP_IQ with its 192 kHz can now read back that the pairing took
+ * effect, and the profile setter's four-field preservation promise finally has an observable
+ * for all four fields. NA_ERR_INVALID on a NULL server. */
+NA_EXPORT na_error_t na_server_get_audio_format(na_audio_server* server, int* sample_rate,
+                                                int* bits_per_sample, int* channels);
+/* @since 0.5.0. The reliability components the server's CURRENT config enables — the server
+ * mirror of na_client_get_reliability: same NA_RELIABILITY_COMPONENT_* bitmask, same
+ * 0-means-bare reading. NA_ERR_INVALID on a NULL server or NULL components. */
+NA_EXPORT na_error_t na_server_get_reliability(na_audio_server* server, int* components);
 /* Write the current TX owner id into `buf` using the text functions' length-return-for-truncation
  * convention (len==0 / buf==NULL just returns the needed length). "" (length 0) if no owner. */
 NA_EXPORT int na_server_tx_owner(na_audio_server* server, char* buf, int len);
