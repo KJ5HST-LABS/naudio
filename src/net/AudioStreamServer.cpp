@@ -183,7 +183,7 @@ private:
     // lastReceiveTime_ (AudioProtocolHandler.cpp), i.e. on what WE last received; this
     // applies the same window to a peer that will not DRAIN. The coupling is
     // deliberate and is a real coupling: CONNECTION_TIMEOUT_MS is frozen by the wire spec
-    // (docs/audio-streaming-protocol-v1.md:291-292 and the constants table at :576-577), so
+    // (docs/audio-streaming-protocol-v1.md:375-376 and the constants table at :673-674), so
     // moving it there moves this cap with it. That is the intended behaviour, not a
     // side effect — but it means this line is not free to retune locally.
     //

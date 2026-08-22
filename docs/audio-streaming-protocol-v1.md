@@ -1,7 +1,8 @@
 # net-audio Audio Streaming Protocol — Specification v1
 
 **Status:** Stable / frozen wire contract (`0xAF01`, version byte = 1).
-**Spec version:** 1.1 (2026-08-15) — §8.4 only: `CONNECT_REQUEST` became a critical (ARQ'd) control type. Frame layout, type numbering and CRC semantics are unchanged, so the `0xAF01` v1 wire contract and every golden vector still hold; see §8.4 and §11.
+**Spec version:** 1.2 (2026-08-22) — per-subscription RX format negotiation, adopted from §13.1 in reduced scope (rate + channel layout only; RX only): appended `CONNECT_REQUEST` fields, an extended `AUDIO_CONFIG` form, and the grant rules — all via the §11 minor-extension path, so the frame layout, type numbering, CRC semantics, and every existing golden vector still hold. See §6.2.1. The 1.2 vectors are authored in `conformance/vectors/vectors-v1_2.ini` and join the loaded suite together with the reference implementation (issue #91 Phase B).
+**Spec version history:** 1.1 (2026-08-15) — §8.4 only: `CONNECT_REQUEST` became a critical (ARQ'd) control type.
 **Scope:** The *audio* half of a radio-streaming toolkit.
 **Provenance:** This document is the normative, field-by-field definition of the `0xAF01` audio wire. Every normative value here is implemented and pinned by the language-neutral golden-vector conformance suite (see §12), so the wire is byte-deterministic and independently checkable. Where the toolkit *plan* describes capabilities that are **not** in the v1 wire, they are isolated in §13 (Proposed extensions) and are explicitly **non-normative**.
 
@@ -179,7 +180,7 @@ At the framing layer the audio payload is an **opaque byte array**; the frame he
 - **Channels:** interleaved. v1 supports **mono (1)** and **stereo (2)**. Mono is conveyed by the channel count; a mono source MAY be duplicated to stereo by the producer.
 - **Frame duration:** a session property (default 20 ms; 10 ms for UDP presets). For 48 kHz/16-bit/stereo a 20 ms audio frame is 3840 bytes (960 samples × 2 ch × 2 bytes).
 
-> v1 transports audio **byte-for-byte unchanged** from server to every client (the "native broadcast" path, §6.4). Per-subscription resampling / channel remap / format conversion is **not** part of v1; it is proposed in §13.1. Sample-rate/channel/format *conversion building blocks* live in companion DSP code, not in this wire spec.
+> v1 transports audio **byte-for-byte unchanged** from server to every client (the "native broadcast" path, §6.4), and that path remains the default. **Since spec 1.2**, a connection that requested and was granted a reduced RX format (§6.2.1) receives audio decimated / channel-reduced to its granted format instead; every other connection stays byte-for-byte native. Sample-*format* conversion (beyond int16) remains proposed in §13.1, and the conversion building blocks live in companion DSP code, not in this wire spec.
 
 ### 5.2 FEC parity payload (`FEC_PARITY`)
 
@@ -247,7 +248,7 @@ configFlag         u8                       (0 = no buffer prefs; nonzero = pres
 
 `clientInfo` sub-encoding: `callsignLen u8, callsign…, nameLen u8, name…, locationLen u8, location…` (each ≤ 255 bytes, UTF-8).
 
-> **v1 negotiation scope:** the request carries **only buffer-timing preferences** — not sample rate, channels, or bit depth. A client inherits the server's native audio format; it cannot request a different one in v1. Format negotiation is proposed in §13.1.
+> **v1 negotiation scope:** the request carries **only buffer-timing preferences** — not sample rate, channels, or bit depth. A client inherits the server's native audio format. **Since spec 1.2** a client MAY additionally request a lower RX rate / reduced channel layout via the appended fields of §6.2.1; the remaining format breadth (sample formats beyond int16) stays proposed in §13.1.
 
 **`CONNECT_ACCEPT` (0x02):** empty data.
 
@@ -267,12 +268,95 @@ bufferMaxMs      u16
 
 A backward-compatible **8-byte legacy form** omits the three trailing buffer shorts (sampleRate, bits, channels, frameDurationMs only); decoders MUST accept both lengths.
 
+### 6.2.1 Per-subscription RX format request (since spec 1.2)
+
+A client MAY append a **format request** to its `CONNECT_REQUEST`, asking for a lower sample
+rate and/or a reduced channel layout for the audio the server sends *to it*. Scope is
+deliberately narrow: **RX direction only** (`AUDIO_TX` payloads remain in the server's native
+format regardless of any grant), **rate + channel layout only** (`bitsPerSample` stays 16;
+§13.1's sample-format breadth remains proposed), and **reduction only** (decimation and channel
+selection/downmix — never upsampling, channel synthesis, or fractional-ratio resampling).
+
+**Appended `CONNECT_REQUEST` fields** — immediately after the v1 fields (i.e. after
+`clientInfo[clientInfoLen]`):
+
+```
+requestedRate    u32     (0 = no rate preference: keep the native rate)
+requestedLayout  u8      (channel layout, table below)
+```
+
+| `requestedLayout` | Name | Payload channels | Meaning |
+|------:|------|-----:|---------|
+| 0 | `NATIVE` | native | No layout change. |
+| 1 | `MONO_DOWNMIX` | 1 | (L+R)/2 of the native stereo. |
+| 2 | `LEFT_ONLY` | 1 | Native channel 0 (e.g. VFO-A). |
+| 3 | `RIGHT_ONLY` | 1 | Native channel 1 (e.g. VFO-B). |
+
+A request of `requestedRate = 0, requestedLayout = 0` is valid and requests the native format
+unchanged; its use is as a **1.2 probe** — the extended `AUDIO_CONFIG` reply (below) reveals
+whether the server understands format requests at all.
+
+**Extended `AUDIO_CONFIG` (15-byte form)** — the 14-byte form of §6.2 plus one appended byte:
+
+```
+grantedLayout    u8      (same table)
+```
+
+The server sends the extended form **only** on a connection whose `CONNECT_REQUEST` carried a
+format request; on every other connection it sends the v1 form unchanged, byte-for-byte. The
+existing `sampleRate` / `channels` / `frameDurationMs` fields carry the **granted** values —
+`AUDIO_CONFIG` remains the sole authority for what that connection's `AUDIO_RX` payloads carry,
+extended form or not, and the client-side merge rule of §6.3 is unchanged.
+
+**Grant rules (normative).** The server either grants the request **exactly** or answers with
+its **native** format — never a partial or substituted grant:
+
+- It MUST NOT grant a `requestedRate` unless `requestedRate` is a positive integer divisor of
+  the native rate **and** `requestedRate × frameDurationMs` is divisible by 1000 (the granted
+  `samplesPerFrame` stays integral).
+- It MUST NOT grant layouts 1–3 unless the native channel count is 2. (`MONO_DOWNMIX`, at
+  native mono, is declined like the rest — answered native.)
+- It MAY decline any request for any reason by answering native. It MUST NOT reject the
+  connection merely because a format request is unservable (`CONNECT_REJECT
+  FORMAT_NOT_SUPPORTED` remains for configurations that are incompatible outright, as in v1).
+- A granted connection's `AUDIO_RX` frames are produced from that subscription's own converted
+  payload stream: its sequence numbers, FEC parity (§5.2), and frame sizes are computed over
+  **what that connection is sent**, exactly as the per-connection framing of §2.4 already
+  implies. The native broadcast path (§6.4) is unaffected for every non-requesting client.
+
+**Detection semantics (client side).** The reply's *form* says who answered; its *fields* say
+what was granted:
+
+- 14-byte (or 8-byte legacy) `AUDIO_CONFIG` → the server predates 1.2 (or the request was not
+  parsed); the format fields carry the native format. The client proceeds exactly as v1.
+- 15-byte form → the server understood the request. `grantedLayout` + the format fields either
+  equal the request (granted) or state the native format with `grantedLayout = 0` (declined).
+
+**Decoder tolerance (normative, restating §11 for these two messages).** A `CONNECT_REQUEST`
+decoder MUST ignore trailing bytes it does not recognize; a trailing run of **fewer than 5
+bytes** after `clientInfo` is not a format request and MUST be ignored. When 5 or more bytes
+follow `clientInfo`, the **first 5** are the format request and any remainder is a later minor
+extension, ignored by a 1.2 decoder — the same prefix-parse rule, one revision on. An
+`AUDIO_CONFIG` decoder MUST accept any data length ≥ 8, reading the fields it recognizes and
+ignoring the remainder. (The v1 reference parsers already behave this way; 1.2 makes it a
+requirement, which is what lets these fields append compatibly.)
+
+**Compatibility matrix:**
+
+| Client | Server | On the wire | Result |
+|---|---|---|---|
+| v1 | v1 | unchanged | Native format, byte-identical to v1. |
+| 1.2, no request | any | unchanged | Byte-identical to v1. |
+| 1.2, request | v1 | appended request bytes ignored by the server | 14-byte `AUDIO_CONFIG`, native format; client detects "not understood" and proceeds native. |
+| v1 | 1.2 | no request → v1 form reply | Byte-identical to v1. |
+| 1.2, request | 1.2 | appended fields both ways | Grant-or-native per the rules above; 15-byte `AUDIO_CONFIG` either way. |
+
 ### 6.3 Connect sequence
 
 ```
 Client                         Server
   | --- CONNECT_REQUEST ------> |   (UDP: also registers the client, §2.3)
-  | <-- AUDIO_CONFIG ---------- |   (server's native format + accepted buffer prefs)
+  | <-- AUDIO_CONFIG ---------- |   (native — or granted (§6.2.1) — format + accepted buffer prefs)
   | <-- CONNECT_ACCEPT -------- |   (or CONNECT_REJECT with a reason)
   |                             |   server registers client with broadcaster + mixer
   | <-- CLIENTS_UPDATE -------- |   (roster broadcast to all)
@@ -283,8 +367,8 @@ On accept, the client applies **only the format fields** of AUDIO_CONFIG into it
 
 ### 6.4 RX broadcast / TX receive
 
-- **RX broadcast:** the server sends the identical RX audio bytes (same buffer, offset, length) to every connected client (1→many). v1 performs no per-client transformation.
-- **TX receive:** each client's `AUDIO_TX` payloads are forwarded into the mixer (§7).
+- **RX broadcast:** the server sends the identical RX audio bytes (same buffer, offset, length) to every connected client (1→many) — the zero-cost native path, and the behavior of every v1 connection. **Since spec 1.2**, a connection granted a reduced format (§6.2.1) is instead served from its own converted payload stream; all non-requesting connections keep the identical-bytes path.
+- **TX receive:** each client's `AUDIO_TX` payloads are forwarded into the mixer (§7). `AUDIO_TX` is **always** in the server's native format — a §6.2.1 grant applies to RX only.
 
 ### 6.5 Heartbeats
 
@@ -501,7 +585,7 @@ This section compares net-audio v1 with Hamlib's audio streaming (issue/PR #1940
 | Sample formats | PCM_SIGNED 16-bit LE (v1) | CS8/CS16/CF32/CU8 family (their I/Q set) | **GAP — Hamlib richer on formats** |
 | Float / 8-bit / unsigned PCM | not in v1 | present in their type set | **GAP → close in §13.1** |
 | RF-center / time-anchor metadata | timestamp only (no RF center) | VITA-49-style UTC anchor / center freq | **GAP → close in §13.5** |
-| Per-subscription format negotiation | buffer timing only | n/a | proposed §13.1 |
+| Per-subscription format negotiation | rate + channel layout since spec 1.2 (§6.2.1); buffer timing in v1 | n/a | sample-format half still proposed §13.1 |
 
 **Net:** net-audio and #1940 are complementary. net-audio contributes the reliability stack (XOR FEC / reorder / control ARQ), an adaptive jitter buffer, per-client TX arbitration, and the cross-platform virtual-audio bridge — the "separate library" pieces upstream invited — **layered on top of** #1940's `rig_stream_*` transport. #1940 leads on **sample-format breadth** and **stream metadata** (RF center / precise time anchor) and owns I/Q. net-audio's `0xAF01` wire is a **distinct** FEC/ARQ transport, not a replacement for #1940's 32-byte UDP datagram: an application can use #1940 for rig-integrated audio and add net-audio's layer where it needs reliability or virtual-audio plumbing. Where net-audio would close its own gaps, the work is additive — format breadth (§13.1) and stream-fact metadata (§13.5) — and neither changes the frozen `0xAF01` framing.
 
@@ -510,7 +594,7 @@ This section compares net-audio v1 with Hamlib's audio streaming (issue/PR #1940
 ## 11. Versioning & compatibility
 
 - The `0xAF01` magic + version byte = 1 frame is a **frozen contract**. Field offsets, sizes, the type enum (0x00–0x04), and CRC semantics MUST NOT change under version 1.
-- **Extensions** that preserve the frame layout (new control message types, new AUDIO_CONFIG fields appended after the v1 fields, new flags bits, new presets) are **minor** and backward compatible: unknown control types/flags are ignored; AUDIO_CONFIG already supports length-based forward/backward compatibility (§6.2).
+- **Extensions** that preserve the frame layout (new control message types, new AUDIO_CONFIG **or CONNECT_REQUEST** fields appended after the v1 fields, new flags bits, new presets) are **minor** and backward compatible: unknown control types/flags are ignored, and control-message decoders MUST ignore trailing bytes they do not recognize (normative since 1.2 — §6.2.1; the v1 reference parsers already parse prefix-only). AUDIO_CONFIG already supports length-based forward/backward compatibility (§6.2). Spec 1.2's per-subscription format request (§6.2.1) is an instance of exactly this path.
 - **Breaking** changes (header layout, type renumbering, CRC change, audio sample-format renegotiation that changes the audio-payload contract) require **bumping the version byte to 2** and a frame-layer version gate (§3.7). Such changes MUST be specified before the first such frame is emitted.
 - The jitter, FEC, reorder, and ARQ algorithms and their constants (EMA 1/16, FEC N∈[2,10] default 5, parity header 5 bytes, ARQ ring 16 / timeout 500 ms / 3 attempts) are part of the contract for interoperating reliability and are versioned with the spec.
 
@@ -524,6 +608,15 @@ The executable companion to this spec is the **golden-vector conformance suite**
 
 Passing against the language-neutral vectors is the proof that an implementation matches this spec — the gate every reference client (C, C++, Python, and any other binding) must also pass.
 
+**Spec 1.2 vectors.** The §6.2.1 wire forms are pinned by a second generated file,
+`conformance/vectors/vectors-v1_2.ini` (same generator, same independence rules): byte-exact
+encodings of the appended `CONNECT_REQUEST` fields and the 15-byte `AUDIO_CONFIG`, plus
+**tolerance vectors** asserting the v1 view of the extended payloads (what a pre-1.2 decoder
+must extract, and that a short trailing run is not a format request). The file is authored with
+the spec revision and joins the loaded suite together with the reference implementation
+(issue #91 Phase B); `vectors.ini` itself is unchanged by 1.2 — the no-drift check is part of
+regeneration.
+
 ### 12.3 Determinism rule for byte-exact vectors
 
 Because the frame timestamp is sampled at packet-creation time (§3.5), a byte-exact frame vector MUST pin the timestamp to a fixed value (the vectors use `timestamp = 0`). Conformance MUST NOT assert timestamp equality across implementations for live (non-pinned) frames.
@@ -534,8 +627,12 @@ Because the frame timestamp is sampled at packet-creation time (§3.5), a byte-e
 
 These are the toolkit-plan capabilities that are **not** in the v1 wire. They are recorded here so the spec is honest about the gap and so future versions have a starting point. Nothing in this section is implemented or conformance-tested.
 
-### 13.1 Per-subscription format negotiation + format breadth
-Let each client request its own sample rate, channel layout (stereo / mono / VFO-A=L / VFO-B=R / downmix), and sample format (int16 / float32 / int8 / uint8) at subscribe time, with the server transcoding per subscription **or** the client converting locally — both first-class; default = native full resolution (the existing zero-cost identical-broadcast fast path). Requires: extending `CONNECT_REQUEST`/`AUDIO_CONFIG` to carry the requested format, a `sampleFormat` enum, and the conversion building blocks. Closes the §10 format-breadth gap.
+### 13.1 Format breadth (the remainder — rate/layout negotiation was adopted in spec 1.2)
+Spec 1.2 adopted the rate + channel-layout half of this proposal as §6.2.1 (server-side
+conversion, reduction only, RX only). What **remains proposed** here: sample formats beyond
+int16 (float32 / int8 / uint8, via a `sampleFormat` enum), upsampling or fractional-ratio
+rates, client-side conversion as a first-class alternative to server-side, and a TX-direction
+format request. Closes the rest of the §10 format-breadth gap.
 
 ### 13.2 Application-level gap markers
 Deliver explicit gap markers to high-rate/SDR consumers instead of silence-filling, so decoders see exact discontinuities. Requires a delivery path that forwards the reorder/FEC null markers to the application rather than collapsing them to silence at playout (§8.6).
@@ -578,7 +675,10 @@ Carry stream facts — sample rate, channel layout, sample format, source kind, 
 | TX idle timeout (default) | 500 ms |
 | Max consecutive CRC errors (TCP resync) | 5 |
 | Default audio format | 48000 Hz, 16-bit, 2 ch, PCM signed LE, 20 ms frame |
+| Channel layouts (spec 1.2, §6.2.1) | NATIVE 0, MONO_DOWNMIX 1, LEFT_ONLY 2, RIGHT_ONLY 3 |
+| Format-request tail (spec 1.2, §6.2.1) | `requestedRate` u32 BE + `requestedLayout` u8 (5 bytes, appended to CONNECT_REQUEST) |
+| Extended AUDIO_CONFIG (spec 1.2, §6.2.1) | 15 bytes: the 14-byte form + `grantedLayout` u8 |
 
 ---
 
-*End of net-audio Audio Streaming Protocol Specification v1.0.*
+*End of the net-audio Audio Streaming Protocol Specification (wire version 1; spec revision history in the title block).*
