@@ -101,6 +101,8 @@ char errbuf[256];
 na_stream_client* c =                                    // host, port, and roster name go in create()
     na_client_create(NA_CLIENT_BACKEND_SYSTEM, "192.168.1.20", 4533, "my-client");
 na_client_set_transport(c, NA_TRANSPORT_TCP);            // NA_CLIENT_BACKEND_NULL = headless RX, no PortAudio
+/* For UDP, call na_client_set_reliability_profile instead — it selects UDP itself and enables the
+   loss-recovery layer (FEC/reorder/jitter/control-ARQ) that set_transport alone leaves off. */
 na_client_set_audio_cb(c, on_pcm, user);                 // the hot-path RX PCM sink
 events.struct_size = sizeof events;                      // REQUIRED — see "Binary compatibility"
 na_client_set_callbacks(c, &events, user);               // connected / stream / roster / error events

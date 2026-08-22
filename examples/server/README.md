@@ -55,6 +55,8 @@ With no `--capture-id`, the first capture-capable device is selected automatical
 --port N          listen port; 0 = OS-assigned ephemeral (default 4533)
 --capture-id N    capture device id to broadcast (default: first capture device)
 --transport T     tcp (default) | udp
+--reliability P   lan | wan  (UDP profiles: FEC/reorder/jitter). Omitted = bare
+                  transport, which across a real network loses audio
 --test-tone       hardware-free: broadcast a deterministic tone (no device)
 --max-clients N   maximum simultaneous clients (default 4)
 --seconds N       run time; 0 = until Ctrl-C (default 0)

@@ -606,6 +606,12 @@ The four unrecovered packets are the fixed in-flight depth of the reorder/FEC pi
 a leak — the same residual of 4 that holds across both 12- and 30-second runs while recoveries scale
 with duration.
 
+> **Planned change** ([#92](https://github.com/KJ5HST-LABS/naudio/issues/92)): an upcoming release
+> will refuse `na_client_connect` / `na_server_start` on a UDP configuration with every reliability
+> component off unless bare UDP is explicitly requested, so the first row of the table above will
+> fail loudly at connect instead of silently discarding parity. The explicit opt-in keeps the
+> bare-transport measurement arm reproducible.
+
 The earlier arm table was taken with a client built directly on `naudio::net::UdpClientConnection`,
 because at the time the C ABI could not enable the reliability layer at all. Nothing needs that
 detour any more: **`na_client_get_stats`** reports the counters, so a single run can assert how many
