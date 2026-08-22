@@ -643,6 +643,45 @@ NA_EXPORT na_error_t na_client_get_reliability(na_stream_client* client, int* co
 NA_EXPORT na_error_t na_client_get_audio_format(na_stream_client* client, int* sample_rate,
                                                 int* bits_per_sample, int* channels);
 
+/* --- Per-subscription RX format request (@since 0.5.0; wire spec 1.2 SS6.2.1 — gate on
+ *     na_version_number() >= NA_VERSION_ENCODE(0,5,0)) ---
+ *
+ * Ask the server to send THIS client a reduced RX format — a lower rate and/or a reduced
+ * channel layout — while every other client keeps the native broadcast. The use case is the
+ * constrained link: 48 kHz stereo is 1.536 Mbps on the wire; 12 kHz mono is 192 kbps. */
+
+/* Channel-layout values for na_client_request_format (the SS6.2.1 wire byte). */
+typedef enum na_rx_layout {
+    NA_RX_LAYOUT_NATIVE = 0,       /* no layout change                          */
+    NA_RX_LAYOUT_MONO_DOWNMIX = 1, /* (L+R)/2 of the native stereo              */
+    NA_RX_LAYOUT_LEFT_ONLY = 2,    /* native channel 0 (e.g. VFO-A)             */
+    NA_RX_LAYOUT_RIGHT_ONLY = 3    /* native channel 1 (e.g. VFO-B)             */
+} na_rx_layout_t;
+
+/* @since 0.5.0. Request a reduced RX format for this client's subscription. Takes effect at
+ * the NEXT na_client_connect (call it before connecting; an auto-reconnect renews the same
+ * request). sample_rate 0 keeps the native rate; otherwise the server grants only an integer
+ * divisor of its native rate (48 kHz native: 24000/16000/12000/8000). Layouts other than
+ * NA_RX_LAYOUT_NATIVE need a stereo native. The server grants the request EXACTLY or answers
+ * with its native format — never a partial grant — and an unservable request never fails the
+ * connection. After connect, na_client_get_audio_format reports the format actually granted,
+ * and na_client_get_granted_rx_layout says whether the server understood the request at all.
+ * A (0, NA_RX_LAYOUT_NATIVE) request is a valid probe: nothing changes, but the reply reveals
+ * whether the server speaks spec 1.2. NA_ERR_INVALID on a NULL client, a negative
+ * sample_rate, or a layout outside the enum. */
+NA_EXPORT na_error_t na_client_request_format(na_stream_client* client, int sample_rate,
+                                              int layout);
+
+/* @since 0.5.0. The SS6.2.1 reply discriminator for the CURRENT connection. Returns NA_OK and
+ * writes the granted layout when the server ANSWERED the format request (its AUDIO_CONFIG
+ * carried the appended grantedLayout byte): the requested layout with the requested rate in
+ * na_client_get_audio_format = granted; NA_RX_LAYOUT_NATIVE with native fields = understood
+ * and DECLINED. Returns NA_ERR_UNSUPPORTED when no such reply exists — no request was made,
+ * connect has not completed, or the server predates spec 1.2 and ignored the request (the
+ * stream is native). That distinction is the point: a declined request and an old server both
+ * deliver native audio, but only one of them will ever grant. NA_ERR_INVALID on NULL args. */
+NA_EXPORT na_error_t na_client_get_granted_rx_layout(na_stream_client* client, int* layout);
+
 /* --- Server roster (from the server's CLIENTS_UPDATE; -1 / empty before the first update) --- */
 NA_EXPORT int na_client_server_client_count(na_stream_client* client);
 NA_EXPORT int na_client_server_max_clients(na_stream_client* client);

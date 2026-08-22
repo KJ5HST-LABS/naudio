@@ -183,6 +183,26 @@ public:
     AudioStreamConfig config() const;
     bool setConfig(AudioStreamConfig config);
 
+    // --- Per-subscription RX format request (wire spec 1.2, §6.2.1) ---
+    // Ask the server for a reduced RX format: rate 0 keeps the native rate; layout is an
+    // RxLayout wire byte. Sent with EVERY handshake once set (a reconnect renews the same
+    // subscription intent). The server grants exactly or answers native — the granted format
+    // lands in config() via the AUDIO_CONFIG merge, exactly like any negotiated format.
+    // A (0, Native) request is the 1.2 probe: it changes nothing but makes the server reveal
+    // whether it understands format requests at all (see grantedRxLayout).
+    void requestRxFormat(const RxFormatRequest& request);
+
+    // The §6.2.1 reply discriminator for the CURRENT connection:
+    //   nullopt         — no extended AUDIO_CONFIG arrived: no request was sent, connect has
+    //                     not completed, or the server predates spec 1.2 (request ignored;
+    //                     the stream is native).
+    //   value 0..3      — the server UNDERSTOOD the request. Equal to the requested layout
+    //                     with config() carrying the requested rate = granted; 0 with native
+    //                     fields = understood and DECLINED. Those two "0" cases and the
+    //                     old-server nullopt are deliberately distinguishable (§6.2.1
+    //                     detection semantics).
+    std::optional<std::uint8_t> grantedRxLayout() const;
+
     // Transport wiring. Supplies the ClientTransport that connect() will use, replacing the
     // one config.transportType would have selected. The mirror of
     // AudioStreamServer::setTransportFactory, and the same argument applies: the transport
@@ -371,6 +391,12 @@ private:
     // --- Config (guarded by configMutex_) ---
     mutable std::mutex configMutex_;
     AudioStreamConfig config_;
+    // The §6.2.1 request, if any (guarded by configMutex_); sent with every handshake.
+    std::optional<RxFormatRequest> rxFormatRequest_;
+    // grantedRxLayout() backing: -1 = no extended AUDIO_CONFIG on the current connection;
+    // reset at each handshake, written when the 15-byte form arrives (atomic: written on the
+    // connect/reconnect thread, read from any).
+    std::atomic<int> grantedRxLayout_{-1};
 
     // Set once before connect() and read on every connect/reconnect attempt; not guarded,
     // like the server's, because the contract is "set it before you start".

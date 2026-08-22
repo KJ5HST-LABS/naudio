@@ -118,6 +118,17 @@ bool AudioStreamClient::setConfig(AudioStreamConfig config) {
     return true;
 }
 
+void AudioStreamClient::requestRxFormat(const RxFormatRequest& request) {
+    std::lock_guard<std::mutex> lock(configMutex_);
+    rxFormatRequest_ = request;
+}
+
+std::optional<std::uint8_t> AudioStreamClient::grantedRxLayout() const {
+    const int v = grantedRxLayout_.load();
+    if (v < 0) return std::nullopt;
+    return static_cast<std::uint8_t>(v);
+}
+
 AudioFormat AudioStreamClient::formatFromConfig() const {
     AudioFormat f;
     std::lock_guard<std::mutex> lock(configMutex_);
@@ -279,8 +290,20 @@ bool AudioStreamClient::performHandshake(const std::shared_ptr<ClientConnection>
     const ClientInfo* infoPtr = info.isEmpty() ? nullptr : &info;
 
     AudioStreamConfig cfg = config();
-    if (!connection->sendControl(ControlMessage::connectRequestFull(clientName_, AudioPacket::VERSION,
-                                                                    &cfg, infoPtr))) {
+    // The §6.2.1 discriminator is per-connection: reset before every handshake so a
+    // reconnect against a different (or downgraded) server cannot inherit a stale answer.
+    grantedRxLayout_.store(-1);
+    std::optional<RxFormatRequest> rxRequest;
+    {
+        std::lock_guard<std::mutex> lock(configMutex_);
+        rxRequest = rxFormatRequest_;
+    }
+    const ControlMessage request =
+        rxRequest.has_value()
+            ? ControlMessage::connectRequestV12(clientName_, AudioPacket::VERSION, &cfg, infoPtr,
+                                                *rxRequest)
+            : ControlMessage::connectRequestFull(clientName_, AudioPacket::VERSION, &cfg, infoPtr);
+    if (!connection->sendControl(request)) {
         notifyError("local", "Handshake send failed");
         return false;
     }
@@ -300,8 +323,15 @@ bool AudioStreamClient::performHandshake(const std::shared_ptr<ClientConnection>
                     case ControlType::AudioConfig: {
                         // Apply ONLY the fields the message carries — replacing the whole config
                         // would wipe UDP/FEC/reorder/jitter settings.
-                        std::lock_guard<std::mutex> lock(configMutex_);
-                        msg->applyAudioConfigTo(config_);
+                        {
+                            std::lock_guard<std::mutex> lock(configMutex_);
+                            msg->applyAudioConfigTo(config_);
+                        }
+                        // The 15-byte form's appended byte (§6.2.1): its PRESENCE says the
+                        // server understood the format request; the v1 14/8-byte forms leave
+                        // the -1 sentinel in place (old server / no request).
+                        if (auto layout = msg->parseAudioConfigGrantedLayout())
+                            grantedRxLayout_.store(static_cast<int>(*layout));
                         break;
                     }
                     case ControlType::ConnectAccept:

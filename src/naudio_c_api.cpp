@@ -934,6 +934,42 @@ extern "C" na_error_t na_client_get_audio_format(na_stream_client* client, int* 
     });
 }
 
+extern "C" na_error_t na_client_request_format(na_stream_client* client, int sample_rate,
+                                               int layout) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr || sample_rate < 0 || layout < NA_RX_LAYOUT_NATIVE ||
+            layout > NA_RX_LAYOUT_RIGHT_ONLY) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        naudio::RxFormatRequest req;
+        req.sampleRate = static_cast<std::uint32_t>(sample_rate);
+        req.layout = static_cast<std::uint8_t>(layout);
+        client->client->requestRxFormat(req);
+        return NA_OK;
+    });
+}
+
+extern "C" na_error_t na_client_get_granted_rx_layout(na_stream_client* client, int* layout) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (client == nullptr || layout == nullptr) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        const auto granted = client->client->grantedRxLayout();
+        if (!granted.has_value()) {
+            // No extended AUDIO_CONFIG on the current connection: no request, not yet
+            // connected, or a pre-1.2 server that ignored the request. Documented as
+            // NA_ERR_UNSUPPORTED -- distinct from the NA_OK + NATIVE "understood and
+            // declined" answer.
+            setError(NA_ERR_UNSUPPORTED);
+            return NA_ERR_UNSUPPORTED;
+        }
+        *layout = static_cast<int>(*granted);
+        return NA_OK;
+    });
+}
+
 // ---- Server roster ---------------------------------------------------------------------
 // -1 is the documented "no data yet" value (before the first CLIENTS_UPDATE) AND the NULL/error
 // sentinel; na_last_error() disambiguates: NA_OK -> no update yet, NA_ERR_INVALID -> NULL client,

@@ -81,6 +81,25 @@ static unsigned char RXBUF[8192];
 
 static NA_TEST_ATOMIC int g_rx_ok = 0;
 
+/* Section (9) instrumentation: cumulative received bytes and the last int16 sample seen.
+ * The (9b) inject is stereo DC with DIFFERENT channels (L=1000, R=3000), so the three
+ * plausible wrong behaviors are mutually distinguishable at the tail sample: 2000 = the
+ * granted mono downmix; 1000 or 3000 = a channel-select miswire; an alternating
+ * 1000/3000 stream (and ~8x the bytes) = conversion skipped entirely. */
+static NA_TEST_ATOMIC long g_fmt_bytes = 0;
+static NA_TEST_ATOMIC int g_fmt_last_sample = 0;
+
+static void on_fmt_audio(const unsigned char *pcm, size_t n_bytes, void *user) {
+    (void)user;
+    if (pcm == NULL || n_bytes < 2) return;
+    g_fmt_bytes += (long)n_bytes;
+    {
+        short s;
+        memcpy(&s, pcm + n_bytes - 2, 2);
+        g_fmt_last_sample = (int)s;
+    }
+}
+
 static void on_rx_audio(const unsigned char *pcm, size_t n_bytes, void *user) {
     (void)user;
     if (pcm == NULL || n_bytes < SIG_PERIOD * 2) return;
@@ -633,6 +652,148 @@ int main(void) {
         na_server_destroy(fsrv);
         printf("c_client_profile: negotiated 12000/16/1 read back post-connect; no playback "
                "device ever set (8b)\n");
+    }
+
+    /* ---- (9) the spec-1.2 format request (@since 0.5.0, #91 B4) ---- */
+
+    /* (9a) argument contract, no server needed. */
+    {
+        na_stream_client *fc = na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", 1, "fmt-9a");
+        int layout = -99;
+        if (fc == NULL) return fail("na_client_create (9a)", NULL, NULL);
+        if (na_client_request_format(NULL, 12000, NA_RX_LAYOUT_MONO_DOWNMIX) != NA_ERR_INVALID)
+            return fail("request_format(NULL) must be NA_ERR_INVALID", fc, NULL);
+        if (na_client_request_format(fc, 12000, -1) != NA_ERR_INVALID ||
+            na_client_request_format(fc, 12000, 4) != NA_ERR_INVALID)
+            return fail("request_format with a layout outside the enum must be NA_ERR_INVALID",
+                        fc, NULL);
+        if (na_client_request_format(fc, -1, NA_RX_LAYOUT_NATIVE) != NA_ERR_INVALID)
+            return fail("request_format with a negative rate must be NA_ERR_INVALID", fc, NULL);
+        if (na_client_request_format(fc, 12000, NA_RX_LAYOUT_MONO_DOWNMIX) != NA_OK)
+            return fail("a valid pre-connect request_format must be NA_OK", fc, NULL);
+        if (na_client_get_granted_rx_layout(NULL, &layout) != NA_ERR_INVALID ||
+            na_client_get_granted_rx_layout(fc, NULL) != NA_ERR_INVALID)
+            return fail("get_granted_rx_layout NULL args must be NA_ERR_INVALID", fc, NULL);
+        if (na_client_get_granted_rx_layout(fc, &layout) != NA_ERR_UNSUPPORTED)
+            return fail("get_granted_rx_layout before any connect must be NA_ERR_UNSUPPORTED "
+                        "(no extended reply exists)", fc, NULL);
+        na_client_destroy(fc);
+        printf("c_client_profile: format-request argument contract holds (9a)\n");
+    }
+
+    /* (9b) granted: a default 48k stereo server, a client asking 12 kHz mono-downmix. */
+    {
+        na_audio_server *fsrv = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+        na_stream_client *fc;
+        int rate = 0, bits = 0, chan = 0, layout = -99;
+        long injected = 0;
+        int waited = 0, i;
+        short stereo_dc[1920]; /* 960 frames of L=1000, R=3000 */
+        if (fsrv == NULL) return fail("na_server_create (9b)", NULL, srv);
+        if (na_server_start(fsrv, err, (int)sizeof err) != NA_OK) {
+            na_server_destroy(fsrv);
+            return fail("na_server_start (9b)", NULL, srv);
+        }
+        for (i = 0; i < 1920; i += 2) { stereo_dc[i] = 1000; stereo_dc[i + 1] = 3000; }
+        fc = na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", na_server_port(fsrv), "fmt-9");
+        if (fc == NULL) { na_server_stop(fsrv); na_server_destroy(fsrv);
+                          return fail("na_client_create (9b)", NULL, srv); }
+        if (na_client_request_format(fc, 12000, NA_RX_LAYOUT_MONO_DOWNMIX) != NA_OK) {
+            na_client_destroy(fc); na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("request_format (9b)", NULL, srv);
+        }
+        g_fmt_bytes = 0;
+        g_fmt_last_sample = 0;
+        na_client_set_audio_cb(fc, on_fmt_audio, NULL);
+        if (na_client_connect(fc, err, (int)sizeof err) != NA_OK) {
+            fprintf(stderr, "  (%s)\n", err);
+            na_client_destroy(fc); na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("connect with a format request (9b)", NULL, srv);
+        }
+        if (na_client_get_granted_rx_layout(fc, &layout) != NA_OK || layout != NA_RX_LAYOUT_MONO_DOWNMIX) {
+            fprintf(stderr, "  (layout=%d)\n", layout);
+            na_client_disconnect(fc); na_client_destroy(fc);
+            na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("the grant must be visible: get_granted_rx_layout == MONO_DOWNMIX (9b)",
+                        NULL, srv);
+        }
+        if (na_client_get_audio_format(fc, &rate, &bits, &chan) != NA_OK ||
+            rate != 12000 || bits != 16 || chan != 1) {
+            fprintf(stderr, "  (granted %d/%d/%d)\n", rate, bits, chan);
+            na_client_disconnect(fc); na_client_destroy(fc);
+            na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("the granted format must reach na_client_get_audio_format (9b)", NULL, srv);
+        }
+        /* Paced injects (L304: burst puts platform buffers in the experiment). */
+        while (waited < 5000 && g_fmt_bytes < 2400) {
+            na_server_inject_audio(fsrv, (const unsigned char *)stereo_dc,
+                                   (int)sizeof stereo_dc);
+            injected += (long)sizeof stereo_dc;
+            sleep_ms(20);
+            waited += 20;
+        }
+        if (g_fmt_bytes < 2400) {
+            fprintf(stderr, "  (received %ld B of %ld injected)\n", (long)g_fmt_bytes, injected);
+            na_client_disconnect(fc); na_client_destroy(fc);
+            na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("converted audio never flowed (9b)", NULL, srv);
+        }
+        /* The stream is the CONVERTED one: 8x smaller than the native injects (2ch * 4:1),
+         * bounded loosely (one in-flight chunk of slack), and its DC tail is the DOWNMIX
+         * value 2000 — not 1000/3000 (channel select) and not the interleaved native pair. */
+        if (g_fmt_bytes > injected / 8 + 1024) {
+            fprintf(stderr, "  (received %ld B for %ld injected — native-sized, not converted)\n",
+                    (long)g_fmt_bytes, injected);
+            na_client_disconnect(fc); na_client_destroy(fc);
+            na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("received byte volume says the stream was NOT converted (9b)", NULL, srv);
+        }
+        if (g_fmt_last_sample != 2000) {
+            fprintf(stderr, "  (tail sample %d, want 2000)\n", (int)g_fmt_last_sample);
+            na_client_disconnect(fc); na_client_destroy(fc);
+            na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("the DC tail must be the (L+R)/2 downmix value (9b)", NULL, srv);
+        }
+        na_client_disconnect(fc);
+        na_client_destroy(fc);
+
+        /* (9c) understood-and-DECLINED, distinct from an old server: an unservable rate
+         * (9600 = divisor 5, unimplemented) answers NA_OK + NATIVE with native fields —
+         * NA_ERR_UNSUPPORTED is reserved for "no extended reply at all" (a pre-1.2 server;
+         * measured out-of-suite against the pre-B1 tree, since ctest cannot build one). */
+        fc = na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", na_server_port(fsrv), "fmt-9");
+        if (fc == NULL) { na_server_stop(fsrv); na_server_destroy(fsrv);
+                          return fail("na_client_create (9c)", NULL, srv); }
+        if (na_client_request_format(fc, 9600, NA_RX_LAYOUT_NATIVE) != NA_OK) {
+            na_client_destroy(fc); na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("request_format (9c)", NULL, srv);
+        }
+        if (na_client_connect(fc, err, (int)sizeof err) != NA_OK) {
+            fprintf(stderr, "  (%s)\n", err);
+            na_client_destroy(fc); na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("an unservable request must never fail the connection (9c)", NULL, srv);
+        }
+        layout = -99;
+        if (na_client_get_granted_rx_layout(fc, &layout) != NA_OK || layout != NA_RX_LAYOUT_NATIVE) {
+            fprintf(stderr, "  (layout=%d)\n", layout);
+            na_client_disconnect(fc); na_client_destroy(fc);
+            na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("a declined request is NA_OK + NATIVE — the server ANSWERED (9c)",
+                        NULL, srv);
+        }
+        if (na_client_get_audio_format(fc, &rate, &bits, &chan) != NA_OK ||
+            rate != 48000 || chan != 2) {
+            fprintf(stderr, "  (fields %d/%d/%d)\n", rate, bits, chan);
+            na_client_disconnect(fc); na_client_destroy(fc);
+            na_server_stop(fsrv); na_server_destroy(fsrv);
+            return fail("a decline is TOTAL: native fields, no substitution (9c)", NULL, srv);
+        }
+        na_client_disconnect(fc);
+        na_client_destroy(fc);
+        na_server_stop(fsrv);
+        na_server_destroy(fsrv);
+        printf("c_client_profile: format request granted 12000/mono-downmix with DC tail 2000; "
+               "9600 declined-to-native distinctly (9b, 9c)\n");
     }
 
     na_server_stop(srv);
