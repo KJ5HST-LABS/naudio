@@ -20,7 +20,7 @@ namespace naudio {
 // streaming.
 //
 // A flat Copy value struct (public fields, value semantics) — the C-ABI-ready
-// shape. The 8 presets are static factories; the struct carries the numeric
+// shape. The presets are static factories; the struct carries the numeric
 // format facts directly.
 struct AudioStreamConfig {
     // --- Format constants ---
@@ -78,6 +78,16 @@ struct AudioStreamConfig {
     double jitterMultiplier = 3.0;                       // RFC 3550 typical multiplier.
     bool controlReliabilityEnabled = false;             // Disabled for TCP.
     std::int32_t controlRetransmitMaxAttempts = 3;
+    // Consent marker for the no-reliability UDP composition (issue #92). A UDP (or, on a server,
+    // DUAL) config with fecEnabled false, reorderBufferSize 0, adaptiveJitterEnabled false AND
+    // controlReliabilityEnabled false is refused where the pipeline is built — AudioStreamClient::
+    // connect / AudioStreamServer::start — unless this is true, because that composition is almost
+    // always the "set the transport and nothing else" trap: it discards every parity packet and is
+    // indistinguishable from a healthy client on loss-free loopback. udpBare() (and the C ABI's
+    // NA_RELIABILITY_UDP_BARE) is the sanctioned way to set it; a C++ caller building a config by
+    // hand may set the field directly. Every other preset leaves it false, and it gates nothing
+    // when any reliability component is on or the transport is TCP.
+    bool explicitBareUdp = false;
 
     // --- Derived calculations ---
     std::int32_t samplesPerFrame() const { return (sampleRate * frameDurationMs) / 1000; }
@@ -192,6 +202,19 @@ struct AudioStreamConfig {
         c.fecEnabled = false;
         c.adaptiveJitterEnabled = false;
         c.controlReliabilityEnabled = true;
+        return c;
+    }
+
+    // Bare UDP by explicit request (issue #92): the default config with only the transport
+    // changed — 20 ms framing, no FEC / reorder / adaptive jitter / control-ARQ — plus the
+    // consent marker that lets connect()/start() accept it. This is BYTE-FOR-BYTE the config
+    // that "set_transport(Udp) on a default config" used to run implicitly, kept reachable so a
+    // measurement-control arm (a deliberately unprotected baseline) stays reproducible. Do not
+    // "improve" its settings: its value is that it is exactly the historical bare composition.
+    static AudioStreamConfig udpBare() {
+        AudioStreamConfig c;
+        c.transportType = TransportType::Udp;
+        c.explicitBareUdp = true;
         return c;
     }
 

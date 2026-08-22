@@ -721,6 +721,23 @@ bool AudioStreamServer::start(std::string* err) {
         return false;
     }
 
+    // Issue #92: refuse the silent no-reliability UDP composition — the server-side mirror of the
+    // gate in AudioStreamClient::connect (see the rationale there). DUAL is gated too: its UDP
+    // half carries the same exposure, and the bare-DUAL composition is reachable only by flipping
+    // the transport on a default config, which is exactly the trap. A config with any reliability
+    // component on (dualDefault() included) is untouched, as is TCP.
+    if ((config_.transportType == TransportType::Udp ||
+         config_.transportType == TransportType::Dual) &&
+        !config_.fecEnabled && config_.reorderBufferSize == 0 && !config_.adaptiveJitterEnabled &&
+        !config_.controlReliabilityEnabled && !config_.explicitBareUdp) {
+        if (err)
+            *err = "UDP with no reliability layer: select a profile "
+                   "(na_server_set_reliability_profile / AudioStreamConfig preset, e.g. "
+                   "NA_RELIABILITY_UDP_WAN) or explicitly request bare UDP "
+                   "(NA_RELIABILITY_UDP_BARE / AudioStreamConfig::udpBare())";
+        return false;
+    }
+
     auto transport = createTransport();
     // Only reachable through setTransportFactory — the config switch always returns one —
     // but it is reachable from public API, and the next line would dereference it.

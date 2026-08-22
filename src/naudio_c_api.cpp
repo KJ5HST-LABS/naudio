@@ -690,6 +690,7 @@ extern "C" na_error_t na_client_set_reliability_profile(na_stream_client* client
             case NA_RELIABILITY_UDP_WAN: preset = naudio::AudioStreamConfig::udpWan(); break;
             case NA_RELIABILITY_UDP_FT8: preset = naudio::AudioStreamConfig::udpFt8(); break;
             case NA_RELIABILITY_UDP_IQ:  preset = naudio::AudioStreamConfig::udpIq();  break;
+            case NA_RELIABILITY_UDP_BARE: preset = naudio::AudioStreamConfig::udpBare(); break;
             // Aliases to TCP once the transport is realised — see AudioStreamClient::createTransport
             // (src/net/AudioStreamClient.cpp:94), which folds TransportType::Dual into the Tcp case. The
             // preset is still applied wholesale here rather than being rewritten to tcpDefault():
@@ -1213,6 +1214,7 @@ extern "C" na_error_t na_server_set_reliability_profile(na_audio_server* server,
             case NA_RELIABILITY_UDP_WAN: preset = naudio::AudioStreamConfig::udpWan(); break;
             case NA_RELIABILITY_UDP_FT8: preset = naudio::AudioStreamConfig::udpFt8(); break;
             case NA_RELIABILITY_UDP_IQ:  preset = naudio::AudioStreamConfig::udpIq();  break;
+            case NA_RELIABILITY_UDP_BARE: preset = naudio::AudioStreamConfig::udpBare(); break;
             case NA_RELIABILITY_DUAL:    preset = naudio::AudioStreamConfig::dualDefault(); break;
             default:
                 setError(NA_ERR_INVALID);

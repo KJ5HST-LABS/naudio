@@ -368,6 +368,13 @@ typedef enum na_transport {
  * NA_RELIABILITY_UDP_WAN sends parity packets that a client left on any other profile receives and
  * discards, silently getting no loss recovery at all.
  *
+ * SINCE 0.5.0 THE NO-RELIABILITY UDP COMPOSITION IS REFUSED where the pipeline is built: a UDP
+ * (server: UDP or DUAL) config with FEC, the reorder buffer, adaptive jitter and control-ARQ all
+ * off fails na_client_connect / na_server_start with both remedies in errbuf, unless it was
+ * requested explicitly via NA_RELIABILITY_UDP_BARE. That composition used to arise silently from
+ * na_client_set_transport(UDP) alone, deliver ~1/3 of the audio on a real link, and be
+ * indistinguishable from health on loss-free loopback.
+ *
  * VALUES ARE APPEND-ONLY and 0-3 are frozen. A library older than a value you pass rejects it with
  * NA_ERR_INVALID rather than misapplying it, so a caller that may load an older naudio should gate
  * a newer value on na_version_number() — the same discipline the @since struct fields use. */
@@ -383,11 +390,19 @@ typedef enum na_reliability_profile {
                                  /*   it with na_server_set_audio_format(192000, 16, ch) on the     */
                                  /*   server, which is the only end that decides the wire format.   */
                                  /*   See na_server_set_reliability_profile.                        */
-    NA_RELIABILITY_DUAL    = 5   /* TCP+UDP served on ONE port (@since 0.3.0), with conservative    */
+    NA_RELIABILITY_DUAL    = 5,  /* TCP+UDP served on ONE port (@since 0.3.0), with conservative    */
                                  /*   FT8-ish buffers + reorder + control-ARQ. A SERVER-SIDE        */
                                  /*   CAPABILITY: a client picks one transport, so this aliases to  */
                                  /*   TCP on the client exactly as NA_TRANSPORT_DUAL does, leaving  */
                                  /*   its reorder knobs inert there. See na_transport.              */
+    NA_RELIABILITY_UDP_BARE = 6  /* UDP with NO reliability layer, BY EXPLICIT REQUEST (@since      */
+                                 /*   0.5.0). Byte-for-byte the composition set_transport(UDP)      */
+                                 /*   alone used to run implicitly — 20 ms framing, no FEC /        */
+                                 /*   reorder / adaptive jitter / control-ARQ — plus the consent    */
+                                 /*   that lets connect/start accept it. For measurement controls   */
+                                 /*   (a deliberately unprotected baseline); real links want        */
+                                 /*   _LAN/_WAN/_FT8. Discards every parity packet a _WAN server    */
+                                 /*   sends. Gate on na_version_number() per the append rule above. */
 } na_reliability_profile;
 
 /* Opaque streaming-client handle. Create with na_client_create, free with na_client_destroy. */
@@ -476,13 +491,19 @@ NA_EXPORT na_error_t na_client_set_capture_device(na_stream_client* client, int 
  * cannot capture. MUST be set before connect: it decides whether the send worker starts, and
  * connect starts the workers once. NA_ERR_INVALID on a NULL client or after connect. */
 NA_EXPORT na_error_t na_client_set_tx_inject(na_stream_client* client, int enabled);
-/* Select the transport. No effect once connected (returns NA_ERR_INVALID). */
+/* Select the transport. No effect once connected (returns NA_ERR_INVALID). This writes the
+ * transport and NOTHING else — it never enables the reliability layer, and since 0.5.0 the config
+ * it used to produce silently (UDP with every reliability component off) is refused at
+ * na_client_connect unless a profile made it explicit: select NA_RELIABILITY_UDP_* below, or
+ * NA_RELIABILITY_UDP_BARE to run genuinely bare. */
 NA_EXPORT na_error_t na_client_set_transport(na_stream_client* client, na_transport transport);
 /* Apply a reliability profile (transport + framing + FEC / reorder / adaptive-jitter / control-ARQ)
  * in one call; see na_reliability_profile. This is the ONLY way to enable the client's loss-recovery
  * layer — na_client_set_transport selects the transport and nothing else, so a client configured with
  * it alone runs UDP with FEC, reordering, adaptive jitter and control-ARQ all OFF and discards every
- * parity packet the server sends.
+ * parity packet the server sends. Since 0.5.0 that unrequested composition no longer connects:
+ * na_client_connect refuses it with both remedies in errbuf, and NA_RELIABILITY_UDP_BARE is the
+ * explicit request that keeps the bare baseline reachable.
  *
  * Selecting a UDP profile makes a separate na_client_set_transport call unnecessary. The two setters
  * both write the transport and the LAST ONE WINS, so calling na_client_set_transport afterwards
@@ -573,7 +594,11 @@ NA_EXPORT int na_client_inject_tx_audio(na_stream_client* client, const unsigned
  *
  * NA_ERR_INVALID means this client has already been disconnected (or a previous connect failed
  * past the handshake): it is spent, and this call did not touch the network. NA_ERR_BACKEND
- * means the attempt failed and retrying this same handle is legitimate. */
+ * means the attempt failed and retrying this same handle is legitimate.
+ *
+ * SINCE 0.5.0 A NO-RELIABILITY UDP CONFIG IS REFUSED HERE (see na_reliability_profile): the call
+ * returns NA_ERR_BACKEND with both remedies in errbuf BEFORE any network contact, so the handle
+ * is not spent — select a profile (or NA_RELIABILITY_UDP_BARE) and call again. */
 NA_EXPORT na_error_t na_client_connect(na_stream_client* client, char* errbuf, int errlen);
 /* Best-effort DISCONNECT to the server, stop reconnection, and join workers. Idempotent.
  * This is the terminal transition: after it, na_client_connect returns NA_ERR_INVALID forever. */
@@ -619,6 +644,11 @@ NA_EXPORT int na_client_server_tx_owner(na_stream_client* client, char* buf, int
  *                                 other, which no field here can.
  *   NA_RELIABILITY_UDP_WAN        + packets_recovered_by_fec, fec_blocks_unreconciled,
  *                                 jitter_ms, buffer_target_ms.
+ *   NA_RELIABILITY_UDP_BARE       (@since 0.5.0) packets_/bytes_ + crc_errors only — no
+ *                                 reliability subsystem exists to move anything else — but the
+ *                                 three pre-reorder loss counters below hold REAL readings
+ *                                 instead of -1, because this is the one profile that engages
+ *                                 no reorder buffer. See UNAVAILABLE IS NOT ZERO.
  *
  * TWO COUNTERS CANNOT MOVE ON A CLIENT AT ALL — control_retransmits and queue_drops. They are not
  * dead code and they are not off: both are written by live paths that only a SERVER-side connection
@@ -689,18 +719,19 @@ typedef struct na_client_stats {
     double    jitter_ms;                 /* current inter-arrival jitter estimate; 0 if off    */
     int       buffer_target_ms;          /* adaptive buffer target; -1 when adaptive jitter is off */
 
-    /* UNAVAILABLE IS NOT ZERO. These three are -1 when the library is not measuring them, which
-     * is the case on every PROFILE selectable here: the sequence-gap tracker runs only when no
-     * reorder buffer is engaged, and every UDP profile configures one (TCP never tracks gaps at
-     * all). -1 means "not measured" and never means "nothing was lost" — to see loss recovery,
-     * read packets_recovered_by_fec.
+    /* UNAVAILABLE IS NOT ZERO. These three are -1 when the library is not measuring them: the
+     * sequence-gap tracker runs only when no reorder buffer is engaged, every recovery profile
+     * (_LAN/_WAN/_FT8/_IQ) configures one, and TCP never tracks gaps at all. -1 means "not
+     * measured" and never means "nothing was lost" — to see loss recovery, read
+     * packets_recovered_by_fec.
      *
-     * A profile is not the only thing that writes the transport, though, and one composition
-     * DOES reach the tracker: NA_RELIABILITY_DEFAULT resets the reliability layer, so following
-     * it with na_client_set_transport(NA_TRANSPORT_UDP) — last writer wins — builds the one
-     * publicly reachable UDP connection carrying no reorder buffer. There these three hold real
-     * readings and sequence_gaps holds the -1. Measured, and pinned by section (6) of
-     * tests/c_client_profile.c. So read the sign rather than assuming it from the profile.
+     * ONE profile does reach the tracker: NA_RELIABILITY_UDP_BARE (@since 0.5.0) builds the one
+     * publicly reachable UDP connection carrying no reorder buffer, so there these three hold
+     * real readings and sequence_gaps holds the -1. (Before 0.5.0 the same connection arose
+     * implicitly from NA_RELIABILITY_DEFAULT followed by na_client_set_transport(UDP) — last
+     * writer wins; since 0.5.0 that unrequested composition is refused at na_client_connect,
+     * and BARE is its explicit replacement, byte-for-byte.) Measured, and pinned by section (6)
+     * of tests/c_client_profile.c. So read the sign rather than assuming it from the profile.
      *
      * They are present, and specified as -1 rather than 0, so that they can begin carrying real
      * values without this struct changing shape if post-reorder loss accounting is ever added. */
@@ -977,7 +1008,11 @@ NA_EXPORT void na_server_destroy(na_audio_server* server);
 /* --- Configuration (set BEFORE na_server_start; each returns NA_ERR_INVALID on a NULL server or
  *     if the server has already been started) --- */
 
-/* Select the transport served (TCP / UDP / DUAL). */
+/* Select the transport served (TCP / UDP / DUAL). This writes the transport and NOTHING else —
+ * it never enables the reliability layer, and since 0.5.0 the config it used to produce silently
+ * (UDP or DUAL with every reliability component off) is refused at na_server_start unless a
+ * profile made it explicit: select NA_RELIABILITY_UDP_* below, or NA_RELIABILITY_UDP_BARE to
+ * serve genuinely bare. */
 NA_EXPORT na_error_t na_server_set_transport(na_audio_server* server, na_transport transport);
 /* Maximum simultaneous clients (must be > 0). Default 4. */
 NA_EXPORT na_error_t na_server_set_max_clients(na_audio_server* server, int max_clients);
@@ -1008,6 +1043,10 @@ NA_EXPORT na_error_t na_server_set_audio_format(na_audio_server* server, int sam
  * the wire format: it advertises the negotiated format to each client in the handshake, so a client
  * sets no rate of its own and needs no matching call.
  *
+ * Since 0.5.0 a UDP/DUAL config with every reliability component off is refused at
+ * na_server_start unless NA_RELIABILITY_UDP_BARE requested it explicitly — see
+ * na_reliability_profile.
+ *
  * NA_ERR_INVALID on a NULL server / bad profile / after start. */
 NA_EXPORT na_error_t na_server_set_reliability_profile(na_audio_server* server,
                                                        na_reliability_profile profile);
@@ -1036,7 +1075,11 @@ NA_EXPORT na_error_t na_server_set_tx_audio_cb(na_audio_server* server, na_serve
  *
  * A FAILED start does NOT consume the handle — see the failure-path contract above the client
  * lifecycle block. The config setters unfreeze, and you may fix the cause and call again; the
- * common case is a port that was momentarily busy. Only a successful start is one-shot. */
+ * common case is a port that was momentarily busy. Only a successful start is one-shot.
+ *
+ * SINCE 0.5.0 A NO-RELIABILITY UDP/DUAL CONFIG IS REFUSED HERE (see na_reliability_profile):
+ * NA_ERR_BACKEND with both remedies in errbuf, before any bind — select a profile (or
+ * NA_RELIABILITY_UDP_BARE) and call again. */
 NA_EXPORT na_error_t na_server_start(na_audio_server* server, char* errbuf, int errlen);
 /* Stop accepting, close all sessions, join workers, tear down audio. Idempotent. */
 NA_EXPORT void na_server_stop(na_audio_server* server);

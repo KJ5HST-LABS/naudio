@@ -194,6 +194,28 @@ bool AudioStreamClient::connect(std::string* err) {
         return false;
     }
 
+    // Issue #92: refuse the silent no-reliability UDP composition. A UDP config with FEC, the
+    // reorder buffer, adaptive jitter and control-ARQ ALL off is almost always the
+    // set-the-transport-and-nothing-else trap: it discards every parity packet the server sends
+    // and is indistinguishable from a healthy client on loss-free loopback — the environment
+    // where it is always first "verified" (it cost two thirds of the audio on the first real
+    // hop). Refusing here, where the pipeline is built, makes the failure loud ON loopback with
+    // the remedy in the message. The composition stays reachable, by explicit request only
+    // (AudioStreamConfig::udpBare() / NA_RELIABILITY_UDP_BARE). TCP is never gated — the
+    // transport itself orders and retransmits — and a config with any component on is untouched.
+    {
+        const AudioStreamConfig cfg = config();
+        if (cfg.transportType == TransportType::Udp && !cfg.fecEnabled &&
+            cfg.reorderBufferSize == 0 && !cfg.adaptiveJitterEnabled &&
+            !cfg.controlReliabilityEnabled && !cfg.explicitBareUdp) {
+            setErr("UDP with no reliability layer: select a profile "
+                   "(na_client_set_reliability_profile / AudioStreamConfig preset, e.g. "
+                   "NA_RELIABILITY_UDP_WAN) or explicitly request bare UDP "
+                   "(NA_RELIABILITY_UDP_BARE / AudioStreamConfig::udpBare())");
+            return false;
+        }
+    }
+
     auto transport = createTransport();
     // Only reachable through setTransportFactory — the config switch always returns one —
     // but it is reachable from public API, and the next line would dereference it.
