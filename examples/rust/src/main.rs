@@ -277,7 +277,7 @@ fn usage() {
          \x20 --playback-id N   output device id to play on (default: first output device)\n\
          \x20 --transport T     tcp (default) | udp\n\
          \x20 --reliability P   lan | wan | ft8  (UDP profiles: FEC/reorder/jitter/control-ARQ).\n\
-         \x20                   Omitted = bare transport, which across a real network loses audio\n\
+         \x20                   UDP needs one: a bare-UDP connect is refused since 0.5.0\n\
          \x20 --seconds N       run time; 0 = until Ctrl-C (default 0)\n\
          \x20 --backend B       system (default; plays RX to the output device) or\n\
          \x20                   null (hardware-free; RX is received but not played)\n\

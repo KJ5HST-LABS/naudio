@@ -242,8 +242,8 @@ def main():
     ap.add_argument("--transport", choices=["tcp", "udp"], default="tcp",
                     help="tcp (default) | udp")
     ap.add_argument("--reliability", choices=["lan", "wan", "ft8"],
-                    help="UDP reliability profile (FEC/reorder/jitter/control-ARQ); omitted = "
-                         "bare transport, which across a real network loses audio")
+                    help="UDP reliability profile (FEC/reorder/jitter/control-ARQ); UDP needs "
+                         "one — a bare-UDP connect is refused since 0.5.0")
     ap.add_argument("--seconds", type=float, default=0.0,
                     help="run time; 0 (default) = until Ctrl-C")
     ap.add_argument("--backend", choices=["system", "null"], default="system",

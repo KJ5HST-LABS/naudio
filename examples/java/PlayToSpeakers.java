@@ -290,7 +290,7 @@ public final class PlayToSpeakers {
                 + "  --playback-id N   output device id to play on (default: first output device)\n"
                 + "  --transport T     tcp (default) | udp\n"
                 + "  --reliability P   lan | wan | ft8  (UDP profiles: FEC/reorder/jitter/control-ARQ).\n"
-                + "                    Omitted = bare transport, which across a real network loses audio\n"
+                + "                    UDP needs one: a bare-UDP connect is refused since 0.5.0\n"
                 + "  --seconds N       run time; 0 = until Ctrl-C (default 0)\n"
                 + "  --backend B       system (default; plays RX to the output device) or\n"
                 + "                    null (hardware-free; RX is received but not played)\n"
