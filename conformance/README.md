@@ -77,12 +77,12 @@ A `ControlMessage` payload (the bytes inside a `CONTROL` frame).
   frameDurationMs/bufferTargetMs/bufferMinMs/bufferMaxMs`; NACK/CONTROL_ACK →
   `sequence`; CONNECT_REJECT → `rejectReason/message`.
 
-### `kind = control_v12` (in `vectors-v1_2.ini` only — not yet loaded by the suite)
+### `kind = control_v12` (in `vectors-v1_2.ini`, loaded by `Conformance.GoldenVectorsV12`)
 Spec-1.2 (§6.2.1) encode vectors: the `control` schema plus `requestedRate`/`requestedLayout`
-(the 5-byte CONNECT_REQUEST tail) or `grantedLayout` (the 15-byte AUDIO_CONFIG). They join the
-loaded suite together with the reference implementation (issue #91 Phase B).
+(the 5-byte CONNECT_REQUEST tail) or `grantedLayout` (the 15-byte AUDIO_CONFIG). Loaded since
+issue #91 B3 under the same fail-closed, 0-skipped gate as `vectors.ini`.
 
-### `kind = control_decode_v1` (in `vectors-v1_2.ini` only — not yet loaded by the suite)
+### `kind = control_decode_v1` (in `vectors-v1_2.ini`, loaded by `Conformance.GoldenVectorsV12`)
 Tolerance vectors: `payloadHex` is fed to a **v1** decoder, and the `expected*` fields are the
 v1 view it must extract — buffer prefs / ClientInfo / the 14-byte AUDIO_CONFIG prefix — with
 `expectedIgnoredTailBytes` of extension tail ignored. `expectedIsFormatRequest` marks whether a

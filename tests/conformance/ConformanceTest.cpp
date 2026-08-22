@@ -452,14 +452,132 @@ void runFecRecover(const Section& v) {
     EXPECT_EQ(toHex(expectedRecovered), toHex(recovered->payload())) << "recovered payload";
 }
 
-std::string locateVectors() {
+std::string locateVectorsFile(const std::string& name) {
     const char* env = std::getenv("NA_CONFORMANCE_DIR");
     std::string dir = (env != nullptr && env[0] != '\0') ? std::string(env)
                                                          : std::string(NA_CONFORMANCE_DIR_DEFAULT);
     if (dir.empty()) return "";
-    std::string file = dir + "/vectors/vectors.ini";
+    std::string file = dir + "/vectors/" + name;
     std::ifstream f(file);
     return f.good() ? file : "";
+}
+
+std::string locateVectors() { return locateVectorsFile("vectors.ini"); }
+
+// ---- spec-1.2 (§6.2.1) handlers — vectors-v1_2.ini ----
+
+// Encode vectors: the extended CONNECT_REQUEST / AUDIO_CONFIG forms, byte-exact.
+void runControlV12(const Section& v) {
+    bool ok = true;
+    long controlType = intLoose(req(v, "controlType", ok));
+    auto expected = hexToBytes(req(v, "expectedPayloadHex", ok));
+    if (!ok) return;
+    if (controlType == 0x01) {
+        std::string clientName = req(v, "clientName", ok);
+        long version = std::stol(req(v, "protocolVersion", ok));
+        naudio::RxFormatRequest fr;
+        fr.sampleRate = static_cast<std::uint32_t>(std::stol(req(v, "requestedRate", ok)));
+        fr.layout = static_cast<std::uint8_t>(std::stol(req(v, "requestedLayout", ok)));
+        if (!ok) return;
+        AudioStreamConfig cfg{};
+        const bool hasConfig = get(v, "hasConfig") == "1";
+        if (hasConfig) {
+            cfg.bufferTargetMs = static_cast<std::int32_t>(std::stol(req(v, "bufferTargetMs", ok)));
+            cfg.bufferMinMs = static_cast<std::int32_t>(std::stol(req(v, "bufferMinMs", ok)));
+            cfg.bufferMaxMs = static_cast<std::int32_t>(std::stol(req(v, "bufferMaxMs", ok)));
+        }
+        ClientInfo info{get(v, "infoCallsign"), get(v, "infoName"), get(v, "infoLocation")};
+        if (!ok) return;
+        auto m = ControlMessage::connectRequestV12(clientName, static_cast<std::uint8_t>(version),
+                                                   hasConfig ? &cfg : nullptr,
+                                                   info.isEmpty() ? nullptr : &info, fr);
+        EXPECT_EQ(toHex(expected), toHex(m.serialize())) << "CONNECT_REQUEST v12 serialize";
+        auto d = ControlMessage::deserialize(expected);
+        ASSERT_TRUE(d.has_value()) << "CONNECT_REQUEST v12 decode failed";
+        auto pf = d->parseConnectRequestFormatRequest();
+        ASSERT_TRUE(pf.has_value()) << "format request missing on decode";
+        EXPECT_EQ(fr.sampleRate, pf->sampleRate) << "requestedRate";
+        EXPECT_EQ(fr.layout, pf->layout) << "requestedLayout";
+    } else if (controlType == 0x04) {
+        AudioStreamConfig cfg{};
+        cfg.sampleRate = static_cast<std::int32_t>(std::stol(req(v, "sampleRate", ok)));
+        cfg.bitsPerSample = static_cast<std::int32_t>(std::stol(req(v, "bitsPerSample", ok)));
+        cfg.channels = static_cast<std::int32_t>(std::stol(req(v, "channels", ok)));
+        cfg.frameDurationMs = static_cast<std::int32_t>(std::stol(req(v, "frameDurationMs", ok)));
+        cfg.bufferTargetMs = static_cast<std::int32_t>(std::stol(req(v, "bufferTargetMs", ok)));
+        cfg.bufferMinMs = static_cast<std::int32_t>(std::stol(req(v, "bufferMinMs", ok)));
+        cfg.bufferMaxMs = static_cast<std::int32_t>(std::stol(req(v, "bufferMaxMs", ok)));
+        long layout = std::stol(req(v, "grantedLayout", ok));
+        if (!ok) return;
+        auto m = ControlMessage::audioConfigV12(cfg, static_cast<std::uint8_t>(layout));
+        EXPECT_EQ(toHex(expected), toHex(m.serialize())) << "AUDIO_CONFIG v12 serialize";
+        auto d = ControlMessage::deserialize(expected);
+        ASSERT_TRUE(d.has_value()) << "AUDIO_CONFIG v12 decode failed";
+        auto gl = d->parseAudioConfigGrantedLayout();
+        ASSERT_TRUE(gl.has_value()) << "grantedLayout missing on decode";
+        EXPECT_EQ(layout, static_cast<long>(*gl)) << "grantedLayout";
+    } else {
+        ADD_FAILURE() << "control_v12: unsupported controlType " << controlType;
+    }
+}
+
+// Tolerance vectors: the v1 decoder's required VIEW of an extended payload. The
+// tail-walk below is deliberately independent of parseConnectRequestFormatRequest
+// so the expectedIgnoredTailBytes assertion does not restate the parser under test.
+void runControlDecodeV1(const Section& v) {
+    bool ok = true;
+    long controlType = intLoose(req(v, "controlType", ok));
+    auto payload = hexToBytes(req(v, "payloadHex", ok));
+    long ignored = std::stol(req(v, "expectedIgnoredTailBytes", ok));
+    if (!ok) return;
+    auto d = ControlMessage::deserialize(payload);
+    ASSERT_TRUE(d.has_value()) << "extended payload must still deserialize";
+    const auto& data = d->data();
+    if (controlType == 0x01) {
+        // v1 view: buffer prefs + client info parse exactly as v1.
+        auto pc = d->parseConnectRequestConfig();
+        ASSERT_TRUE(pc.has_value()) << "v1 config view";
+        EXPECT_EQ(std::stol(req(v, "expectedBufferTargetMs", ok)), pc->bufferTargetMs);
+        EXPECT_EQ(std::stol(req(v, "expectedBufferMinMs", ok)), pc->bufferMinMs);
+        EXPECT_EQ(std::stol(req(v, "expectedBufferMaxMs", ok)), pc->bufferMaxMs);
+        if (!get(v, "expectedCallsign").empty()) {
+            auto pi = d->parseConnectRequestClientInfo();
+            ASSERT_TRUE(pi.has_value()) << "v1 client-info view";
+            EXPECT_EQ(get(v, "expectedCallsign"), pi->callsign);
+            EXPECT_EQ(get(v, "expectedName"), pi->name);
+            EXPECT_EQ(get(v, "expectedLocation"), pi->location);
+        }
+        // Independent walk of the v1 body to measure the trailing run.
+        std::size_t pos = 1;  // version
+        ASSERT_LT(pos, data.size());
+        std::size_t nameLen = data[pos++];
+        pos += nameLen;
+        ASSERT_LT(pos, data.size());
+        std::uint8_t hasConfig = data[pos++];
+        if (hasConfig != 0) pos += 6;
+        ASSERT_LT(pos, data.size());
+        std::size_t infoLen = data[pos++];
+        pos += infoLen;
+        ASSERT_LE(pos, data.size());
+        EXPECT_EQ(ignored, static_cast<long>(data.size() - pos)) << "ignored tail bytes";
+        // A 1.2 decoder additionally sees a format request iff the tail is >= 5 bytes.
+        const bool expectFr = get(v, "expectedIsFormatRequest") == "1";
+        EXPECT_EQ(expectFr, d->parseConnectRequestFormatRequest().has_value())
+            << "1.2 format-request visibility";
+    } else if (controlType == 0x04) {
+        AudioStreamConfig got{};
+        ASSERT_TRUE(d->applyAudioConfigTo(got)) << "v1 AUDIO_CONFIG view";
+        EXPECT_EQ(std::stol(req(v, "expectedSampleRate", ok)), got.sampleRate);
+        EXPECT_EQ(std::stol(req(v, "expectedBitsPerSample", ok)), got.bitsPerSample);
+        EXPECT_EQ(std::stol(req(v, "expectedChannels", ok)), got.channels);
+        EXPECT_EQ(std::stol(req(v, "expectedFrameDurationMs", ok)), got.frameDurationMs);
+        EXPECT_EQ(std::stol(req(v, "expectedBufferTargetMs", ok)), got.bufferTargetMs);
+        EXPECT_EQ(std::stol(req(v, "expectedBufferMinMs", ok)), got.bufferMinMs);
+        EXPECT_EQ(std::stol(req(v, "expectedBufferMaxMs", ok)), got.bufferMaxMs);
+        EXPECT_EQ(ignored, static_cast<long>(data.size()) - 14) << "ignored tail bytes";
+    } else {
+        ADD_FAILURE() << "control_decode_v1: unsupported controlType " << controlType;
+    }
 }
 
 }  // namespace
@@ -517,5 +635,42 @@ TEST(Conformance, GoldenVectors) {
     // config, nack, ack, connect-reject, connect-request ±config, latency
     // probe/response, error, tx denied/preempted, and the clamped clients-update).
     EXPECT_EQ(29, ran) << "expected all 29 vectors to run";
+    EXPECT_EQ(0, skipped) << "expected 0 skipped vectors";
+}
+
+TEST(Conformance, GoldenVectorsV12) {
+    // The spec-1.2 (§6.2.1) vectors, authored at the B1 spec revision and loaded
+    // here together with the reference implementation (issue #91 B3) — the same
+    // fail-closed, 0-skipped contract as GoldenVectors above: these are vendored
+    // and git-tracked, so absence is a broken checkout, never a skip.
+    std::string path = locateVectorsFile("vectors-v1_2.ini");
+    ASSERT_FALSE(path.empty())
+        << "spec-1.2 conformance vectors not found at NA_CONFORMANCE_DIR / the vendored "
+           "default (conformance/vectors/vectors-v1_2.ini).";
+    std::ifstream in(path);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    auto vectors = parseIni(ss.str());
+    ASSERT_FALSE(vectors.empty()) << "no vectors parsed from " << path;
+
+    int ran = 0;
+    int skipped = 0;
+    for (const auto& [name, sec] : vectors) {
+        SCOPED_TRACE("vector [" + name + "]");
+        std::string kind = get(sec, "kind");
+        if (kind == "control_v12") {
+            runControlV12(sec);
+            ++ran;
+        } else if (kind == "control_decode_v1") {
+            runControlDecodeV1(sec);
+            ++ran;
+        } else {
+            ADD_FAILURE() << "unknown kind: " << kind;
+        }
+    }
+    std::cerr << "conformance v1.2: " << ran << " ran, " << skipped << " skipped\n";
+    // Full gate: all 8 vectors run, 0 skipped — 5 control_v12 encode (3
+    // connect-request + 2 audio-config) + 3 control_decode_v1 tolerance.
+    EXPECT_EQ(8, ran) << "expected all 8 spec-1.2 vectors to run";
     EXPECT_EQ(0, skipped) << "expected 0 skipped vectors";
 }

@@ -1,7 +1,7 @@
 # net-audio Audio Streaming Protocol — Specification v1
 
 **Status:** Stable / frozen wire contract (`0xAF01`, version byte = 1).
-**Spec version:** 1.2 (2026-08-22) — per-subscription RX format negotiation, adopted from §13.1 in reduced scope (rate + channel layout only; RX only): appended `CONNECT_REQUEST` fields, an extended `AUDIO_CONFIG` form, and the grant rules — all via the §11 minor-extension path, so the frame layout, type numbering, CRC semantics, and every existing golden vector still hold. See §6.2.1. The 1.2 vectors are authored in `conformance/vectors/vectors-v1_2.ini` and join the loaded suite together with the reference implementation (issue #91 Phase B).
+**Spec version:** 1.2 (2026-08-22) — per-subscription RX format negotiation, adopted from §13.1 in reduced scope (rate + channel layout only; RX only): appended `CONNECT_REQUEST` fields, an extended `AUDIO_CONFIG` form, and the grant rules — all via the §11 minor-extension path, so the frame layout, type numbering, CRC semantics, and every existing golden vector still hold. See §6.2.1. The 1.2 vectors in `conformance/vectors/vectors-v1_2.ini` are loaded by the conformance suite (`Conformance.GoldenVectorsV12`) alongside the reference implementation.
 **Spec version history:** 1.1 (2026-08-15) — §8.4 only: `CONNECT_REQUEST` became a critical (ARQ'd) control type.
 **Scope:** The *audio* half of a radio-streaming toolkit.
 **Provenance:** This document is the normative, field-by-field definition of the `0xAF01` audio wire. Every normative value here is implemented and pinned by the language-neutral golden-vector conformance suite (see §12), so the wire is byte-deterministic and independently checkable. Where the toolkit *plan* describes capabilities that are **not** in the v1 wire, they are isolated in §13 (Proposed extensions) and are explicitly **non-normative**.
@@ -612,9 +612,9 @@ Passing against the language-neutral vectors is the proof that an implementation
 `conformance/vectors/vectors-v1_2.ini` (same generator, same independence rules): byte-exact
 encodings of the appended `CONNECT_REQUEST` fields and the 15-byte `AUDIO_CONFIG`, plus
 **tolerance vectors** asserting the v1 view of the extended payloads (what a pre-1.2 decoder
-must extract, and that a short trailing run is not a format request). The file is authored with
-the spec revision and joins the loaded suite together with the reference implementation
-(issue #91 Phase B); `vectors.ini` itself is unchanged by 1.2 — the no-drift check is part of
+must extract, and that a short trailing run is not a format request). The file is loaded by
+`Conformance.GoldenVectorsV12` under the same fail-closed, 0-skipped contract as
+`vectors.ini`; `vectors.ini` itself is unchanged by 1.2 — the no-drift check is part of
 regeneration.
 
 ### 12.3 Determinism rule for byte-exact vectors
