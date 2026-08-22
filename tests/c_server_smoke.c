@@ -410,6 +410,7 @@ int main(void) {
             na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_FT8) != NA_OK ||
             na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_IQ)  != NA_OK ||
             na_server_set_reliability_profile(cfg, NA_RELIABILITY_DUAL)    != NA_OK ||
+            na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_BARE) != NA_OK ||
             na_server_set_reliability_profile(cfg, NA_RELIABILITY_UDP_WAN) != NA_OK) {
             fprintf(stderr, "FAIL: a documented profile was rejected by the server setter\n");
             na_server_destroy(cfg);
@@ -845,6 +846,75 @@ int main(void) {
         !check_ordering_arm(ORD_PROFILE_UDP_IQ,
                             "F: profile(UDP_IQ) alone [transport only]", 1, 0)) {
         return 1;
+    }
+
+    /* ---- the #92 gate, server side: bare UDP/DUAL start is refused unless explicit ----
+     *
+     * The server mirror of tests/c_client_profile.c section (6). set_transport writes the
+     * transport and nothing else, so UDP (and DUAL, whose UDP half carries the same exposure)
+     * with every reliability component off is refused at na_server_start with both remedies in
+     * errbuf — before any bind, so the handle survives and the setters unfreeze (the same
+     * failed-start recovery the port-busy case documents). NA_RELIABILITY_UDP_BARE is the
+     * explicit request that starts: byte-for-byte the old bare composition. */
+    {
+        static const na_transport bare_transports[] = {NA_TRANSPORT_UDP, NA_TRANSPORT_DUAL};
+        char gerr[256];
+        size_t t;
+        for (t = 0; t < sizeof bare_transports / sizeof bare_transports[0]; t++) {
+            na_audio_server *g = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+            if (g == NULL) {
+                fprintf(stderr, "FAIL: na_server_create (gate probe)\n");
+                return 1;
+            }
+            if (na_server_set_transport(g, bare_transports[t]) != NA_OK) {
+                fprintf(stderr, "FAIL: set_transport on the gate probe\n");
+                na_server_destroy(g);
+                return 1;
+            }
+            gerr[0] = '\0';
+            if (na_server_start(g, gerr, (int)sizeof gerr) == NA_OK) {
+                fprintf(stderr, "FAIL: bare transport %d started — the #92 gate is dead\n",
+                        (int)bare_transports[t]);
+                na_server_stop(g);
+                na_server_destroy(g);
+                return 1;
+            }
+            if (strstr(gerr, "NA_RELIABILITY_UDP_BARE") == NULL ||
+                strstr(gerr, "na_server_set_reliability_profile") == NULL) {
+                fprintf(stderr, "FAIL: gate refusal names neither remedy (%s)\n", gerr);
+                na_server_destroy(g);
+                return 1;
+            }
+            /* A failed start unfreezes the setters (documented recovery): the SAME handle, given
+             * the explicit BARE request, must start — which is also the consent control proving
+             * the gate passes an explicit bare server rather than refusing everything. */
+            if (na_server_set_reliability_profile(g, NA_RELIABILITY_UDP_BARE) != NA_OK) {
+                fprintf(stderr, "FAIL: setters still frozen after the gate refusal\n");
+                na_server_destroy(g);
+                return 1;
+            }
+            if (bare_transports[t] == NA_TRANSPORT_DUAL &&
+                na_server_set_transport(g, NA_TRANSPORT_DUAL) != NA_OK) {
+                fprintf(stderr, "FAIL: could not restore DUAL after the BARE profile\n");
+                na_server_destroy(g);
+                return 1;
+            }
+            if (na_server_start(g, gerr, (int)sizeof gerr) != NA_OK) {
+                fprintf(stderr, "FAIL: explicit BARE start refused (%s)\n", gerr);
+                na_server_destroy(g);
+                return 1;
+            }
+            if (na_server_port(g) <= 0) {
+                fprintf(stderr, "FAIL: BARE server reports no bound port\n");
+                na_server_stop(g);
+                na_server_destroy(g);
+                return 1;
+            }
+            na_server_stop(g);
+            na_server_destroy(g);
+        }
+        printf("c_server_smoke: bare UDP and DUAL starts refused with both remedies; explicit "
+               "BARE starts (#92)\n");
     }
 
     printf("c_server_smoke OK (port=%d, client RX byte-identical, roster=1, TX-extract frames=%d "

@@ -120,9 +120,13 @@ int main(void) {
     if (c == NULL) return fail("na_client_create", NULL, srv);
 
     /* The server selected a UDP profile, so the client MUST match — a client left on the
-     * default TCP transport is refused at connect. */
-    if (na_client_set_transport(c, NA_TRANSPORT_UDP) != NA_OK) {
-        return fail("na_client_set_transport(UDP)", c, srv);
+     * default TCP transport is refused at connect. BARE, not a recovery profile, on purpose:
+     * this arm measures the sustained TX-inject cadence, and BARE is byte-for-byte the bare
+     * composition it always ran (20 ms framing, no client-side FEC/reorder/jitter/ARQ), now
+     * requested explicitly as the #92 gate requires. A _WAN client would change the TX framing
+     * to 10 ms and put parity on the client's send path — a different arm, not this one. */
+    if (na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_BARE) != NA_OK) {
+        return fail("na_client_set_reliability_profile(UDP_BARE)", c, srv);
     }
     na_client_set_playback_device(c, 0);
     na_client_set_auto_reconnect(c, 0);  /* a reconnect would mask the very defect under test */

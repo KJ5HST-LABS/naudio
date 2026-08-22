@@ -509,21 +509,53 @@ TEST(Client, GateCallbackReentrancyNoDeadlock) {
     server.stop();
 }
 
+// THE #92 GATE, client side: a UDP config with every reliability component off is refused at
+// connect() — BEFORE any socket is opened — unless AudioStreamConfig::udpBare() (or the field it
+// sets) made the bare composition explicit. No server exists in this arm on purpose: the remedy
+// text (rather than a socket error) proves the gate fired first. The consent side has two pins:
+// GateE2eUdpTransport below connects a udpBare() client to a real server, and the tail of this
+// arm proves a gate refusal does not spend the handle — the same client, re-configured, proceeds
+// to a genuine socket attempt.
+TEST(Client, BareUdpConnectRefusedWithoutConsent) {
+    PacedBackend backend;
+    AudioStreamClient client{"127.0.0.1", 1};  // nothing listens; must not matter — no socket opens
+    AudioStreamConfig bare{};
+    bare.transportType = TransportType::Udp;
+    ASSERT_TRUE(client.setConfig(bare));
+    client.setBackend(&backend);
+    client.setPlaybackDevice(0);
+    client.setAutoReconnect(false);
+    std::string err;
+    EXPECT_FALSE(client.connect(&err));
+    EXPECT_NE(err.find("NA_RELIABILITY_UDP_BARE"), std::string::npos) << err;
+    EXPECT_NE(err.find("udpBare"), std::string::npos) << err;
+
+    // The refusal is pre-transport, so the handle is NOT spent (the failure-path contract's
+    // "transport-level failure" clause, one step earlier): fix the config and the same handle
+    // reaches a real connect attempt — TCP to a dead port, refused at the socket, fast, and
+    // carrying no remedy text.
+    ASSERT_TRUE(client.setConfig(AudioStreamConfig{}));
+    err.clear();
+    EXPECT_FALSE(client.connect(&err));
+    EXPECT_EQ(err.find("udpBare"), std::string::npos) << err;
+}
+
 // THE GATE (UDP): the same client over the UDP transport (server serves DUAL) — proves the
 // client's createTransport(UDP) + the 3b reliability data path end-to-end for RX + roster.
 TEST(Client, GateE2eUdpTransport) {
     PacedBackend backend;
     AudioStreamConfig scfg = injectOnlyServerConfig();
     scfg.transportType = TransportType::Dual;  // serve TCP + UDP on one port
+    scfg.explicitBareUdp = true;  // bare-by-request (#92): this arm tests the transport, not the layer
     AudioStreamServer server{0, scfg};
     server.setInjectOnlyMode(true);
     std::string err;
     ASSERT_TRUE(server.start(&err)) << err;
 
     AudioStreamClient client{"127.0.0.1", static_cast<std::uint16_t>(server.port())};
-    AudioStreamConfig ccfg{};
-    ccfg.transportType = TransportType::Udp;  // client picks UDP
-    ASSERT_TRUE(client.setConfig(ccfg));
+    // udpBare() IS the old bare composition (default config + Udp) plus the #92 consent marker,
+    // so this arm keeps exercising the raw 3b data path it always did.
+    ASSERT_TRUE(client.setConfig(AudioStreamConfig::udpBare()));
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
     client.setAutoReconnect(false);
@@ -581,6 +613,7 @@ TEST(Client, GateE2eUdpTransport) {
 TEST(Client, GateHandshakeSurvivesALostConnectRequest) {
     AudioStreamConfig scfg = injectOnlyServerConfig();
     scfg.transportType = TransportType::Udp;
+    scfg.explicitBareUdp = true;  // bare-by-request (#92): the ARQ under test is the CLIENT's
     AudioStreamServer server{0, scfg};
     server.setInjectOnlyMode(true);
     std::string err;
@@ -642,6 +675,7 @@ TEST(Client, GateHandshakeSurvivesALostConnectRequest) {
 TEST(Client, HandshakeThroughALosslessRelayIsUnaffected) {
     AudioStreamConfig scfg = injectOnlyServerConfig();
     scfg.transportType = TransportType::Udp;
+    scfg.explicitBareUdp = true;  // bare-by-request (#92), as in the arm above
     AudioStreamServer server{0, scfg};
     server.setInjectOnlyMode(true);
     std::string err;

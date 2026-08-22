@@ -300,11 +300,58 @@ TEST(Server, MaxClientsRejectsBusy) {
 // Multi-client loopback over the server.
 // ===========================================================================
 
+// THE #92 GATE, server side: a UDP or DUAL config with every reliability component off is refused
+// at start() — before any bind — unless explicitBareUdp made it explicit. The consent arm then
+// binds an ephemeral port for real, so the gate provably passes an explicit bare server through
+// rather than refusing everything.
+TEST(Server, BareUdpStartRefusedWithoutConsent) {
+    for (TransportType tt : {TransportType::Udp, TransportType::Dual}) {
+        AudioStreamConfig bare{};
+        bare.transportType = tt;
+        AudioStreamServer server{0, bare};
+        server.setInjectOnlyMode(true);
+        std::string err;
+        EXPECT_FALSE(server.start(&err)) << "transport " << static_cast<int>(tt);
+        EXPECT_NE(err.find("NA_RELIABILITY_UDP_BARE"), std::string::npos) << err;
+        EXPECT_NE(err.find("udpBare"), std::string::npos) << err;
+    }
+    AudioStreamConfig consent{};
+    consent.transportType = TransportType::Udp;
+    consent.explicitBareUdp = true;
+    AudioStreamServer ok{0, consent};
+    ok.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(ok.start(&err)) << err;
+    EXPECT_GT(ok.port(), 0);
+    ok.stop();
+
+    // EVERY CONJUNCT OF THE PREDICATE, individually: the gate fires only when ALL four components
+    // are off, so a UDP config with any SINGLE one on must start without consent. A dropped
+    // conjunct in the gate widens it and reddens exactly the config for the dropped knob — this
+    // is what makes the predicate's shape testable rather than asserted.
+    for (int knob = 0; knob < 4; knob++) {
+        AudioStreamConfig one{};
+        one.transportType = TransportType::Udp;
+        switch (knob) {
+            case 0: one.fecEnabled = true; break;
+            case 1: one.reorderBufferSize = 8; break;
+            case 2: one.adaptiveJitterEnabled = true; break;
+            case 3: one.controlReliabilityEnabled = true; break;
+        }
+        AudioStreamServer s{0, one};
+        s.setInjectOnlyMode(true);
+        err.clear();
+        EXPECT_TRUE(s.start(&err)) << "knob " << knob << " alone was gated: " << err;
+        s.stop();
+    }
+}
+
 // THE GATE (fan-out): three raw clients — two TCP and one UDP, via the 3a/3b transports —
 // complete the handshake; an injected payload fans out byte-identically to all three.
 TEST(Server, GateThreeClientsByteIdenticalBroadcast) {
     AudioStreamConfig config{};
     config.transportType = TransportType::Dual;  // serve TCP + UDP on one port
+    config.explicitBareUdp = true;  // bare-by-request (#92): this arm tests fan-out, not the layer
     config.maxClients = 8;
     AudioStreamServer server{0, config};
     server.setInjectOnlyMode(true);
@@ -1845,6 +1892,7 @@ TEST(Server, GateRejectedClientsLeaveNoTraceInTheRosterGauge) {
     for (TransportType tt : {TransportType::Tcp, TransportType::Udp}) {
         AudioStreamConfig config{};
         config.transportType = tt;
+        config.explicitBareUdp = true;  // bare-by-request (#92); inert on the TCP arm
         AudioStreamServer server{0, config};  // no capture device, NOT inject-only => reject all
         std::string err;
         ASSERT_TRUE(server.start(&err)) << err;

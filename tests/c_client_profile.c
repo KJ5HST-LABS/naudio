@@ -6,11 +6,13 @@
  * Copyright (C) 2025-2026 Terrell Deppe
  *
  * WHAT THIS COVERS. na_client_set_transport writes the transport and NOTHING else, so a C-ABI
- * client configured with it alone runs UDP with FEC, reordering, adaptive jitter and control-ARQ
- * all off — it receives every parity packet the server sends and discards it. The profile setter
- * is the only way to turn that layer on, and this file asserts it does. It also asserts the
- * reverse, which is a separate claim: NA_RELIABILITY_DEFAULT turns that layer back OFF (6), not
- * merely the transport back to TCP (5).
+ * client configured with it alone COMPOSES UDP with FEC, reordering, adaptive jitter and
+ * control-ARQ all off. Since 0.5.0 (issue #92) that unrequested composition is REFUSED at
+ * na_client_connect — section (6) pins the refusal, its remedy text, the handle surviving it,
+ * and the explicit NA_RELIABILITY_UDP_BARE opt-in that keeps the bare baseline reachable. The
+ * profile setter is the only way to turn the loss-recovery layer on, and this file asserts it
+ * does. It also asserts the reverse, which is a separate claim: NA_RELIABILITY_DEFAULT turns
+ * that layer back OFF (6b), not merely the transport back to TCP (5).
  *
  * WHAT IT DOES NOT COVER — read before adding a claim here. Every path below is loss-free
  * loopback, so it CANNOT distinguish FEC-on from FEC-off: with nothing dropped, the recovering and
@@ -20,9 +22,9 @@
  * ALONE reaches a UDP-only server, which a client left on the TCP default cannot) and that a client
  * running the whole reliability pipeline still delivers real audio end to end.
  *
- * SO SECTION (6) IS NOT A WHOLE-LAYER CLAIM, and must not be read as one. Of the four knobs
- * NA_RELIABILITY_DEFAULT resets, exactly two have an observable on this side of the C ABI, and
- * that is measured rather than assumed — the same two clients, one per configuration:
+ * SO SECTION (6c) IS NOT A WHOLE-LAYER CLAIM, and must not be read as one. Of the four knobs
+ * the bare composition turns off, exactly two have a counter observable on this side of the C
+ * ABI, and that is measured rather than assumed — the same two clients, one per configuration:
  *
  *   reorder buffer  — OBSERVED. sequence_gaps 0 with UDP_WAN against -1 after the reset, and the
  *                     three pre-reorder loss counters flip the opposite way (unmeasured against
@@ -40,8 +42,11 @@
  *                     thread that pumps the retransmit sweep has exited. Measured 0 in both
  *                     configurations here, exactly as that says.
  *
- * A preset wrongly left in the DEFAULT case is therefore caught by this file iff it differs in
- * reordering or adaptive jitter. One differing only in FEC or control-ARQ is NOT caught.
+ * A preset wrongly left in the DEFAULT case used to be caught iff it differed in reordering or
+ * adaptive jitter. The #92 gate widened that to ALL FOUR knobs: its predicate is "every
+ * reliability component off", so section (6b)'s refusal only fires when DEFAULT genuinely
+ * zeroed FEC and control-ARQ too — a mis-wiring that leaves ANY knob on makes (6b)'s connect
+ * SUCCEED and the arm go red.
  *
  * SECTION (7) APPLIES THE SAME TWO-KNOB INSTRUMENT to a different question (issue #11): not
  * "did DEFAULT turn the layer off" but "did UDP_IQ apply its own preset rather than a neighbouring
@@ -167,7 +172,8 @@ int main(void) {
             na_client_set_reliability_profile(probe, NA_RELIABILITY_UDP_WAN) != NA_OK ||
             na_client_set_reliability_profile(probe, NA_RELIABILITY_UDP_FT8) != NA_OK ||
             na_client_set_reliability_profile(probe, NA_RELIABILITY_UDP_IQ)  != NA_OK ||
-            na_client_set_reliability_profile(probe, NA_RELIABILITY_DUAL)    != NA_OK) {
+            na_client_set_reliability_profile(probe, NA_RELIABILITY_DUAL)    != NA_OK ||
+            na_client_set_reliability_profile(probe, NA_RELIABILITY_UDP_BARE) != NA_OK) {
             return fail("a documented profile was rejected", probe, NULL);
         }
         if (na_client_set_reliability_profile(probe, (na_reliability_profile)99) != NA_ERR_INVALID) {
@@ -291,93 +297,147 @@ int main(void) {
         return fail("NA_RELIABILITY_DUAL did not alias to TCP on the client", NULL, srv);
     }
 
-    /* ---- (6) DEFAULT resets the RELIABILITY LAYER too, not merely the transport ---- */
+    /* ---- (6) the #92 gate: bare UDP is REFUSED unless explicitly requested ---- */
 
-    /* NA_RELIABILITY_DEFAULT's contract (naudio.h, na_reliability_profile) is TWO assertions —
-     * "plain TCP" AND "with the whole reliability layer off". Everything above pins only the
-     * first, and the refusal probe (5) uses CANNOT be extended to the second: NA_TRANSPORT_DUAL
-     * is aliased to TCP on the client side, so a preset that leaves the transport wrong AND every
-     * reliability knob on is refused by this UDP-only server in exactly the way a correct reset
-     * is, and (5) still passes. Measured: replacing the DEFAULT case with dualDefault() left the
-     * whole suite green before this section existed.
+    /* Three arms, replacing the pre-gate section (6) whose composition no longer connects.
      *
-     * The technique that does work is to stop varying the transport at all. set_transport(UDP)
-     * runs AFTER the profile and overwrites whichever transport it chose — last-writer-wins,
-     * which (5) itself pins — so this client reaches the server whatever DEFAULT did to the
-     * transport, and the reliability half is then the only thing left varying. The counters read
-     * it directly.
-     *
-     * This is also the only public path that builds a UDP connection with NO reorder buffer: all
-     * four NA_RELIABILITY_UDP_* profiles configure one (UDP_IQ included — see section (7), which
-     * depends on that), so a C consumer reaches the reorder-free branch only by resetting with
-     * DEFAULT and re-selecting UDP. */
+     * (6a) replays the exact mistake that cost two thirds of the audio on the first real network
+     *      hop (issue #92): set_transport(UDP) alone, then connect. Since 0.5.0 that is refused
+     *      — ON LOOPBACK, the environment where the misconfiguration used to be invisible — with
+     *      both remedies in errbuf, and the refusal is pre-network so the handle survives it.
+     * (6b) reruns the composition the pre-gate section used to pin DEFAULT's reset with:
+     *      UDP_WAN -> DEFAULT -> set_transport(UDP). Also refused — and the refusal is now
+     *      itself the reset detector, because the gate's predicate is "every reliability
+     *      component off". The mis-wiring the old section documented as its own blind spot
+     *      (DEFAULT wired to dualDefault(), which keeps reorder + control-ARQ on) fails the
+     *      predicate, so (6b)'s connect would SUCCEED and redden the arm. All four knobs are
+     *      covered by this detector; the old counter instrument could see only two.
+     * (6c) proves the explicit opt-in: NA_RELIABILITY_UDP_BARE connects, and its counters read
+     *      the reorder-free complement the old section measured — BARE is byte-for-byte the old
+     *      bare composition, requested instead of implied. This keeps the only public reach to
+     *      the no-reorder-buffer UDP branch (all four recovery profiles configure one — section
+     *      (7) depends on that). */
 
+    {
+        /* (6a) the replay. */
+        na_stream_client *bare =
+            na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", port, "bare-cli");
+        if (bare == NULL) return fail("na_client_create (bare)", NULL, srv);
+        na_client_set_playback_device(bare, 0);
+        na_client_set_auto_reconnect(bare, 0);
+        if (na_client_set_transport(bare, NA_TRANSPORT_UDP) != NA_OK) {
+            return fail("na_client_set_transport(UDP) on the bare probe", bare, srv);
+        }
+        if (na_client_connect(bare, err, (int)sizeof err) == NA_OK) {
+            return fail("bare set_transport(UDP) + connect was NOT refused — the #92 gate is dead",
+                        bare, srv);
+        }
+        if (strstr(err, "NA_RELIABILITY_UDP_BARE") == NULL ||
+            strstr(err, "na_client_set_reliability_profile") == NULL) {
+            fprintf(stderr, "  (errbuf: %s)\n", err);
+            return fail("the gate refusal does not name both remedies", bare, srv);
+        }
+        /* The refusal happened before any network contact, so per the failure-path contract the
+         * handle is NOT spent: the same handle, given a profile, must connect. */
+        if (na_client_set_reliability_profile(bare, NA_RELIABILITY_UDP_WAN) != NA_OK) {
+            return fail("profile setter refused after a gate refusal — the handle was spent",
+                        bare, srv);
+        }
+        if (na_client_connect(bare, err, (int)sizeof err) != NA_OK) {
+            fprintf(stderr, "  (%s)\n", err);
+            return fail("the gate-refused handle could not connect once fixed", bare, srv);
+        }
+        na_client_disconnect(bare);
+        na_client_destroy(bare);
+        printf("c_client_profile: bare UDP refused with both remedies, handle recovered (6a)\n");
+    }
+
+    {
+        /* (6b) DEFAULT's reset, detected by the refusal itself. */
+        na_stream_client *reset =
+            na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", port, "reset-cli");
+        if (reset == NULL) return fail("na_client_create (reset)", NULL, srv);
+        na_client_set_playback_device(reset, 0);
+        na_client_set_auto_reconnect(reset, 0);
+        if (na_client_set_reliability_profile(reset, NA_RELIABILITY_UDP_WAN) != NA_OK ||
+            na_client_set_reliability_profile(reset, NA_RELIABILITY_DEFAULT) != NA_OK ||
+            na_client_set_transport(reset, NA_TRANSPORT_UDP) != NA_OK) {
+            return fail("UDP_WAN -> DEFAULT -> set_transport(UDP) rejected", reset, srv);
+        }
+        if (na_client_connect(reset, err, (int)sizeof err) == NA_OK) {
+            return fail("WAN -> DEFAULT -> UDP connected — DEFAULT left a reliability component "
+                        "on, or the gate's all-off predicate is wrong", reset, srv);
+        }
+        na_client_destroy(reset);
+        printf("c_client_profile: DEFAULT's reset confirmed by the gate refusing its UDP "
+               "composition (6b)\n");
+    }
+
+    /* (6c) the explicit opt-in, measured with the pre-gate section's own instrument. */
     g_rx_ok = 0;  /* section (3) left it set; this arm needs a reading of its own */
-    na_stream_client *reset =
-        na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", port, "reset-cli");
-    if (reset == NULL) return fail("na_client_create (reset)", NULL, srv);
-    na_client_set_playback_device(reset, 0);
-    na_client_set_audio_cb(reset, on_rx_audio, NULL);
-    na_client_set_auto_reconnect(reset, 0);
-    if (na_client_set_reliability_profile(reset, NA_RELIABILITY_UDP_WAN) != NA_OK ||
-        na_client_set_reliability_profile(reset, NA_RELIABILITY_DEFAULT) != NA_OK ||
-        na_client_set_transport(reset, NA_TRANSPORT_UDP) != NA_OK) {
-        return fail("UDP_WAN -> DEFAULT -> set_transport(UDP) rejected", reset, srv);
+    na_stream_client *bare2 =
+        na_client_create(NA_CLIENT_BACKEND_NULL, "127.0.0.1", port, "bare2-cli");
+    if (bare2 == NULL) return fail("na_client_create (bare2)", NULL, srv);
+    na_client_set_playback_device(bare2, 0);
+    na_client_set_audio_cb(bare2, on_rx_audio, NULL);
+    na_client_set_auto_reconnect(bare2, 0);
+    if (na_client_set_reliability_profile(bare2, NA_RELIABILITY_UDP_BARE) != NA_OK) {
+        return fail("na_client_set_reliability_profile(UDP_BARE) rejected", bare2, srv);
     }
-    if (na_client_connect(reset, err, (int)sizeof err) != NA_OK) {
+    if (na_client_connect(bare2, err, (int)sizeof err) != NA_OK) {
         fprintf(stderr, "  (%s)\n", err);
-        return fail("the reset client could not reach the UDP server", reset, srv);
+        return fail("the explicit BARE client could not reach the UDP server", bare2, srv);
     }
 
-    /* Gate on RX ALONE, never on the roster: the server has not yet reaped the client section (4)
-     * disconnected, so na_client_server_client_count reads 2 here and a `== 1` gate burns the
-     * entire budget waiting for a number that never arrives. Measured: 20 ms with this gate
-     * against the full 3000 ms with the roster one. */
+    /* Gate on RX ALONE, never on the roster: the server has not yet reaped the clients earlier
+     * sections disconnected, so na_client_server_client_count over-reads here and a `== 1` gate
+     * burns the entire budget waiting for a number that never arrives (measured when this file
+     * used one: 20 ms with the RX gate against the full 3000 ms with the roster one). */
     int rwaited = 0;
     while (rwaited < 3000 && !g_rx_ok) {
         na_server_inject_audio(srv, RXBUF, (int)sizeof RXBUF);
         sleep_ms(20);
         rwaited += 20;
     }
-    if (!g_rx_ok) return fail("no RX reached the reset client within budget", reset, srv);
+    if (!g_rx_ok) return fail("no RX reached the BARE client within budget", bare2, srv);
 
     {
         na_client_stats off;
-        if (na_client_get_stats(reset, &off, sizeof off) != NA_OK) {
-            return fail("na_client_get_stats on the reset client", reset, srv);
+        if (na_client_get_stats(bare2, &off, sizeof off) != NA_OK) {
+            return fail("na_client_get_stats on the BARE client", bare2, srv);
         }
         /* The exact mirror of section (3): with no reorder buffer it is the post-reorder counter
-         * that reads -1 and the three pre-reorder ones that carry the reading. */
+         * that reads -1 and the three pre-reorder ones that carry the reading. This is what pins
+         * "BARE is the old bare composition" — a BARE wired to any recovery preset would engage
+         * a reorder buffer and flip this complement. */
         if (off.sequence_gaps != -1) {
-            fprintf(stderr, "  (sequence_gaps %lld — a reorder buffer survived the reset)\n",
+            fprintf(stderr, "  (sequence_gaps %lld — BARE engaged a reorder buffer)\n",
                     off.sequence_gaps);
-            return fail("DEFAULT left the reorder buffer engaged on a UDP client", reset, srv);
+            return fail("NA_RELIABILITY_UDP_BARE is not bare: a reorder buffer exists", bare2, srv);
         }
         if (off.packets_lost < 0 || off.packets_out_of_order < 0 || off.packet_loss_rate < 0.0) {
             return fail("the gap tracker is not running, so no reorder-free path was taken",
-                        reset, srv);
+                        bare2, srv);
         }
         /* A separate knob builds a separate estimator, so this is a SECOND detector rather than a
          * restatement of the first. It is MASKED by the reorder assertions above, which are
-         * evaluated first and which most wrong presets also trip — dualDefault() dies there and
-         * never reaches this line. Isolating it needs the reorder pair neutralised and a preset
-         * that enables adaptive jitter ALONE; done that way it fails here with
-         * buffer_target_ms 40, and the same neutralisation with no mutation stays green. Keep
-         * that in mind before trusting a red run to mean this assertion is live. */
+         * evaluated first and which most wrong presets also trip — a BARE wired to udpWan() dies
+         * there and never reaches this line. Isolating it needs the reorder pair neutralised and
+         * a preset that enables adaptive jitter ALONE. Keep that in mind before trusting a red
+         * run to mean this assertion is live. */
         if (off.buffer_target_ms != -1) {
-            fprintf(stderr, "  (buffer_target_ms %d — an adaptive-jitter estimator survived)\n",
+            fprintf(stderr, "  (buffer_target_ms %d — an adaptive-jitter estimator exists)\n",
                     off.buffer_target_ms);
-            return fail("DEFAULT left adaptive jitter enabled on a UDP client", reset, srv);
+            return fail("NA_RELIABILITY_UDP_BARE enabled adaptive jitter", bare2, srv);
         }
         if (off.jitter_ms != 0.0) {
-            return fail("DEFAULT left a live jitter estimate on a UDP client", reset, srv);
+            return fail("NA_RELIABILITY_UDP_BARE carries a live jitter estimate", bare2, srv);
         }
-        printf("c_client_profile: UDP_WAN -> DEFAULT -> UDP — reliability layer off "
-               "(sequence_gaps -1, loss counters measured, buffer_target_ms -1) (%d ms)\n",
-               rwaited);
+        printf("c_client_profile: BARE connected bare — sequence_gaps -1, loss counters measured, "
+               "buffer_target_ms -1 (6c, %d ms)\n", rwaited);
     }
-    na_client_disconnect(reset);
-    na_client_destroy(reset);
+    na_client_disconnect(bare2);
+    na_client_destroy(bare2);
 
     /* ---- (7) NA_RELIABILITY_UDP_IQ applies its PRESET, not merely its transport (issue #11) ----
      *
