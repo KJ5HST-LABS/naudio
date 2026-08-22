@@ -61,7 +61,7 @@ All five clients accept the same core options, so one habit transfers across the
 --playback-id N     output device id (default: first output device)
 --transport tcp|udp transport (default tcp) — must match the server's
 --reliability P     UDP profile lan|wan|ft8 (FEC/reorder/jitter/control-ARQ); selects UDP itself.
-                    Omitted = bare transport, which across a real network loses audio
+                    UDP needs one: a bare-UDP connect is refused since 0.5.0
 --seconds N         run time; 0 = until Ctrl-C (default 0)
 --backend system|null  system (default) plays to a device; null discards (hardware-free)
 --list-devices      print output device ids, then exit
