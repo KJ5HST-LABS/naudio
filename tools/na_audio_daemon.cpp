@@ -18,11 +18,14 @@
 //                              to find the capture device's backendId and any virtual sink.
 //
 //   --mode capture-probe       open the chosen capture device DIRECTLY (no server) and read
-//                              48 kHz stereo for --duration-ms. The foundational real-hardware
-//                              proof: reports frames transferred, the OVERFLOW count (the "no
-//                              overruns" gate — the only place the device's overrun flag is
-//                              directly observable), and per-channel RMS (so an asymmetric or
-//                              single-channel source shows up per channel).
+//                              the requested format (--rate/--channels; 48 kHz stereo default)
+//                              for --duration-ms. The foundational real-hardware proof: reports
+//                              frames transferred, the OVERFLOW count (the "no overruns" gate —
+//                              the only place the device's overrun flag is directly observable),
+//                              and per-channel RMS (so an asymmetric or single-channel source
+//                              shows up per channel). A DECLARED format the device answers with
+//                              something else (the mono fallback) is REFUSED — naudio does not
+//                              resample, so serving it would mislabel the audio (#91 Phase A).
 //
 //   --mode hardware (default)  the full pipeline: AudioStreamServer captures from the REAL
 //                              device and fans it out over a 127.0.0.1 transport to an
@@ -39,7 +42,7 @@
 //   na_audio_daemon --list-devices
 //   na_audio_daemon [--mode capture-probe|hardware] [--capture <pat>|--capture-id N]
 //                   [--playback <pat>|--playback-id N] [--transport tcp|udp|dual]
-//                   [--port N] [--duration-ms N]
+//                   [--rate HZ] [--channels 1|2] [--port N] [--duration-ms N]
 
 #include <algorithm>
 #include <atomic>
@@ -141,6 +144,9 @@ struct Args {
     int port = naudio::AudioStreamConfig::DEFAULT_PORT;
     std::int64_t durationMs = 30000;  // 0 == until Ctrl-C
     bool listDevices = false;
+    int rate = 48000;      // #91 Phase A: the declared capture/server format
+    int channels = 2;
+    bool formatDeclared = false;  // set by --rate/--channels; arms the capture-probe refusal
 };
 
 void usage() {
@@ -165,6 +171,11 @@ void usage() {
         "                    line names a real device before trusting a hardware-mode pass.\n"
         "  --playback-id N   force playback device backendId\n"
         "  --transport       tcp (default) | udp | dual\n"
+        "  --rate HZ         capture/server sample rate, 8000..192000, divisible by 50 for an\n"
+        "                    exact 20 ms frame (default 48000). naudio does NOT resample: the\n"
+        "                    device must open at exactly this rate or the run refuses -- a\n"
+        "                    silent fallback would ship wrong-rate audio labeled with this rate\n"
+        "  --channels N      1 (mono) | 2 (stereo, default); refused like --rate on mismatch\n"
         "  --port N          server port; 0 = ephemeral (default %d)\n"
         "  --duration-ms N   run time; 0 = until Ctrl-C (default 30000)\n"
         "  --list-devices    enumerate capture + playback devices, then exit\n"
@@ -239,17 +250,42 @@ int runCaptureProbe(const Args& a) {
     std::printf("capture-probe: device [%d] %s\n", dev->backendIdFor(naudio::Direction::Capture),
                 dev->name.c_str());
 
-    naudio::AudioFormat requested;  // 48 kHz / 16-bit / stereo
+    naudio::AudioFormat requested;  // 48 kHz / 16-bit / stereo unless --rate/--channels declared
+    requested.sampleRate = a.rate;
+    requested.channels = a.channels;
     std::unique_ptr<naudio::CaptureStream> stream;
     try {
         stream = opener.openCapture(*dev, requested);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: openCapture failed: %s\n", e.what());
+        if (a.formatDeclared)
+            std::fprintf(stderr, "hint: the device may not support %d Hz / %d ch — naudio does "
+                                 "not resample. Pick a rate/channel count the device supports.\n",
+                         a.rate, a.channels);
         return 1;
     }
     const naudio::AudioFormat fmt = stream->actualFormat();
     std::printf("opened: %d Hz / %d-bit / %d ch%s\n", fmt.sampleRate, fmt.bitsPerSample,
                 fmt.channels, fmt.channels == 1 ? "  (mono fallback)" : "");
+    // The refusal (#91 Phase A). StreamOpener's one silent divergence is the mono fallback —
+    // the backend otherwise opens EXACTLY the requested format or throws (PortAudioBackend
+    // stores `requested` verbatim as actualFormat). A declared format that came back different
+    // must not be served: naudio has no resampler, so proceeding would measure — and in
+    // hardware mode ship — audio in a format other than the one the operator declared. The
+    // undeclared default keeps the labeled fallback above: the probe then reports what it
+    // actually opened, which lies to no one.
+    if (a.formatDeclared &&
+        (fmt.sampleRate != requested.sampleRate || fmt.channels != requested.channels ||
+         fmt.bitsPerSample != requested.bitsPerSample)) {
+        std::fprintf(stderr,
+                     "error: capture opened %d Hz / %d ch but %d Hz / %d ch was declared — "
+                     "refusing.\nnaudio does not resample; serving this would label %d Hz / %d ch "
+                     "audio as the declared format.\nDrop --rate/--channels to accept the device's "
+                     "fallback, or pick a device that supports the declared format.\n",
+                     fmt.sampleRate, fmt.channels, requested.sampleRate, requested.channels,
+                     fmt.sampleRate, fmt.channels);
+        return 1;
+    }
 
     const int chunkFrames = (fmt.sampleRate / 10);  // ~100 ms per read
     std::vector<std::uint8_t> buf(static_cast<std::size_t>(chunkFrames) * fmt.frameSize());
@@ -347,10 +383,17 @@ int runHardware(const Args& a) {
     const int captureId = capDev->backendIdFor(naudio::Direction::Capture);
     std::printf("server capture: device [%d] %s\n", captureId, capDev->name.c_str());
 
-    const naudio::AudioStreamConfig cfg = configFor(a.transport);
+    naudio::AudioStreamConfig cfg = configFor(a.transport);
+    // #91 Phase A: the declared server-wide format (defaults match cfg's own, so this is a no-op
+    // without --rate/--channels). No refusal check is needed on this path: the server opens the
+    // capture device DIRECTLY on the backend, which opens exactly formatFromConfig() or throws —
+    // there is no fallback here to diverge silently, so a device that cannot do the declared
+    // format fails server.start loudly instead.
+    cfg.sampleRate = a.rate;
+    cfg.channels = a.channels;
 
     // --- Resolve the client's RX sink: a real virtual device, else a FakeBackend drain. ---
-    naudio::AudioFormat fmt;  // 48 kHz / 16-bit / stereo (matches cfg)
+    naudio::AudioFormat fmt;  // matches cfg (48 kHz / 16-bit / stereo at the defaults)
     fmt.sampleRate = cfg.sampleRate;
     fmt.bitsPerSample = cfg.bitsPerSample;
     fmt.channels = cfg.channels;
@@ -382,8 +425,10 @@ int runHardware(const Args& a) {
         std::printf("client sink  : device [%d] %s (real — external apps can read this)\n",
                     clientPlaybackId, sinkDev->name.c_str());
     } else {
-        // Hardware-free drain: register the 48k/16/stereo playback format the client will open.
-        fakeBackend.add(naudio::RawDevice{/*backendId=*/0, "fake-sink", "fake", 0, 2, 48000.0});
+        // Hardware-free drain: register the cfg playback format the client will open (the
+        // negotiated format IS cfg's — the server announces it in AUDIO_CONFIG).
+        fakeBackend.add(naudio::RawDevice{/*backendId=*/0, "fake-sink", "fake", 0, cfg.channels,
+                                          static_cast<double>(cfg.sampleRate)});
         fakeBackend.addSupportedFormat(0, naudio::Direction::Playback, fmt);
         clientBackend = &fakeBackend;
         clientPlaybackId = 0;
@@ -407,6 +452,10 @@ int runHardware(const Args& a) {
     std::string err;
     if (!server.start(&err)) {
         std::fprintf(stderr, "error: server.start failed: %s\n", err.c_str());
+        if (a.formatDeclared)
+            std::fprintf(stderr, "hint: the capture device may not support %d Hz / %d ch — naudio "
+                                 "does not resample. Pick a rate the device supports.\n",
+                         cfg.sampleRate, cfg.channels);
         return 1;
     }
     const int boundPort = server.port();
@@ -436,7 +485,9 @@ int runHardware(const Args& a) {
 
     // --- Monitor loop: per-second throughput + RMS; min-throughput is the dropout proxy. ---
     const std::int64_t expectedBps = cfg.bytesPerSecond();
-    std::printf("expected RX  : %lld bytes/s (48k/16/stereo)\n", static_cast<long long>(expectedBps));
+    std::printf("expected RX  : %lld bytes/s (%d Hz / %d-bit / %d ch)\n",
+                static_cast<long long>(expectedBps), cfg.sampleRate, cfg.bitsPerSample,
+                cfg.channels);
     std::printf("streaming for %s ... (Ctrl-C to stop)\n\n",
                 a.durationMs > 0 ? (std::to_string(a.durationMs) + " ms").c_str() : "ever");
 
@@ -475,7 +526,9 @@ int runHardware(const Args& a) {
                 static_cast<long long>(avgBps), avgPct, static_cast<long long>(minBps < 0 ? 0 : minBps),
                 static_cast<long long>(expectedBps));
     std::printf("  LEFT  (ch 0)   : RMS %.1f dBFS, peak %.1f dBFS\n", dbfs(s.rmsL), dbfs(s.peakL));
-    std::printf("  RIGHT (ch 1)   : RMS %.1f dBFS, peak %.1f dBFS\n", dbfs(s.rmsR), dbfs(s.peakR));
+    if (cfg.channels >= 2)
+        std::printf("  RIGHT (ch 1)   : RMS %.1f dBFS, peak %.1f dBFS\n", dbfs(s.rmsR),
+                    dbfs(s.peakR));
     std::printf("  client errors  : %d\n", listener.errors.load());
 
     const bool gotStream = s.bytes > 0;
@@ -540,6 +593,14 @@ int main(int argc, char** argv) {
             args.playbackId = static_cast<int>(
                 requireInt("--playback-id", next("--playback-id"), 0, INT_MAX));
         else if (a == "--transport") args.transport = next("--transport");
+        else if (a == "--rate") {
+            args.rate = static_cast<int>(requireInt("--rate", next("--rate"), 8000, 192000));
+            args.formatDeclared = true;
+        }
+        else if (a == "--channels") {
+            args.channels = static_cast<int>(requireInt("--channels", next("--channels"), 1, 2));
+            args.formatDeclared = true;
+        }
         else if (a == "--port")
             args.port = static_cast<int>(requireInt("--port", next("--port"), 0, 65535));
         else if (a == "--duration-ms")
@@ -549,6 +610,13 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
     }
 
+    // Before the transport check so a bad rate is named as such even when the argcheck harness's
+    // --transport guard is also on the command line. Still before any device work.
+    if (args.rate % 50 != 0) {
+        std::fprintf(stderr, "error: --rate %d does not make an exact 20 ms frame "
+                             "(must be divisible by 50)\n", args.rate);
+        return 2;
+    }
     if (args.transport != "tcp" && args.transport != "udp" && args.transport != "dual") {
         std::fprintf(stderr, "error: invalid --transport '%s' (tcp|udp|dual)\n", args.transport.c_str());
         return 2;

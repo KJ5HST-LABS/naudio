@@ -72,6 +72,22 @@ expect 2 'expects an integer' --capture-id ''
 expect 2 'must be in' --capture-id -1
 expect 2 'must be in' --port 99999
 
+# --- Phase A (#91): --rate / --channels parse strictly and range-check like every other int ---
+expect 2 'expects an integer' --rate 12000x
+expect 2 'expects an integer' --channels ''
+expect 2 'must be in' --rate 4000
+expect 2 'must be in' --rate 200000
+expect 2 'must be in' --channels 0
+expect 2 'must be in' --channels 3
+# Granularity: an exact 20 ms frame needs rate % 50 == 0. Validated after the parse loop and
+# BEFORE the transport check, so this case must name the granularity, not the guard's transport.
+expect 2 'divisible by 50' --rate 11025
+
+# --- POSITIVE CONTROLS for the Phase A flags (same shape as the id/port controls below) ---
+expect 2 'invalid --transport' --rate 12000 --channels 1
+expect_not 2 'expects an integer|must be in|divisible by 50' --rate 12000
+expect_not 2 'expects an integer|must be in|divisible by 50' --channels 1
+
 # --- POSITIVE CONTROLS ---
 # Without these, a requireInt() that rejected EVERYTHING would pass every case above.
 #
