@@ -58,9 +58,10 @@ java --enable-native-access=ALL-UNNAMED examples/java/PlayToSpeakers.java --back
 
 To use UDP, give a reliability profile to **both** the source and the client — e.g.
 `--reliability wan` on each. A profile selects UDP itself and enables the loss-recovery layer
-(FEC/reorder/jitter/control-ARQ); bare `--transport udp` on both ends still works, but leaves
-every recovery component off, which across a real network loses audio. A server serves the one
-transport it is configured for (TCP by default), so the two ends must match.
+(FEC/reorder/jitter/control-ARQ). Since 0.5.0 a bare `--transport udp` no longer connects: the
+library refuses a UDP configuration with no reliability layer unless it is requested explicitly
+(`NA_RELIABILITY_UDP_BARE`, an API-level opt-in for measurement baselines). A server serves the
+one transport it is configured for (TCP by default), so the two ends must match.
 
 ## Options
 
@@ -71,7 +72,7 @@ transport it is configured for (TCP by default), so the two ends must match.
 --playback-id N   output device id to play on (default: first output device)
 --transport T     tcp (default) | udp
 --reliability P   lan | wan | ft8  (UDP profiles: FEC/reorder/jitter/control-ARQ).
-                  Omitted = bare transport, which across a real network loses audio
+                  UDP needs one: a bare-UDP connect is refused since 0.5.0
 --seconds N       run time; 0 = until Ctrl-C (default 0)
 --backend B       system (default; plays to the output device) | null (hardware-free)
 --list-devices    print output device ids, then exit
