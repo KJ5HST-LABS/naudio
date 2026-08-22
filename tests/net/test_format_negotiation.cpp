@@ -327,6 +327,12 @@ TEST(FormatNegotiation, ConvertedSubscriberRecoversViaFecUnderInducedLoss) {
     // 25 injects x 960 native stereo frames -> 25 converted audio packets (480 B
     // each, one datagram) -> exactly 5 FEC blocks; the relay drops ordinal 2 of
     // each block, which single-parity XOR FEC is specified to repair.
+    //
+    // The injects are paced at the real 20 ms frame cadence, NOT burst: CI's
+    // Windows job measured a 2 ms burst losing one datagram to loopback UDP
+    // buffering BEFORE the relay (24 of 25 seen), which makes that block
+    // double-lossy — unrecoverable by single-parity FEC, correctly. Real
+    // producers pace at frame cadence; the burst was this test's artifact.
     const std::size_t kInjects = 25, kFramesPerInject = 960;
     const std::vector<std::int16_t> all =
         lcgSamples(910003u, kInjects * kFramesPerInject * 2);
@@ -336,12 +342,12 @@ TEST(FormatNegotiation, ConvertedSubscriberRecoversViaFecUnderInducedLoss) {
         server.injectAudio(std::vector<std::uint8_t>(
             allBytes.begin() + static_cast<std::ptrdiff_t>(i * chunkBytes),
             allBytes.begin() + static_cast<std::ptrdiff_t>((i + 1) * chunkBytes)));
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
     const std::vector<std::uint8_t> expected = expectedMonoDecimated(all, 4);
     std::vector<std::uint8_t> got;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     while (got.size() < expected.size() && std::chrono::steady_clock::now() < deadline) {
         auto p = recvUntil(*cc, PacketType::AudioRx, std::nullopt, 200);
         if (p.has_value()) got.insert(got.end(), p->payload().begin(), p->payload().end());
