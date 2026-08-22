@@ -341,3 +341,22 @@ consumer. The byte-identity tell for a correctly received stream is
 - **No arbitrary sample-rate conversion.** naudio carries audio at the negotiated rate (48 kHz is the
   first-class default) and does **not** resample between arbitrary rates in v1; rate conversion is left
   to the application or a companion DSP stage.
+- **No graceful degradation on a constrained link — provision the rate instead.** The default
+  48 kHz / 16-bit / stereo format costs **1.536 Mbps** on the wire, unconditionally: nothing adapts
+  mid-stream, and deeper buffers do not help (measured on a congested 2.4 GHz WiFi hop: 33 % of the
+  audio delivered over UDP — and over TCP too, so the shortfall was sustained undercapacity, which
+  no buffer depth converts into throughput). What exists today is **static provisioning**: declare a
+  lower server-wide format with `na_server_set_audio_format` (or `--rate`/`--channels` on
+  `na_audio_source` and `na_audio_daemon`) before start. Clients discover it via
+  `na_client_get_audio_format` after connect; nothing resamples, and every client gets the same
+  format (per-client negotiation is [issue #91](https://github.com/KJ5HST-LABS/naudio/issues/91)
+  Phase B). Against that measured link (~0.5 Mbps effective — **derived** from 33 % of 1.536 Mbps,
+  not itself measured):
+
+  | Format | Rate on wire | On that link |
+  |---|---|---|
+  | 48 kHz / 16 / stereo | 1.536 Mbps | 3× over — 33 % delivered |
+  | 48 kHz / 16 / mono | 768 kbps | marginal |
+  | 16 kHz / 16 / mono | 256 kbps | fits, 2× headroom |
+  | 12 kHz / 16 / mono | 192 kbps | fits, 2.6× headroom — covers SSB (≤3 kHz) and FT8 (≤3.1 kHz audio) |
+  | 8 kHz / 16 / mono | 128 kbps | fits; voice-grade only |

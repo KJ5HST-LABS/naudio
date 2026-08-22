@@ -26,6 +26,29 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   unchanged.
 
 ### Added
+- **`na_audio_source` and `na_audio_daemon` gain `--rate`/`--channels`** (8000–192000 Hz,
+  divisible by 50 for an exact 20 ms frame; 1 or 2 channels) — static provisioning for a
+  constrained link: 12 kHz mono is 192 kbps on the wire against the default 48 kHz stereo's
+  1.536 Mbps, which a measured congested hop (33 % delivered, over TCP too) could not carry. The
+  format is server-wide (per-client negotiation is #91 Phase B) and **nothing resamples**: the
+  capture device must open at the declared rate or the run fails loudly — `na_audio_daemon`
+  additionally *refuses* to proceed when a declared format comes back different from the device
+  (the mono-fallback path), because a silent fallback would ship wrong-rate audio labeled with
+  the declared rate. Undeclared runs keep the labeled mono fallback exactly as before.
+  `na_audio_source`'s deterministic tone keeps `tone_first_frame_hex=68c569c66ac76bc8` at every
+  format (the fingerprint identifies the tone, not the format), and its banner now reports the
+  effective transport (`udp` when a `--reliability` profile selected it) rather than echoing the
+  `--transport` flag — the same misreport the 0.5.0 client sweep fixed, which the server example
+  had kept. A bitrate/provisioning table is in README **Known limitations** and the on-air
+  runbook.
+
+- **`na_wav_tap` derives its WAV format from `na_client_get_audio_format`** instead of assuming
+  48000/16/2. Against a 12 kHz mono server the old tool exited 0 while writing a mislabeled,
+  time-mangled file and blaming the network; now the negotiated format drives channel selection,
+  the decimator (to the WSJT-X 12 kHz whenever the rate divides by it, as-is otherwise), the WAV
+  header, and the delivered-byte-rate assertion — which now checks the stream against its own
+  AUDIO_CONFIG. At the default 48 kHz the output is unchanged.
+
 - **Introspection getters (@since 0.5.0):** `na_client_get_reliability` /
   `na_server_get_reliability` report the reliability components the current config enables as an
   `NA_RELIABILITY_COMPONENT_*` bitmask (0 = bare), and `na_client_get_audio_format` /

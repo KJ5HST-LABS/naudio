@@ -206,11 +206,13 @@ wire — six decodes across five consecutive periods, +15 dB down to −25 dB:
 000000 -25 -0.0 1727 ~  CQ AD9GE EM69
 ```
 
-`na_wav_tap` also asserts the wire format rather than assuming it: it measures the delivered byte
-rate against the 192000 B/s that 48000/16/2 implies. Off the rig this read **exactly 100.0 %**. Note
-that synthetic sources do not — `na_audio_source --test-tone` measures 75.8 %, the Hamlib dummy
-~83 %, a loopback dummy ~70 % — so a shortfall is expected from a generator and is a real finding
-from a radio.
+`na_wav_tap` reads the **negotiated** format back from the library after connect
+(`na_client_get_audio_format`) rather than assuming one: the WAV header carries the truth at any
+server provisioning, and the delivered byte rate is measured against what that format implies
+(192000 B/s for the default 48000/16/2 — the on-air runs below read **exactly 100.0 %** of it off
+the rig). Note that synthetic sources do not reach 100 % — `na_audio_source --test-tone` measures
+75–86 %, the Hamlib dummy ~83 %, a loopback dummy ~70 % — so a shortfall is expected from a
+generator and is a real finding from a radio.
 
 > ### ⚠ Do not "control" this with a naive direct capture — it produces garbage that looks fine
 >
@@ -229,6 +231,36 @@ from a radio.
 > (L −35.5 dBFS vs R −31.8 dBFS measured), so a downmix is not the left channel the tap reads; and
 > avfoundation's device indices are its own, unrelated to naudio's `--list-devices` ids. If you want
 > this control, validate it by spectrum before trusting a null result from it.
+
+### 7. If the link cannot carry 1.5 Mbps: provision a lower rate
+
+The 2026-08-21 remote runs found this the hard way: on a congested 2.4 GHz WiFi hop only **33 %**
+of the audio arrived — over UDP *and* over TCP, which is the tell that the link was simply under
+capacity (retransmission cannot manufacture throughput; moving to 5 GHz took the same runs to
+101 %). naudio does not adapt mid-stream and deeper buffers do not help; what it has is **static
+provisioning**: declare a lower server-wide format before start, and every client — `na_wav_tap`
+included — picks it up from the negotiated format automatically.
+
+```bash
+# server side (the radio machine): 12 kHz mono = 192 kbps on the wire, 8x less than the default,
+# and still covers SSB (<=3 kHz) and FT8 (<=3.1 kHz audio)
+./build/tools/na_audio_daemon --mode hardware --capture-id <N> --rate 12000 --channels 1 \
+    --transport udp --port 4533
+# or, with the examples' broadcast server:
+./build/examples/na_audio_source --capture-id <N> --reliability wan --rate 12000 --channels 1
+```
+
+The wire-rate arithmetic is in the README's **Known limitations** table (48 k stereo 1.536 Mbps
+down to 8 k mono 128 kbps). Three properties to keep in mind:
+
+- **Server-wide.** Every client gets the lower format; per-client negotiation is
+  [issue #91](https://github.com/KJ5HST-LABS/naudio/issues/91) Phase B.
+- **No resampling exists.** The capture device must open at the declared rate. If it cannot, the
+  run fails loudly — `na_audio_daemon` *refuses* to serve a format other than the one you declared
+  (a silent 48 k fallback would ship wrong-rate audio labeled 12 k, and nothing downstream could
+  tell). Most USB codecs and Core Audio devices open 8–48 kHz natively.
+- **`na_wav_tap` needs no flags.** It reads the negotiated format after connect; at 12 kHz the
+  decimator is 1:1 and the WAV is decoder-ready as before.
 
 ---
 
