@@ -19,7 +19,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   explicitly with `NA_RELIABILITY_UDP_BARE`. This is the behavior change that makes the release
   **0.5.0**.
 
+- **`na_client_set_playback_device` is now optional on the NULL backend.** That backend never
+  opens a device, yet connect demanded an id anyway — the one wart the hardware-free backend had.
+  The id now defaults to 0 at create on `NA_CLIENT_BACKEND_NULL`; a strict relaxation (every
+  program that worked keeps working; programs that failed now work). SYSTEM-backend behavior is
+  unchanged.
+
 ### Added
+- **Introspection getters (@since 0.5.0):** `na_client_get_reliability` /
+  `na_server_get_reliability` report the reliability components the current config enables as an
+  `NA_RELIABILITY_COMPONENT_*` bitmask (0 = bare), and `na_client_get_audio_format` /
+  `na_server_get_audio_format` report the audio format — on the client, the **negotiated** format
+  once connected (the server's AUDIO_CONFIG), which is what a recorder or resampler needs; on the
+  server, the configured format (readable before and after start). These are the read-back half
+  of the setters: a tool can now assert what it configured instead of trusting that it did — the
+  assertion whose absence let a client run a whole on-air session with loss recovery silently
+  off. `na_server_get_audio_format` is the accessor issue #36 declined "until wanted for
+  consumer-facing reasons"; with it, the profile setter's format-preservation promise is finally
+  testable (and tested) for all four preserved fields, and the `NA_RELIABILITY_UDP_IQ` + 192 kHz
+  pairing is readable back. `na_wav_tap` prints its component bitmask at startup.
+
 - **`NA_RELIABILITY_UDP_BARE`** (enum value 6, append-only; `AudioStreamConfig::udpBare()` on the
   C++ side) — UDP with no reliability layer, by explicit request: byte-for-byte the composition
   `set_transport(UDP)` alone used to produce, kept reachable so measurement-control baselines (a
