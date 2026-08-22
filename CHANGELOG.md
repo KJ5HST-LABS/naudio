@@ -5,6 +5,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **`na_wav_tap`** — records what a naudio *client* receives, as a 12 kHz mono WAV that the WSJT-X
+  decoders read. It is a normal client driving only the public C ABI
+  (`na_client_create` / `na_client_set_audio_cb` / `na_client_connect`) on
+  `NA_CLIENT_BACKEND_NULL`, so no audio device is opened and the file holds what naudio *delivered*
+  rather than what a sound card then did to it. This makes "the audio is intelligible" a decode
+  instead of an opinion: measured against a Yaesu on 14.074 MHz, a remote Windows client across a
+  WiFi hop produced **21 FT8 decodes**, matching a local client on the adjacent period. It asserts
+  the wire format rather than assuming it, reports the client's own counters
+  (`packets_recovered_by_fec`, `socket_rx_drops`, `jitter_ms`, `buffer_target_ms`) and can run over
+  TCP (`--tcp`) as a discriminating check when UDP comes up short. POSIX and **Windows**;
+  see `docs/on-air-verification.md`.
+
+- **`na_audio_source` gains `--reliability lan|wan`.** The example server previously called only
+  `na_server_set_transport`, so no FEC parity ever reached the wire and a client asking for
+  `NA_RELIABILITY_UDP_WAN` recovered nothing — both ends must select a profile for the reliability
+  layer to exist. The default is unchanged (bare transport), so existing behaviour is untouched.
+
+- **`docs/on-air-verification.md`** — what a real radio can and cannot verify, and the procedure for
+  the part it can, including the FT8 decode check and its mandatory silence control.
+
 ### Changed
 - **`na_hamlib_bridge`'s periodic RX health line now carries `reads=`, the denominator of the gap
   signature.** It reads
