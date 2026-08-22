@@ -50,8 +50,11 @@ With no `--playback-id`, the first output device is selected automatically.
 python3 examples/python/play_to_speakers.py --backend null --port 4533 --seconds 5
 ```
 
-To use UDP, give the **same** `--transport udp` to both the source and the client — a server
-serves the one transport it is configured for (TCP by default), so the two must match.
+To use UDP, give a reliability profile to **both** the source and the client — e.g.
+`--reliability wan` on each. A profile selects UDP itself and enables the loss-recovery layer
+(FEC/reorder/jitter/control-ARQ); bare `--transport udp` on both ends still works, but leaves
+every recovery component off, which across a real network loses audio. A server serves the one
+transport it is configured for (TCP by default), so the two ends must match.
 
 ## Options
 
@@ -61,6 +64,8 @@ serves the one transport it is configured for (TCP by default), so the two must 
 --name S          this client's name in the server roster (default na-py-client)
 --playback-id N   output device id to play on (default: first output device)
 --transport T     tcp (default) | udp
+--reliability P   lan | wan | ft8  (UDP profiles: FEC/reorder/jitter/control-ARQ).
+                  Omitted = bare transport, which across a real network loses audio
 --seconds N       run time; 0 = until Ctrl-C (default 0)
 --backend B       system (default; plays to the output device) | null (hardware-free)
 --list-devices    print device ids, then exit
@@ -96,7 +101,7 @@ The script declares the `na_*` functions it uses with `ctypes` and mirrors a cou
 | Lifecycle | `na_client_create` → `na_client_connect` → `na_client_disconnect` → `na_client_destroy` |
 | RX audio | `na_client_set_audio_cb` — the hot-path PCM sink (a short frame meter here; a real app consumes the PCM) |
 | Events | `na_client_set_callbacks` — connected / stream-started / error / disconnected |
-| Config | `na_client_set_transport`, `na_client_set_playback_device` |
+| Config | `na_client_set_reliability_profile` (UDP loss recovery), `na_client_set_transport`, `na_client_set_playback_device` |
 
 **Threading (from `naudio.h`):** the RX audio callback fires on naudio's receive **worker**
 thread, once per frame — keep it short, don't call client lifecycle methods from it, and don't

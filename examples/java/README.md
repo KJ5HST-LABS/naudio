@@ -56,8 +56,11 @@ With no `--playback-id`, the first output device is selected automatically.
 java --enable-native-access=ALL-UNNAMED examples/java/PlayToSpeakers.java --backend null --port 4533 --seconds 5
 ```
 
-To use UDP, give the **same** `--transport udp` to both the source and the client — a server
-serves the one transport it is configured for (TCP by default), so the two must match.
+To use UDP, give a reliability profile to **both** the source and the client — e.g.
+`--reliability wan` on each. A profile selects UDP itself and enables the loss-recovery layer
+(FEC/reorder/jitter/control-ARQ); bare `--transport udp` on both ends still works, but leaves
+every recovery component off, which across a real network loses audio. A server serves the one
+transport it is configured for (TCP by default), so the two ends must match.
 
 ## Options
 
@@ -67,6 +70,8 @@ serves the one transport it is configured for (TCP by default), so the two must 
 --name S          this client's name in the server roster (default na-java-client)
 --playback-id N   output device id to play on (default: first output device)
 --transport T     tcp (default) | udp
+--reliability P   lan | wan | ft8  (UDP profiles: FEC/reorder/jitter/control-ARQ).
+                  Omitted = bare transport, which across a real network loses audio
 --seconds N       run time; 0 = until Ctrl-C (default 0)
 --backend B       system (default; plays to the output device) | null (hardware-free)
 --list-devices    print output device ids, then exit
@@ -100,7 +105,7 @@ struct (`na_device`) as a `MemoryLayout`:
 | Devices | `na_context_create` → `na_enumerate` → `na_context_destroy` |
 | Lifecycle | `na_client_create` → `na_client_connect` → `na_client_disconnect` → `na_client_destroy` |
 | RX audio | `na_client_set_audio_cb` — the hot-path PCM sink, passed as an FFM **upcall stub** |
-| Config | `na_client_set_transport`, `na_client_set_playback_device` |
+| Config | `na_client_set_reliability_profile` (UDP loss recovery), `na_client_set_transport`, `na_client_set_playback_device` |
 
 This client is **RX-only**: it registers just the audio sink and skips the `na_client_callbacks`
 event struct, so the only callback it installs is the single `na_audio_cb` function pointer.
