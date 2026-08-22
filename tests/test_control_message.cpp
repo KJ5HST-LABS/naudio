@@ -185,3 +185,115 @@ TEST(ControlMessage, TypeAndRejectReasonRoundTrip) {
     // Unknown reason byte defaults to Rejected.
     EXPECT_EQ(RejectReason::Rejected, naudio::rejectReasonFromValue(0x55));
 }
+
+// --- Spec 1.2 (§6.2.1) format-request codec, pinned to the vectors-v1_2.ini ---
+// golden hex (authored independently by conformance/tools/gen_vectors.py at the
+// B1 spec revision — matching it is a cross-check, not self-confirmation).
+
+TEST(ControlMessage, ConnectRequestV12FormatVector) {
+    naudio::RxFormatRequest req{12000, 1};
+    auto m = ControlMessage::connectRequestV12("W1AW-client", 1, nullptr, nullptr, req);
+    EXPECT_EQ("01010b573141572d636c69656e74000000002ee001", hex(m.serialize()));
+    auto d = ControlMessage::deserialize(m.serialize());
+    ASSERT_TRUE(d.has_value());
+    auto fr = d->parseConnectRequestFormatRequest();
+    ASSERT_TRUE(fr.has_value());
+    EXPECT_EQ(12000u, fr->sampleRate);
+    EXPECT_EQ(1, fr->layout);
+    // The v1 view of the same payload: no buffer config, no client info.
+    EXPECT_FALSE(d->parseConnectRequestConfig().has_value());
+    EXPECT_FALSE(d->parseConnectRequestClientInfo().has_value());
+}
+
+TEST(ControlMessage, ConnectRequestV12FullVector) {
+    AudioStreamConfig cfg{};
+    cfg.bufferTargetMs = 100;
+    cfg.bufferMinMs = 40;
+    cfg.bufferMaxMs = 300;
+    ClientInfo info{"W1AW", "Hiram", "Newington CT"};
+    naudio::RxFormatRequest req{12000, 2};
+    auto m = ControlMessage::connectRequestV12("W1AW-client", 1, &cfg, &info, req);
+    EXPECT_EQ(
+        "01010b573141572d636c69656e740100640028012c18045731415705486972616d0c4e6577696e67746f6e2043"
+        "5400002ee002",
+        hex(m.serialize()));
+    auto d = ControlMessage::deserialize(m.serialize());
+    ASSERT_TRUE(d.has_value());
+    // The 1.2 view: the tail parses.
+    auto fr = d->parseConnectRequestFormatRequest();
+    ASSERT_TRUE(fr.has_value());
+    EXPECT_EQ(12000u, fr->sampleRate);
+    EXPECT_EQ(2, fr->layout);
+    // The v1 view is intact: buffer prefs and client info parse exactly as before.
+    auto pc = d->parseConnectRequestConfig();
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(100, pc->bufferTargetMs);
+    auto pi = d->parseConnectRequestClientInfo();
+    ASSERT_TRUE(pi.has_value());
+    EXPECT_EQ("W1AW", pi->callsign);
+    EXPECT_EQ("Newington CT", pi->location);
+}
+
+TEST(ControlMessage, ConnectRequestV12ProbeVector) {
+    // The 0,0 probe: a valid request for the native format unchanged.
+    naudio::RxFormatRequest req{0, 0};
+    auto m = ControlMessage::connectRequestV12("W1AW-client", 1, nullptr, nullptr, req);
+    EXPECT_EQ("01010b573141572d636c69656e7400000000000000", hex(m.serialize()));
+    auto fr = ControlMessage::deserialize(m.serialize())->parseConnectRequestFormatRequest();
+    ASSERT_TRUE(fr.has_value());
+    EXPECT_EQ(0u, fr->sampleRate);
+    EXPECT_EQ(0, fr->layout);
+}
+
+TEST(ControlMessage, V1RequestCarriesNoFormatRequest) {
+    auto m = ControlMessage::connectRequest("W1AW-client", 1);
+    EXPECT_FALSE(m.parseConnectRequestFormatRequest().has_value());
+}
+
+TEST(ControlMessage, ShortTailIsNotAFormatRequest) {
+    // The neg-short-tail tolerance vector: a 2-byte trailing run after the v1
+    // body must NOT parse as a format request.
+    const std::vector<std::uint8_t> payload = {
+        0x01, 0x01, 0x0b, 0x57, 0x31, 0x41, 0x57, 0x2d, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74,
+        0x01, 0x00, 0x64, 0x00, 0x28, 0x01, 0x2c, 0x00, 0x2e, 0xe0};
+    auto d = ControlMessage::deserialize(payload);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_FALSE(d->parseConnectRequestFormatRequest().has_value());
+    // The v1 view still parses.
+    auto pc = d->parseConnectRequestConfig();
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(100, pc->bufferTargetMs);
+}
+
+TEST(ControlMessage, AudioConfigV12GrantedVector) {
+    AudioStreamConfig cfg{};
+    cfg.sampleRate = 12000;
+    cfg.channels = 1;
+    auto m = ControlMessage::audioConfigV12(cfg, 1);
+    EXPECT_EQ("0400002ee01001001400640028012c01", hex(m.serialize()));
+    auto d = ControlMessage::deserialize(m.serialize());
+    ASSERT_TRUE(d.has_value());
+    auto layout = d->parseAudioConfigGrantedLayout();
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(1, *layout);
+    // The v1 view: the 14-byte prefix parses as before (granted fields ride it).
+    AudioStreamConfig got{};
+    ASSERT_TRUE(d->applyAudioConfigTo(got));
+    EXPECT_EQ(12000, got.sampleRate);
+    EXPECT_EQ(1, got.channels);
+    EXPECT_EQ(20, got.frameDurationMs);
+}
+
+TEST(ControlMessage, AudioConfigV12DeclinedNativeVector) {
+    auto m = ControlMessage::audioConfigV12(AudioStreamConfig{}, 0);
+    EXPECT_EQ("040000bb801002001400640028012c00", hex(m.serialize()));
+    auto layout = ControlMessage::deserialize(m.serialize())->parseAudioConfigGrantedLayout();
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(0, *layout);
+}
+
+TEST(ControlMessage, V1AudioConfigCarriesNoGrantedLayout) {
+    // 14-byte form: the "who answered" discriminator must say v1.
+    auto m = ControlMessage::audioConfig(AudioStreamConfig{});
+    EXPECT_FALSE(m.parseAudioConfigGrantedLayout().has_value());
+}

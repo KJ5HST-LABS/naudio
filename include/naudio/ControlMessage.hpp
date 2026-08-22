@@ -63,6 +63,24 @@ enum class RejectReason : std::uint8_t {
 RejectReason rejectReasonFromValue(std::uint8_t value);
 const char* rejectReasonName(RejectReason reason);
 
+// Channel-layout wire values for the spec-1.2 (§6.2.1) per-subscription RX
+// format request. Layouts 1-3 reduce native stereo to one payload channel.
+enum class RxLayout : std::uint8_t {
+    Native = 0,       // No layout change.
+    MonoDownmix = 1,  // (L+R)/2 of the native stereo.
+    LeftOnly = 2,     // Native channel 0 (e.g. VFO-A).
+    RightOnly = 3,    // Native channel 1 (e.g. VFO-B).
+};
+
+// The §6.2.1 CONNECT_REQUEST tail: a requested RX rate + channel layout.
+// `layout` is kept as the raw wire byte (not RxLayout) because unknown values
+// can arrive from the wire and the server declines them rather than the codec
+// rejecting them.
+struct RxFormatRequest {
+    std::uint32_t sampleRate = 0;  // 0 = no rate preference (keep native).
+    std::uint8_t layout = 0;       // RxLayout wire byte.
+};
+
 // Client identification (callsign, name, location) so connected clients can see
 // who they share the radio with. Empty strings stand in for absent fields.
 struct ClientInfo {
@@ -113,6 +131,17 @@ public:
                                              const ClientInfo* clientInfo);
     std::optional<AudioStreamConfig> parseConnectRequestConfig() const;
     std::optional<ClientInfo> parseConnectRequestClientInfo() const;
+    // The spec-1.2 (§6.2.1) form: connectRequestFull plus the 5-byte format-request
+    // tail (requestedRate u32 BE + requestedLayout u8) appended after clientInfo.
+    static ControlMessage connectRequestV12(const std::string& clientName,
+                                            std::uint8_t protocolVersion,
+                                            const AudioStreamConfig* requestedConfig,
+                                            const ClientInfo* clientInfo,
+                                            const RxFormatRequest& formatRequest);
+    // The §6.2.1 format request, if the message carries one. A trailing run
+    // shorter than 5 bytes is NOT a format request (nullopt) — the tolerance
+    // vectors pin that; a longer tail's extra bytes are ignored (§11).
+    std::optional<RxFormatRequest> parseConnectRequestFormatRequest() const;
 
     // --- Connect accept/reject ---
     static ControlMessage connectAccept() { return ofType(ControlType::ConnectAccept); }
@@ -124,6 +153,15 @@ public:
     // Applies the audio-format fields onto an existing config in place (handles
     // the old 8-byte and new 14-byte formats); true if it was a parseable AUDIO_CONFIG.
     bool applyAudioConfigTo(AudioStreamConfig& target) const;
+    // The spec-1.2 (§6.2.1) extended AUDIO_CONFIG: the 14-byte form plus one
+    // appended grantedLayout byte. Sent only on connections whose
+    // CONNECT_REQUEST carried a format request; the granted rate/channels ride
+    // the EXISTING fields of `config`.
+    static ControlMessage audioConfigV12(const AudioStreamConfig& config,
+                                         std::uint8_t grantedLayout);
+    // grantedLayout if this is the 15-byte extended form; nullopt for the v1
+    // 8/14-byte forms (the client-side "who answered" discriminator, §6.2.1).
+    std::optional<std::uint8_t> parseAudioConfigGrantedLayout() const;
 
     // --- Stream control ---
     static ControlMessage streamStart() { return ofType(ControlType::StreamStart); }

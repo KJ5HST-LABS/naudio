@@ -244,6 +244,50 @@ ControlMessage ControlMessage::connectRequestFull(const std::string& clientName,
     return ControlMessage(ControlType::ConnectRequest, w.take());
 }
 
+ControlMessage ControlMessage::connectRequestV12(const std::string& clientName,
+                                                 std::uint8_t protocolVersion,
+                                                 const AudioStreamConfig* requestedConfig,
+                                                 const ClientInfo* clientInfo,
+                                                 const RxFormatRequest& formatRequest) {
+    // The v1 body, byte-for-byte, plus the §6.2.1 5-byte tail — a v1 decoder's
+    // prefix walk never reaches it (the tolerance vectors pin that view).
+    ControlMessage base =
+        connectRequestFull(clientName, protocolVersion, requestedConfig, clientInfo);
+    ByteWriter w;
+    w.putBytes(base.data());
+    w.putU32(formatRequest.sampleRate);
+    w.putU8(formatRequest.layout);
+    return ControlMessage(ControlType::ConnectRequest, w.take());
+}
+
+std::optional<RxFormatRequest> ControlMessage::parseConnectRequestFormatRequest() const {
+    if (type_ != ControlType::ConnectRequest || data_.size() < 3) return std::nullopt;
+    // Walk the complete v1 body (version, name, optional config, client info) —
+    // the same guards as the v1 parsers, except clientInfoLen == 0 is walked
+    // past rather than rejected (an info-less request can still carry the tail).
+    ByteReader r(data_);
+    r.getU8();  // version
+    std::size_t nameLen = r.getU8();
+    if (r.remaining() < nameLen + 1) return std::nullopt;
+    r.setPosition(r.position() + nameLen);
+    std::uint8_t hasConfig = r.getU8();
+    if (hasConfig != 0) {
+        if (r.remaining() < 6) return std::nullopt;
+        r.setPosition(r.position() + 6);
+    }
+    if (r.remaining() < 1) return std::nullopt;  // old protocol: no client-info byte
+    std::size_t clientInfoLen = r.getU8();
+    if (r.remaining() < clientInfoLen) return std::nullopt;
+    r.setPosition(r.position() + clientInfoLen);
+    // The tail: exactly-or-more than 5 bytes → a format request (extra bytes are
+    // a future minor extension, ignored per §11); shorter → not one.
+    if (r.remaining() < 5) return std::nullopt;
+    RxFormatRequest req;
+    req.sampleRate = static_cast<std::uint32_t>(r.getI32());
+    req.layout = r.getU8();
+    return req;
+}
+
 std::optional<AudioStreamConfig> ControlMessage::parseConnectRequestConfig() const {
     if (type_ != ControlType::ConnectRequest || data_.size() < 3) return std::nullopt;
     ByteReader r(data_);
@@ -325,6 +369,23 @@ bool ControlMessage::applyAudioConfigTo(AudioStreamConfig& target) const {
         target.bufferMaxMs = r.getU16();
     }
     return true;
+}
+
+ControlMessage ControlMessage::audioConfigV12(const AudioStreamConfig& config,
+                                              std::uint8_t grantedLayout) {
+    // The 14-byte v1 form plus the one appended §6.2.1 byte. The granted
+    // rate/channels ride the existing fields; AUDIO_CONFIG stays the sole
+    // authority for what this connection's AUDIO_RX payloads carry.
+    ControlMessage base = audioConfig(config);
+    ByteWriter w;
+    w.putBytes(base.data());
+    w.putU8(grantedLayout);
+    return ControlMessage(ControlType::AudioConfig, w.take());
+}
+
+std::optional<std::uint8_t> ControlMessage::parseAudioConfigGrantedLayout() const {
+    if (type_ != ControlType::AudioConfig || data_.size() < 15) return std::nullopt;
+    return data_[14];
 }
 
 // --- Latency ---
