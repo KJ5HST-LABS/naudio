@@ -26,6 +26,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   unchanged.
 
 ### Added
+- **The server implements spec 1.2: per-subscription RX format grants** (issue #91 B3). A
+  connection whose `CONNECT_REQUEST` carries a §6.2.1 format request is granted **exactly or
+  answered native** — integer divisors of the native rate (48 kHz → 24/16/12/8 k) with the
+  frame duration kept integral, and the reduced layouts (mono-downmix `(L+R)/2`, left-only,
+  right-only) on stereo natives; anything else, unknown layout bytes included, is declined to
+  native without rejecting the connection. A granted subscription's audio is converted per
+  connection — integer anti-alias decimation and channel reduction, bit-exact across platforms
+  — **before** framing, so its sequence numbers, FEC parity, and frame sizes are computed over
+  what that connection is actually sent; a converted subscriber recovers dropped packets from
+  its own stream's parity (measured under induced loss). Every non-requesting client keeps the
+  byte-identical native broadcast path. The 1.2 golden vectors are now loaded by the
+  conformance suite (`Conformance.GoldenVectorsV12`, fail-closed). The client-side request API
+  is #91 B4; until then no shipped client sends a format request.
+
 - **Wire spec revision 1.2: per-subscription RX format negotiation is specified** (approved
   2026-08-22; `docs/audio-streaming-protocol-v1.md` §6.2.1). A client MAY append a 5-byte format
   request to `CONNECT_REQUEST` (`requestedRate` u32 + `requestedLayout` u8: NATIVE /
@@ -34,9 +48,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   v1 peer sees byte-identical traffic, which the v1 parsers' prefix-only behavior guarantees
   (measured, and pinned by tolerance vectors). Scope: RX only, rate + channel layout only,
   reduction only; the wire version byte stays 1 (§11 minor extension). Golden vectors for the
-  1.2 forms are authored in `conformance/vectors/vectors-v1_2.ini` (not yet loaded by the
-  suite). **The spec is ahead of the code here by design:** the reference implementation is
-  issue #91 Phase B (B2–B5); no runtime behavior changes in this entry.
+  1.2 forms are authored in `conformance/vectors/vectors-v1_2.ini` (loaded by the suite since
+  the B3 entry above). No runtime behavior changed in this entry itself; the server-side
+  implementation landed as issue #91 B3.
 
 - **`na_audio_source` and `na_audio_daemon` gain `--rate`/`--channels`** (8000–192000 Hz,
   divisible by 50 for an exact 20 ms frame; 1 or 2 channels) — static provisioning for a
