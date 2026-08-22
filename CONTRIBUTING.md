@@ -50,8 +50,9 @@ naudio is **LGPL-2.1-or-later**. Contributions are accepted under that license.
 The `0xAF01` wire is **frozen at v1** (`docs/audio-streaming-protocol-v1.md`). A wire change
 requires: (1) a spec revision, (2) regenerating the golden vectors via
 `conformance/tools/gen_vectors.py` — which writes `conformance/vectors/vectors.ini` **and**
-`conformance/vectors/vectors-v1_2.ini` (spec-1.2 forms, not yet loaded by the suite; see spec
-§12) — and (3) re-checking the codec and every example client against the regenerated vectors.
+`conformance/vectors/vectors-v1_2.ini` (spec-1.2 forms, loaded by the suite's
+`Conformance.GoldenVectorsV12` under its own fail-closed gate; see spec §12) — and
+(3) re-checking the codec and every example client against the regenerated vectors.
 The byte-identity tell for a correctly received stream is `first_frame_hex=68c569c66ac76bc8`.
 
 ## Pull requests
