@@ -23,6 +23,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `NA_RELIABILITY_UDP_WAN` recovered nothing — both ends must select a profile for the reliability
   layer to exist. The default is unchanged (bare transport), so existing behaviour is untouched.
 
+- **Every example client gains `--reliability lan|wan|ft8`.** All five (C, C++, Python, Rust,
+  Java) previously called only `na_client_set_transport`, so a copy of any of them ran UDP with
+  FEC, reordering, adaptive jitter and control-ARQ all off and discarded every parity packet the
+  server sent — the composition that cost two thirds of the audio on the first real network hop
+  while remaining invisible on loopback. The flag selects the matching
+  `na_client_set_reliability_profile` preset; `--transport` stays for TCP, and the bare default is
+  unchanged. Each client's connected/summary lines now report the effective transport (`udp+wan`)
+  rather than the `--transport` flag's value, which was wrong whenever a profile was given. The
+  example READMEs' UDP guidance now leads with a profile on both ends instead of bare
+  `--transport udp`.
+
 - **`docs/on-air-verification.md`** — what a real radio can and cannot verify, and the procedure for
   the part it can, including the FT8 decode check and its mandatory silence control.
 
