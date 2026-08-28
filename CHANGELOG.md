@@ -6,6 +6,23 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Changed
+- **`na_hamlib_bridge` now *demands* the native sample rate it was already choosing, when its
+  libhamlib can express that** — Hamlib PR
+  [#2172](https://github.com/Hamlib/Hamlib/pull/2172) (open at the time of writing) turns
+  `rig_stream_config.require_native` into a per-stage mask of the `RIG_STREAM_CONV_*`
+  constants, which is the capability naudio asked for on PR #2116. Built against such a
+  libhamlib (detected by a new `RIG_STREAM_CONV_ALL` capability check, never a version
+  compare), every stream opens with `require_native = RIG_STREAM_CONV_RATE`: a resample inside
+  the radio-site hop now refuses the open loudly with `-RIG_ENAVAIL` instead of quietly
+  degrading latency, while the F32→S16 format conversion the bridge deliberately accepts keeps
+  flowing. In the ordinary case the rate negotiation already picked a native rate, so nothing
+  changes but the guarantee. Against any earlier libhamlib — upstream `master` included, until
+  that PR merges — the demand compiles out and behavior is byte-identical to before. Measured
+  both ways against real prefixes (PR head `a3fc759` vs master `e4c8d09`): the refusal fires on
+  a non-native-rate open and only then; the same arms hold over netrigctl against both an old
+  and a new `rigctld`, where the new client side enforces the demand locally from the
+  advertised caps.
+
 - **A no-reliability UDP configuration is refused at `na_client_connect` / `na_server_start`**
   (server: UDP or DUAL). `na_client_set_transport(NA_TRANSPORT_UDP)` alone leaves FEC, reordering,
   adaptive jitter and control-ARQ all off — a composition that discards every parity packet, cost

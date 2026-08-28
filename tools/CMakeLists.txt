@@ -100,6 +100,18 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
             include(CheckStructHasMember)
             check_struct_has_member("struct rig_stream_caps" channels "hamlib/rig.h"
                                     NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST LANGUAGE C)
+            # Hamlib PR #2172 then turned rig_stream_config.require_native from an all-or-nothing
+            # boolean into a per-stage bitmask of the same RIG_STREAM_CONV_* constants the
+            # conversion report speaks — which is what lets the bridge demand a native sample
+            # rate while still accepting the frontend's format conversion (the request naudio
+            # made on that PR). RIG_STREAM_CONV_ALL is an object-like macro added by the same
+            # commit as the mask semantics, so its presence is exactly "require_native takes
+            # stages", and check_symbol_exists can see a macro.
+            #
+            # Verified to discriminate against two real prefixes: upstream master e4c8d09
+            # reports FALSE, the PR #2172 head a3fc759 reports TRUE.
+            check_symbol_exists(RIG_STREAM_CONV_ALL "hamlib/rig.h"
+                                NAUDIO_HAMLIB_HAS_REQUIRE_NATIVE_MASK)
             unset(CMAKE_REQUIRED_INCLUDES)
             unset(CMAKE_REQUIRED_LIBRARIES)
             if(NOT NAUDIO_HAMLIB_HAS_STREAM)
@@ -116,10 +128,25 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
                     target_compile_definitions(na_hamlib_bridge
                                                PRIVATE NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)
                 endif()
+                if(NAUDIO_HAMLIB_HAS_REQUIRE_NATIVE_MASK)
+                    target_compile_definitions(na_hamlib_bridge
+                                               PRIVATE NAUDIO_HAMLIB_HAS_REQUIRE_NATIVE_MASK)
+                endif()
                 if(NAUDIO_HAMLIB_HAS_STREAM_CONV)
                     target_compile_definitions(na_hamlib_bridge PRIVATE NAUDIO_HAMLIB_HAS_STREAM_CONV)
-                    message(STATUS "naudio: na_hamlib_bridge enabled (hamlib ${HAMLIB_VERSION}, "
-                                   "conversion reporting available)")
+                    if(NAUDIO_HAMLIB_HAS_REQUIRE_NATIVE_MASK)
+                        message(STATUS "naudio: na_hamlib_bridge enabled (hamlib ${HAMLIB_VERSION}, "
+                                       "conversion reporting available, native sample rate enforced "
+                                       "at open)")
+                    else()
+                        # Reported, not enforced: this libhamlib predates PR #2172's per-stage
+                        # require_native, whose all-or-nothing predecessor would refuse the format
+                        # conversion the bridge deliberately accepts. Still a STATUS, not a
+                        # WARNING — the bridge behaves exactly as it did before that PR existed.
+                        message(STATUS "naudio: na_hamlib_bridge enabled (hamlib ${HAMLIB_VERSION}, "
+                                       "conversion reporting available; a resample would be "
+                                       "reported but not refused — pre-PR-#2172 require_native)")
+                    endif()
                 else()
                     # Not a warning: the bridge is fully functional here, it just cannot say
                     # whether libhamlib is converting for it. Worth one STATUS line so an operator

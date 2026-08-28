@@ -23,8 +23,13 @@
  * frontend conversion pipeline. S16 is not native on every backend — the dummy now advertises
  * PCM_F32|OPUS natively — so the request above is commonly served through an F32->S16
  * conversion. That is a deliberate trade: converting reaches far more hardware than demanding
- * native would, and demanding it (rig_stream_config.require_native = 1) would fail outright
- * against the dummy backend. What is NOT acceptable is doing it silently, so open_stream()
+ * native would, and when require_native was an all-or-nothing boolean, demanding it would have
+ * failed outright against the dummy backend. Hamlib PR #2172 (naudio's own request on that PR)
+ * made the demand per-stage — require_native now takes the RIG_STREAM_CONV_* constants — so
+ * open_stream() demands exactly the one stage this bridge cannot afford, RIG_STREAM_CONV_RATE
+ * (resample = refuse the open; format conversion = fine), when the libhamlib it is built
+ * against has the mask. Against an older one the demand compiles out and the conversion
+ * report below is the only guard. Either way, nothing converts silently: open_stream()
  * reports the active stages at open.
  *
  * THE RATE IS THE AXIS THIS BRIDGE CAN MOVE, AND IT DOES (issue #84). The format axis is
@@ -488,9 +493,12 @@ static void print_native_channels(FILE *f, const struct rig_stream_caps *c) {
  * The bridge asks for S16 because that is what naudio carries, at the rate negotiate_rate()
  * chose. Since PR #2116 commit 961093f2 that request is served whether or not the hardware
  * speaks it, so silence here is ambiguous — it could mean a native stream or an undisclosed
- * conversion sitting in the local hop. One line at open removes the ambiguity. Reported,
- * never enforced: require_native is left at 0 deliberately (see the DATA PATH note in this
- * file's header).
+ * conversion sitting in the local hop. One line at open removes the ambiguity. The format
+ * stage is reported, never refused — it is the trade the DATA PATH note in this file's
+ * header argues for. The RATE stage is stronger than reported wherever the libhamlib has
+ * PR #2172's per-stage require_native: open_stream() demands it natively, so a resample
+ * cannot appear in this line at all — the open it rode in on has already been refused.
+ * Against an older libhamlib the demand does not exist and this report is the only guard.
  *
  * `rate` is passed in rather than re-read from the stream so this line names the rate the
  * bridge actually opened at. It used to print a hardcoded "48k", which was true only while
@@ -618,6 +626,15 @@ static int open_stream(RIG *rig, rig_stream_type_t type, int channels, int rate,
     cfg->format = RIG_STREAM_FORMAT_PCM_S16;
     cfg->sample_rate = rate;
     cfg->channels = channels;
+#ifdef NAUDIO_HAMLIB_HAS_REQUIRE_NATIVE_MASK
+    /* Resample = refuse the open; format conversion = fine. negotiate_rate() already picks a
+     * native rate whenever the backend publishes one, so in the ordinary case this demand is
+     * met by construction and costs nothing. What it adds is the guarantee the choice alone
+     * never had: if a backend, a configuration change, or a blind negotiation (no native
+     * rates published) would put a resample inside the very hop this bridge exists to keep
+     * short, the open fails loudly at startup instead of the audio quietly degrading. */
+    cfg->require_native = RIG_STREAM_CONV_RATE;
+#endif
     int r = rig_stream_open(rig, cfg, out);
     rig_stream_config_free(cfg);
     if (r == RIG_OK) {
@@ -626,6 +643,16 @@ static int open_stream(RIG *rig, rig_stream_type_t type, int channels, int rate,
     }
     fprintf(stderr, "na_hamlib_bridge: rig_stream_open(type=%d, S16@%d/%dch): %s\n",
             (int)type, rate, channels, rigerror(r));
+#ifdef NAUDIO_HAMLIB_HAS_REQUIRE_NATIVE_MASK
+    if (r == -RIG_ENAVAIL) {
+        /* The distinct code rig_stream_open documents for exactly this refusal. */
+        fprintf(stderr,
+            "  Refused rather than resampled: serving S16@%d would resample, and this bridge\n"
+            "  demands a native sample rate (require_native=RATE). The native rates are in the\n"
+            "  caps dump below — negotiate_rate() picks from them when the backend publishes\n"
+            "  any, so landing here usually means it could not.\n", rate);
+    }
+#endif
     int n = rig_stream_caps_count(rig);
     for (int i = 0; i < n; i++) {
         const struct rig_stream_caps *c = rig_stream_caps_at(rig, i);

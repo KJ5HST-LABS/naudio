@@ -46,16 +46,17 @@ a version number, so a wrong libhamlib can never break the rest of the build —
 produces no bridge. That is deliberate, and it is also why the failure looks like a broken flag
 instead of a missing dependency.
 
-The API moved twice during review and can still move now that it is in `master`, so that presence
-gate is not enough on its own: two further checks detect *which* revision you have and compile the
+The API moved twice during review and has moved once since it reached `master`, so that presence
+gate is not enough on its own: three further checks detect *which* revision you have and compile the
 matching code, rather than assuming the newest shape. They also remain necessary because a prefix
 built before the merge is still perfectly usable — the checks describe revisions, not a timeline.
-Both are capability checks, never version comparisons.
+All are capability checks, never version comparisons.
 
 | Check | Arrived in | What it selects |
 |---|---|---|
 | `rig_stream_get_conversions` | `961093f2` | whether the bridge can report the conversion stages libhamlib is running for it |
 | `struct rig_stream_caps.channels` | `b538567b` | whether openable channel counts are an exact 0-terminated **list** or a `channels_min`/`channels_max` **range** |
+| `RIG_STREAM_CONV_ALL` | PR [#2172](https://github.com/Hamlib/Hamlib/pull/2172) head `a3fc759` (open at the time of writing) | whether `require_native` is a **per-stage mask** of `RIG_STREAM_CONV_*` — in which case the bridge demands a native sample rate at open — or the older all-or-nothing boolean, which it leaves at 0 |
 
 The second is a struct-field change, so `check_symbol_exists` cannot see it — a prefix on either side
 of that commit exports identical symbols, and the mismatch would surface only as a compile error.
@@ -87,7 +88,7 @@ of that commit exports identical symbols, and the mismatch would surface only as
 |---|---|
 | Repository | `https://github.com/Hamlib/Hamlib.git` — upstream, since PR #2116 merged |
 | Branch | `master` |
-| Verified at | commits `2ef1e1d`, `961093f2` and `b538567b` on the pre-merge fork branch, and upstream `master` after the merge — the bridge builds and runs against all of them |
+| Verified at | commits `2ef1e1d`, `961093f2` and `b538567b` on the pre-merge fork branch, upstream `master` after the merge (most recently `e4c8d09`, 2026-08-27), and the PR [#2172](https://github.com/Hamlib/Hamlib/pull/2172) head `a3fc759` — the bridge builds and runs against all of them |
 | Reports as | `pkg-config --modversion hamlib` → `5.0.0~git` |
 
 naudio tracks upstream `master`'s head rather than pinning a commit. That is a decision, not an
@@ -469,12 +470,33 @@ resample instead of removing it, and invisibly, since nothing on the TX path rep
 Where the two directions share no native rate at all, RX wins: it is the mandatory stream and runs
 continuously, while TX only carries audio while an operator is keyed.
 
-**What it does not do.** It does not set `require_native = 1`. That flag is all-or-nothing across
-*both* axes, and the format axis cannot move — naudio's ABI carries signed 16-bit PCM, so demanding
-native format would fail outright against the dummy (which advertises `PCM_F32|OPUS`) and, on
-hardware, would only relocate the F32→S16 quantization into the bridge. Negotiating the rate just
-removes one stage from what the conversion line has to report: `conv=0x1` (format only) instead of
-`conv=0x3` (format + resample).
+**The choice is now also enforced — where the libhamlib can express it.** Choosing a native rate
+and *demanding* one used to be different things: `require_native` was all-or-nothing across every
+axis, and the format axis cannot move — naudio's ABI carries signed 16-bit PCM, so demanding native
+format would fail outright against the dummy (which advertises `PCM_F32|OPUS`) and, on hardware,
+would only relocate the F32→S16 quantization into the bridge. naudio asked on PR #2116 for the
+demand to be per-stage, and Hamlib PR [#2172](https://github.com/Hamlib/Hamlib/pull/2172) delivers
+exactly that: `require_native` now takes the same `RIG_STREAM_CONV_*` constants the conversion
+report speaks. Built against such a libhamlib (the `RIG_STREAM_CONV_ALL` gate above), the bridge
+sets `require_native = RIG_STREAM_CONV_RATE` on every open — resample = refuse with
+`-RIG_ENAVAIL`, format conversion = fine. In the ordinary case the demand is met by construction
+(the negotiation already picked a native rate) and changes nothing; what it adds is the guarantee
+the choice alone never had — a backend or configuration change that would quietly reintroduce a
+resample now fails the open loudly at startup instead of degrading the audio. Against a
+pre-#2172 libhamlib the demand compiles out, `require_native` stays 0, and negotiating the rate
+just removes one stage from what the conversion line has to report: `conv=0x1` (format only)
+instead of `conv=0x3` (format + resample).
+
+Measured (2026-08-27, dummy backend, PR #2172 head `a3fc759` vs upstream master `e4c8d09`): a
+probe opening S16 at a non-native 44100 with `require_native=RATE` is refused `-RIG_ENAVAIL`; the
+identical open with no demand succeeds with `conv=0x3` — so the refusal is the demand and nothing
+else — and the 48 kHz native open under the same demand runs `conv=0x1` with no over-refusal. The
+same three arms hold over netrigctl (`-m 2`) against **both** an old and a new `rigctld`: the new
+*client-side* frontend enforces the demand locally from the advertised caps before anything
+crosses the wire. An old server does silently ignore the `require_native=` key itself (measured:
+`RPRT 0` even for a bogus value, where a new server answers `RPRT -1`), so the wire-level demand
+only binds where the *server* is new too — the local check is what covers the old-peer case, and
+it covers every stage the advertised caps can predict.
 
 Against a libhamlib older than PR [#2116](https://github.com/Hamlib/Hamlib/pull/2116) commit
 `961093f2` the `native_*` caps fields do not exist, the negotiation compiles out, and the bridge
