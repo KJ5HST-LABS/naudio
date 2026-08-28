@@ -5,6 +5,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-08-28
+
+**The spec-1.2 release: per-subscription RX format grants, the client request ABI, and the
+per-stage native-rate demand in the Hamlib bridge.** The behavior change that makes this 0.5.0
+is the refusal of a no-reliability UDP configuration (first entry below).
+
 ### Changed
 - **`na_hamlib_bridge` now *demands* the native sample rate it was already choosing, when its
   libhamlib can express that** — Hamlib PR
