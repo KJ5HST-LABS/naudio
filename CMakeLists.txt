@@ -993,3 +993,61 @@ endif()
 # NAUDIO_BUILD_APPS.
 # ----------------------------------------------------------------------------
 add_subdirectory(examples)
+
+# ----------------------------------------------------------------------------
+# CPack — binary packages (issue #93). TGZ is the default, relocatable shape on
+# every platform (the installed tools self-locate libnaudio through the relative
+# rpath set near the top of this file); the release workflow additionally asks
+# for DEB + RPM on Linux and ZIP on Windows via `cpack -G`. A release-shaped
+# tree configures with NAUDIO_BUNDLE_PORTAUDIO=ON and (POSIX) a --static
+# streaming-hamlib prefix, so the packaged binaries carry no dependency a
+# package manager cannot satisfy — the release workflow asserts that on the
+# artifacts themselves, never on this configuration having been used.
+#
+# Top-level only: a parent project embedding naudio via FetchContent/
+# add_subdirectory must not inherit naudio's packaging identity.
+# ----------------------------------------------------------------------------
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(CPACK_PACKAGE_NAME "naudio")
+    set(CPACK_PACKAGE_VENDOR "KJ5HST")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+        "net-audio streaming toolkit: C ABI, multi-tenant server/client, reliability stack")
+    set(CPACK_PACKAGE_DESCRIPTION "${PROJECT_DESCRIPTION}")
+    set(CPACK_PACKAGE_CONTACT "KJ5HST <kj5hst@deppe.com>")
+    set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/KJ5HST/naudio")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+    set(CPACK_STRIP_FILES ON)
+
+    # naudio-<version>-<os>-<arch>: lowercase, human-first names (Darwin is
+    # "macos" to the people downloading it), uniform across the three
+    # per-platform CPack generators so the release page sorts as one family.
+    string(TOLOWER "${CMAKE_SYSTEM_NAME}" NAUDIO_PKG_OS)
+    if(NAUDIO_PKG_OS STREQUAL "darwin")
+        set(NAUDIO_PKG_OS "macos")
+    endif()
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" NAUDIO_PKG_ARCH)
+    if(NAUDIO_PKG_ARCH STREQUAL "amd64")
+        set(NAUDIO_PKG_ARCH "x86_64")
+    endif()
+    set(CPACK_PACKAGE_FILE_NAME
+        "naudio-${PROJECT_VERSION}-${NAUDIO_PKG_OS}-${NAUDIO_PKG_ARCH}")
+    set(CPACK_GENERATOR "TGZ")
+
+    # DEB/RPM install under /usr (the generators' default packaging prefix), so
+    # the Linux release job configures with CMAKE_INSTALL_PREFIX=/usr and the
+    # installed naudio.pc / naudioConfig.cmake are truthful after `dpkg -i`.
+    # SHLIBDEPS computes Depends from what the binaries actually link (libasound2
+    # etc. — measured, not hand-maintained); PRIVATE_DIRS keeps dpkg-shlibdeps
+    # from failing on the package's OWN libnaudio, which no installed package
+    # provides at build time.
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS_PRIVATE_DIRS "${CMAKE_INSTALL_LIBDIR}")
+    set(CPACK_DEBIAN_PACKAGE_SECTION "hamradio")
+    set(CPACK_DEBIAN_FILE_NAME "${CPACK_PACKAGE_FILE_NAME}.deb")
+    set(CPACK_RPM_PACKAGE_LICENSE "LGPL-2.1-or-later")
+    set(CPACK_RPM_PACKAGE_GROUP "Applications/Communications")
+    set(CPACK_RPM_FILE_NAME "${CPACK_PACKAGE_FILE_NAME}.rpm")
+
+    include(CPack)
+endif()
