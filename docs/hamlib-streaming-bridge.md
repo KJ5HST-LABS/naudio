@@ -151,6 +151,7 @@ Hamlib's ~200 backends parallelise well, so expect that figure to scale with cor
 | `--ref REF` | `master` | Branch, tag, or commit. Use a commit to pin. |
 | `--repo URL` | `https://github.com/Hamlib/Hamlib.git` | Override for a fork or mirror. |
 | `--jobs N` | detected CPU count | Parallel `make` jobs. |
+| `--static` | off (shared) | Static-only libhamlib, `--without-samplerate --without-libusb` — the release-packaging shape (issue #93): the bridge then **embeds** hamlib and ships with no dependency a package manager cannot satisfy. naudio's build detects the static-only prefix and links the static closure; the fault-injection test arm is honestly unregistered (a preload shim cannot interpose a statically linked call). Development builds want the default shared shape. |
 
 <details>
 <summary>Manual equivalent, if you would rather not run the script</summary>
