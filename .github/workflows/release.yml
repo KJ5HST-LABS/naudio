@@ -164,10 +164,21 @@ jobs:
 
       - name: Configure (release shape, prefix /usr so DEB/RPM metadata is truthful after install)
         run: |
+          # CMAKE_INSTALL_LIBDIR is pinned: with prefix /usr on a Debian-family
+          # host, GNUInstallDirs otherwise switches to the multiarch
+          # lib/x86_64-linux-gnu — measured by this gate's first run, where the
+          # tarball's lib/ globs went literal while the tools still ran (their
+          # rpath derives from CMAKE_INSTALL_LIBDIR and followed it). A plain
+          # lib/ keeps the relocatable tarball layout uniform across platforms,
+          # and /usr/lib is a loader-trusted directory on both DEB and RPM
+          # families (pkg-config's default search covers /usr/lib/pkgconfig on
+          # Debian; on RPM distros the .pc needs PKG_CONFIG_PATH — a GitHub
+          # convenience RPM, not distro-official packaging, per the issue's
+          # non-goals).
           PKG_CONFIG_PATH="${{ runner.temp }}/hamlib-static/lib/pkgconfig" \
             cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
                   -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON \
-                  -DCMAKE_INSTALL_PREFIX=/usr
+                  -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib
 
       - name: Build
         run: cmake --build build -j
