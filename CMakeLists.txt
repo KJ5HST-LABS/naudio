@@ -67,6 +67,24 @@ include(FetchContent)
 include(GNUInstallDirs)
 
 # ----------------------------------------------------------------------------
+# Installed-binary rpath (issue #93). The installed tools (na_wav_tap,
+# na_hamlib_bridge) link the SHARED libnaudio, which lands in <prefix>/lib while
+# they land in <prefix>/bin. CMake strips the build rpath at install time, so
+# without this an installed tool resolves libnaudio only through the loader's
+# default search path — which works for a /usr package and silently fails for a
+# relocatable tarball untarred anywhere else. A relative rpath makes the
+# installed tree self-locating wherever it is unpacked. Guarded so a packager
+# who sets a policy of their own (or strips rpaths entirely) is not overridden.
+# ----------------------------------------------------------------------------
+if(NOT DEFINED CMAKE_INSTALL_RPATH)
+    if(APPLE)
+        set(CMAKE_INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
+    elseif(UNIX)
+        set(CMAKE_INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+    endif()
+endif()
+
+# ----------------------------------------------------------------------------
 # Version drift gate (issue #31).
 #
 # include/naudio.h carries NAUDIO_VERSION_MAJOR/MINOR/PATCH as HAND-WRITTEN macros. The public
@@ -487,23 +505,29 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/naudio.pc.in"
 # All four targets relocate together under one export set, so a C++ consumer
 # linking naudio::naudio_net pulls the transitive naudio::naudio_core / Threads
 # automatically.
+# Component layout (issue #93): `runtime` = the shared C ABI library, `dev` =
+# headers + static archives + pkg-config + CMake package, `tools` = the installed
+# executables (tools/CMakeLists.txt). A plain `cmake --install` still installs
+# everything; the tags let a packager split, and put the .so/.dylib namelink with
+# the development files where DEB/RPM conventions expect it.
 install(TARGETS naudio naudio_core naudio_pa naudio_net
     EXPORT naudioTargets
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+            COMPONENT runtime NAMELINK_COMPONENT dev
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT dev
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime)
 
 # Public headers: the top-level C ABI header + the entire C++ API tree (naudio/**,
 # incl. export.h and net/). install(DIRECTORY) preserves the naudio/ and
 # naudio/net/ subdirs the #includes expect.
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/include/naudio.h"
-        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT dev)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/naudio"
-        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT dev
         FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h")
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/naudio.pc"
-        DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig" COMPONENT dev)
 
 # CMake package config: naudioTargets.cmake (relocatable target definitions) +
 # naudioConfig.cmake (recreates the Threads/PortAudio imported deps the C++ targets
@@ -512,7 +536,8 @@ set(NAUDIO_CMAKE_CONFIG_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/naudio")
 install(EXPORT naudioTargets
     FILE naudioTargets.cmake
     NAMESPACE naudio::
-    DESTINATION "${NAUDIO_CMAKE_CONFIG_DESTINATION}")
+    DESTINATION "${NAUDIO_CMAKE_CONFIG_DESTINATION}"
+    COMPONENT dev)
 configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/naudioConfig.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/naudioConfig.cmake"
@@ -524,7 +549,8 @@ write_basic_package_version_file(
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/naudioConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/naudioConfigVersion.cmake"
-    DESTINATION "${NAUDIO_CMAKE_CONFIG_DESTINATION}")
+    DESTINATION "${NAUDIO_CMAKE_CONFIG_DESTINATION}"
+    COMPONENT dev)
 
 # ----------------------------------------------------------------------------
 # Tests — GoogleTest (system/Homebrew preferred, FetchContent fallback).

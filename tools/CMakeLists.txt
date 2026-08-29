@@ -15,6 +15,10 @@
 if(NAUDIO_BUILD_APPS AND NOT WIN32)
     add_executable(na_audio_daemon na_audio_daemon.cpp)
     target_link_libraries(na_audio_daemon PRIVATE naudio_net naudio_pa)
+    # Ships in the binary packages (issue #93): the daemon is the operator-facing
+    # surface, and an installer without it is a dev-kit-only installer.
+    install(TARGETS na_audio_daemon
+            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
 endif()
 
 # ----------------------------------------------------------------------------
@@ -39,6 +43,11 @@ endif()
 if(NAUDIO_BUILD_APPS)
     add_executable(na_wav_tap na_wav_tap.c)
     target_link_libraries(na_wav_tap PRIVATE naudio)
+    # Installed on every platform it builds on — Windows included, deliberately:
+    # the remote end of an on-air check is frequently the operator's spare Windows
+    # box, which is why the target itself is not WIN32-gated (issue #93).
+    install(TARGETS na_wav_tap
+            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
 endif()
 
 # ----------------------------------------------------------------------------
@@ -124,6 +133,10 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
                 target_link_directories(na_hamlib_bridge PRIVATE ${HAMLIB_LIBRARY_DIRS})
                 target_link_libraries(na_hamlib_bridge
                                       PRIVATE naudio ${HAMLIB_LINK_LIBRARIES} Threads::Threads)
+                # Ships in the binary packages when built (issue #93, operator
+                # decision).
+                install(TARGETS na_hamlib_bridge
+                        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
                 if(NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)
                     target_compile_definitions(na_hamlib_bridge
                                                PRIVATE NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)
