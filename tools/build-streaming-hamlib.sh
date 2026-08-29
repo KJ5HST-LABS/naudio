@@ -24,6 +24,22 @@
 #   --ref REF      branch, tag or commit (default: master)
 #   --repo URL     git remote            (default: upstream Hamlib/Hamlib)
 #   --jobs N       parallel make jobs    (default: detected CPU count)
+#   --static       build a STATIC libhamlib (no shared library), configured
+#                  --without-samplerate --without-libusb. For release packaging
+#                  (issue #93): a bridge linked against this prefix embeds
+#                  hamlib, so the shipped binary carries no dependency on a
+#                  libhamlib no package manager can install yet — and no
+#                  environment-dependent extras either. samplerate costs
+#                  nothing the bridge uses (it DEMANDS the native rate and
+#                  refuses in-hamlib resampling — the PR #2172 work); dropping
+#                  libusb loses only the libusb-direct backends (USB-serial
+#                  rigs are /dev/tty* and unaffected) — build from source if
+#                  you need one. Also load-bearing: hamlib.pc's Libs.private
+#                  omits -lsamplerate (upstream .pc gap, measured 2026-08-29),
+#                  so a static build WITH samplerate underlinks every consumer
+#                  that trusts pkg-config --static, this script's own verify
+#                  probe included. naudio's build detects the static-only
+#                  prefix and links the static closure (tools/CMakeLists.txt).
 #   -h, --help
 #
 # The prefix must be durable: naudio's CMakeCache.txt records an ABSOLUTE path
@@ -52,6 +68,7 @@ src=""
 ref="$default_ref"
 repo="$default_repo"
 jobs=""
+static=0
 
 die() { printf 'build-streaming-hamlib: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -72,6 +89,7 @@ while [ $# -gt 0 ]; do
     --ref)    [ $# -ge 2 ] || die "--ref needs an argument";    ref="$2";    shift 2 ;;
     --repo)   [ $# -ge 2 ] || die "--repo needs an argument";   repo="$2";   shift 2 ;;
     --jobs)   [ $# -ge 2 ] || die "--jobs needs an argument";   jobs="$2";   shift 2 ;;
+    --static) static=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -161,18 +179,36 @@ if ! grep -q 'rig_stream_open' "$src/include/hamlib/rig.h"; then
 fi
 
 # ---------------------------------------------------------------------------
-# Build. --without-cxx-binding and --disable-static drop artifacts the bridge
-# never links (it is pure C against the shared library); --disable-dependency-
-# tracking is a one-shot-build speedup. None of the three is required — they
-# just make this faster. The prefix is the part that matters.
+# Build. --without-cxx-binding drops an artifact the bridge never links (it is
+# pure C), and --disable-dependency-tracking is a one-shot-build speedup;
+# neither is required — they just make this faster. The library shape IS
+# required: the default builds shared-only (what a development prefix wants —
+# rebuilds relink automatically), --static builds static-only (what a shipped
+# bridge wants — the binary embeds hamlib and depends on no libhamlib the
+# user cannot install). Never both: a prefix with both shapes makes which one
+# the linker picked an accident of the toolchain.
 # ---------------------------------------------------------------------------
+if [ "$static" = 1 ]; then
+  # --without-samplerate / --without-libusb: see the --static help text above.
+  # Explicit rather than left to auto-detection, so the static shape does not
+  # vary with what happens to be installed on the build machine.
+  shape_flags="--enable-static --disable-shared --without-samplerate --without-libusb"
+  pc_static_flag="--static"
+else
+  shape_flags="--disable-static"
+  pc_static_flag=""
+fi
+
 step "Bootstrapping (autoreconf)"
 ( cd "$src" && ./bootstrap )
 
-step "Configuring --prefix=$prefix"
+shape_desc="shared"
+[ "$static" = 1 ] && shape_desc="static"
+step "Configuring --prefix=$prefix ($shape_desc libhamlib)"
+# shellcheck disable=SC2086  # shape_flags is a deliberate word-split
 ( cd "$src" && ./configure --prefix="$prefix" \
                            --without-cxx-binding \
-                           --disable-static \
+                           $shape_flags \
                            --disable-dependency-tracking )
 
 step "Building (make -j$jobs)"
@@ -207,9 +243,11 @@ int main(void) {
     return 0;
 }
 PROBE
-# shellcheck disable=SC2046  # word splitting of pkg-config output is intended
+# A static-only prefix needs the PRIVATE closure (-lm etc.) that plain --libs
+# omits — exactly the underlink naudio's own build guards against; mirror it.
+# shellcheck disable=SC2046,SC2086  # word splitting of pkg-config output is intended
 if ! ${CC:-cc} -o "$probe/probe" "$probe/probe.c" \
-       $(PKG_CONFIG_PATH="$pkgdir" pkg-config --cflags --libs hamlib) 2>"$probe/err"; then
+       $(PKG_CONFIG_PATH="$pkgdir" pkg-config $pc_static_flag --cflags --libs hamlib) 2>"$probe/err"; then
   sed 's/^/      /' "$probe/err" >&2
   die "libhamlib $version installed, but rig_stream_open did not compile+link.
     naudio's build applies the same test, so it would skip na_hamlib_bridge."

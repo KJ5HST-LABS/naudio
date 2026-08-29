@@ -85,9 +85,31 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
                             "skipping na_hamlib_bridge. Set PKG_CONFIG_PATH=<prefix>/lib/pkgconfig "
                             "on the cmake configure line." ${NAUDIO_HAMLIB_HELP})
         else()
+            # Which link closure? A static-only prefix (build-streaming-hamlib.sh
+            # --static, the release-packaging shape — issue #93) resolves
+            # -lhamlib to libhamlib.a, whose PRIVATE closure (-ldl etc.) the
+            # shared link line legitimately omits. Underlinking the archive
+            # fails not just the final link but the capability PROBES below —
+            # which report a plain FALSE on a link failure, so the bridge would
+            # be skipped with a warning that blames the wrong thing. Decide by
+            # what pkg-config actually resolved, never by a flag: a .a in the
+            # list IS the static case. HAMLIB_STATIC_LDFLAGS (the raw -L/-l
+            # flag list), not HAMLIB_STATIC_LINK_LIBRARIES — the latter is
+            # EMPTY here (measured, CMake 4.1 FindPkgConfig against this
+            # static-only prefix) while the flag list carries the closure.
+            if(HAMLIB_LINK_LIBRARIES MATCHES "\\.a(;|$)")
+                set(NAUDIO_HAMLIB_LIBS ${HAMLIB_STATIC_LDFLAGS})
+                # Read by the fault-arm registration in the top-level CMakeLists
+                # (after add_subdirectory(tools)): a preload shim cannot
+                # interpose calls into a statically linked hamlib.
+                set(NAUDIO_HAMLIB_STATIC_ONLY TRUE PARENT_SCOPE)
+            else()
+                set(NAUDIO_HAMLIB_LIBS ${HAMLIB_LINK_LIBRARIES})
+                set(NAUDIO_HAMLIB_STATIC_ONLY FALSE PARENT_SCOPE)
+            endif()
             include(CheckSymbolExists)
             set(CMAKE_REQUIRED_INCLUDES ${HAMLIB_INCLUDE_DIRS})
-            set(CMAKE_REQUIRED_LIBRARIES ${HAMLIB_LINK_LIBRARIES})
+            set(CMAKE_REQUIRED_LIBRARIES ${NAUDIO_HAMLIB_LIBS})
             check_symbol_exists(rig_stream_open "hamlib/rig.h" NAUDIO_HAMLIB_HAS_STREAM)
             # Hamlib PR #2116 commit 961093f2 moved sample-format/rate/channel conversion out of
             # the backends and into the streaming core, and added rig_stream_get_conversions() to
@@ -132,9 +154,12 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
                 target_include_directories(na_hamlib_bridge PRIVATE ${HAMLIB_INCLUDE_DIRS})
                 target_link_directories(na_hamlib_bridge PRIVATE ${HAMLIB_LIBRARY_DIRS})
                 target_link_libraries(na_hamlib_bridge
-                                      PRIVATE naudio ${HAMLIB_LINK_LIBRARIES} Threads::Threads)
+                                      PRIVATE naudio ${NAUDIO_HAMLIB_LIBS} Threads::Threads)
                 # Ships in the binary packages when built (issue #93, operator
-                # decision).
+                # decision). Release builds link a STATIC libhamlib (see
+                # build-streaming-hamlib.sh --static and the closure pick above)
+                # so the installed binary carries no dependency on a libhamlib
+                # no package manager can satisfy yet.
                 install(TARGETS na_hamlib_bridge
                         RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
                 if(NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)

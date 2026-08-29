@@ -62,6 +62,14 @@ endif()
 
 option(NAUDIO_BUILD_TESTS "Build naudio unit tests" ON)
 option(NAUDIO_BUILD_APPS  "Build naudio demo apps"  ON)
+# Force the FetchContent PortAudio (static, PIC, linked INTO libnaudio) even when a
+# system PortAudio exists. This is the release-packaging switch (issue #93): a binary
+# package must not change shape with the builder's environment — a runner image that
+# happens to grow a system PortAudio would otherwise silently turn a self-contained
+# libnaudio into one referencing a Homebrew/apt dylib the user may not have. OFF for
+# development, where the system path is the supported default.
+option(NAUDIO_BUNDLE_PORTAUDIO
+       "Ignore any system PortAudio and build the bundled static one into libnaudio" OFF)
 
 include(FetchContent)
 include(GNUInstallDirs)
@@ -297,15 +305,22 @@ target_link_libraries(naudio_core PUBLIC Threads::Threads)
 # environment (the local build resolves PortAudio through pkg-config).
 # ----------------------------------------------------------------------------
 set(NAUDIO_PORTAUDIO_TARGET "")
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(PORTAUDIO QUIET IMPORTED_TARGET portaudio-2.0)
-    if(TARGET PkgConfig::PORTAUDIO)
-        set(NAUDIO_PORTAUDIO_TARGET PkgConfig::PORTAUDIO)
+if(NOT NAUDIO_BUNDLE_PORTAUDIO)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(PORTAUDIO QUIET IMPORTED_TARGET portaudio-2.0)
+        if(TARGET PkgConfig::PORTAUDIO)
+            set(NAUDIO_PORTAUDIO_TARGET PkgConfig::PORTAUDIO)
+        endif()
     endif()
 endif()
 if(NOT NAUDIO_PORTAUDIO_TARGET)
-    message(STATUS "naudio: PortAudio not found locally; fetching v19.7.0 from source")
+    if(NAUDIO_BUNDLE_PORTAUDIO)
+        message(STATUS "naudio: NAUDIO_BUNDLE_PORTAUDIO=ON — ignoring any system PortAudio; "
+                       "fetching v19.7.0 from source")
+    else()
+        message(STATUS "naudio: PortAudio not found locally; fetching v19.7.0 from source")
+    endif()
     # PortAudio v19.7.0 still ships cmake_minimum_required(VERSION <3.5), which
     # CMake >= 4.0 rejects outright (CMP0000) unless the policy floor is lowered.
     # Scope CMAKE_POLICY_VERSION_MINIMUM to just the fetched sub-build so naudio
@@ -864,6 +879,21 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
     # issues #5 and #6 describe (the Hamlib dummy has no error-injection knob, and it routes reads
     # through its own caps->stream_read hook).
     #
+    # NOT registered against a static-only hamlib prefix (build-streaming-hamlib.sh --static, the
+    # release-packaging shape — issue #93): rig_stream_read/write are then linked INTO
+    # na_hamlib_bridge as direct calls, so there is no dynamic symbol for DYLD_INSERT_LIBRARIES /
+    # LD_PRELOAD to bind and the arm can only fail as a harness fault — which is exactly what it
+    # did (measured: "the shim loaded but rig_stream_read was never interposed", 478/479). Skipped
+    # at REGISTRATION with a STATUS naming the reason, matching how WIN32 and TSan exclusions are
+    # handled above, so the release suite is honestly green rather than structurally red — and the
+    # CI hamlib-bridge job, which builds the SHARED prefix, still asserts this arm BY NAME on every
+    # run, so the coverage cannot silently vanish from the matrix.
+    if(NAUDIO_HAMLIB_STATIC_ONLY)
+        message(STATUS "naudio: naudio_bridge_fault_arm NOT registered — static libhamlib: the "
+                       "preload shim has no dynamic rig_stream_* to interpose. Fault coverage "
+                       "needs the default shared-libhamlib prefix.")
+    else()
+    #
     # SHARED, and NOT MODULE, even though nothing links it. MODULE builds a -bundle on macOS, and
     # DYLD_INSERT_LIBRARIES flatly refuses one: `cannot link against bundle`, at which point dyld
     # aborts the process before main. Measured — the arms failed as harness faults, not as bridge
@@ -899,6 +929,8 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
                           "$<TARGET_FILE:na_hamlib_bridge>"
                           "$<TARGET_FILE:naudio_bridge_probe>"
                           "$<TARGET_FILE:naudio_failshim>")
+    message(STATUS "naudio: naudio_bridge_fault_arm enabled (na_hamlib_bridge present)")
+    endif()
 
     # netrigctl arm (issue #88 item 8) — the ONLY arm that drives `-m 2`. Every other bridge arm
     # runs the dummy backend in-process, so the `\stream_open` round trip over a wire had no
@@ -933,7 +965,10 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
     # The bridge arms bind fixed ports and all drive a dummy backend, so they are serialised rather
     # than left to race a port bind under `ctest -j`. The netrigctl arm binds a second (TCP) port of
     # its own for rigctld and is held under the same lock for the same reason.
-    set(NAUDIO_BRIDGE_ARMS naudio_bridge_arm naudio_bridge_fault_arm)
+    set(NAUDIO_BRIDGE_ARMS naudio_bridge_arm)
+    if(NOT NAUDIO_HAMLIB_STATIC_ONLY)
+        list(APPEND NAUDIO_BRIDGE_ARMS naudio_bridge_fault_arm)
+    endif()
     if(NAUDIO_RIGCTLD)
         list(APPEND NAUDIO_BRIDGE_ARMS naudio_netrigctl_arm)
     endif()
@@ -948,7 +983,6 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
     # sit for ~29 minutes before anyone intervened.
     set_tests_properties(${NAUDIO_BRIDGE_ARMS} PROPERTIES TIMEOUT 600)
     unset(NAUDIO_BRIDGE_ARMS)
-    message(STATUS "naudio: naudio_bridge_fault_arm enabled (na_hamlib_bridge present)")
 endif()
 
 # ----------------------------------------------------------------------------
