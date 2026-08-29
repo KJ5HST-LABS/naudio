@@ -1,0 +1,367 @@
+name: Release
+
+# Build, gate and publish binary packages (issue #93).
+#
+# Two triggers, one pipeline:
+#   * push of a v* tag  — the release: every platform builds, the full suite runs,
+#     the PACKAGES themselves are gated (not the build tree they came from), and
+#     the artifacts land on a GitHub Release for that tag.
+#   * workflow_dispatch — the DRY RUN: byte-identical jobs, artifacts land as
+#     workflow artifacts only and no Release is touched. This is what makes the
+#     pipeline provable without cutting a release — the tag path differs only in
+#     the final attach job.
+#
+# Release shape (differs from ci.yml's development shape, deliberately):
+#   * NAUDIO_BUNDLE_PORTAUDIO=ON — the FetchContent static PortAudio is linked
+#     INTO libnaudio, so the package cannot silently grow a dependency on a
+#     Homebrew/apt dylib just because the runner image has one (the same
+#     determinism reasoning as the option's own comment in CMakeLists.txt).
+#   * POSIX: the bridge builds against a --static streaming libhamlib
+#     (tools/build-streaming-hamlib.sh --static), so the shipped binary embeds
+#     hamlib rather than referencing a library no package manager can install.
+#   * Every self-containment claim is asserted on the ARTIFACT with ldd/otool,
+#     never inferred from the configuration — a green build with the wrong
+#     flags would otherwise ship the wrong package (Learning 9's shape).
+#
+# The per-platform package gates below are the issue's acceptance criterion:
+# a PACKAGE-BASED install (unpacked tarball, dpkg -i, expanded zip) passes the
+# same external-consumer commands ci.yml runs against a build-tree install.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version-guard:
+    name: tag matches PROJECT_VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the pushed tag against project(naudio VERSION)
+        run: |
+          proj="$(sed -n 's/^ *VERSION \([0-9][0-9.]*\)$/\1/p' CMakeLists.txt | head -1)"
+          echo "PROJECT_VERSION=${proj}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Package files are named from PROJECT_VERSION, the Release from the
+            # tag. If they disagree, v0.5.1 would publish artifacts named 0.5.0 —
+            # caught here, before three platforms build them.
+            [ "v${proj}" = "${GITHUB_REF_NAME}" ] \
+              || { echo "::error::tag ${GITHUB_REF_NAME} != v${proj} (CMakeLists.txt project VERSION)"; exit 1; }
+            echo "tag ${GITHUB_REF_NAME} matches"
+          else
+            echo "dispatch dry run — no tag to compare"
+          fi
+
+  package-macos:
+    name: package (macos, TGZ)
+    runs-on: macos-latest
+    needs: version-guard
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the suite's version-skew arm pins old headers out of history (ci.yml:66)
+
+      - name: Install autotools (for the from-source libhamlib; PortAudio deliberately NOT installed)
+        run: brew install autoconf automake libtool
+
+      - name: Build a static streaming libhamlib
+        run: tools/build-streaming-hamlib.sh --static --prefix "${{ runner.temp }}/hamlib-static"
+
+      - name: Configure (release shape)
+        run: |
+          PKG_CONFIG_PATH="${{ runner.temp }}/hamlib-static/lib/pkgconfig" \
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                  -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON \
+                  -DCMAKE_INSTALL_PREFIX=/usr/local
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Assert all three tools were built — never the build's exit code
+        run: |
+          for t in na_audio_daemon na_wav_tap na_hamlib_bridge; do
+            test -x "build/tools/$t" || { echo "::error::$t was not built"; exit 1; }
+          done
+
+      - name: Test (full suite; the fault arm is honestly unregistered against a static hamlib)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package
+        run: cd build && cpack -G TGZ
+
+      - name: "Package gate: unpack, consume, run, scan"
+        run: |
+          set -euo pipefail
+          pkg=$(ls build/naudio-*.tar.gz)
+          echo "package: $pkg"
+          mkdir -p "${{ runner.temp }}/pkg"
+          tar xzf "$pkg" -C "${{ runner.temp }}/pkg" --strip-components 1
+          P="${{ runner.temp }}/pkg"
+
+          # Tools run from the unpacked tree with NO library-path environment —
+          # this is the relative-rpath contract the package relies on.
+          "$P/bin/na_wav_tap" --help > /dev/null
+          "$P/bin/na_audio_daemon" -h > /dev/null 2>&1
+          "$P/bin/na_hamlib_bridge" -h 2>&1 | grep -q '^usage:' \
+            || { echo "::error::na_hamlib_bridge from the package will not run"; exit 1; }
+          echo "all three tools run env-free from the package"
+
+          # Self-containment: every load command outside @rpath//usr/lib//System
+          # is a finding. Cardinality-checked (L230): exactly 4 binaries scanned.
+          scanned=0
+          for f in "$P"/bin/* "$P"/lib/libnaudio.*.*.*.dylib; do
+            scanned=$((scanned+1))
+            bad=$(otool -L "$f" | tail -n +2 | grep -v '@rpath\|/usr/lib/\|/System/' || true)
+            if [ -n "$bad" ]; then echo "::error::$f references non-system libraries:"; echo "$bad"; exit 1; fi
+          done
+          [ "$scanned" -eq 4 ] || { echo "::error::expected to scan 4 binaries, scanned $scanned"; exit 1; }
+          echo "otool scan clean over $scanned binaries"
+
+          # The external-consumer gate, against the PACKAGE (find_package path).
+          cmake -S tests/external-consumer -B consumer-build -DCMAKE_PREFIX_PATH="$P" > consumer.log 2>&1 \
+            || { cat consumer.log; echo "::error::find_package(naudio) failed against the package"; exit 1; }
+          grep -E 'external-consumer: naudio_pa arm (ENABLED|SKIPPED)' consumer.log
+          cmake --build consumer-build -j > /dev/null
+          DYLD_LIBRARY_PATH="$P/lib" ./consumer-build/consume_c   | tee -a consume.log
+          DYLD_LIBRARY_PATH="$P/lib" ./consumer-build/consume_cxx | tee -a consume.log
+          grep -q '^consume_c OK'   consume.log || { echo "::error::consume_c did not run"; exit 1; }
+          grep -q '^consume_cxx OK' consume.log || { echo "::error::consume_cxx did not run"; exit 1; }
+
+          # And the pkg-config path, relocated to wherever the tarball landed.
+          cflags=$(PKG_CONFIG_PATH="$P/lib/pkgconfig" pkg-config --define-prefix --cflags naudio)
+          libs=$(PKG_CONFIG_PATH="$P/lib/pkgconfig" pkg-config --define-prefix --libs naudio)
+          cc $cflags tests/external-consumer/consume_c.c $libs -o consume_c_pc
+          DYLD_LIBRARY_PATH="$P/lib" ./consume_c_pc | grep -q '^consume_c OK' \
+            || { echo "::error::pkg-config consumer did not run"; exit 1; }
+          echo "== macOS package gate: PASS =="
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-macos
+          path: build/naudio-*.tar.gz
+          if-no-files-found: error
+
+  package-linux:
+    name: package (linux, TGZ + DEB + RPM)
+    runs-on: ubuntu-latest
+    needs: version-guard
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build deps (ALSA for the bundled PortAudio; rpm for cpack; NO portaudio19-dev)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config autoconf automake libtool build-essential rpm
+
+      - name: Build a static streaming libhamlib
+        run: tools/build-streaming-hamlib.sh --static --prefix "${{ runner.temp }}/hamlib-static"
+
+      - name: Configure (release shape, prefix /usr so DEB/RPM metadata is truthful after install)
+        run: |
+          PKG_CONFIG_PATH="${{ runner.temp }}/hamlib-static/lib/pkgconfig" \
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                  -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON \
+                  -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Assert all three tools were built — never the build's exit code
+        run: |
+          for t in na_audio_daemon na_wav_tap na_hamlib_bridge; do
+            test -x "build/tools/$t" || { echo "::error::$t was not built"; exit 1; }
+          done
+
+      - name: Test (full suite)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package (TGZ + DEB + RPM)
+        run: cd build && cpack -G TGZ && cpack -G DEB && cpack -G RPM
+
+      - name: "Package gate 1/3: tarball — unpack, consume, run, scan"
+        run: |
+          set -euo pipefail
+          pkg=$(ls build/naudio-*.tar.gz)
+          mkdir -p "${{ runner.temp }}/pkg"
+          tar xzf "$pkg" -C "${{ runner.temp }}/pkg" --strip-components 1
+          P="${{ runner.temp }}/pkg"
+
+          "$P/bin/na_wav_tap" --help > /dev/null
+          "$P/bin/na_audio_daemon" -h > /dev/null 2>&1
+          "$P/bin/na_hamlib_bridge" -h 2>&1 | grep -q '^usage:' \
+            || { echo "::error::na_hamlib_bridge from the package will not run"; exit 1; }
+          echo 'all three tools run env-free from the tarball ($ORIGIN rpath)'
+
+          # Self-containment: no hamlib/portaudio/samplerate/libusb reference and
+          # no unresolvable library. libasound &co are fine — they are what
+          # dpkg-shlibdeps declares. Cardinality-checked: exactly 4 binaries.
+          scanned=0
+          for f in "$P"/bin/* "$P"/lib/libnaudio.so.*.*; do
+            scanned=$((scanned+1))
+            ldd "$f" > ldd.out
+            if grep -Ei 'hamlib|portaudio|samplerate|libusb' ldd.out; then
+              echo "::error::$f references a library the package must not depend on"; exit 1; fi
+            if grep -F 'not found' ldd.out | grep -v 'libnaudio'; then
+              echo "::error::$f has unresolvable dependencies"; exit 1; fi
+          done
+          [ "$scanned" -eq 4 ] || { echo "::error::expected to scan 4 binaries, scanned $scanned"; exit 1; }
+          echo "ldd scan clean over $scanned binaries"
+
+          cmake -S tests/external-consumer -B consumer-build -DCMAKE_PREFIX_PATH="$P" > consumer.log 2>&1 \
+            || { cat consumer.log; echo "::error::find_package(naudio) failed against the tarball"; exit 1; }
+          grep -E 'external-consumer: naudio_pa arm (ENABLED|SKIPPED)' consumer.log
+          cmake --build consumer-build -j > /dev/null
+          LD_LIBRARY_PATH="$P/lib" ./consumer-build/consume_c   | tee -a consume.log
+          LD_LIBRARY_PATH="$P/lib" ./consumer-build/consume_cxx | tee -a consume.log
+          grep -q '^consume_c OK'   consume.log || { echo "::error::consume_c did not run"; exit 1; }
+          grep -q '^consume_cxx OK' consume.log || { echo "::error::consume_cxx did not run"; exit 1; }
+
+          cflags=$(PKG_CONFIG_PATH="$P/lib/pkgconfig" pkg-config --define-prefix --cflags naudio)
+          libs=$(PKG_CONFIG_PATH="$P/lib/pkgconfig" pkg-config --define-prefix --libs naudio)
+          cc $cflags tests/external-consumer/consume_c.c $libs -o consume_c_pc
+          LD_LIBRARY_PATH="$P/lib" ./consume_c_pc | grep -q '^consume_c OK' \
+            || { echo "::error::pkg-config consumer did not run"; exit 1; }
+          echo "== tarball gate: PASS =="
+
+      - name: "Package gate 2/3: DEB — actually install it, then consume /usr"
+        run: |
+          set -euo pipefail
+          # THE package-based install the acceptance criterion asks for: the real
+          # package manager placing real files under /usr, not an unpacked image.
+          sudo apt-get install -y ./build/naudio-*.deb
+          sudo ldconfig
+          dpkg -s naudio | sed -n '1,8p'
+
+          na_wav_tap --help > /dev/null
+          na_audio_daemon -h > /dev/null 2>&1
+          na_hamlib_bridge -h 2>&1 | grep -q '^usage:' \
+            || { echo "::error::installed na_hamlib_bridge will not run"; exit 1; }
+          echo "all three tools run from /usr/bin"
+
+          cmake -S tests/external-consumer -B deb-consumer > deb-consumer.log 2>&1 \
+            || { cat deb-consumer.log; echo "::error::find_package(naudio) failed against the installed DEB"; exit 1; }
+          cmake --build deb-consumer -j > /dev/null
+          ./deb-consumer/consume_c   | tee -a deb-consume.log
+          ./deb-consumer/consume_cxx | tee -a deb-consume.log
+          grep -q '^consume_c OK'   deb-consume.log || { echo "::error::consume_c did not run"; exit 1; }
+          grep -q '^consume_cxx OK' deb-consume.log || { echo "::error::consume_cxx did not run"; exit 1; }
+
+          # /usr/lib/pkgconfig is on pkg-config's default path — no env needed.
+          cc $(pkg-config --cflags naudio) tests/external-consumer/consume_c.c \
+             $(pkg-config --libs naudio) -o deb_consume_c_pc
+          ./deb_consume_c_pc | grep -q '^consume_c OK' \
+            || { echo "::error::pkg-config consumer did not run against the DEB"; exit 1; }
+          echo "== DEB gate: PASS =="
+
+      - name: "Package gate 3/3: RPM — content assertions (no rpm host here to install on)"
+        run: |
+          set -euo pipefail
+          rpm=$(ls build/naudio-*.rpm)
+          rpm -qlp "$rpm" > rpm-contents.txt
+          for want in /usr/bin/na_audio_daemon /usr/bin/na_wav_tap /usr/bin/na_hamlib_bridge \
+                      /usr/include/naudio.h /usr/lib/pkgconfig/naudio.pc; do
+            grep -qx "$want" rpm-contents.txt \
+              || { echo "::error::RPM is missing $want"; cat rpm-contents.txt; exit 1; }
+          done
+          echo "RPM carries the tools, the header and the pkgconfig file"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-linux
+          path: |
+            build/naudio-*.tar.gz
+            build/naudio-*.deb
+            build/naudio-*.rpm
+          if-no-files-found: error
+
+  package-windows:
+    name: package (windows, ZIP — lib + headers + na_wav_tap)
+    runs-on: windows-latest
+    needs: version-guard
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (bundled PortAudio; apps ON so na_wav_tap ships — ci.yml's windows-wav-tap rationale)
+        run: cmake -S . -B build -DNAUDIO_BUNDLE_PORTAUDIO=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Test (full suite)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        run: cd build; cpack -G ZIP -C Release
+
+      - name: "Package gate: expand, consume, run"
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem build/naudio-*.zip | Select-Object -First 1
+          if (-not $zip) { Write-Output "::error::no ZIP produced"; exit 1 }
+          Expand-Archive $zip.FullName -DestinationPath "${{ runner.temp }}/pkgroot"
+          $P = Get-ChildItem "${{ runner.temp }}/pkgroot" | Select-Object -First 1
+
+          # The one tool Windows ships. naudio.dll sits beside it in bin/.
+          & "$($P.FullName)/bin/na_wav_tap.exe" --help
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::na_wav_tap.exe from the package will not run"; exit 1 }
+
+          cmake -S tests/external-consumer -B consumer-build -DCMAKE_PREFIX_PATH="$($P.FullName)" 2>&1 |
+            Tee-Object -FilePath consumer.log
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::find_package(naudio) failed against the ZIP"; exit 1 }
+          if (-not (Select-String -Path consumer.log -Pattern 'naudio_pa arm SKIPPED' -Quiet)) {
+            Write-Output "::error::expected the naudio_pa arm to be SKIPPED on a host with no PortAudio"; exit 1
+          }
+          cmake --build consumer-build --config Release
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::consumer build failed"; exit 1 }
+
+          $env:PATH = "$($P.FullName)/bin;" + $env:PATH
+          & "consumer-build/Release/consume_c.exe"   2>&1 | Tee-Object -FilePath consume.log
+          & "consumer-build/Release/consume_cxx.exe" 2>&1 | Tee-Object -FilePath consume.log -Append
+          if (-not (Select-String -Path consume.log -Pattern '^consume_c OK' -Quiet)) {
+            Write-Output "::error::consume_c did not run"; exit 1 }
+          if (-not (Select-String -Path consume.log -Pattern '^consume_cxx OK' -Quiet)) {
+            Write-Output "::error::consume_cxx did not run"; exit 1 }
+          Write-Output "== Windows package gate: PASS =="
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-windows
+          path: build/naudio-*.zip
+          if-no-files-found: error
+
+  release:
+    name: attach artifacts to the GitHub Release
+    runs-on: ubuntu-latest
+    needs: [package-macos, package-linux, package-windows]
+    # Tag pushes only — a workflow_dispatch run is the dry run and stops at the
+    # uploaded workflow artifacts above.
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum naudio-* > sha256sums.txt && cat sha256sums.txt
+
+      - name: Create (or complete) the Release for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" --verify-tag --title "naudio $tag" \
+              --notes "Binary packages for $tag. See CHANGELOG.md for what changed. The DEB/RPM install under /usr; the tarballs are relocatable (tools find libnaudio via a relative rpath). na_hamlib_bridge is built against a static streaming libhamlib (Hamlib master) — no hamlib install required."
+          fi
+          gh release upload "$tag" dist/naudio-* dist/sha256sums.txt --clobber
+          gh release view "$tag" --json assets --jq '.assets[].name'

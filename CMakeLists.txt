@@ -1017,7 +1017,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/KJ5HST/naudio")
     set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
     set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
-    set(CPACK_STRIP_FILES ON)
+    if(NOT WIN32)
+        # MSVC keeps symbols in PDBs and ships no strip tool; POSIX release
+        # binaries are stripped at packaging time.
+        set(CPACK_STRIP_FILES ON)
+    endif()
 
     # naudio-<version>-<os>-<arch>: lowercase, human-first names (Darwin is
     # "macos" to the people downloading it), uniform across the three
