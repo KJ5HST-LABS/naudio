@@ -6,7 +6,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
-- **Binary packages** ([#93](https://github.com/KJ5HST/naudio/issues/93)). `cmake --install` now
+- **Binary packages** ([#93](https://github.com/KJ5HST-LABS/naudio/issues/93)). `cmake --install` now
   ships the tools (`na_audio_daemon`, `na_wav_tap`, and `na_hamlib_bridge` when built —
   `na_wav_tap` on Windows too), with `runtime`/`dev`/`tools` install components and a relative
   rpath so a relocatable tarball's tools find their own `libnaudio` wherever it is unpacked.
@@ -18,7 +18,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `NAUDIO_BUNDLE_PORTAUDIO=ON` links the bundled static PortAudio into `libnaudio`, and
   `tools/build-streaming-hamlib.sh --static` (new flag) builds a static-only streaming libhamlib
   the bridge embeds, so no shipped binary references a library a package manager cannot install.
-  A Homebrew tap ([`KJ5HST/homebrew-naudio`](https://github.com/KJ5HST/homebrew-naudio))
+  A Homebrew tap ([`KJ5HST-LABS/homebrew-naudio`](https://github.com/KJ5HST-LABS/homebrew-naudio))
   installs from source on macOS.
 
 ## [0.5.0] — 2026-08-28
