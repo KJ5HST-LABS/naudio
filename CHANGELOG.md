@@ -10,12 +10,27 @@ Everything in 0.5.0's ABI carries forward unchanged — the major bump formalize
 (and moves the soname), it does not break it.
 
 ### Changed
+- **The documentation now addresses a general reader.** The README opens with what naudio
+  does in plain language, a one-paragraph architecture, and an honest placement of the
+  amateur-radio material: the project's origin and a first-class use, with the Hamlib
+  bridge presented as the optional radio-specific bolt-on it is. The getting-started
+  guide leads with the shipped demo pair and collects the radio walkthroughs into one
+  clearly optional section.
 - **Version 1.0.0; `SOVERSION` 0 → 1.** The soname becomes `libnaudio.1` (`libnaudio.so.1` /
   `libnaudio.1.dylib`): consumers linked against a 0.x build must relink. No symbol, struct,
   or semantic changed in the same step — the declared-size compatibility mechanism and every
   `na_*` surface are exactly 0.5.0's.
 
 ### Added
+- **The demo pair ships in every package — Windows included.** `na_audio_source`
+  (broadcast an audio input, or a built-in test tone that needs no hardware) and
+  `na_c_play_to_speakers` (play a stream on the local speakers) install alongside the
+  tools, with man pages on POSIX. Two terminals give an audible end-to-end demo on one
+  machine; two machines give the real thing — no code involved. Both programs were made
+  Windows-portable for this (the same small time-call shim `na_wav_tap` uses; C11 atomics
+  via MSVC), and the Windows package gate now streams the packaged pair end to end as
+  part of every release build. The Debian package moved from section `hamradio` to
+  `sound` to match what naudio is.
 - **Release-candidate releases.** `vX.Y.ZrcN` tags now build the full package set with
   `rcN`-suffixed artifact names, `~rcN` DEB/RPM internal versions (so a candidate upgrades
   cleanly to the final release), and a GitHub Release marked *prerelease*. CMake's
