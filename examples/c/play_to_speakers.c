@@ -29,7 +29,9 @@
 // Output: the machine-readable `RESULT ...` line goes to STDOUT; all human logs
 // (events, the throughput meter, the summary) go to STDERR.
 
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L  // nanosleep + clock_gettime(CLOCK_MONOTONIC) on glibc
+#endif
 
 #include <signal.h>
 #include <stdatomic.h>
@@ -37,6 +39,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef _WIN32
+// Same portability posture as tools/na_wav_tap.c: the library underneath is fully
+// cross-platform, and only two POSIX facilities were in this file's way — a
+// millisecond sleep and a monotonic clock — so they are wrapped rather than the
+// demo being kept POSIX-only. The C11 atomics stay: MSVC provides <stdatomic.h>
+// in C11 mode (the build passes /experimental:c11atomics, see examples/CMakeLists.txt).
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 #include "naudio.h"  // the only audio header — pure C, no C++
 
@@ -116,6 +128,13 @@ static void on_signal(int sig) {
     g_stop = 1;
 }
 
+#ifdef _WIN32
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+
+// GetTickCount64: monotonic milliseconds since boot — the same contract the
+// POSIX arm gets from CLOCK_MONOTONIC, at the resolution this meter needs.
+static long long now_ms(void) { return (long long)GetTickCount64(); }
+#else
 static void sleep_ms(int ms) {
     struct timespec ts;
     ts.tv_sec  = ms / 1000;
@@ -128,6 +147,7 @@ static long long now_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
+#endif
 
 // ---- device listing / default-playback selection (SYSTEM backend) ------------------------
 #define MAX_DEVICES 128

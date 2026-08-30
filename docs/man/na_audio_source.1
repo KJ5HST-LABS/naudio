@@ -1,0 +1,109 @@
+.\" SPDX-License-Identifier: LGPL-2.1-or-later
+.TH NA_AUDIO_SOURCE 1 "2026-08-30" "naudio" "naudio manual"
+.SH NAME
+na_audio_source \- broadcast an audio input or a test tone as a naudio stream
+.SH SYNOPSIS
+.B na_audio_source
+.RB [ \-\-port
+.IR N ]
+.RB [ \-\-capture\-id
+.IR N ]
+.RB [ \-\-transport
+.IR tcp | udp ]
+.RB [ \-\-reliability
+.IR lan | wan ]
+.RB [ \-\-rate
+.IR HZ ]
+.RB [ \-\-channels
+.IR 1 | 2 ]
+.RB [ \-\-test\-tone ]
+.RB [ \-\-max\-clients
+.IR N ]
+.RB [ \-\-seconds
+.IR N ]
+.br
+.B na_audio_source \-\-list\-devices
+.SH DESCRIPTION
+.B na_audio_source
+is the simplest way to put audio on the network with naudio: it starts a
+streaming server and broadcasts either a local audio input (a microphone,
+line-in, or any capture device) or \(em with
+.B \-\-test\-tone
+\(em a built-in tone that needs no audio hardware at all.
+Anything that speaks the naudio protocol can listen:
+.BR na_c_play_to_speakers (1)
+plays the stream on another machine's speakers,
+.BR na_wav_tap (1)
+records it to a WAV file.
+.PP
+With
+.B \-\-test\-tone
+it is the out-of-the-box demo and the first thing to run on a new install:
+start it on one machine, point the player at that machine from anywhere on
+the network, and you hear the tone \(em proof the whole path works before
+any real audio source is involved.
+.SH OPTIONS
+.TP
+.BI \-\-port " N"
+port to listen on; 0 lets the OS pick one (default 4533).
+.TP
+.BI \-\-capture\-id " N"
+audio input device to broadcast, by the id shown by
+.B \-\-list\-devices
+(default: the first capture device).
+.TP
+.BI \-\-transport " tcp\fR|\fPudp"
+network transport (default tcp).
+Connecting clients must use the same one.
+.TP
+.BI \-\-reliability " lan\fR|\fPwan"
+loss-recovery profile for UDP (forward error correction, reordering,
+jitter buffering).
+UDP requires one \(em plain UDP with no recovery is refused.
+.TP
+.BI \-\-rate " HZ"
+sample rate, 8000..192000 and divisible by 50 (default 48000).
+naudio never resamples: in capture mode the device must support the
+requested rate or the start fails.
+Lower rates cost proportionally less network bandwidth \(em 12000\ Hz mono
+is 192\ kbps against the 1536\ kbps default.
+.TP
+.BI \-\-channels " N"
+1 (mono) or 2 (stereo, the default); server-wide, like
+.BR \-\-rate .
+.TP
+.B \-\-test\-tone
+broadcast a deterministic built-in tone instead of a capture device.
+Needs no audio hardware.
+.TP
+.BI \-\-max\-clients " N"
+maximum simultaneous listeners (default 4).
+.TP
+.BI \-\-seconds " N"
+run time in seconds; 0 runs until Ctrl-C (default 0).
+.TP
+.B \-\-list\-devices
+print the ids of capture-capable devices, then exit.
+.TP
+.BR \-h ", " \-\-help
+print usage and exit.
+.SH EXAMPLES
+Serve the test tone (no audio hardware needed):
+.PP
+.nf
+.RS
+na_audio_source \-\-test\-tone
+.RE
+.fi
+.PP
+Broadcast the first microphone on the machine over UDP with loss recovery:
+.PP
+.nf
+.RS
+na_audio_source \-\-transport udp \-\-reliability wan
+.RE
+.fi
+.SH SEE ALSO
+.BR na_c_play_to_speakers (1),
+.BR na_wav_tap (1),
+.BR na_audio_daemon (1)

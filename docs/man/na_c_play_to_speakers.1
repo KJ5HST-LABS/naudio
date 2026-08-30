@@ -1,0 +1,95 @@
+.\" SPDX-License-Identifier: LGPL-2.1-or-later
+.TH NA_C_PLAY_TO_SPEAKERS 1 "2026-08-30" "naudio" "naudio manual"
+.SH NAME
+na_c_play_to_speakers \- play a naudio stream on the local speakers
+.SH SYNOPSIS
+.B na_c_play_to_speakers
+.RB [ \-\-host
+.IR H ]
+.RB [ \-\-port
+.IR N ]
+.RB [ \-\-name
+.IR S ]
+.RB [ \-\-playback\-id
+.IR N ]
+.RB [ \-\-transport
+.IR tcp | udp ]
+.RB [ \-\-reliability
+.IR lan | wan | ft8 ]
+.RB [ \-\-seconds
+.IR N ]
+.RB [ \-\-backend
+.IR system | null ]
+.br
+.B na_c_play_to_speakers \-\-list\-devices
+.SH DESCRIPTION
+.B na_c_play_to_speakers
+connects to a naudio streaming server \(em
+.BR na_audio_source (1),
+.BR na_audio_daemon (1),
+or any application serving the protocol \(em and plays whatever it is
+streaming on this machine's speakers (or any output device).
+With no options it connects to a server on the local machine and plays to
+the default output: the listening half of the out-of-the-box demo.
+.PP
+It is also the reference client of the naudio examples suite \(em the same
+program exists in C++, Python, Java, and Rust in the source tree, each
+driving the identical public C API.
+.SH OPTIONS
+.TP
+.BI \-\-host " H"
+server to connect to (default 127.0.0.1).
+.TP
+.BI \-\-port " N"
+server port (default 4533).
+.TP
+.BI \-\-name " S"
+this client's name in the server's roster (default na-c-client).
+.TP
+.BI \-\-playback\-id " N"
+output device to play on, by the id shown by
+.B \-\-list\-devices
+(default: the first output device).
+.TP
+.BI \-\-transport " tcp\fR|\fPudp"
+network transport (default tcp) \(em must match the server's.
+.TP
+.BI \-\-reliability " lan\fR|\fPwan\fR|\fPft8"
+loss-recovery profile for UDP.
+UDP requires one \(em plain UDP with no recovery is refused.
+.TP
+.BI \-\-seconds " N"
+run time in seconds; 0 runs until Ctrl-C (default 0).
+.TP
+.BI \-\-backend " system\fR|\fPnull"
+.I system
+(default) plays to a real output device;
+.I null
+receives the stream but plays nothing \(em useful to check a connection on
+a machine with no sound output.
+.TP
+.B \-\-list\-devices
+print the ids of output devices, then exit.
+.TP
+.BR \-h ", " \-\-help
+print usage and exit.
+.SH EXAMPLES
+Listen to a server on the same machine:
+.PP
+.nf
+.RS
+na_c_play_to_speakers
+.RE
+.fi
+.PP
+Listen to another machine on the network:
+.PP
+.nf
+.RS
+na_c_play_to_speakers \-\-host 192.168.1.20
+.RE
+.fi
+.SH SEE ALSO
+.BR na_audio_source (1),
+.BR na_audio_daemon (1),
+.BR na_wav_tap (1)
