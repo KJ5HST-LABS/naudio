@@ -6,19 +6,19 @@ Every install path below ends in the same package: the shared `naudio` library (
 stable `na_*` C ABI), the C++ static archives and headers, `naudio.pc` for pkg-config,
 the CMake package for `find_package(naudio)`, and the command-line programs — the demo
 pair (`na_audio_source`, `na_c_play_to_speakers`: hear audio across two machines with no
-code), the device-serving daemon (`na_audio_daemon`), the stream recorder (`na_wav_tap`),
-and, where it can be built, the optional Hamlib bridge (`na_hamlib_bridge`) — with man
-pages on the platforms that read them.
+code), the device-serving daemon (`na_audio_daemon`), and the stream recorder
+(`na_wav_tap`) — with man pages on the platforms that read them. (The optional Hamlib
+bridge is a from-source build only for now; see the note under Option C.)
 
 Once installed, **[docs/getting-started.md](docs/getting-started.md)** is the walkthrough
 from an installed toolkit to audio streaming end to end.
 
 > **Current availability (2026-08).** naudio is not yet public — the repository is
-> private ahead of its planned Hamlib contribution. The first packaged release,
-> **v1.0.0rc1** (a prerelease), carries the full installer set: TGZ for Linux and macOS,
+> private ahead of its planned Hamlib contribution. The current packaged release,
+> **v1.0.0rc2** (a prerelease), carries the full installer set: TGZ for Linux and macOS,
 > DEB, RPM, a Windows ZIP, and `sha256sums.txt`. While the repository is private,
 > collaborators with access fetch packages with
-> `gh release download v1.0.0rc1 -R KJ5HST-LABS/naudio` rather than anonymous URLs, and
+> `gh release download v1.0.0rc2 -R KJ5HST-LABS/naudio` rather than anonymous URLs, and
 > the Homebrew tap installs over ssh. Everything else on this page is written for the
 > durable, public state and works unchanged once the repository is public.
 
@@ -27,8 +27,12 @@ from an installed toolkit to audio streaming end to end.
 Packages are attached to tagged releases on the
 [Releases page](https://github.com/KJ5HST-LABS/naudio/releases), named
 `naudio-<version>-<os>-<arch>` with a `sha256sums.txt` beside them. They are
-self-contained: PortAudio is built into the library, and `na_hamlib_bridge` embeds a
-static streaming libhamlib — no dependency a package manager cannot satisfy.
+self-contained — PortAudio is built into the library, and nothing in a package depends on
+anything a package manager cannot satisfy. Deliberately **not** in the packages:
+`na_hamlib_bridge`, which needs a streaming-capable libhamlib that no released Hamlib
+provides yet. Shipping it would mean embedding a frozen pre-release hamlib beside
+whatever hamlib your other applications carry; instead it joins the packages — linked
+against the system's real libhamlib — once a released Hamlib ships the streaming API.
 
 ### Debian / Ubuntu (.deb)
 
@@ -103,10 +107,9 @@ brew install naudio
 ```
 
 The formula builds the tagged release from source against Homebrew's PortAudio (the
-explicit tap URL is only needed while the tap is private). One difference from the
-binary packages: `na_hamlib_bridge` is **not** built (it needs a streaming-capable
-libhamlib no released Hamlib provides — the binary packages carry a self-contained one).
-The other tools and their man pages install from the formula from v1.0.0rc1 onward.
+explicit tap URL is only needed while the tap is private). Like the binary packages, it
+does not build `na_hamlib_bridge` (no released Hamlib provides the streaming API it
+needs). The programs and their man pages install from the formula from v1.0.0rc1 onward.
 
 ## Option C — from source
 

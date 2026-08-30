@@ -3,6 +3,20 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.0rc2] — 2026-08-30
+
+### Changed
+- **The binary packages no longer carry `na_hamlib_bridge`, and no release artifact embeds
+  or references any hamlib.** rc1 shipped the bridge with a static, frozen pre-release
+  hamlib built from Hamlib master — a second hamlib dialect sitting beside applications
+  that bundle their own (WSJT-class applications do). Until a released Hamlib actually
+  provides the streaming API, the bridge is a from-source build (unchanged:
+  `docs/hamlib-streaming-bridge.md`; CI still builds and tests it on every push). It
+  returns to the packages linked against the system's real libhamlib once such a release
+  exists — deliberately not pre-linked against a guessed pre-release soname, whose ABI has
+  already shifted more than once before release. The release gates now assert the bridge's
+  **absence** and the no-hamlib-reference rule on every artifact.
+
 ## [1.0.0rc1] — 2026-08-30
 
 **The 1.0 release candidate: the C ABI's first major, cut for pre-publication validation.**

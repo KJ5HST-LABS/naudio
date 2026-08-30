@@ -124,13 +124,16 @@ WAV files with `na_wav_tap` — it writes 12 kHz mono, aligned to FT8 periods wi
 **[on-air-verification.md](on-air-verification.md)**. The optional `na_hamlib_bridge`
 connects naudio to Hamlib's rig-audio streaming API for rigs whose audio arrives through
 Hamlib rather than a sound device; it works hardware-free against Hamlib's test rig
-today, but no released Hamlib (and no real rig backend yet) supports the API it needs —
-status and build instructions in **[hamlib-streaming-bridge.md](hamlib-streaming-bridge.md)**.
+today, but no released Hamlib (and no real rig backend yet) supports the API it needs, so
+it is a from-source build and deliberately not in the binary packages — shipping it would
+embed a frozen pre-release hamlib beside whatever hamlib your other radio software uses.
+Status and build instructions: **[hamlib-streaming-bridge.md](hamlib-streaming-bridge.md)**.
 
 ## Where next
 
 - The manual pages: `na_audio_source(1)`, `na_c_play_to_speakers(1)`,
-  `na_audio_daemon(1)`, `na_wav_tap(1)`, `na_hamlib_bridge(1)`.
+  `na_audio_daemon(1)`, `na_wav_tap(1)` — plus `na_hamlib_bridge(1)` on a from-source
+  build that includes the bridge.
 - Building an application on the library: the README's *C ABI* walkthrough, and the
   worked example clients in five languages under `examples/` in the source tree.
 - What's on the wire: the [protocol overview](protocols.md) and the

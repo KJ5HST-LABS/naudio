@@ -163,11 +163,12 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
                 target_link_directories(na_hamlib_bridge PRIVATE ${HAMLIB_LIBRARY_DIRS})
                 target_link_libraries(na_hamlib_bridge
                                       PRIVATE naudio ${NAUDIO_HAMLIB_LIBS} Threads::Threads)
-                # Ships in the binary packages when built (issue #93, operator
-                # decision). Release builds link a STATIC libhamlib (see
-                # build-streaming-hamlib.sh --static and the closure pick above)
-                # so the installed binary carries no dependency on a libhamlib
-                # no package manager can satisfy yet.
+                # Installed for whoever BUILDS it — but deliberately absent from
+                # the binary release packages since 1.0.0rc2: the release shape
+                # does not enable this option, so no release artifact embeds or
+                # references any hamlib (the release gates assert that absence).
+                # It returns to the packages, linked against the system's real
+                # libhamlib, once a released Hamlib ships the streaming API.
                 install(TARGETS na_hamlib_bridge
                         RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
                 # Installed only when the target is: a man page for a tool the

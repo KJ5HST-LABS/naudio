@@ -16,9 +16,14 @@ name: Release
 #     INTO libnaudio, so the package cannot silently grow a dependency on a
 #     Homebrew/apt dylib just because the runner image has one (the same
 #     determinism reasoning as the option's own comment in CMakeLists.txt).
-#   * POSIX: the bridge builds against a --static streaming libhamlib
-#     (tools/build-streaming-hamlib.sh --static), so the shipped binary embeds
-#     hamlib rather than referencing a library no package manager can install.
+#   * na_hamlib_bridge is deliberately NOT packaged, and no hamlib is embedded
+#     or referenced: no released Hamlib provides the streaming API the bridge
+#     needs, and shipping a frozen pre-release hamlib inside the binary would
+#     put a second hamlib dialect beside applications that carry their own
+#     (WSJT-class apps bundle one). The bridge stays fully built and tested
+#     from source (ci.yml's bridge job); it returns to the packages linked
+#     against the REAL released libhamlib the day one ships the streaming API
+#     — tracked in the repo issue opened for exactly that event.
 #   * Every self-containment claim is asserted on the ARTIFACT with ldd/otool,
 #     never inferred from the configuration — a green build with the wrong
 #     flags would otherwise ship the wrong package (Learning 9's shape).
@@ -74,33 +79,27 @@ jobs:
         with:
           fetch-depth: 0   # the suite's version-skew arm pins old headers out of history (ci.yml:66)
 
-      - name: Install autotools (for the from-source libhamlib; PortAudio deliberately NOT installed)
-        run: brew install autoconf automake libtool
-
-      - name: Build a static streaming libhamlib
-        run: tools/build-streaming-hamlib.sh --static --prefix "${{ runner.temp }}/hamlib-static"
-
       - name: Derive the pre-release suffix from the tag (empty on final tags and dry runs)
         run: echo "NAUDIO_PKG_SUFFIX=$(echo "${GITHUB_REF_NAME}" | sed -n 's/^v[0-9.]*\(rc[0-9][0-9]*\)$/\1/p')" >> "$GITHUB_ENV"
 
-      - name: Configure (release shape)
+      - name: Configure (release shape — no bridge, no hamlib; PortAudio bundled)
         run: |
-          PKG_CONFIG_PATH="${{ runner.temp }}/hamlib-static/lib/pkgconfig" \
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-                  -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON \
-                  -DCMAKE_INSTALL_PREFIX=/usr/local \
-                  -DNAUDIO_PKG_VERSION_SUFFIX="${{ env.NAUDIO_PKG_SUFFIX }}"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DNAUDIO_BUNDLE_PORTAUDIO=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DNAUDIO_PKG_VERSION_SUFFIX="${{ env.NAUDIO_PKG_SUFFIX }}"
 
       - name: Build
         run: cmake --build build -j
 
-      - name: Assert all three tools were built — never the build's exit code
+      - name: Assert the four shipped binaries were built — never the build's exit code
         run: |
-          for t in na_audio_daemon na_wav_tap na_hamlib_bridge; do
-            test -x "build/tools/$t" || { echo "::error::$t was not built"; exit 1; }
+          for t in tools/na_audio_daemon tools/na_wav_tap \
+                   examples/na_audio_source examples/na_c_play_to_speakers; do
+            test -x "build/$t" || { echo "::error::$t was not built"; exit 1; }
           done
 
-      - name: Test (full suite; the fault arm is honestly unregistered against a static hamlib)
+      - name: Test (full suite)
         run: ctest --test-dir build --output-on-failure
 
       - name: Package
@@ -121,20 +120,19 @@ jobs:
           "$P/bin/na_audio_daemon" -h > /dev/null 2>&1
           "$P/bin/na_audio_source" --help > /dev/null
           "$P/bin/na_c_play_to_speakers" --help > /dev/null
-          "$P/bin/na_hamlib_bridge" -h 2>&1 | grep -q '^usage:' \
-            || { echo "::error::na_hamlib_bridge from the package will not run"; exit 1; }
-          echo "all five shipped binaries run env-free from the package"
+          echo "all four shipped binaries run env-free from the package"
 
           # Self-containment: every load command outside @rpath//usr/lib//System
-          # is a finding. Cardinality-checked (L230): exactly 6 binaries scanned
-          # (3 tools + the demo pair + libnaudio).
+          # is a finding. Cardinality-checked (L230): exactly 5 binaries scanned
+          # (2 tools + the demo pair + libnaudio). A bin/na_hamlib_bridge here
+          # would trip the count — the bridge is deliberately not packaged.
           scanned=0
           for f in "$P"/bin/* "$P"/lib/libnaudio.*.*.*.dylib; do
             scanned=$((scanned+1))
             bad=$(otool -L "$f" | tail -n +2 | grep -v '@rpath\|/usr/lib/\|/System/' || true)
             if [ -n "$bad" ]; then echo "::error::$f references non-system libraries:"; echo "$bad"; exit 1; fi
           done
-          [ "$scanned" -eq 6 ] || { echo "::error::expected to scan 6 binaries, scanned $scanned"; exit 1; }
+          [ "$scanned" -eq 5 ] || { echo "::error::expected to scan 5 binaries, scanned $scanned"; exit 1; }
           echo "otool scan clean over $scanned binaries"
 
           # The external-consumer gate, against the PACKAGE (find_package path).
@@ -173,15 +171,12 @@ jobs:
       - name: Install build deps (ALSA for the bundled PortAudio; rpm for cpack; NO portaudio19-dev)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev pkg-config autoconf automake libtool build-essential rpm
-
-      - name: Build a static streaming libhamlib
-        run: tools/build-streaming-hamlib.sh --static --prefix "${{ runner.temp }}/hamlib-static"
+          sudo apt-get install -y libasound2-dev pkg-config build-essential rpm
 
       - name: Derive the pre-release suffix from the tag (empty on final tags and dry runs)
         run: echo "NAUDIO_PKG_SUFFIX=$(echo "${GITHUB_REF_NAME}" | sed -n 's/^v[0-9.]*\(rc[0-9][0-9]*\)$/\1/p')" >> "$GITHUB_ENV"
 
-      - name: Configure (release shape, prefix /usr so DEB/RPM metadata is truthful after install)
+      - name: Configure (release shape — no bridge, no hamlib; prefix /usr so DEB/RPM metadata is truthful after install)
         run: |
           # CMAKE_INSTALL_LIBDIR is pinned: with prefix /usr on a Debian-family
           # host, GNUInstallDirs otherwise switches to the multiarch
@@ -194,19 +189,19 @@ jobs:
           # Debian; on RPM distros the .pc needs PKG_CONFIG_PATH — a GitHub
           # convenience RPM, not distro-official packaging, per the issue's
           # non-goals).
-          PKG_CONFIG_PATH="${{ runner.temp }}/hamlib-static/lib/pkgconfig" \
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-                  -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON \
-                  -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib \
-                  -DNAUDIO_PKG_VERSION_SUFFIX="${{ env.NAUDIO_PKG_SUFFIX }}"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DNAUDIO_BUNDLE_PORTAUDIO=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib \
+                -DNAUDIO_PKG_VERSION_SUFFIX="${{ env.NAUDIO_PKG_SUFFIX }}"
 
       - name: Build
         run: cmake --build build -j
 
-      - name: Assert all three tools were built — never the build's exit code
+      - name: Assert the four shipped binaries were built — never the build's exit code
         run: |
-          for t in na_audio_daemon na_wav_tap na_hamlib_bridge; do
-            test -x "build/tools/$t" || { echo "::error::$t was not built"; exit 1; }
+          for t in tools/na_audio_daemon tools/na_wav_tap \
+                   examples/na_audio_source examples/na_c_play_to_speakers; do
+            test -x "build/$t" || { echo "::error::$t was not built"; exit 1; }
           done
 
       - name: Test (full suite)
@@ -227,14 +222,14 @@ jobs:
           "$P/bin/na_audio_daemon" -h > /dev/null 2>&1
           "$P/bin/na_audio_source" --help > /dev/null
           "$P/bin/na_c_play_to_speakers" --help > /dev/null
-          "$P/bin/na_hamlib_bridge" -h 2>&1 | grep -q '^usage:' \
-            || { echo "::error::na_hamlib_bridge from the package will not run"; exit 1; }
-          echo 'all five shipped binaries run env-free from the tarball ($ORIGIN rpath)'
+          echo 'all four shipped binaries run env-free from the tarball ($ORIGIN rpath)'
 
           # Self-containment: no hamlib/portaudio/samplerate/libusb reference and
           # no unresolvable library. libasound &co are fine — they are what
-          # dpkg-shlibdeps declares. Cardinality-checked: exactly 6 binaries
-          # (3 tools + the demo pair + libnaudio).
+          # dpkg-shlibdeps declares. The hamlib term now guards the operator
+          # decision directly: NOTHING in the package may reference any hamlib.
+          # Cardinality-checked: exactly 5 binaries (2 tools + the demo pair +
+          # libnaudio) — a packaged bridge would trip the count.
           scanned=0
           for f in "$P"/bin/* "$P"/lib/libnaudio.so.*.*; do
             scanned=$((scanned+1))
@@ -244,7 +239,7 @@ jobs:
             if grep -F 'not found' ldd.out | grep -v 'libnaudio'; then
               echo "::error::$f has unresolvable dependencies"; exit 1; fi
           done
-          [ "$scanned" -eq 6 ] || { echo "::error::expected to scan 6 binaries, scanned $scanned"; exit 1; }
+          [ "$scanned" -eq 5 ] || { echo "::error::expected to scan 5 binaries, scanned $scanned"; exit 1; }
           echo "ldd scan clean over $scanned binaries"
 
           cmake -S tests/external-consumer -B consumer-build -DCMAKE_PREFIX_PATH="$P" > consumer.log 2>&1 \
@@ -276,9 +271,9 @@ jobs:
           na_audio_daemon -h > /dev/null 2>&1
           na_audio_source --help > /dev/null
           na_c_play_to_speakers --help > /dev/null
-          na_hamlib_bridge -h 2>&1 | grep -q '^usage:' \
-            || { echo "::error::installed na_hamlib_bridge will not run"; exit 1; }
-          echo "all five shipped binaries run from /usr/bin"
+          if command -v na_hamlib_bridge > /dev/null; then
+            echo "::error::na_hamlib_bridge was installed by the DEB — the bridge must not be packaged"; exit 1; fi
+          echo "all four shipped binaries run from /usr/bin (and the bridge is absent, as intended)"
 
           cmake -S tests/external-consumer -B deb-consumer > deb-consumer.log 2>&1 \
             || { cat deb-consumer.log; echo "::error::find_package(naudio) failed against the installed DEB"; exit 1; }
@@ -300,13 +295,15 @@ jobs:
           set -euo pipefail
           rpm=$(ls build/naudio-*.rpm)
           rpm -qlp "$rpm" > rpm-contents.txt
-          for want in /usr/bin/na_audio_daemon /usr/bin/na_wav_tap /usr/bin/na_hamlib_bridge \
+          for want in /usr/bin/na_audio_daemon /usr/bin/na_wav_tap \
                       /usr/bin/na_audio_source /usr/bin/na_c_play_to_speakers \
                       /usr/include/naudio.h /usr/lib/pkgconfig/naudio.pc; do
             grep -qx "$want" rpm-contents.txt \
               || { echo "::error::RPM is missing $want"; cat rpm-contents.txt; exit 1; }
           done
-          echo "RPM carries the tools, the header and the pkgconfig file"
+          if grep -q 'na_hamlib_bridge' rpm-contents.txt; then
+            echo "::error::RPM carries na_hamlib_bridge — the bridge must not be packaged"; exit 1; fi
+          echo "RPM carries the four binaries, the header and the pkgconfig file; no bridge"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -423,7 +420,7 @@ jobs:
           case "$tag" in *rc[0-9]*) pre="--prerelease" ;; esac
           if ! gh release view "$tag" > /dev/null 2>&1; then
             gh release create "$tag" --verify-tag $pre --title "naudio $tag" \
-              --notes "Binary packages for $tag. See CHANGELOG.md for what changed. The DEB/RPM install under /usr; the tarballs are relocatable (tools find libnaudio via a relative rpath). na_hamlib_bridge is built against a static streaming libhamlib (Hamlib master) — no hamlib install required."
+              --notes "Binary packages for $tag. See CHANGELOG.md for what changed. The DEB/RPM install under /usr; the tarballs are relocatable (tools find libnaudio via a relative rpath). The Hamlib bridge (na_hamlib_bridge) is not included: it needs a streaming-capable libhamlib no released Hamlib provides yet, and it will join the packages — linked against the system's real libhamlib — once one does. Until then it builds from source: docs/hamlib-streaming-bridge.md."
           fi
           gh release upload "$tag" dist/naudio-* dist/sha256sums.txt --clobber
           gh release view "$tag" --json assets --jq '.assets[].name'
