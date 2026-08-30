@@ -1,0 +1,114 @@
+.\" SPDX-License-Identifier: LGPL-2.1-or-later
+.TH NA_HAMLIB_BRIDGE 1 "2026-08-30" "naudio" "naudio manual"
+.SH NAME
+na_hamlib_bridge \- bridge a Hamlib rig_stream audio stream onto the naudio wire
+.SH SYNOPSIS
+.B na_hamlib_bridge
+.RB [ \-m
+.IR model ]
+.RB [ \-r
+.IR host:port ]
+.RB [ \-p
+.IR naudio_port ]
+.RB [ \-c
+.IR channels ]
+.RB [ \-R
+.IR lan | wan | ft8 ]
+.RB [ \-S
+.IR stream_mode ]
+.RB [ \-k ]
+.RB [ \-x ]
+.SH DESCRIPTION
+.B na_hamlib_bridge
+re-originates a Hamlib
+.BR rig_stream_ *
+audio stream onto naudio's FEC-native wire, so rig audio survives a lossy
+LAN/WAN hop.
+It runs at the radio site, upstream of that hop: Hamlib talks to the rig
+(directly, or via
+.BR rigctld (1)
+over netrigctl), and the bridge serves the rig's RX audio as a naudio
+stream while feeding client TX audio back to the rig.
+.PP
+The streaming subsystem it is built on is Hamlib PR #2116 (Hamlib 5.0+),
+which no released Hamlib ships yet \(em the bridge must be linked against a
+streaming-capable libhamlib, and as of this writing no real radio backend
+implements
+.IR stream_caps ,
+so real-rig behaviour is unverified.
+The Dummy backend (model 1) exercises the full path hardware-free.
+.SH OPTIONS
+.TP
+.BI \-m " model"
+Hamlib model number (default 1 = DUMMY, hardware-free; 2 = NETRIGCTL).
+.TP
+.BI \-r " host:port"
+netrigctl target for model 2, e.g. localhost:5555.
+.TP
+.BI \-S " stream_mode"
+backend stream_mode configuration.
+The Dummy backend accepts
+.IR tone ,
+.IR silence ,
+.IR loopback ,
+.IR counter ;
+.I loopback
+feeds TX back out of RX \(em a hardware-free TX round trip.
+.TP
+.BI \-p " naudio_port"
+port the bridge's naudio server listens on (default 4533).
+.TP
+.BI \-c " channels"
+1 or 2 (default 1).
+Stereo over netrigctl needs a libhamlib at or after Hamlib commit
+961093f2 on
+.B this
+side; the bridge prints the applicable advice when it detects RX gaps.
+.TP
+.BI \-R " lan\fR|\fPwan\fR|\fPft8"
+naudio reliability profile (default wan, with FEC).
+.TP
+.B \-k
+key the rig's PTT around client TX bursts.
+.TP
+.B \-x
+disable the TX (operator-to-rig) direction; RX only.
+.TP
+.B \-h
+print usage and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+clean run.
+.TP
+.B 1
+startup or streaming failure.
+.TP
+.B 2
+usage error.
+.SH EXAMPLES
+Hardware-free end to end, serving a test tone from the Dummy rig:
+.PP
+.nf
+.RS
+na_hamlib_bridge \-m 1 \-S tone
+.RE
+.fi
+.PP
+Bridge a remote rigctld, RX only, FT8-tuned reliability:
+.PP
+.nf
+.RS
+na_hamlib_bridge \-m 2 \-r radio\-host:5555 \-x \-R ft8
+.RE
+.fi
+.SH SEE ALSO
+.BR na_audio_daemon (1),
+.BR na_wav_tap (1),
+.BR rigctld (1)
+.PP
+Building the streaming libhamlib this tool needs, and why a skipped build
+looks like a broken flag:
+.I docs/hamlib\-streaming\-bridge.md
+in the naudio source tree
+(https://github.com/KJ5HST\-LABS/naudio).

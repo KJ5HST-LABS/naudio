@@ -19,6 +19,8 @@ if(NAUDIO_BUILD_APPS AND NOT WIN32)
     # surface, and an installer without it is a dev-kit-only installer.
     install(TARGETS na_audio_daemon
             RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
+    install(FILES "${naudio_SOURCE_DIR}/docs/man/na_audio_daemon.1"
+            DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
 endif()
 
 # ----------------------------------------------------------------------------
@@ -48,6 +50,12 @@ if(NAUDIO_BUILD_APPS)
     # box, which is why the target itself is not WIN32-gated (issue #93).
     install(TARGETS na_wav_tap
             RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
+    # The man page is POSIX-only even though the tool is not: the Windows ZIP
+    # has no man tree and no man(1) to read one.
+    if(NOT WIN32)
+        install(FILES "${naudio_SOURCE_DIR}/docs/man/na_wav_tap.1"
+                DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
+    endif()
 endif()
 
 # ----------------------------------------------------------------------------
@@ -162,6 +170,10 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
                 # no package manager can satisfy yet.
                 install(TARGETS na_hamlib_bridge
                         RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
+                # Installed only when the target is: a man page for a tool the
+                # package does not carry would document a phantom.
+                install(FILES "${naudio_SOURCE_DIR}/docs/man/na_hamlib_bridge.1"
+                        DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
                 if(NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)
                     target_compile_definitions(na_hamlib_bridge
                                                PRIVATE NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)

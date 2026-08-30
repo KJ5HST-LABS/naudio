@@ -1,0 +1,100 @@
+.\" SPDX-License-Identifier: LGPL-2.1-or-later
+.TH NA_WAV_TAP 1 "2026-08-30" "naudio" "naudio manual"
+.SH NAME
+na_wav_tap \- record what a naudio client receives, as a decodable WAV file
+.SH SYNOPSIS
+.B na_wav_tap
+.RB [ \-\-host
+.IR H ]
+.RB [ \-\-port
+.IR N ]
+.RB [ \-\-seconds
+.IR S ]
+.RB [ \-\-out
+.IR F ]
+.RB [ \-\-align15 ]
+.RB [ \-\-tcp ]
+.SH DESCRIPTION
+.B na_wav_tap
+connects to a naudio (net-audio protocol) streaming server as an ordinary
+client, records the received audio for a fixed length of time, and writes it
+as a WAV file.
+It drives only the public naudio C ABI, so the file it writes is what any
+third-party consumer of the shipped library receives \(em not what an
+internal buffer held.
+.PP
+It needs no audio device of its own, which makes it the natural remote end
+of an on-air check: run the server on the machine with the radio, run
+.B na_wav_tap
+anywhere else, and feed the resulting WAV to a decoder (for a digital mode,
+\(lqthe audio survived the trip\(rq becomes objective \(em it either still
+decodes to real callsigns or it does not).
+.PP
+When the negotiated sample rate divides by 12000 (48\ kHz, 24\ kHz and
+12\ kHz all do), the output is downmixed to mono at 12000\ Hz \(em the rate
+WSJT-X-family decoders read.
+Otherwise the file carries the negotiated rate unchanged.
+.B na_wav_tap
+takes no format flags: it reads the negotiated format back from the library
+after connect, so a server provisioned at a lower rate needs no client-side
+change.
+.SH OPTIONS
+.TP
+.BI \-\-host " H"
+naudio server to connect to (default 127.0.0.1).
+.TP
+.BI \-\-port " N"
+server port (default 4533).
+.TP
+.BI \-\-seconds " S"
+record length in seconds (default 15, one FT8 period).
+.TP
+.BI \-\-out " F"
+output WAV path (default tap.wav).
+.TP
+.B \-\-align15
+wait for a wall-clock 15-second boundary before recording, so the file
+aligns with FT8/FT4 transmit periods.
+.TP
+.B \-\-tcp
+use TCP instead of the default UDP_WAN reliability profile.
+This is the discriminating run when a UDP recording comes up short: TCP
+retransmits, so link loss shows up as delay rather than absence.
+.TP
+.BR \-h ", " \-\-help
+print usage and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+a WAV file was written.
+.TP
+.B 1
+the connection failed or no audio arrived.
+.TP
+.B 2
+usage error, or the output file could not be written.
+.SH EXAMPLES
+Record 5 seconds from a server on the local machine:
+.PP
+.nf
+.RS
+na_wav_tap \-\-seconds 5 \-\-out hello.wav
+.RE
+.fi
+.PP
+Record one aligned FT8 period from the radio machine, for decoding:
+.PP
+.nf
+.RS
+na_wav_tap \-\-host radio\-host \-\-port 4533 \-\-seconds 15 \-\-align15 \-\-out period.wav
+.RE
+.fi
+.SH SEE ALSO
+.BR na_audio_daemon (1),
+.BR na_hamlib_bridge (1)
+.PP
+The on-air verification procedure, including the negative control without
+which \(lqit decoded\(rq is not yet evidence:
+.I docs/on\-air\-verification.md
+in the naudio source tree
+(https://github.com/KJ5HST\-LABS/naudio).

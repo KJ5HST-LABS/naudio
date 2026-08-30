@@ -1,0 +1,157 @@
+.\" SPDX-License-Identifier: LGPL-2.1-or-later
+.TH NA_AUDIO_DAEMON 1 "2026-08-30" "naudio" "naudio manual"
+.SH NAME
+na_audio_daemon \- serve a real capture device as a naudio stream, or probe it
+.SH SYNOPSIS
+.B na_audio_daemon
+.RB [ \-\-mode
+.IR capture\-probe | hardware ]
+.RB [ \-\-capture
+.IR pat \ |\ \-\-capture\-id
+.IR N ]
+.RB [ \-\-playback
+.IR pat \ |\ \-\-playback\-id
+.IR N ]
+.RB [ \-\-transport
+.IR tcp | udp | dual ]
+.RB [ \-\-rate
+.IR HZ ]
+.RB [ \-\-channels
+.IR 1 | 2 ]
+.RB [ \-\-port
+.IR N ]
+.RB [ \-\-duration\-ms
+.IR N ]
+.br
+.B na_audio_daemon \-\-list\-devices
+.SH DESCRIPTION
+.B na_audio_daemon
+is the hardware driver of the naudio toolkit: it opens a
+.I real
+audio capture device (a radio's USB codec, a sound card, a microphone) and
+either probes it directly or serves its audio as a naudio (net-audio
+protocol) stream that any naudio client can receive \(em
+.BR na_wav_tap (1),
+the example play-to-speakers clients, or an application linking the naudio
+library.
+.PP
+Two modes:
+.TP
+.B capture\-probe
+open the capture device directly and report frames, overflows and per-channel
+RMS \(em the real-hardware capture gate, with no network involved.
+Use it to prove capture works at all before adding a network hop.
+.TP
+.B hardware
+(default) start a naudio server that captures the device and streams it;
+an in-process RX-only client measures sustained throughput and RMS.
+External clients can connect to the same server while it runs.
+.SH OPTIONS
+.TP
+.BI \-\-capture " pat"
+capture device name substring (default: \(lqUSB Audio CODEC\(rq).
+.TP
+.BI \-\-capture\-id " N"
+force the capture device by backend id (skips the name lookup).
+Ids come from
+.BR \-\-list\-devices .
+.TP
+.BI \-\-playback " pat"
+hardware mode: the client's RX sink device, e.g. a virtual device feeding a
+digital-mode application.
+When omitted \(em or when the pattern matches nothing \(em audio drains to a
+hardware-free fake backend instead (see
+.B CAVEATS
+below).
+.TP
+.BI \-\-playback\-id " N"
+force the playback device by backend id.
+.TP
+.BI \-\-transport " tcp\fR|\fPudp\fR|\fPdual"
+server transport (default tcp).
+.TP
+.BI \-\-rate " HZ"
+capture/server sample rate, 8000..192000 and divisible by 50 for an exact
+20\ ms frame (default 48000).
+naudio does
+.B not
+resample: the device must open at exactly this rate or the run refuses \(em
+a silent fallback would ship wrong-rate audio labeled with this rate.
+.TP
+.BI \-\-channels " N"
+1 (mono) or 2 (stereo, the default); refused on mismatch, like
+.BR \-\-rate .
+.TP
+.BI \-\-port " N"
+server port; 0 picks an ephemeral port (default 4533).
+.TP
+.BI \-\-duration\-ms " N"
+run time in milliseconds; 0 runs until Ctrl-C (default 30000).
+.TP
+.B \-\-list\-devices
+enumerate capture and playback devices with their backend ids, then exit.
+.TP
+.BR \-h ", " \-\-help
+print usage and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+the probe completed with no overruns, or the hardware run streamed with no
+errors.
+.TP
+.B 1
+a runtime failure: device open refused, overruns, stream errors.
+.TP
+.B 2
+usage error.
+.SH CAVEATS
+A
+.B \-\-playback
+pattern that matches
+.I nothing
+falls back to the same hardware-free drain as omitting the option, and the
+run can still exit 0 \(em so a misspelled sink name reports a PASS for a
+check that never fed your application.
+Confirm the \(lqclient sink\(rq line in the output names a real device
+before trusting a hardware-mode pass.
+.SH EXAMPLES
+Find the radio's audio device:
+.PP
+.nf
+.RS
+na_audio_daemon \-\-list\-devices
+.RE
+.fi
+.PP
+Prove capture works, no network involved:
+.PP
+.nf
+.RS
+na_audio_daemon \-\-mode capture\-probe \-\-capture\-id 3 \-\-duration\-ms 30000
+.RE
+.fi
+.PP
+Serve the device until interrupted, for remote clients:
+.PP
+.nf
+.RS
+na_audio_daemon \-\-mode hardware \-\-capture\-id 3 \-\-transport tcp \-\-duration\-ms 0
+.RE
+.fi
+.PP
+Provision a constrained link at 12\ kHz mono (192\ kbps on the wire instead
+of the default 1.536\ Mbps):
+.PP
+.nf
+.RS
+na_audio_daemon \-\-mode hardware \-\-capture\-id 3 \-\-rate 12000 \-\-channels 1
+.RE
+.fi
+.SH SEE ALSO
+.BR na_wav_tap (1),
+.BR na_hamlib_bridge (1)
+.PP
+The full on-air verification procedure:
+.I docs/on\-air\-verification.md
+in the naudio source tree
+(https://github.com/KJ5HST\-LABS/naudio).
