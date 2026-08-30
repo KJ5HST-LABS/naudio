@@ -1062,7 +1062,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # provides at build time.
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS_PRIVATE_DIRS "${CMAKE_INSTALL_LIBDIR}")
-    set(CPACK_DEBIAN_PACKAGE_SECTION "hamradio")
+    # "sound", not "hamradio": naudio is a general network-audio library with
+    # amateur-radio uses, not a ham-radio package with an audio side.
+    set(CPACK_DEBIAN_PACKAGE_SECTION "sound")
     set(CPACK_DEBIAN_FILE_NAME "${CPACK_PACKAGE_FILE_NAME}.deb")
     set(CPACK_RPM_PACKAGE_LICENSE "LGPL-2.1-or-later")
     set(CPACK_RPM_PACKAGE_GROUP "Applications/Communications")

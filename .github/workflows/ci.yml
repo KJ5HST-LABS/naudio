@@ -565,8 +565,33 @@ jobs:
       - name: Configure (apps on, tests off — this job builds one binary)
         run: cmake -S . -B build -DNAUDIO_BUILD_APPS=ON -DNAUDIO_BUILD_TESTS=OFF
 
-      - name: Build na_wav_tap
-        run: cmake --build build --config RelWithDebInfo --target na_wav_tap -j
+      - name: Build na_wav_tap and the shipped demo pair
+        # The demo pair (na_audio_source / na_c_play_to_speakers) is Windows-portable
+        # since 1.0.0rc1 (POSIX time calls shimmed, MSVC C11 atomics) and ships in the
+        # release ZIP — this is the job that compiles it on every push, since the
+        # lib-only `windows` job runs with NAUDIO_BUILD_APPS=OFF.
+        run: cmake --build build --config RelWithDebInfo --target na_wav_tap na_audio_source na_c_play_to_speakers -j
+
+      - name: "Demo pair runtime proof: test-tone loopback, no audio device"
+        shell: pwsh
+        run: |
+          $src = Get-ChildItem -Path build -Recurse -Filter na_audio_source.exe | Select-Object -First 1
+          $ply = Get-ChildItem -Path build -Recurse -Filter na_c_play_to_speakers.exe | Select-Object -First 1
+          if (-not $src -or -not $ply) { Write-Output "::error::demo pair was not produced"; exit 1 }
+          # naudio is a SHARED target: put the DLL's directory on PATH so both exes load it.
+          $dll = Get-ChildItem -Path build -Recurse -Filter naudio.dll | Select-Object -First 1
+          if (-not $dll) { Write-Output "::error::naudio.dll was not produced"; exit 1 }
+          $env:PATH = "$($dll.DirectoryName);" + $env:PATH
+          $srv = Start-Process -PassThru -NoNewWindow -FilePath $src.FullName -ArgumentList '--test-tone','--seconds','25'
+          Start-Sleep -Seconds 3
+          & $ply.FullName --backend null --seconds 5 2>&1 | Tee-Object -FilePath demo.log
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::na_c_play_to_speakers exited $LASTEXITCODE"; exit 1 }
+          # The byte-tell for a correctly received stream (examples/README.md) — the
+          # deterministic test tone's first frame is the same on every platform.
+          if (-not (Select-String -Path demo.log -Pattern 'first_frame_hex=68c569c66ac76bc8' -Quiet)) {
+            Write-Output "::error::stream byte-tell missing from client output"; exit 1 }
+          Stop-Process -Id $srv.Id -ErrorAction SilentlyContinue
+          Write-Output "demo pair streams on windows-latest (byte-tell verified)"
 
       - name: Collect the exe and the DLL it needs
         shell: pwsh

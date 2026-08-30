@@ -119,19 +119,22 @@ jobs:
           # this is the relative-rpath contract the package relies on.
           "$P/bin/na_wav_tap" --help > /dev/null
           "$P/bin/na_audio_daemon" -h > /dev/null 2>&1
+          "$P/bin/na_audio_source" --help > /dev/null
+          "$P/bin/na_c_play_to_speakers" --help > /dev/null
           "$P/bin/na_hamlib_bridge" -h 2>&1 | grep -q '^usage:' \
             || { echo "::error::na_hamlib_bridge from the package will not run"; exit 1; }
-          echo "all three tools run env-free from the package"
+          echo "all five shipped binaries run env-free from the package"
 
           # Self-containment: every load command outside @rpath//usr/lib//System
-          # is a finding. Cardinality-checked (L230): exactly 4 binaries scanned.
+          # is a finding. Cardinality-checked (L230): exactly 6 binaries scanned
+          # (3 tools + the demo pair + libnaudio).
           scanned=0
           for f in "$P"/bin/* "$P"/lib/libnaudio.*.*.*.dylib; do
             scanned=$((scanned+1))
             bad=$(otool -L "$f" | tail -n +2 | grep -v '@rpath\|/usr/lib/\|/System/' || true)
             if [ -n "$bad" ]; then echo "::error::$f references non-system libraries:"; echo "$bad"; exit 1; fi
           done
-          [ "$scanned" -eq 4 ] || { echo "::error::expected to scan 4 binaries, scanned $scanned"; exit 1; }
+          [ "$scanned" -eq 6 ] || { echo "::error::expected to scan 6 binaries, scanned $scanned"; exit 1; }
           echo "otool scan clean over $scanned binaries"
 
           # The external-consumer gate, against the PACKAGE (find_package path).
@@ -222,13 +225,16 @@ jobs:
 
           "$P/bin/na_wav_tap" --help > /dev/null
           "$P/bin/na_audio_daemon" -h > /dev/null 2>&1
+          "$P/bin/na_audio_source" --help > /dev/null
+          "$P/bin/na_c_play_to_speakers" --help > /dev/null
           "$P/bin/na_hamlib_bridge" -h 2>&1 | grep -q '^usage:' \
             || { echo "::error::na_hamlib_bridge from the package will not run"; exit 1; }
-          echo 'all three tools run env-free from the tarball ($ORIGIN rpath)'
+          echo 'all five shipped binaries run env-free from the tarball ($ORIGIN rpath)'
 
           # Self-containment: no hamlib/portaudio/samplerate/libusb reference and
           # no unresolvable library. libasound &co are fine — they are what
-          # dpkg-shlibdeps declares. Cardinality-checked: exactly 4 binaries.
+          # dpkg-shlibdeps declares. Cardinality-checked: exactly 6 binaries
+          # (3 tools + the demo pair + libnaudio).
           scanned=0
           for f in "$P"/bin/* "$P"/lib/libnaudio.so.*.*; do
             scanned=$((scanned+1))
@@ -238,7 +244,7 @@ jobs:
             if grep -F 'not found' ldd.out | grep -v 'libnaudio'; then
               echo "::error::$f has unresolvable dependencies"; exit 1; fi
           done
-          [ "$scanned" -eq 4 ] || { echo "::error::expected to scan 4 binaries, scanned $scanned"; exit 1; }
+          [ "$scanned" -eq 6 ] || { echo "::error::expected to scan 6 binaries, scanned $scanned"; exit 1; }
           echo "ldd scan clean over $scanned binaries"
 
           cmake -S tests/external-consumer -B consumer-build -DCMAKE_PREFIX_PATH="$P" > consumer.log 2>&1 \
@@ -268,9 +274,11 @@ jobs:
 
           na_wav_tap --help > /dev/null
           na_audio_daemon -h > /dev/null 2>&1
+          na_audio_source --help > /dev/null
+          na_c_play_to_speakers --help > /dev/null
           na_hamlib_bridge -h 2>&1 | grep -q '^usage:' \
             || { echo "::error::installed na_hamlib_bridge will not run"; exit 1; }
-          echo "all three tools run from /usr/bin"
+          echo "all five shipped binaries run from /usr/bin"
 
           cmake -S tests/external-consumer -B deb-consumer > deb-consumer.log 2>&1 \
             || { cat deb-consumer.log; echo "::error::find_package(naudio) failed against the installed DEB"; exit 1; }
@@ -293,6 +301,7 @@ jobs:
           rpm=$(ls build/naudio-*.rpm)
           rpm -qlp "$rpm" > rpm-contents.txt
           for want in /usr/bin/na_audio_daemon /usr/bin/na_wav_tap /usr/bin/na_hamlib_bridge \
+                      /usr/bin/na_audio_source /usr/bin/na_c_play_to_speakers \
                       /usr/include/naudio.h /usr/lib/pkgconfig/naudio.pc; do
             grep -qx "$want" rpm-contents.txt \
               || { echo "::error::RPM is missing $want"; cat rpm-contents.txt; exit 1; }
@@ -309,7 +318,7 @@ jobs:
           if-no-files-found: error
 
   package-windows:
-    name: package (windows, ZIP — lib + headers + na_wav_tap)
+    name: package (windows, ZIP — lib + headers + na_wav_tap + the demo pair)
     runs-on: windows-latest
     needs: version-guard
     steps:
@@ -339,9 +348,26 @@ jobs:
           Expand-Archive $zip.FullName -DestinationPath "${{ runner.temp }}/pkgroot"
           $P = Get-ChildItem "${{ runner.temp }}/pkgroot" | Select-Object -First 1
 
-          # The one tool Windows ships. naudio.dll sits beside it in bin/.
+          # The shipped Windows binaries. naudio.dll sits beside them in bin/.
           & "$($P.FullName)/bin/na_wav_tap.exe" --help
           if ($LASTEXITCODE -ne 0) { Write-Output "::error::na_wav_tap.exe from the package will not run"; exit 1 }
+          & "$($P.FullName)/bin/na_audio_source.exe" --help
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::na_audio_source.exe from the package will not run"; exit 1 }
+          & "$($P.FullName)/bin/na_c_play_to_speakers.exe" --help
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::na_c_play_to_speakers.exe from the package will not run"; exit 1 }
+
+          # Runtime proof ON THE ARTIFACT: test-tone server -> null-backend client,
+          # byte-tell asserted (examples/README.md) — no audio device involved.
+          $srv = Start-Process -PassThru -NoNewWindow -FilePath "$($P.FullName)/bin/na_audio_source.exe" `
+                 -ArgumentList '--test-tone','--seconds','25'
+          Start-Sleep -Seconds 3
+          & "$($P.FullName)/bin/na_c_play_to_speakers.exe" --backend null --seconds 5 2>&1 |
+            Tee-Object -FilePath demo.log
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::demo client exited $LASTEXITCODE"; exit 1 }
+          if (-not (Select-String -Path demo.log -Pattern 'first_frame_hex=68c569c66ac76bc8' -Quiet)) {
+            Write-Output "::error::stream byte-tell missing — the packaged pair did not stream"; exit 1 }
+          Stop-Process -Id $srv.Id -ErrorAction SilentlyContinue
+          Write-Output "packaged demo pair streams end to end on Windows"
 
           cmake -S tests/external-consumer -B consumer-build -DCMAKE_PREFIX_PATH="$($P.FullName)" 2>&1 |
             Tee-Object -FilePath consumer.log
