@@ -1034,9 +1034,24 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     if(NAUDIO_PKG_ARCH STREQUAL "amd64")
         set(NAUDIO_PKG_ARCH "x86_64")
     endif()
+    # Pre-release qualifier (e.g. "rc1"). project(VERSION) is numeric-only by
+    # CMake's own grammar, so a release candidate cannot live there — it rides
+    # the TAG (v1.0.0rc1) and this variable, which the release workflow derives
+    # FROM the tag and passes at configure time. Empty for final releases and
+    # for every ordinary build. It shapes the artifact file names (so rc and
+    # final artifacts cannot collide on a release page) and the DEB/RPM
+    # internal versions, where the "~" makes the package manager sort the rc
+    # BEFORE the final release it precedes (dpkg and rpm both order tilde
+    # first), so upgrading rc -> final works instead of comparing equal.
+    set(NAUDIO_PKG_VERSION_SUFFIX "" CACHE STRING
+        "Pre-release qualifier appended to package names/versions (e.g. rc1)")
     set(CPACK_PACKAGE_FILE_NAME
-        "naudio-${PROJECT_VERSION}-${NAUDIO_PKG_OS}-${NAUDIO_PKG_ARCH}")
+        "naudio-${PROJECT_VERSION}${NAUDIO_PKG_VERSION_SUFFIX}-${NAUDIO_PKG_OS}-${NAUDIO_PKG_ARCH}")
     set(CPACK_GENERATOR "TGZ")
+    if(NAUDIO_PKG_VERSION_SUFFIX)
+        set(CPACK_DEBIAN_PACKAGE_VERSION "${PROJECT_VERSION}~${NAUDIO_PKG_VERSION_SUFFIX}")
+        set(CPACK_RPM_PACKAGE_VERSION "${PROJECT_VERSION}~${NAUDIO_PKG_VERSION_SUFFIX}")
+    endif()
 
     # DEB/RPM install under /usr (the generators' default packaging prefix), so
     # the Linux release job configures with CMAKE_INSTALL_PREFIX=/usr and the

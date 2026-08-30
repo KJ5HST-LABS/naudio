@@ -48,10 +48,19 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             # Package files are named from PROJECT_VERSION, the Release from the
             # tag. If they disagree, v0.5.1 would publish artifacts named 0.5.0 —
-            # caught here, before three platforms build them.
-            [ "v${proj}" = "${GITHUB_REF_NAME}" ] \
-              || { echo "::error::tag ${GITHUB_REF_NAME} != v${proj} (CMakeLists.txt project VERSION)"; exit 1; }
-            echo "tag ${GITHUB_REF_NAME} matches"
+            # caught here, before three platforms build them. A release
+            # candidate is the numeric version plus an rcN suffix (project
+            # VERSION is numeric-only by CMake's grammar, so the rc lives on
+            # the tag and flows into the artifact names via
+            # NAUDIO_PKG_VERSION_SUFFIX in each package job).
+            case "${GITHUB_REF_NAME}" in
+              "v${proj}")
+                echo "tag ${GITHUB_REF_NAME} matches" ;;
+              "v${proj}"rc[0-9] | "v${proj}"rc[0-9][0-9])
+                echo "tag ${GITHUB_REF_NAME} matches (release candidate of ${proj})" ;;
+              *)
+                echo "::error::tag ${GITHUB_REF_NAME} != v${proj}[rcN] (CMakeLists.txt project VERSION)"; exit 1 ;;
+            esac
           else
             echo "dispatch dry run — no tag to compare"
           fi
@@ -71,12 +80,16 @@ jobs:
       - name: Build a static streaming libhamlib
         run: tools/build-streaming-hamlib.sh --static --prefix "${{ runner.temp }}/hamlib-static"
 
+      - name: Derive the pre-release suffix from the tag (empty on final tags and dry runs)
+        run: echo "NAUDIO_PKG_SUFFIX=$(echo "${GITHUB_REF_NAME}" | sed -n 's/^v[0-9.]*\(rc[0-9][0-9]*\)$/\1/p')" >> "$GITHUB_ENV"
+
       - name: Configure (release shape)
         run: |
           PKG_CONFIG_PATH="${{ runner.temp }}/hamlib-static/lib/pkgconfig" \
             cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
                   -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON \
-                  -DCMAKE_INSTALL_PREFIX=/usr/local
+                  -DCMAKE_INSTALL_PREFIX=/usr/local \
+                  -DNAUDIO_PKG_VERSION_SUFFIX="${{ env.NAUDIO_PKG_SUFFIX }}"
 
       - name: Build
         run: cmake --build build -j
@@ -162,6 +175,9 @@ jobs:
       - name: Build a static streaming libhamlib
         run: tools/build-streaming-hamlib.sh --static --prefix "${{ runner.temp }}/hamlib-static"
 
+      - name: Derive the pre-release suffix from the tag (empty on final tags and dry runs)
+        run: echo "NAUDIO_PKG_SUFFIX=$(echo "${GITHUB_REF_NAME}" | sed -n 's/^v[0-9.]*\(rc[0-9][0-9]*\)$/\1/p')" >> "$GITHUB_ENV"
+
       - name: Configure (release shape, prefix /usr so DEB/RPM metadata is truthful after install)
         run: |
           # CMAKE_INSTALL_LIBDIR is pinned: with prefix /usr on a Debian-family
@@ -178,7 +194,8 @@ jobs:
           PKG_CONFIG_PATH="${{ runner.temp }}/hamlib-static/lib/pkgconfig" \
             cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
                   -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON \
-                  -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib
+                  -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib \
+                  -DNAUDIO_PKG_VERSION_SUFFIX="${{ env.NAUDIO_PKG_SUFFIX }}"
 
       - name: Build
         run: cmake --build build -j
@@ -298,8 +315,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Derive the pre-release suffix from the tag (empty on final tags and dry runs)
+        shell: bash
+        run: echo "NAUDIO_PKG_SUFFIX=$(echo "${GITHUB_REF_NAME}" | sed -n 's/^v[0-9.]*\(rc[0-9][0-9]*\)$/\1/p')" >> "$GITHUB_ENV"
+
       - name: Configure (bundled PortAudio; apps ON so na_wav_tap ships — ci.yml's windows-wav-tap rationale)
-        run: cmake -S . -B build -DNAUDIO_BUNDLE_PORTAUDIO=ON
+        run: cmake -S . -B build -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_PKG_VERSION_SUFFIX="${{ env.NAUDIO_PKG_SUFFIX }}"
 
       - name: Build
         run: cmake --build build --config Release -j
@@ -370,8 +391,12 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          # An rc tag publishes a PRERELEASE — visible as such on the Releases
+          # page, and excluded from "latest release" until the final tag lands.
+          pre=""
+          case "$tag" in *rc[0-9]*) pre="--prerelease" ;; esac
           if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" --verify-tag --title "naudio $tag" \
+            gh release create "$tag" --verify-tag $pre --title "naudio $tag" \
               --notes "Binary packages for $tag. See CHANGELOG.md for what changed. The DEB/RPM install under /usr; the tarballs are relocatable (tools find libnaudio via a relative rpath). na_hamlib_bridge is built against a static streaming libhamlib (Hamlib master) — no hamlib install required."
           fi
           gh release upload "$tag" dist/naudio-* dist/sha256sums.txt --clobber
