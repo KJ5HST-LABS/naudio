@@ -6,6 +6,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **User-facing documentation and man pages**
+  ([#94](https://github.com/KJ5HST-LABS/naudio/issues/94)). `INSTALL.md` covers every install
+  path per platform — the release packages, the Homebrew tap, and from-source — with
+  verification and removal; `docs/getting-started.md` walks an operator from an installed
+  toolkit to audio streaming end to end using only the shipped tools (every command in the
+  core walkthrough was executed on real hardware before being documented). The three tools
+  gain `man1` pages (`docs/man/`), installed beside them (`share/man/man1`, `tools`
+  component) and carried by every POSIX package; the Windows ZIP deliberately ships none
+  (no man tree there). README's install section is now a pointer at `INSTALL.md`.
 - **Binary packages** ([#93](https://github.com/KJ5HST-LABS/naudio/issues/93)). `cmake --install` now
   ships the tools (`na_audio_daemon`, `na_wav_tap`, and `na_hamlib_bridge` when built —
   `na_wav_tap` on Windows too), with `runtime`/`dev`/`tools` install components and a relative
