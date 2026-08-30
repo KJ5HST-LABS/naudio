@@ -3,9 +3,24 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.0.0rc1] — 2026-08-30
+
+**The 1.0 release candidate: the C ABI's first major, cut for pre-publication validation.**
+Everything in 0.5.0's ABI carries forward unchanged — the major bump formalizes the contract
+(and moves the soname), it does not break it.
+
+### Changed
+- **Version 1.0.0; `SOVERSION` 0 → 1.** The soname becomes `libnaudio.1` (`libnaudio.so.1` /
+  `libnaudio.1.dylib`): consumers linked against a 0.x build must relink. No symbol, struct,
+  or semantic changed in the same step — the declared-size compatibility mechanism and every
+  `na_*` surface are exactly 0.5.0's.
 
 ### Added
+- **Release-candidate releases.** `vX.Y.ZrcN` tags now build the full package set with
+  `rcN`-suffixed artifact names, `~rcN` DEB/RPM internal versions (so a candidate upgrades
+  cleanly to the final release), and a GitHub Release marked *prerelease*. CMake's
+  `project(VERSION)` is numeric-only, so the qualifier rides the tag and the new
+  `NAUDIO_PKG_VERSION_SUFFIX` configure variable.
 - **User-facing documentation and man pages**
   ([#94](https://github.com/KJ5HST-LABS/naudio/issues/94)). `INSTALL.md` covers every install
   path per platform — the release packages, the Homebrew tap, and from-source — with

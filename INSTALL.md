@@ -12,12 +12,12 @@ Once installed, **[docs/getting-started.md](docs/getting-started.md)** is the wa
 from an installed toolkit to audio streaming end to end.
 
 > **Current availability (2026-08).** naudio is not yet public — the repository is
-> private ahead of its planned Hamlib contribution, and the first *packaged* release has
-> not been cut (the release pipeline landed after v0.5.0 was tagged, so that tag carries
-> no binary assets). Until the next tagged release, collaborators with repository access
-> can fetch packages from a release with
-> `gh release download <tag> -R KJ5HST-LABS/naudio` rather than anonymous URLs, and the
-> Homebrew tap installs over ssh. Everything else on this page is written for the
+> private ahead of its planned Hamlib contribution. The first packaged release,
+> **v1.0.0rc1** (a prerelease), carries the full installer set: TGZ for Linux and macOS,
+> DEB, RPM, a Windows ZIP, and `sha256sums.txt`. While the repository is private,
+> collaborators with access fetch packages with
+> `gh release download v1.0.0rc1 -R KJ5HST-LABS/naudio` rather than anonymous URLs, and
+> the Homebrew tap installs over ssh. Everything else on this page is written for the
 > durable, public state and works unchanged once the repository is public.
 
 ## Option A — binary release packages
@@ -99,11 +99,10 @@ brew install naudio
 ```
 
 The formula builds the tagged release from source against Homebrew's PortAudio (the
-explicit tap URL is only needed while the tap is private). Two differences from the
+explicit tap URL is only needed while the tap is private). One difference from the
 binary packages: `na_hamlib_bridge` is **not** built (it needs a streaming-capable
-libhamlib no released Hamlib provides — the binary packages carry a self-contained one),
-and a formula pinned to v0.5.0 predates the tools' install rules, so the tools arrive
-with the next release or now via `brew install --HEAD kj5hst-labs/naudio/naudio`.
+libhamlib no released Hamlib provides — the binary packages carry a self-contained one).
+The other tools and their man pages install from the formula from v1.0.0rc1 onward.
 
 ## Option C — from source
 
