@@ -1,125 +1,137 @@
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-# Getting started — audio streaming without touching the ABI
+# Getting started
 
-This is the operator walkthrough: from an installed naudio toolkit to audio moving over
-the network, using only the shipped command-line tools. Nothing here requires writing
-code. Install first — **[INSTALL.md](../INSTALL.md)** covers packages, Homebrew, and
-from-source; each tool also has a man page (`man na_audio_daemon`).
+naudio streams live audio between computers. This walkthrough goes from an installed
+toolkit to audio moving across your network, using only the programs that come with it —
+no code, and for the first step, no microphone. Install first: **[INSTALL.md](../INSTALL.md)**.
+Every program here also has a manual page (`man na_audio_source`).
 
-**What you need:** one machine with an audio input (a radio's USB codec, a sound card, a
-laptop microphone) to serve; any machine — same one included — to receive. The wire
-between them is the [net-audio `0xAF01` protocol](audio-streaming-protocol-v1.md), so
-anything speaking it can join later; here the two ends are the shipped tools
-`na_audio_daemon` (serve) and `na_wav_tap` (receive).
+## 1. Hear it work — one machine, about a minute
 
-## 1. Find your audio device
+Open two terminals.
 
 ```bash
-na_audio_daemon --list-devices
+# terminal 1 — start a server broadcasting the built-in test tone:
+na_audio_source --test-tone
+
+# terminal 2 — connect a player and listen:
+na_c_play_to_speakers
 ```
 
-Every capture and playback device prints with a backend **id**. Note the id of the input
-you want to stream — the steps below select by `--capture-id`, which skips name matching
-entirely (`--capture <substring>` works too; the default pattern is `USB Audio CODEC`,
-a radio codec, so anything else needs one of the two flags).
+You hear a steady tone. Stop both with Ctrl-C.
 
-## 2. Prove capture works — no network yet
+What just happened: the first program is a real streaming server (the tone stands in for
+a sound source); the second connected to it over the network stack — the same path a
+connection from another machine takes — received the stream, and played it on your
+default output.
+
+## 2. Now across two machines
+
+On the machine that will broadcast:
 
 ```bash
-na_audio_daemon --mode capture-probe --capture-id <N> --channels 1 --duration-ms 10000
+na_audio_source --test-tone
 ```
 
-Ten seconds of direct capture: the report shows frames read, overflows, and per-channel
-RMS. Speak into the device (or open the radio's squelch) and the RMS should move well off
-the floor. Exit code 0 means no overruns.
-
-Two flags matter here and everywhere below:
-
-- **`--channels`** must match what the device can open — 1 for a mono source (most
-  microphones), 2 for stereo (the default). naudio **refuses** a mismatch rather than
-  silently converting.
-- **`--rate`** (default 48000) is refused the same way: naudio does not resample, so a
-  device that cannot open at exactly the requested rate fails loudly instead of shipping
-  wrong-rate audio labeled with the right number.
-
-## 3. Serve it
+On any other machine on the network:
 
 ```bash
-na_audio_daemon --mode hardware --capture-id <N> --channels 1 --transport udp --duration-ms 0
+na_c_play_to_speakers --host <address-of-the-first-machine>
 ```
 
-This starts a naudio streaming server on port 4533 (`--port` to change it), capturing
-the device and serving every client that connects, until Ctrl-C. The daemon's own
-in-process client prints a throughput/RMS line so you can see audio flowing before any
-remote client exists.
+The tone comes out of the second machine's speakers. Any number of machines can listen at
+once (the server admits 4 by default — `--max-clients` raises it). If nothing arrives,
+check that TCP port 4533 is open on the broadcasting machine; `--port` changes it on both
+ends.
 
-`--transport udp` is explicit for a reason: **the transport must match on both ends, and
-the two tools' defaults differ** — the daemon defaults to TCP, while `na_wav_tap` (next
-step) defaults to the UDP_WAN reliability profile. A mismatch fails cleanly at connect
-(`Handshake failed`), it does not half-work. Serve UDP as above, or keep the daemon's
-TCP default and pass `--tcp` to the tap.
+## 3. Stream something real
 
-## 4. Receive it — anywhere
-
-On any machine with naudio installed (the serving machine included):
+Replace the test tone with an actual audio input — a microphone, a line-in, a USB audio
+device:
 
 ```bash
-na_wav_tap --host <server-host> --seconds 5 --out hello.wav
+na_audio_source --list-devices        # shows each input with an id number
+na_audio_source --capture-id <N>
 ```
 
-Then play `hello.wav` with anything (`afplay hello.wav` on macOS, `aplay hello.wav` on
-Linux). If the negotiated rate divides by 12 kHz — 48/24/12 kHz all do — the file is
-written mono at 12 kHz, the rate WSJT-X-family decoders read; that is deliberate, because
-recording *what a client actually received* as decoder-ready evidence is this tool's job.
+Listen from anywhere exactly as before. Two rules save confusion here:
 
-`na_wav_tap` uses the UDP_WAN reliability profile (FEC, reorder, jitter buffering) by
-default; `--tcp` is the discriminating run when a UDP recording comes up short, since TCP
-turns loss into delay rather than absence. On Windows, `na_wav_tap.exe` works the same —
-it needs no audio device, which is why it is the one tool the Windows package ships.
+- **Mono and stereo are explicit.** The default is stereo; most microphones are mono.
+  naudio never converts silently — if the device can't open as asked, the start fails
+  with a clear message instead of streaming something mislabeled. Pass `--channels 1`
+  for a mono source.
+- **The sample rate is explicit too** (default 48000). naudio never resamples; a device
+  that can't do the requested rate is refused, not approximated.
 
-## 5. Listen live
+## 4. Record what a listener hears
 
-To hear the stream rather than record it, point one of the example clients at the server
-— a "play to speakers" client exists in C, C++, Python, Java, and Rust, and the Python
-one needs no compile step. They build from the source tree; see
-**[examples/README.md](../examples/README.md)**. The same suite includes
-`na_audio_source --test-tone`, a hardware-free demo server, so the whole path can be
-exercised on machines with no audio input at all.
-
-## 6. When the link is thin
-
-The default format (48 kHz / 16-bit / stereo) costs **1.536 Mbps** on the wire,
-unconditionally — naudio provisions statically rather than degrading mid-stream. On a
-link that cannot carry that, declare a lower format **at the server**:
+`na_wav_tap` is a client that saves the stream to a WAV file instead of playing it:
 
 ```bash
-na_audio_daemon --mode hardware --capture-id <N> --rate 12000 --channels 1 --transport udp --duration-ms 0
+na_wav_tap --host <server> --seconds 5 --out hello.wav --tcp
 ```
 
-12 kHz mono is 192 kbps — 8× less — and still covers SSB (≤3 kHz) and FT8 (≤3.1 kHz
-audio). Clients need no flags: they read the negotiated format after connect. The
-rate/bandwidth table is in the README's *Known limitations*; the measured
-congested-link case behind it is in
-[on-air-verification.md](on-air-verification.md).
+Play `hello.wav` with anything. The `--tcp` matters: **the transport must match on both
+ends, and the defaults differ** — the servers default to TCP while `na_wav_tap` defaults
+to UDP with loss recovery (its usual habitat is imperfect links). A mismatch fails
+cleanly at connect (`Handshake failed`); it never half-works. Either pass `--tcp` to the
+recorder, or run the server with `--transport udp --reliability wan` and let the
+recorder's default match it.
 
-## 7. The radio paths
+## 5. UDP, and networks that lose packets
 
-- **Streaming a real radio's audio** is exactly steps 1–4 with the radio's USB codec as
-  the capture device. The full evidence-grade procedure — FT8-period alignment, decoding
-  the tap, and the negative control without which "it decoded" is not yet evidence — is
-  **[on-air-verification.md](on-air-verification.md)**.
-- **`na_hamlib_bridge`** re-originates a Hamlib `rig_stream_*` audio stream onto this
-  same wire, for rigs whose audio arrives through Hamlib rather than a sound device. The
-  binary packages ship it self-contained, and it runs hardware-free against Hamlib's
-  Dummy rig today (`na_hamlib_bridge -m 1 -S tone`, then step 4 taps it) — but no
-  released Hamlib, and no real radio backend yet, implements the streaming subsystem it
-  needs, so it cannot be pointed at a real rig yet. Status and build instructions:
-  **[hamlib-streaming-bridge.md](hamlib-streaming-bridge.md)**.
+TCP is the friction-free default on a LAN. On links that drop or reorder packets, UDP
+with a loss-recovery profile keeps latency low while repairing the damage (forward error
+correction, reordering, jitter buffering):
+
+```bash
+na_audio_source --test-tone --transport udp --reliability wan
+na_c_play_to_speakers --host <server> --transport udp --reliability wan
+```
+
+Plain UDP with no recovery profile is refused on purpose — unprotected UDP audio on a
+real network sounds like torn paper, so naudio makes the protection explicit rather than
+the failure silent.
+
+## 6. When the connection is slow
+
+The default format (48 kHz, 16-bit, stereo) costs about 1.5 Mbit/s, and naudio provisions
+bandwidth up front rather than degrading quality mid-stream. On a connection that can't
+carry that, declare a smaller format at the server — clients adapt automatically:
+
+```bash
+na_audio_source --capture-id <N> --rate 12000 --channels 1    # ~192 kbit/s
+```
+
+12 kHz mono still covers speech fully. The rate/bandwidth table is in the README under
+*Known limitations*.
+
+## 7. The device-serving daemon
+
+`na_audio_daemon` is the heavier sibling of `na_audio_source`, for permanent
+installations and diagnostics: a `capture-probe` mode that tests an input device with no
+network involved (frame counts, overflow detection, signal levels), and a `hardware` mode
+that serves the device while continuously measuring throughput. Its manual page covers
+both. If you only want audio on the network, `na_audio_source` is enough.
+
+## 8. For radio amateurs
+
+naudio's original habitat: put a receiver's audio on the network by streaming its USB
+audio codec (steps 3–4, with the radio as the capture device), and record decoder-ready
+WAV files with `na_wav_tap` — it writes 12 kHz mono, aligned to FT8 periods with
+`--align15`, and the evidence-grade verification procedure lives in
+**[on-air-verification.md](on-air-verification.md)**. The optional `na_hamlib_bridge`
+connects naudio to Hamlib's rig-audio streaming API for rigs whose audio arrives through
+Hamlib rather than a sound device; it works hardware-free against Hamlib's test rig
+today, but no released Hamlib (and no real rig backend yet) supports the API it needs —
+status and build instructions in **[hamlib-streaming-bridge.md](hamlib-streaming-bridge.md)**.
 
 ## Where next
 
-- `man na_audio_daemon`, `man na_wav_tap`, `man na_hamlib_bridge` — the complete option
-  references, including the caveat about playback-sink patterns that match nothing.
-- Writing an application against the stream: the README's C ABI walkthrough, and the
-  [protocol docs](protocols.md) for what is on the wire.
+- The manual pages: `na_audio_source(1)`, `na_c_play_to_speakers(1)`,
+  `na_audio_daemon(1)`, `na_wav_tap(1)`, `na_hamlib_bridge(1)`.
+- Building an application on the library: the README's *C ABI* walkthrough, and the
+  worked example clients in five languages under `examples/` in the source tree.
+- What's on the wire: the [protocol overview](protocols.md) and the
+  [full specification](audio-streaming-protocol-v1.md).

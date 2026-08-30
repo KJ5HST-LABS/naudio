@@ -1,23 +1,68 @@
 # naudio — the C/C++ network-audio streaming toolkit
 
-**naudio** is an open, cross-platform toolkit for moving radio **audio** over the network: a versioned wire **spec**, a reference **server** and **clients**, a reliability stack (jitter / FEC / reorder / ARQ), virtual-audio device plumbing, and a stable **C ABI** so C / Hamlib / Python consumers can link a single versioned artifact. It is the C/C++ home of the **net-audio** audio-streaming protocol (magic `0xAF01`), built so the ham ecosystem — fldigi, Quisk, digital-mode apps, and Hamlib based apps — can reuse one audio transport (as clients) instead of each re-inventing it.
+**naudio** sends live audio from one computer to another over an ordinary network. One machine
+runs a small server that broadcasts a sound source — a microphone, a line-in, any audio device,
+or audio an application feeds in. Any number of machines connect and listen: play the stream on
+their speakers, record it to a file, or hand it to another program. The connection is built for
+imperfect networks — lost, late, and out-of-order packets are corrected rather than heard.
+
+Three things ship here:
+
+- **Ready-to-run programs.** A demo server and player that put audio across two machines in
+  about a minute with no code and (using the built-in test tone) no microphone; a device-serving
+  daemon; a stream recorder. Start at **[docs/getting-started.md](docs/getting-started.md)**.
+- **A small, stable C library** (`libnaudio`) that any application — in C, C++, Python, Java,
+  Rust, or anything with a C foreign-function interface — links to send or receive streams. A
+  worked example client exists in each of those five languages.
+- **An open wire protocol** (*net-audio*, magic `0xAF01`), fully specified and frozen, so
+  independent implementations can interoperate.
+
+naudio grew out of amateur radio — streaming a receiver's audio to operators and digital-mode
+software elsewhere on a network — and that remains a first-class use. But nothing in the library
+is radio-specific: it is a general-purpose audio transport. The one radio-specific piece, an
+optional bridge to the [Hamlib](https://github.com/Hamlib/Hamlib) rig-control project, is a
+separate bolt-on tool (off by default, built only on request) documented in
+**[docs/hamlib-streaming-bridge.md](docs/hamlib-streaming-bridge.md)**.
 
 > **On the names:** *net-audio* is the wire **protocol** — the frozen `0xAF01` frame contract defined in [the spec](docs/audio-streaming-protocol-v1.md). *naudio* is this C/C++ **toolkit** that implements it. There is no separate "net-audio" package to find or install; the protocol name and this repository are the whole story.
 
-- **License:** LGPL-2.1-or-later — see **[LICENSE](LICENSE)**. (Matches Hamlib; links cleanly from proprietary apps and from GPL apps alike.)
 - **Install:** **[INSTALL.md](INSTALL.md)** — binary packages, Homebrew, and from-source, per platform.
-- **Getting started:** **[docs/getting-started.md](docs/getting-started.md)** — audio streaming end to end on the shipped tools, no code required.
+- **Getting started:** **[docs/getting-started.md](docs/getting-started.md)** — audio streaming end to end with the shipped programs, no code required.
+- **License:** LGPL-2.1-or-later — see **[LICENSE](LICENSE)**. (Links cleanly from proprietary and GPL applications alike.)
 - **Wire spec:** **[docs/audio-streaming-protocol-v1.md](docs/audio-streaming-protocol-v1.md)** — the frozen `0xAF01` v1 contract.
-- **Protocols overview:** **[docs/protocols.md](docs/protocols.md)** — the `0xAF01` network audio wire format at a glance.
+- **Protocols overview:** **[docs/protocols.md](docs/protocols.md)** — the wire format at a glance.
 - **Conformance:** **[conformance/README.md](conformance/README.md)** — language-neutral golden vectors that pin every normative value in the wire spec.
-- **On-air verification:** **[docs/on-air-verification.md](docs/on-air-verification.md)** — what a real radio can and cannot verify today, and the procedure for the part it can.
+- **For radio amateurs:** **[docs/on-air-verification.md](docs/on-air-verification.md)** — verifying the toolkit against a real radio.
 
+
+---
+
+## How it fits together
+
+```
+audio in ──▶ server ──▶ network (TCP, or UDP with loss recovery) ──▶ clients ──▶ speakers / file / your app
+```
+
+A **server** owns the audio source and accepts clients; every **client** receives the same
+stream. Audio is carried as 16-bit PCM at a sample rate you choose (48 kHz stereo by default),
+framed by the `0xAF01` protocol, over TCP or UDP — the UDP path adds forward error correction,
+reordering, and jitter buffering so brief network trouble is repaired instead of audible.
+Everything above the socket lives in the library; the shipped programs are thin wrappers over
+the same public C API any application would use.
 
 ---
 
 ## Status
 
-The audio streaming stack is **implemented and tested** (the device layer, the `0xAF01` codec, the reliability primitives, the multi-tenant TCP/UDP server + client, and the full networking C ABI — both the `na_client_*` and `na_server_*` surfaces). It installs as a package: `find_package(naudio)` or pkg-config resolves the C ABI **and** the C++ API. The whole ctest suite is **hardware-free** and runs green on Linux, macOS and Windows on every push. It covers the language-neutral conformance golden vectors and — on Linux and macOS — the documentation snippet compile-gate (every fenced `c`/`cpp` block in this file and in `docs/hamlib-streaming-bridge.md` is compiled against the real headers; that harness is POSIX-only). A separate CI job runs the Python, Java and Rust example clients and diffs each one's hand-declared `na_device` against a C reference, so a layout change cannot silently break them. What is hardware-gated (real PortAudio capture/playback, on-air decode) is exercised by opt-in smokes and the `na_audio_daemon` driver, not by CI; see **Known limitations** below.
+The streaming stack is implemented, tested, and packaged: the device layer, the `0xAF01` codec,
+the loss-recovery machinery, the multi-tenant TCP/UDP server and client, and the complete C API
+(both the client and server surfaces). It installs as a normal package — `find_package(naudio)`
+or pkg-config — and binary installers exist for Linux, macOS, and Windows
+(**[INSTALL.md](INSTALL.md)**). The automated test suite needs no audio hardware and runs on all
+three platforms on every change; it includes the protocol conformance vectors, compile checks
+for every code sample in this file, and cross-language checks of the example clients. What does
+require real audio hardware — live capture and playback — is exercised by the shipped tools and
+documented procedures rather than by CI; see **Known limitations** below.
 
 ---
 
@@ -29,8 +74,8 @@ The audio streaming stack is **implemented and tested** (the device layer, the `
 | `naudio_pa` | static lib | `naudio_core` + the PortAudio device backend. |
 | `naudio_net` | static lib | The transport layer — TCP/UDP sockets, per-client threads, the multi-tenant `AudioStreamServer`, and `AudioStreamClient`. Backend-agnostic (takes a `DeviceBackend*`). |
 | `naudio` | **shared lib** | The public artifact: the **C ABI** (`include/naudio.h`) over the internal backends, exporting **only** the `na_*` surface (hidden visibility + `SOVERSION`). This is what a C / Hamlib consumer links and what `make install` ships, alongside `naudio.pc`. |
-| `tools/` | apps | The **hardware smoke daemon** (`na_audio_daemon`) — runs the real `AudioStreamServer` / `AudioStreamClient` over a live PortAudio device, the path ctest (fake backend only) cannot reach. An exerciser, **not** an audio primitive: it lives outside the libraries to keep the core pure + portable. Also the optional **Hamlib streaming bridge** (`na_hamlib_bridge`), which re-originates a Hamlib `rig_stream_*` audio stream onto naudio's wire so it survives a lossy/WAN hop — off by default, and needs a libhamlib that no release ships yet: see **[docs/hamlib-streaming-bridge.md](docs/hamlib-streaming-bridge.md)**. |
-| `examples/` | apps | The **examples suite** — a "play to speakers" client in C, C++, Python, Java, and Rust, plus a small demo source. Each links the public shared `naudio` and uses **only** `naudio.h`, proving the C ABI is self-sufficient from C and from any FFI consumer. See **[examples/README.md](examples/README.md)**. |
+| `tools/` | apps | The **device-serving daemon** (`na_audio_daemon`), which streams a real capture device and doubles as the hardware diagnostic (it exercises the live-device path the hardware-free test suite cannot reach); the **stream recorder** (`na_wav_tap`), which saves what a client receives as a WAV file; and the optional **Hamlib streaming bridge** (`na_hamlib_bridge`) — a radio-specific bolt-on, off by default, needing a libhamlib no release ships yet: see **[docs/hamlib-streaming-bridge.md](docs/hamlib-streaming-bridge.md)**. |
+| `examples/` | apps | The **examples suite** — a "play to speakers" client in C, C++, Python, Java, and Rust, plus `na_audio_source`, the demo server. The C client and the demo server **ship in the binary packages** as the out-of-the-box demo pair. Each example links the public shared `naudio` and uses **only** `naudio.h`, proving the C ABI is self-sufficient from C and from any FFI consumer. See **[examples/README.md](examples/README.md)**. |
 
 ---
 

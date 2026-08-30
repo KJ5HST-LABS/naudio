@@ -4,9 +4,11 @@
 
 Every install path below ends in the same package: the shared `naudio` library (the
 stable `na_*` C ABI), the C++ static archives and headers, `naudio.pc` for pkg-config,
-the CMake package for `find_package(naudio)`, and — on the paths that carry them — the
-command-line tools (`na_audio_daemon`, `na_wav_tap`, `na_hamlib_bridge`) with their man
-pages.
+the CMake package for `find_package(naudio)`, and the command-line programs — the demo
+pair (`na_audio_source`, `na_c_play_to_speakers`: hear audio across two machines with no
+code), the device-serving daemon (`na_audio_daemon`), the stream recorder (`na_wav_tap`),
+and, where it can be built, the optional Hamlib bridge (`na_hamlib_bridge`) — with man
+pages on the platforms that read them.
 
 Once installed, **[docs/getting-started.md](docs/getting-started.md)** is the walkthrough
 from an installed toolkit to audio streaming end to end.
@@ -80,16 +82,18 @@ cmake -S . -B build -DCMAKE_PREFIX_PATH=~/naudio
 ### Windows (.zip)
 
 The ZIP carries the library (`naudio.dll` + import library), the headers, the CMake
-package — and one tool, `na_wav_tap.exe`, which needs no audio device and is frequently
-the remote end of an on-air check. Expand it anywhere:
+package, and three programs: the demo pair (`na_audio_source.exe`,
+`na_c_play_to_speakers.exe`) and the stream recorder (`na_wav_tap.exe`). Expand it
+anywhere:
 
 ```powershell
 Expand-Archive naudio-<version>-windows-x86_64.zip -DestinationPath C:\naudio
-C:\naudio\<unpacked-dir>\bin\na_wav_tap.exe --help
+C:\naudio\<unpacked-dir>\bin\na_audio_source.exe --test-tone     # then play it from any machine
 ```
 
 Consume it from CMake with `-DCMAKE_PREFIX_PATH=<unpacked-dir>`; `naudio.dll` sits in
-`bin\` beside the tool.
+`bin\` beside the programs. (`na_audio_daemon` and the Hamlib bridge are not built on
+Windows.)
 
 ## Option B — Homebrew (macOS)
 
