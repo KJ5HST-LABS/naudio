@@ -5,6 +5,8 @@
 > **On the names:** *net-audio* is the wire **protocol** — the frozen `0xAF01` frame contract defined in [the spec](docs/audio-streaming-protocol-v1.md). *naudio* is this C/C++ **toolkit** that implements it. There is no separate "net-audio" package to find or install; the protocol name and this repository are the whole story.
 
 - **License:** LGPL-2.1-or-later — see **[LICENSE](LICENSE)**. (Matches Hamlib; links cleanly from proprietary apps and from GPL apps alike.)
+- **Install:** **[INSTALL.md](INSTALL.md)** — binary packages, Homebrew, and from-source, per platform.
+- **Getting started:** **[docs/getting-started.md](docs/getting-started.md)** — audio streaming end to end on the shipped tools, no code required.
 - **Wire spec:** **[docs/audio-streaming-protocol-v1.md](docs/audio-streaming-protocol-v1.md)** — the frozen `0xAF01` v1 contract.
 - **Protocols overview:** **[docs/protocols.md](docs/protocols.md)** — the `0xAF01` network audio wire format at a glance.
 - **Conformance:** **[conformance/README.md](conformance/README.md)** — language-neutral golden vectors that pin every normative value in the wire spec.
@@ -48,20 +50,12 @@ fetch GoogleTest (and, if no system PortAudio, PortAudio v19.7.0) from the netwo
 **System dependency:** PortAudio. On Debian/Ubuntu `sudo apt-get install portaudio19-dev`; on macOS
 `brew install portaudio pkg-config`. Without it, CMake fetches and builds PortAudio from source.
 
-To **install** the package — the shared `naudio` C ABI, the static C++ archives
-(`naudio_core` / `naudio_net` / `naudio_pa`), the `naudio.h` + `naudio/**` headers, `naudio.pc`, and
-the CMake package config (`find_package(naudio)`):
-
-```bash
-cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local   # set the prefix at CONFIGURE time
-cmake --build build
-cmake --install build
-pkg-config --cflags --libs naudio                       # or: find_package(naudio) in CMake
-```
-
-> Set `-DCMAKE_INSTALL_PREFIX` at **configure** time (not only on `cmake --install --prefix`):
-> `naudio.pc` bakes the prefix when the build tree is configured, so a configure-time prefix keeps
-> the pkg-config paths correct.
+To **install** — the shared `naudio` C ABI, the C++ archives and headers, `naudio.pc` /
+`find_package(naudio)`, and the tools with their man pages — see **[INSTALL.md](INSTALL.md)**: it
+covers the binary release packages, the Homebrew tap, and the from-source path (including the
+configure-time-prefix rule that keeps `naudio.pc` truthful). Once installed,
+**[docs/getting-started.md](docs/getting-started.md)** streams audio end to end using only the
+shipped tools.
 
 ---
 
