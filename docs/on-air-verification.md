@@ -214,24 +214,6 @@ the rig). Note that synthetic sources do not reach 100 % — `na_audio_source --
 75–86 %, the Hamlib dummy ~83 %, a loopback dummy ~70 % — so a shortfall is expected from a
 generator and is a real finding from a radio.
 
-> ### ⚠ Do not "control" this with a naive direct capture — it produces garbage that looks fine
->
-> The obvious control is to record the same period straight off the codec, bypassing naudio, and
-> compare decodes. Attempted with `ffmpeg -f avfoundation`, it decoded **nothing** in five periods,
-> at every window offset and on both channels, while naudio's path decoded every time.
->
-> **That was the control being broken, not naudio being better**, and the statistic that would have
-> caught it is not the one you reach for. RMS matched naudio's within 4 %, so by level the capture
-> looked perfect. The spectrum gave it away: `sox … -n stat` reported a rough frequency of
-> **10813 Hz** for the direct capture against **1505 Hz** for naudio's — and a receiver with a 3 kHz
-> filter cannot put its dominant energy at 10.8 kHz. The decode DFs (1073–2857 Hz) agree with
-> naudio's figure and not the control's.
->
-> Two traps worth carrying: `-ac 1` **averages L+R**, and this rig's channels are not identical
-> (L −35.5 dBFS vs R −31.8 dBFS measured), so a downmix is not the left channel the tap reads; and
-> avfoundation's device indices are its own, unrelated to naudio's `--list-devices` ids. If you want
-> this control, validate it by spectrum before trusting a null result from it.
-
 ### 7. If the link cannot carry 1.5 Mbps: provision a lower rate
 
 The 2026-08-21 remote runs found this the hard way: on a congested 2.4 GHz WiFi hop only **33 %**
