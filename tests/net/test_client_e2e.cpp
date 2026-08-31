@@ -333,9 +333,11 @@ TEST(Client, DisconnectWithoutConnect) {
 // is borrowed, each notify* captures it by value into a task the dispatcher runs later, and the
 // drain + join happen in ~AudioStreamClient. An arm that returns with an event still queued —
 // disconnect() POSTS onClientDisconnected rather than delivering it — then destroys its listener
-// first and the drain reads a dead object. Every arm here had the order reversed until issue #97,
-// which is the same defect the server suite hit twice under #28 and once more under #97; the
-// server's arms carry the same note. Measured, not reasoned: a probe that parks the dispatch
+// first and the drain reads a dead object. Fourteen of the fifteen arms here had the order
+// reversed until issue #97 — the exception declared its listener as an inline struct and got it
+// right by accident — and it is the same defect the server suite hit twice under #28 and once
+// more under #97; the server's arms carry the same note. Measured, not reasoned: a probe that
+// parks the dispatch
 // thread inside the posted fan-out reports stack-use-after-scope in notifyClientDisconnected's
 // task on the reversed order and nothing on this one. An arm that needs the other order must hand
 // the listener back with removeStreamListener(), which fences.
