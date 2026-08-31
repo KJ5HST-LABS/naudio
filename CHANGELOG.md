@@ -66,6 +66,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   choice — `autostart = true` in the configuration file, or the checkbox on the page — so
   the decision belongs to the operator rather than to the package.
 
+### Fixed
+- **The release notes no longer claim a signature nothing checked.** Every release body
+  asserted that the macOS `.pkg` "is signed and notarized and opens with no warning" — a
+  property the release workflow neither performs nor verifies, because signing is a manual
+  step done after publishing. The sentence was therefore false at the moment it appeared and
+  became true only if a human followed up; on 1.0.0rc3 it was wrong for 36 minutes, and it
+  was wrong in the direction that tells you a Gatekeeper warning is unexpected, so the
+  natural reaction to a real one is to distrust the download. An earlier wording had the
+  same defect pointed the other way and sent macOS users through a right-click → Open they
+  did not need. The note is now written from a measurement of the artifact itself
+  (`pkgutil --check-signature`, `spctl`, `stapler validate`), and signing the published
+  `.pkg` — with the checksum regeneration and the corrected sentence that belong to it — is
+  one command that verifies before it uploads and re-checks the published result afterwards.
+  See CONTRIBUTING.md, *Cutting a release*.
+
 ## [1.0.0rc3] — 2026-08-30
 
 ### Added

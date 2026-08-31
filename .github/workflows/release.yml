@@ -38,10 +38,20 @@ name: Release
 # (scoped at cpack time in cmake/CPackProjectConfig.cmake); the gates assert
 # that absence as policy, with the archive trees as the positive control that
 # the absence checks can fire. DEB/RPM already are Linux's double-clickable
-# installers and are unchanged. The macOS .pkg is SIGNED AND NOTARIZED (Developer ID,
-# stapled — it opens with no warning); that is still a MANUAL post-build step, not part
-# of this workflow, so the artifact this job uploads is unsigned until it is done. The
-# Windows installer is unsigned and SmartScreen warns about it.
+# installers and are unchanged.
+#
+# SIGNING IS MEASURED, NEVER ASSERTED (issue #99). Signing and notarizing the macOS .pkg
+# is a MANUAL post-build step this workflow does not perform — no signing identity is
+# available to it — so the .pkg it uploads is unsigned. The note therefore does not claim
+# otherwise: package-macos runs packaging/macos/signing-status.sh against the artifact and
+# the release job writes the macOS sentence from that measurement. The note used to assert
+# "signed and notarized and opens with no warning" unconditionally, which was false at the
+# moment it published and true only if a human followed up; an earlier wording asserted the
+# opposite and sent users through a Gatekeeper bypass they did not need. Both were the same
+# defect — a signing outcome nothing established. packaging/macos/publish-signed-pkg.sh is
+# the manual step, and it rewrites this sentence from the same measurement once the signed
+# .pkg is actually published, so the note tracks the artifact instead of the intent.
+# The Windows installer is unsigned and SmartScreen warns about it.
 
 on:
   push:
@@ -333,12 +343,42 @@ jobs:
           echo "installed daemon serves its control page and reports an idle pipeline"
           echo "== macOS installer gate: PASS =="
 
+      - name: "Signing status: measured on the .pkg, never assumed (#99)"
+        run: |
+          set -euo pipefail
+          pkg=$(ls build/naudio-*.pkg)
+
+          # THE NEGATIVE CONTROL RUNS FIRST. A detector stuck at one answer would be
+          # indistinguishable from a correct one here, because the artifact this job
+          # produces is always unsigned — so require the measurement to convict a
+          # package that is unsigned by construction before believing what it says
+          # about ours (L222: an absence is a measurement only once something has
+          # produced a presence). The other direction cannot be exercised on a runner
+          # with no signing identity; it is exercised by publish-signed-pkg.sh, on the
+          # machine that has one.
+          mkdir -p /tmp/signing-control/payload
+          echo control > /tmp/signing-control/payload/control.txt
+          pkgbuild --root /tmp/signing-control/payload \
+                   --identifier org.kj5hst.naudio.signing-control \
+                   --version 1 /tmp/signing-control/control.pkg > /dev/null
+          ctl=$(packaging/macos/signing-status.sh /tmp/signing-control/control.pkg 2>/dev/null)
+          if [ "$ctl" != unsigned ]; then
+            echo "::error::the signing detector called an unsigned package '$ctl' — its verdict on the real .pkg cannot be believed"
+            exit 1
+          fi
+          echo "negative control: a package with no signature measures as 'unsigned'"
+
+          status=$(packaging/macos/signing-status.sh "$pkg")
+          echo "$status" > build/macos-signing-status.txt
+          echo "== macOS .pkg signing status: $status =="
+
       - uses: actions/upload-artifact@v4
         with:
           name: package-macos
           path: |
             build/naudio-*.tar.gz
             build/naudio-*.pkg
+            build/macos-signing-status.txt
           if-no-files-found: error
 
   package-linux:
@@ -896,6 +936,25 @@ jobs:
       - name: Checksums
         run: cd dist && sha256sum naudio-* > sha256sums.txt && cat sha256sums.txt
 
+      - name: Compose the macOS signing sentence from what was measured (#99)
+        run: |
+          set -euo pipefail
+          f=dist/macos-signing-status.txt
+          # A MISSING MEASUREMENT IS A FAILURE, NOT A DEFAULT. Falling back to a
+          # sentence here would recreate the exact bug: a signing claim the pipeline
+          # never established. If package-macos did not measure, this release does not
+          # publish a claim about it.
+          test -f "$f" || {
+            echo "::error::no macOS signing measurement in the artifacts — refusing to describe the .pkg"
+            exit 1
+          }
+          status=$(tr -d '[:space:]' < "$f")
+          # The wording itself belongs to signing-status.sh, so the note and the
+          # post-signing rewrite cannot drift apart.
+          sentence=$(packaging/macos/signing-status.sh --sentence "$status")
+          echo "MACOS_SIGNING_SENTENCE=$sentence" >> "$GITHUB_ENV"
+          echo "measured '$status' -> $sentence"
+
       - name: Create (or complete) the Release for this tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -908,7 +967,7 @@ jobs:
           case "$tag" in *rc[0-9]*) pre="--prerelease" ;; esac
           if ! gh release view "$tag" > /dev/null 2>&1; then
             gh release create "$tag" --verify-tag $pre --title "naudio $tag" \
-              --notes "Binary packages for $tag. See CHANGELOG.md for what changed. Want it to just work? Take the .pkg (macOS) or the setup .exe (Windows) — double-click installers carrying the runtime library and tools, no build files; on Linux the .deb/.rpm are the equivalent. The Windows installer is unsigned, so SmartScreen warns: choose More info -> Run anyway. The macOS .pkg is signed and notarized and opens with no warning. Developers: the tarballs/ZIP carry headers, pkg-config and the CMake package; DEB/RPM install under /usr, tarballs are relocatable (tools find libnaudio via a relative rpath). The Hamlib bridge (na_hamlib_bridge) is not included: it needs a streaming-capable libhamlib no released Hamlib provides yet, and it will join the packages — linked against the system's real libhamlib — once one does. Until then it builds from source: docs/hamlib-streaming-bridge.md."
+              --notes "Binary packages for $tag. See CHANGELOG.md for what changed. Want it to just work? Take the .pkg (macOS) or the setup .exe (Windows) — double-click installers carrying the runtime library and tools, no build files; on Linux the .deb/.rpm are the equivalent. The Windows installer is unsigned, so SmartScreen warns: choose More info -> Run anyway. ${MACOS_SIGNING_SENTENCE} Developers: the tarballs/ZIP carry headers, pkg-config and the CMake package; DEB/RPM install under /usr, tarballs are relocatable (tools find libnaudio via a relative rpath). The Hamlib bridge (na_hamlib_bridge) is not included: it needs a streaming-capable libhamlib no released Hamlib provides yet, and it will join the packages — linked against the system's real libhamlib — once one does. Until then it builds from source: docs/hamlib-streaming-bridge.md."
           fi
           gh release upload "$tag" dist/naudio-* dist/sha256sums.txt --clobber
           gh release view "$tag" --json assets --jq '.assets[].name'

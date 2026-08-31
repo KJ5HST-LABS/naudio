@@ -55,6 +55,32 @@ requires: (1) a spec revision, (2) regenerating the golden vectors via
 (3) re-checking the codec and every example client against the regenerated vectors.
 The byte-identity tell for a correctly received stream is `first_frame_hex=68c569c66ac76bc8`.
 
+## Cutting a release
+
+Push a `v*` tag. `.github/workflows/release.yml` builds every platform, runs the full suite,
+gates the **packages themselves** (a package-based install must pass the same external-consumer
+commands a build-tree install does), and attaches the artifacts to a GitHub Release — prerelease
+automatically for a `v*rc*` tag. `workflow_dispatch` runs the byte-identical dry run without
+touching a release, which is how the pipeline is proven before a tag exists.
+
+**Signing the macOS `.pkg` is a manual step, and it is one command:**
+
+```
+packaging/macos/publish-signed-pkg.sh v1.0.0rc4          # add --dry-run to verify and publish nothing
+```
+
+The workflow has no signing identity, so the `.pkg` it publishes is unsigned and the release note
+says so — measured on the artifact by `packaging/macos/signing-status.sh`, never assumed (issue
+#99: the note used to assert "signed and notarized" unconditionally, which was false at the moment
+it published and true only if a human followed up). The script above signs, notarizes, staples,
+re-uploads, regenerates `sha256sums.txt` from the published assets, and rewrites that sentence —
+together, because doing them separately is what left one release describing a file it had already
+replaced. It refuses to upload anything that does not measure as signed first, and re-downloads
+the published assets to check the result. It needs a Developer ID Installer identity and a
+`notarytool` keychain profile; run it with `--help` for the one-time setup.
+
+The Windows installer is unsigned (no certificate) and SmartScreen warns about it.
+
 ## Pull requests
 
 Keep PRs focused. Describe what changed and why, and confirm `ctest` is green. New behavior should
