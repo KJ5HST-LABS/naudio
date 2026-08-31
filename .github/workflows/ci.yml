@@ -172,6 +172,25 @@ jobs:
       - name: Test (conformance vectors + Winsock loopback smokes)
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
 
+      - name: Assert the config gate took its WINDOWS branch, not a silent skip
+        shell: pwsh
+        run: |
+          # A passing naudio_daemon_configcheck above says nothing about WHICH default-location
+          # branch ran: if uname's spelling here stopped matching MINGW*, the arm would skip the
+          # three %ProgramData% cases and still report Passed. The script now fails outright in
+          # that case, but ctest prints nothing for a test that passes, so the evidence that the
+          # branch ran would exist nowhere. This re-runs that one arm verbosely (about two
+          # seconds) so the log carries it.
+          ctest --test-dir build -C RelWithDebInfo -R naudio_daemon_configcheck -V 2>&1 |
+            Tee-Object -FilePath cfg.log | Out-Null
+          if (-not (Select-String -Path cfg.log -Pattern 'file at %ProgramData% default path applied' -Quiet)) {
+            Write-Output "::error::configcheck did not run its %ProgramData% cases on Windows"
+            Get-Content cfg.log
+            exit 1
+          }
+          Select-String -Path cfg.log -Pattern 'default search|no-config|absent default'
+          Write-Output "== configcheck exercised defaultConfigPath()'s _WIN32 branch =="
+
       - name: Install (the step this job never had — issue #61)
         run: cmake --install build --config RelWithDebInfo
 

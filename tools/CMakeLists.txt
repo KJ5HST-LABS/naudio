@@ -112,12 +112,11 @@ endif()
 # shipped contract receives, not what an internal buffer held. Pure C, same posture as
 # na_hamlib_bridge.
 #
-# POSIX-only (clock_gettime / usleep / sleep), so gated like the examples rather than by
-# NAUDIO_BUILD_APPS alone.
+# Its two POSIX time calls (a millisecond sleep and a monotonic clock) are SHIMMED for Windows,
+# the same way the demo pair's are, so NAUDIO_BUILD_APPS alone is the right gate.
 # ----------------------------------------------------------------------------
-# Builds on Windows too, unlike everything else in here — see the note in the top-level
-# CMakeLists. It opens no device, so there is nothing platform-specific to exclude, and the
-# remote end of an on-air check is frequently the operator's spare Windows box.
+# It opens no device, so there is nothing platform-specific to exclude, and the remote end of an
+# on-air check is frequently the operator's spare Windows box.
 if(NAUDIO_BUILD_APPS)
     add_executable(na_wav_tap na_wav_tap.c)
     target_link_libraries(na_wav_tap PRIVATE naudio)

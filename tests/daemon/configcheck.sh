@@ -210,7 +210,22 @@ MINGW*|MSYS*|CYGWIN*)
     ;;
 
 *)
-    echo "skip: [default search] default path is /etc/naudio/daemon.conf here (not redirectable)"
+    # A silent skip is the way this section could report success while testing nothing, so the
+    # fallback is not allowed to assume it was reached for the right reason. Ask the SUBJECT, not
+    # the shell: a daemon named *.exe is a Windows binary, and a Windows binary reaching this
+    # branch means uname's spelling did not match the case above and the %ProgramData% cases were
+    # skipped without anyone being told. That is a harness fault, and it fails.
+    case "$DAEMON" in
+    *.exe)
+        echo "FAIL: [default search] the daemon under test is a Windows binary, but this shell"
+        echo "      reports '$(uname -s)' and matched no branch — the %ProgramData% cases did not"
+        echo "      run, and would have been skipped silently"
+        fails=$((fails + 1))
+        ;;
+    *)
+        echo "skip: [default search] default path is /etc/naudio/daemon.conf here (not redirectable)"
+        ;;
+    esac
     ;;
 esac
 
