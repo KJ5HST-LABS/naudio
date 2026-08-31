@@ -3,7 +3,18 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.0.0rc2] — 2026-08-30
+## [Unreleased]
+
+### Added
+- **Double-click installers: a macOS `.pkg` and a Windows setup `.exe`.** For the person
+  who wants naudio to just work: both install the runtime library and every command-line
+  program (man pages included on macOS) with a guided, no-questions flow — no unpacking,
+  no build files. The development files (headers, `naudio.pc`, the CMake package) stay in
+  the archives, Linux packages, and Homebrew, which are unchanged. The installers are
+  unsigned for now (macOS: right-click → Open on first launch; Windows: SmartScreen →
+  More info → Run anyway). The release pipeline installs each installer for real on its
+  platform — `installer -pkg` on macOS, a silent NSIS install *and uninstall* on
+  Windows — and gates on the installed result before anything is published.
 
 ### Changed
 - **The binary packages no longer carry `na_hamlib_bridge`, and no release artifact embeds

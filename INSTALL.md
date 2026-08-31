@@ -2,21 +2,26 @@
 
 # Installing naudio
 
-Every install path below ends in the same package: the shared `naudio` library (the
-stable `na_*` C ABI), the C++ static archives and headers, `naudio.pc` for pkg-config,
-the CMake package for `find_package(naudio)`, and the command-line programs — the demo
-pair (`na_audio_source`, `na_c_play_to_speakers`: hear audio across two machines with no
-code), the device-serving daemon (`na_audio_daemon`), and the stream recorder
-(`na_wav_tap`) — with man pages on the platforms that read them. (The optional Hamlib
-bridge is a from-source build only for now; see the note under Option C.)
+Every install path below delivers the shared `naudio` library (the stable `na_*` C ABI)
+and the command-line programs — the demo pair (`na_audio_source`,
+`na_c_play_to_speakers`: hear audio across two machines with no code), the
+device-serving daemon (`na_audio_daemon`), and the stream recorder (`na_wav_tap`) — with
+man pages on the platforms that read them. The archives, Linux packages, and Homebrew
+additionally carry the development files: headers, the C++ static archives, `naudio.pc`
+for pkg-config, and the CMake package for `find_package(naudio)`. The double-click
+installers deliberately do not — they are for running naudio, not compiling against it.
+(The optional Hamlib bridge is a from-source build only for now; see the note under
+Option C.)
 
 Once installed, **[docs/getting-started.md](docs/getting-started.md)** is the walkthrough
 from an installed toolkit to audio streaming end to end.
 
 > **Current availability (2026-08).** naudio is not yet public — the repository is
 > private ahead of its planned Hamlib contribution. The current packaged release,
-> **v1.0.0rc2** (a prerelease), carries the full installer set: TGZ for Linux and macOS,
-> DEB, RPM, a Windows ZIP, and `sha256sums.txt`. While the repository is private,
+> **v1.0.0rc2** (a prerelease), carries the full package set: TGZ for Linux and macOS,
+> DEB, RPM, a Windows ZIP, and `sha256sums.txt`. The double-click installers (.pkg /
+> setup .exe) described below join the artifacts at the first tag after rc2 — the
+> pipeline that builds and gates them is in place. While the repository is private,
 > collaborators with access fetch packages with
 > `gh release download v1.0.0rc2 -R KJ5HST-LABS/naudio` rather than anonymous URLs, and
 > the Homebrew tap installs over ssh. Everything else on this page is written for the
@@ -33,6 +38,24 @@ anything a package manager cannot satisfy. Deliberately **not** in the packages:
 provides yet. Shipping it would mean embedding a frozen pre-release hamlib beside
 whatever hamlib your other applications carry; instead it joins the packages — linked
 against the system's real libhamlib — once a released Hamlib ships the streaming API.
+
+### Double-click installers — macOS (.pkg) and Windows (setup .exe)
+
+The "make it just work" path: download `naudio-<version>-macos-<arch>.pkg` or
+`naudio-<version>-windows-x86_64.exe` and double-click it. Both carry the runtime
+library and all the command-line programs (with man pages on macOS) and none of the
+development files — to compile against naudio, use an archive, the Linux packages, or
+Homebrew instead.
+
+- **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`). The installer is
+  not signed or notarized, so Gatekeeper objects on first open: right-click the `.pkg`,
+  choose *Open*, then *Open* again. macOS packages have no uninstaller; to remove
+  naudio, delete the installed files and forget the receipts
+  (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
+- **Windows** installs into `C:\Program Files\naudio`, registers an uninstaller
+  (*Add or remove programs*, or `Uninstall.exe` in the install directory), and offers to
+  add the tools to `PATH`. SmartScreen warns on the unsigned installer: choose
+  *More info* → *Run anyway*.
 
 ### Debian / Ubuntu (.deb)
 
