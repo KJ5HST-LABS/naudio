@@ -221,10 +221,24 @@ TEST(DualTransport, AggregateStatsZeroWithNoClients) {
 namespace {
 
 // Refuses the first `failures` paired UDP binds, then behaves normally.
+//
+// `squats` (issue #98) makes the OS do the refusing instead of the injector: before a bind
+// that has reached the REAL path, occupy the paired UDP port with a live UdpServerTransport.
+// That transport passes reuseAddr=false deliberately (issue #83), so the second bind to the
+// same port is refused on every platform — the portable stand-in for the WSAEACCES this whole
+// section is about, produced by the kernel rather than by a `return false`.
 class FlakyUdpBindTransport : public DualServerTransport {
 public:
-    explicit FlakyUdpBindTransport(int failures) : failures_(failures) {}
+    explicit FlakyUdpBindTransport(int failures, int squats = 0)
+        : failures_(failures), squats_(squats) {}
     int udpBindCalls() const { return calls_; }
+
+    // Paired binds the OS itself refused, counted apart from the injected ones (issue #98).
+    // The bind that follows the injected run is real, and on a Windows host with WinNAT
+    // reserved ranges it can genuinely fail — the exact fault #73 exists for. Without this
+    // the arms below assert "the first real bind always succeeds", which is false by
+    // construction on the one platform they were written for.
+    int realRefusals() const { return realRefusals_; }
 
 protected:
     bool bindUdpTo(std::uint16_t port, std::string* err) override {
@@ -234,12 +248,21 @@ protected:
             if (err) *err = "bind() failed (errno=10013)";
             return false;
         }
-        return DualServerTransport::bindUdpTo(port, err);
+        UdpServerTransport squatter;
+        std::string squatErr;
+        const bool squatted = squats_ > 0 && squatter.bind(port, &squatErr);
+        if (squatted) --squats_;
+        const bool ok = DualServerTransport::bindUdpTo(port, err);
+        if (squatted) squatter.close();  // the retry gets a fresh port either way
+        if (!ok) ++realRefusals_;
+        return ok;
     }
 
 private:
     int failures_;
+    int squats_;
     int calls_{0};
+    int realRefusals_{0};
 };
 
 }  // namespace
@@ -253,9 +276,15 @@ TEST(DualTransport, Port0BindRetriesPastRefusedUdpPorts) {
     ASSERT_TRUE(server.bind(0, &err)) << err;
     EXPECT_TRUE(server.isBound());
     EXPECT_GT(server.port(), 0);
-    // It retried, and it retried exactly as far as it had to.
-    EXPECT_EQ(server.bindAttempts(), kRefusals + 1);
-    EXPECT_EQ(server.udpBindCalls(), kRefusals + 1);
+    // It retried, and it retried exactly as far as it had to. realRefusals() is part of the
+    // count, not an escape from it (issue #98): the bind after the injected run is real, so
+    // on a WinNAT host it can be refused for precisely the reason this arm exists, and going
+    // round again is then the behaviour #73 shipped. Adding the OS's refusals to what is owed
+    // keeps the assertion EXACT — it is not EXPECT_GE, and it still fails if the code stops
+    // retrying (bind() fails above) or spends one attempt more than something refused it.
+    const int owed = kRefusals + server.realRefusals() + 1;
+    EXPECT_EQ(server.bindAttempts(), owed) << server.realRefusals() << " genuine refusal(s)";
+    EXPECT_EQ(server.udpBindCalls(), owed);
     server.close();
 }
 
@@ -265,7 +294,38 @@ TEST(DualTransport, Port0BindReportsOneAttemptWhenUdpNeverRefuses) {
     FlakyUdpBindTransport server(0);
     std::string err;
     ASSERT_TRUE(server.bind(0, &err)) << err;
-    EXPECT_EQ(server.bindAttempts(), 1);
+    // Nothing is injected here, so every bind is real and a genuine refusal is the ONLY thing
+    // that may legitimately push this past 1 (issue #98) — accounted for, never tolerated. A
+    // fix that retried when it must not still reads >1 against realRefusals() == 0 and fails.
+    EXPECT_EQ(server.bindAttempts(), server.realRefusals() + 1)
+        << server.realRefusals() << " genuine refusal(s)";
+    server.close();
+}
+
+// THE COUNTER'S OWN CONTROL — and the only arm where the OS does the refusing (issue #98).
+//
+// The two arms above subtract realRefusals() from what they demand. If that counter could
+// never rise, they would be exact by luck rather than by construction and the Windows
+// intermittent would still fail them, so something has to prove it can. Here the injector
+// passes every call and a real UdpServerTransport occupies the paired port instead; it sets
+// no SO_REUSEADDR (issue #83), so the kernel refuses the second bind on Linux, macOS and
+// Windows alike. The retry then does on demand what #73 only ever did by lottery.
+//
+// This is also the first arm in which #73's retry recovers from a refusal that no test wrote:
+// every other one asserts against `return false`. realRefusals() is EXPECT_GE rather than
+// EXPECT_EQ for the same reason the arms above changed — the retry's own second bind is real
+// too, and may itself be refused — but the accounting stays exact against whatever it reads.
+TEST(DualTransport, Port0BindRecoversFromAGenuineUdpRefusal) {
+    FlakyUdpBindTransport server(/*failures=*/0, /*squats=*/1);
+    std::string err;
+
+    ASSERT_TRUE(server.bind(0, &err)) << err;
+    EXPECT_TRUE(server.isBound());
+    EXPECT_GT(server.port(), 0);
+    EXPECT_GE(server.realRefusals(), 1) << "the squatter never refused a real bind — the "
+                                           "counter the other two arms rely on cannot rise";
+    EXPECT_EQ(server.bindAttempts(), server.realRefusals() + 1);
+    EXPECT_EQ(server.udpBindCalls(), server.realRefusals() + 1);
     server.close();
 }
 
