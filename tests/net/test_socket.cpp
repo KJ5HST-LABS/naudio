@@ -13,6 +13,14 @@
 
 #include <gtest/gtest.h>
 
+#ifndef _WIN32
+#  include <fcntl.h>
+#  include <sys/resource.h>
+#  include <sys/select.h>
+#  include <unistd.h>
+#endif
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -938,3 +946,90 @@ TEST(Socket, RecvFromClampsAndFlagsOversizedDatagram) {
     EXPECT_EQ(r.bytes, small.size());
 #endif
 }
+
+// C9: a listener whose DESCRIPTOR NUMBER is at or above FD_SETSIZE must still accept.
+//
+// POSIX only, and not because Windows is untested — because Windows cannot have this bug.
+// Winsock's fd_set is { u_int fd_count; SOCKET fd_array[FD_SETSIZE]; }, indexed by insertion
+// order rather than by descriptor value, and select()'s first argument is ignored. On POSIX an
+// fd_set is a bitmap indexed BY DESCRIPTOR NUMBER, so before Socket.cpp moved to poll() this
+// arrangement did three different wrong things (all measured 2026-08-31): SIGABRT on a shipped
+// fortified Linux build via glibc's __fdelt_chk, a silent out-of-bounds write on an unfortified
+// one, and EINVAL from ::select on macOS, which left the listener permanently unable to accept.
+//
+// naudio is a library, so the descriptor number is chosen by the HOST process. Any application
+// already holding a thousand descriptors hands us a high one on its first listen, which is why
+// this is reachable without anything unusual happening inside naudio.
+//
+// The arm asserts a COMPLETED accept, not merely a non-error poll: a fix that made the wait
+// return cleanly while still failing to see the connection would pass the weaker assertion.
+//
+// It covers BOTH readiness sites at once — listen, connect and accept all run on descriptors
+// above FD_SETSIZE here, which is the shape a real embedding produces — and WHICH ONE reddens
+// first is timing-dependent, because connectTcp only waits when the non-blocking connect does
+// not complete immediately. Reverting waitOne's POSIX branch to ::select was measured failing
+// this arm at `client.valid()` with errno 22 (EINVAL); on a run where the connect completes
+// inline it fails at the acceptTcp assertion instead. Either way the arm is red, which is what
+// makes it a detector rather than a demonstration.
+#ifndef _WIN32
+TEST(Socket, AcceptsOnAListenerWhoseDescriptorIsAboveFdSetsize) {
+    // Raise the soft limit toward the hard one; without headroom above FD_SETSIZE the premise
+    // cannot be staged at all and the arm would pass while proving nothing.
+    rlimit lim{};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &lim), 0);
+    const rlim_t wanted = static_cast<rlim_t>(FD_SETSIZE) + 64;
+    if (lim.rlim_cur < wanted) {
+        rlimit raised = lim;
+        raised.rlim_cur = (lim.rlim_max == RLIM_INFINITY) ? wanted : std::min(lim.rlim_max, wanted);
+        ::setrlimit(RLIMIT_NOFILE, &raised);
+        ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &lim), 0);
+    }
+    if (lim.rlim_cur < wanted) {
+        GTEST_SKIP() << "RLIMIT_NOFILE soft limit is " << lim.rlim_cur << ", which leaves no room "
+                     << "above FD_SETSIZE (" << FD_SETSIZE << ") to stage the premise";
+    }
+
+    // Burn descriptors until the next socket must land at or above FD_SETSIZE.
+    std::vector<int> hogs;
+    for (;;) {
+        int fd = ::open("/dev/null", O_RDONLY);
+        if (fd < 0) break;
+        hogs.push_back(fd);
+        if (fd > FD_SETSIZE) break;
+    }
+    struct HogCloser {
+        std::vector<int>& v;
+        ~HogCloser() { for (int fd : v) ::close(fd); }
+    } closer{hogs};
+
+    std::string err;
+    Socket server = Socket::listenTcp("", 0, true, &err);
+    ASSERT_TRUE(server.valid()) << err;
+
+    // THE PREMISE, asserted rather than assumed. If the listener landed below FD_SETSIZE this
+    // arm is exercising the ordinary path and says nothing about the defect it is named for.
+    ASSERT_GE(static_cast<long long>(server.handle()), static_cast<long long>(FD_SETSIZE))
+        << "listener fd is " << static_cast<long long>(server.handle())
+        << ", below FD_SETSIZE (" << FD_SETSIZE << ") — the premise was not staged";
+
+    std::uint16_t port = server.localPort();
+    ASSERT_NE(port, 0);
+    Socket client = Socket::connectTcp("127.0.0.1", port, 2000, &err);
+    ASSERT_TRUE(client.valid()) << err;
+
+    Socket accepted;
+    err.clear();
+    IoStatus st = server.acceptTcp(2000, accepted, &err);
+    ASSERT_EQ(st, IoStatus::Ok) << err;
+    ASSERT_TRUE(accepted.valid());
+
+    // And it is a real connection, not just a descriptor: move a byte over it.
+    const std::uint8_t sent = 0x5A;
+    ASSERT_TRUE(client.sendAll(&sent, 1));
+    std::uint8_t got = 0;
+    RecvResult r = accepted.recv(&got, 1);
+    EXPECT_EQ(r.status, IoStatus::Ok);
+    EXPECT_EQ(r.bytes, 1u);
+    EXPECT_EQ(got, sent);
+}
+#endif

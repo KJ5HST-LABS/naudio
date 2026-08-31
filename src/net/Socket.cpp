@@ -37,6 +37,7 @@
 #  include <netdb.h>
 #  include <netinet/in.h>
 #  include <sys/socket.h>
+#  include <poll.h>
 #  include <sys/types.h>
 #  include <unistd.h>
 #endif
@@ -231,6 +232,64 @@ timeval msToTimeval(int ms) {
     tv.tv_sec = ms / 1000;
     tv.tv_usec = (ms % 1000) * 1000;
     return tv;
+}
+
+// Waits for ONE descriptor to become ready. Returns >0 ready, 0 deadline reached, <0 error with
+// lastErr() carrying the reason — the same three-way answer ::select gives, so callers are
+// unchanged in shape.
+//
+// POSIX USES poll(), NOT select(), AND THAT IS THE WHOLE POINT OF THIS FUNCTION. select()'s
+// fd_set is a fixed bitmap of FD_SETSIZE (1024) bits indexed BY DESCRIPTOR NUMBER, so a
+// descriptor >= FD_SETSIZE cannot be represented at all. Measured on 2026-08-31, with a low-fd
+// control beside each arm:
+//
+//   * Linux, as this project ships it (glibc, _FORTIFY_SOURCE active — the released
+//     libnaudio.so.1.0.0 carries an undefined reference to __fdelt_chk): FD_SET on such a
+//     descriptor ABORTS the process. "*** bit out of range 0 - FD_SETSIZE on fd_set ***",
+//     SIGABRT. A server does not fail the connection; the host process dies.
+//   * Linux built without fortification: a silent 4-byte write PAST the end of the fd_set, after
+//     which the accept loop carries on and appears to work. Confirmed with a guard word.
+//   * macOS: FD_SET is bounds-guarded so nothing is corrupted, but ::select then rejects
+//     nfds > FD_SETSIZE with EINVAL, so acceptTcp returns Error forever and the listener is dead.
+//
+// naudio is a LIBRARY: the descriptor number is set by the HOST process, not by us. An
+// application that already holds a thousand descriptors — a server, a GUI with many files open,
+// anything with a raised RLIMIT_NOFILE — hands us a high one on the first listen. poll() takes
+// the descriptor as a plain int in a struct and has no such ceiling.
+//
+// WINDOWS DELIBERATELY KEEPS select(), and this is not the lazy branch. Winsock's fd_set is not
+// a bitmap: it is { u_int fd_count; SOCKET fd_array[FD_SETSIZE]; }, indexed by insertion order,
+// and select()'s first argument is ignored entirely — so a SOCKET of any value is fine here,
+// where only one is ever added. WSAPoll would be the analogue but is documented not to report a
+// FAILED connection in revents, which is precisely what connectTcp below relies on. Swapping it
+// in would trade a bug Windows does not have for one it does.
+enum class WaitFor { Readable, Writable };
+
+int waitOne(socket_t h, WaitFor what, int timeoutMs) {
+#ifdef _WIN32
+    // Both call shapes are preserved exactly as they were before poll() arrived: the readable
+    // wait passes no exception set, the writable wait does — a refused connect signals the
+    // exception set on Winsock and the write set on POSIX.
+    fd_set primary;
+    FD_ZERO(&primary);
+    FD_SET(h, &primary);
+    timeval tv = msToTimeval(timeoutMs);
+    if (what == WaitFor::Readable) {
+        return ::select(static_cast<int>(h) + 1, &primary, nullptr, nullptr, &tv);
+    }
+    fd_set except;
+    FD_ZERO(&except);
+    FD_SET(h, &except);
+    return ::select(static_cast<int>(h) + 1, nullptr, &primary, &except, &tv);
+#else
+    // POLLERR / POLLHUP / POLLNVAL are output-only: they arrive in revents whether or not they
+    // were requested, so a failed connect wakes this wait exactly as the Winsock exception set
+    // does. Callers confirm with SO_ERROR either way.
+    pollfd pfd{};
+    pfd.fd = static_cast<int>(h);
+    pfd.events = (what == WaitFor::Readable) ? POLLIN : POLLOUT;
+    return ::poll(&pfd, 1, timeoutMs);
+#endif
 }
 
 // Reads SO_SNDTIMEO back from the kernel, in milliseconds. 0 means "no deadline" —
@@ -479,18 +538,14 @@ IoStatus Socket::acceptTcp(int timeoutMs, Socket& out, std::string* err) {
     for (int remaining = timeoutMs;;) {
         const int slice = (timeoutMs > 0 && remaining < kAcceptPollSliceMs) ? remaining
                                                                            : kAcceptPollSliceMs;
-        fd_set rf;
-        FD_ZERO(&rf);
-        FD_SET(h, &rf);
-        timeval tv = msToTimeval(slice);
-        int sel = ::select(static_cast<int>(h) + 1, &rf, nullptr, nullptr, &tv);
+        int sel = waitOne(h, WaitFor::Readable, slice);
         if (sel > 0) break;  // a connection is pending — go take it
         if (sel < 0) {
             // EINTR reports TimedOut exactly as it always has, rather than being retried here:
             // every caller already loops on TimedOut, and preserving the old answer keeps this
             // change to the polling cadence alone.
             if (isInterrupted(lastErr())) return IoStatus::TimedOut;
-            setErr(err, "select() failed in acceptTcp");
+            setErr(err, "readiness wait failed in acceptTcp");
             return IoStatus::Error;
         }
         if (handle_.load() == kInvalidSocket) {
@@ -550,15 +605,9 @@ Socket Socket::connectTcp(const std::string& host, std::uint16_t port,
         // A completed non-blocking connect signals writability; a FAILED one signals the
         // write set on POSIX but the EXCEPTION set on Winsock. Watch both so a refused
         // connect is reported immediately (via SO_ERROR) instead of waiting out the timeout.
-        fd_set wf, ef;
-        FD_ZERO(&wf);
-        FD_ZERO(&ef);
-        FD_SET(fd, &wf);
-        FD_SET(fd, &ef);
-        timeval tv = msToTimeval(timeoutMs);
-        int sel = ::select(static_cast<int>(fd) + 1, nullptr, &wf, &ef, &tv);
+        int sel = waitOne(fd, WaitFor::Writable, timeoutMs);
         if (sel <= 0) {
-            setErr(err, sel == 0 ? "connect timed out" : "select() failed");
+            setErr(err, sel == 0 ? "connect timed out" : "readiness wait failed");
             closeNative(fd);
             return Socket();
         }
