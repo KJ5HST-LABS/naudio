@@ -28,4 +28,19 @@ install -m 0644 -o root -g wheel "$SRC" "$DST"
 # by that user: group staff, which every local macOS account belongs to.
 install -d -m 0775 -o root -g staff "$LOGDIR"
 
+# "naudio Control.app" into /Applications (issue #96 item 4) — the shortcut that opens the
+# control page. Same reason as the plist: /Applications is not under the .pkg's /usr/local
+# payload prefix, so the payload carries the bundle in share/naudio/ and this copies it out.
+#
+# cp -R onto a REMOVED destination, not over a live one: a bundle updated in place can end up
+# holding files from both versions, and LaunchServices caches what it finds. Removing first
+# makes an upgrade replace rather than merge.
+APP_SRC="${VOL}@NAUDIO_APP_PAYLOAD_PATH@"
+APP_DST="${VOL}/Applications/naudio Control.app"
+if [ -d "$APP_SRC" ]; then
+    rm -rf "$APP_DST"
+    cp -R "$APP_SRC" "$APP_DST"
+    chown -R root:wheel "$APP_DST"
+fi
+
 exit 0

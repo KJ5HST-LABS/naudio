@@ -1,0 +1,16 @@
+// GENERATED — do not edit. CMake writes this from tools/control_page.cpp.in, embedding
+// tools/control_page.html and tools/control_page.js verbatim (issue #96 item 4).
+//
+// Why embedded rather than installed as files the daemon reads at runtime: a control page read
+// from disk is a path the daemon has to locate on three platforms, that a package can fail to
+// install, and that anything with write access to the install tree could replace with script the
+// browser would then run as same-origin. Compiled in, the page cannot be any of those.
+//
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (C) 2025-2026 Terrell Deppe
+
+extern const char kControlPageHtml[];
+extern const char kControlPageJs[];
+
+const char kControlPageHtml[] = R"NAUDIO_ASSET(@NAUDIO_CONTROL_PAGE_HTML@)NAUDIO_ASSET";
+const char kControlPageJs[] = R"NAUDIO_ASSET(@NAUDIO_CONTROL_PAGE_JS@)NAUDIO_ASSET";

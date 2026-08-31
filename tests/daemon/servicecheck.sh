@@ -49,9 +49,17 @@ bad()  { echo "FAIL: $*"; fails=$((fails + 1)); }
 # what the unit's own arguments mean. Neither appears in the unit itself.
 GUARD=(--mode zzz --no-config)
 
-case "$(uname -s)" in
-    Darwin) KIND=launchd ;;
-    *)      KIND=systemd ;;
+# Which KIND of unit is decided by the SUBJECT — the file handed to this script — and not by
+# asking the shell what platform it is on. That is S146's lesson from configcheck, where a
+# `uname` spelling that stopped matching would have skipped three cases and still passed. Here
+# the failure would be worse than a skip: on Windows a `uname`-derived default of "systemd"
+# would grep a Task Scheduler XML for `Type=simple`, find nothing, and report the daemon broken.
+# An unrecognised unit is a HARNESS FAULT and fails, rather than falling through to a guess.
+case "$UNIT" in
+    *.plist)   KIND=launchd  ;;
+    *.service) KIND=systemd  ;;
+    *.xml)     KIND=schtasks ;;
+    *) echo "FAIL: harness fault — cannot classify the unit file '$UNIT'"; exit 1 ;;
 esac
 echo "servicecheck: $KIND unit $UNIT"
 
@@ -96,6 +104,49 @@ if [ "$KIND" = launchd ]; then
     while v="$(plutil -extract "ProgramArguments.$n" raw -o - "$UNIT" 2>/dev/null)"; do
         unit_args+=("$v"); n=$((n + 1))
     done
+elif [ "$KIND" = schtasks ]; then
+    # A Task Scheduler logon task (issue #96 item 2, Windows half). Three of its defaults would
+    # break a long-running audio service SILENTLY, so each is asserted rather than left to the
+    # scheduler: the run would simply stop, or never start, with nothing written anywhere.
+    if command -v xmllint > /dev/null 2>&1; then
+        xmllint --noout "$UNIT" 2>/dev/null \
+            && ok "the task XML is well-formed" \
+            || bad "the task XML is not well-formed: $(xmllint --noout "$UNIT" 2>&1 | head -1)"
+    else
+        echo "note: no xmllint here; skipping the XML conformance check (CI has one)"
+    fi
+
+    grep -q '<LogonTrigger>' "$UNIT" && ok "runs at logon" \
+        || bad "no LogonTrigger — the task would never start by itself"
+
+    # Every assertion below is TAG-ANCHORED, which is not style: this template documents its own
+    # defaults in an XML comment, and a bare grep for PT0S would match the prose that explains
+    # why PT0S is needed and pass on a file that had lost the setting (L230).
+    settings="$(sed -n '/<Settings>/,/<\/Settings>/p' "$UNIT")"
+    [ -n "$settings" ] || bad "no <Settings> block in the task XML"
+
+    # The trigger's own <Enabled> is true; this is the task-level one, which is the inertness.
+    printf '%s' "$settings" | grep -q '<Enabled>false</Enabled>' \
+        && ok "the task ships disabled" \
+        || bad "the task is not disabled — installing would start capturing at the next logon"
+
+    # Defaults to PT72H. A service that must run indefinitely would be killed after three days.
+    printf '%s' "$settings" | grep -q '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>' \
+        && ok "no execution time limit (PT0S)" \
+        || bad "ExecutionTimeLimit is not PT0S — the task would be killed after three days"
+
+    # Both default to true. On a laptop the task would refuse to start on battery, or stop
+    # mid-stream the moment the charger came out.
+    printf '%s' "$settings" | grep -q '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>' \
+        && ok "starts on battery" || bad "DisallowStartIfOnBatteries is not false — no laptop would start it"
+    printf '%s' "$settings" | grep -q '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' \
+        && ok "keeps running on battery" || bad "StopIfGoingOnBatteries is not false"
+
+    cmd="$(sed -n 's|.*<Command>\(.*\)</Command>.*|\1|p' "$UNIT")"
+    xargs_line="$(sed -n 's|.*<Arguments>\(.*\)</Arguments>.*|\1|p' "$UNIT")"
+    [ -n "$cmd" ] || bad "no <Command> in the task XML"
+    # shellcheck disable=SC2206
+    unit_args=("$cmd" $xargs_line)
 else
     grep -q '^Type=simple$'                  "$UNIT" && ok "Type=simple"           || bad "no Type=simple"
     grep -q '^Restart=on-failure$'           "$UNIT" && ok "Restart=on-failure"    || bad "no Restart=on-failure"
@@ -124,6 +175,15 @@ if [ "${unit_args[0]}" = "$WANT_EXEC" ]; then
 else
     bad "unit names '${unit_args[0]}', but this build installs to '$WANT_EXEC'"
 fi
+
+# All three units run control mode since issue #96 item 4. It is a strict superset of what they
+# ran before — the page is served and NOTHING is captured until the operator asks — so a unit
+# that lost this would silently go back to opening a microphone at every login, which is exactly
+# the behaviour the arc decided against.
+printf '%s\n' "${unit_args[@]}" | grep -qx -- '--mode' \
+    && [ "$(printf '%s\n' "${unit_args[@]}" | grep -A1 -x -- '--mode' | tail -1)" = "control" ] \
+    && ok "unit serves the control page (--mode control)" \
+    || bad "unit does not pass --mode control — it would capture at login with no page to stop it"
 
 # A service that inherits the 30 s default would exit half a minute after every login.
 printf '%s\n' "${unit_args[@]}" | grep -qx -- '--duration-ms' \

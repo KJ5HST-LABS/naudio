@@ -24,7 +24,13 @@ Type=simple
 # --duration-ms 0 lives HERE, not in a shipped config file: a service runs until it is
 # stopped, always, and a flag cannot be undone by a stray file (flags beat the file —
 # issue #96 item 1). Every other setting comes from /etc/naudio/daemon.conf.
-ExecStart=@NAUDIO_SERVICE_EXEC@ --duration-ms 0
+#
+# --mode control (issue #96 item 4) is a strict superset of what this unit ran before:
+# it serves the localhost control page and captures NOTHING until something asks it to,
+# so enabling the service gives the operator a page to click rather than a microphone
+# that is already open. Capture at login is `autostart = true` in the config file, which
+# the page writes from a checkbox — the operator's choice, not the package's.
+ExecStart=@NAUDIO_SERVICE_EXEC@ --mode control --duration-ms 0
 Restart=on-failure
 RestartSec=5
 # The daemon's exit-code contract, encoded: 2 is a usage or config-file error — a

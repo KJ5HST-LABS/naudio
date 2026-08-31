@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<!--
+  naudio — the local control page (issue #96 item 4).
+  SPDX-License-Identifier: LGPL-2.1-or-later
+  Copyright (C) 2025-2026 Terrell Deppe
+
+  Embedded into na_audio_daemon at build time (tools/CMakeLists.txt) and served from
+  127.0.0.1 by `na_audio_daemon --mode control`. It loads NOTHING from the network: the
+  machine running the daemon may have no route off the LAN, and a page that fetched a font
+  or a stylesheet would render unstyled exactly where it matters most. The script lives in
+  control_page.js, served from this same daemon, so the Content-Security-Policy can forbid
+  inline script outright rather than allowing it.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>naudio control</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f5f7;  --panel: #ffffff; --ink: #14161a; --muted: #5d6470;
+    --line: #dfe3e8; --accent: #1f6feb; --accent-ink: #ffffff;
+    --ok: #1a7f47; --warn: #a5670a; --bad: #c0392b; --idle: #6b7280;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --panel: #1d2026; --ink: #e8eaed; --muted: #9aa2ae;
+      --line: #2c313a; --accent: #4c8dff; --accent-ink: #0b1220;
+      --ok: #4ec97f; --warn: #e0a53a; --bad: #ff6b5e; --idle: #8b93a1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { margin: 0; font-size: 19px; letter-spacing: -0.01em; }
+  header .ver { color: var(--muted); font: 12px/1 var(--mono); }
+  header .path { margin-left: auto; color: var(--muted); font: 12px/1.4 var(--mono); word-break: break-all; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px; display: grid; gap: 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; }
+  .panel > h2 {
+    margin: 0 0 14px; font-size: 12px; font-weight: 650; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--muted);
+  }
+
+  /* --- status --- */
+  .statusline { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 999px;
+    font-size: 13px; font-weight: 600; background: color-mix(in srgb, var(--idle) 15%, transparent);
+    color: var(--idle);
+  }
+  .badge::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .badge.running { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
+  .badge.starting, .badge.stopping { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+  .badge.error { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
+  .statusline .detail { color: var(--muted); font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 14px; }
+  .stat { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .stat .k { font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+  .stat .v { font: 600 20px/1.3 var(--mono); margin-top: 2px; overflow-wrap: anywhere; }
+  .stat .v small { font-size: 12px; font-weight: 400; color: var(--muted); }
+  .meter { height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 7px; }
+  .meter > i { display: block; height: 100%; background: var(--ok); width: 0; transition: width .35s; }
+
+  /* --- controls --- */
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+  button {
+    font: inherit; font-weight: 550; padding: 9px 18px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* --- settings --- */
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font-size: 12px; font-weight: 600; color: var(--muted); }
+  .field .hint { font-size: 11.5px; color: var(--muted); }
+  input, select {
+    font: inherit; padding: 8px 10px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .field.check { flex-direction: row; align-items: center; gap: 9px; }
+  .field.check input { width: 16px; height: 16px; }
+  .field.check label { font-size: 14px; color: var(--ink); }
+  .full { grid-column: 1 / -1; }
+
+  /* --- notices --- */
+  .notice { padding: 10px 14px; border-radius: 8px; font-size: 13.5px; margin-bottom: 14px; }
+  .notice.err { background: color-mix(in srgb, var(--bad) 13%, transparent); color: var(--bad); }
+  .notice.good { background: color-mix(in srgb, var(--ok) 13%, transparent); color: var(--ok); }
+  .notice.info { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
+  footer { color: var(--muted); font-size: 12px; padding: 0 24px 28px; max-width: 1080px; margin: 0 auto; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<header>
+  <h1>naudio</h1>
+  <span class="ver" id="version">—</span>
+  <span class="path" id="configPath"></span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Stream</h2>
+    <div id="streamNotice" hidden></div>
+    <div class="statusline">
+      <span class="badge" id="stateBadge">idle</span>
+      <span class="detail" id="stateDetail"></span>
+    </div>
+    <div class="grid">
+      <div class="stat"><div class="k">Delivered</div><div class="v" id="sDelivery">—</div>
+        <div class="meter"><i id="mDelivery"></i></div></div>
+      <div class="stat"><div class="k">Clients</div><div class="v" id="sClients">—</div></div>
+      <div class="stat"><div class="k">Received</div><div class="v" id="sRx">—</div></div>
+      <div class="stat"><div class="k">Uptime</div><div class="v" id="sUptime">—</div></div>
+      <div class="stat"><div class="k">Left</div><div class="v" id="sRmsL">—</div>
+        <div class="meter"><i id="mRmsL"></i></div></div>
+      <div class="stat"><div class="k">Right</div><div class="v" id="sRmsR">—</div>
+        <div class="meter"><i id="mRmsR"></i></div></div>
+      <div class="stat"><div class="k">Gaps</div><div class="v" id="sGaps">—</div></div>
+      <div class="stat"><div class="k">Recovered by FEC</div><div class="v" id="sFec">—</div></div>
+      <div class="stat"><div class="k">Errors</div><div class="v" id="sErrors">—</div></div>
+    </div>
+    <div class="actions">
+      <button class="primary" id="btnStart">Start streaming</button>
+      <button id="btnStop" disabled>Stop</button>
+      <button id="btnRestart" disabled>Restart</button>
+      <button id="btnQuit">Quit daemon</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Settings</h2>
+    <div id="configNotice" hidden></div>
+    <div class="fields">
+      <div class="field">
+        <label for="captureSel">Capture device (the radio)</label>
+        <select id="captureSel"></select>
+        <span class="hint" id="captureHint"></span>
+      </div>
+      <div class="field">
+        <label for="playbackSel">Send received audio to</label>
+        <select id="playbackSel"></select>
+        <span class="hint">A virtual sink (BlackHole, VB-Cable, Loopback) is what a digital-mode app reads.</span>
+      </div>
+      <div class="field">
+        <label for="transportSel">Transport</label>
+        <select id="transportSel"></select>
+        <span class="hint">TCP is reliable; UDP and DUAL add the FEC/reorder stack for lossy links.</span>
+      </div>
+      <div class="field">
+        <label for="portInp">Server port</label>
+        <input id="portInp" type="number" inputmode="numeric">
+        <span class="hint">Where clients connect. 0 picks a free port at startup.</span>
+      </div>
+      <div class="field">
+        <label for="rateInp">Sample rate (Hz)</label>
+        <input id="rateInp" type="number" inputmode="numeric">
+        <span class="hint">Must divide by 50 for an exact 20 ms frame. naudio never resamples: the
+          device has to open at exactly this rate.</span>
+      </div>
+      <div class="field">
+        <label for="channelsSel">Channels</label>
+        <select id="channelsSel">
+          <option value="1">1 — mono</option>
+          <option value="2">2 — stereo</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="controlPortInp">Control-page port</label>
+        <input id="controlPortInp" type="number" inputmode="numeric">
+        <span class="hint">Takes effect the next time the daemon starts.</span>
+      </div>
+      <div class="field check full">
+        <input id="autostartChk" type="checkbox">
+        <label for="autostartChk">Start streaming automatically when the daemon starts</label>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="primary" id="btnSave">Save settings</button>
+      <button id="btnRescan">Rescan devices</button>
+      <button id="btnRevert">Discard changes</button>
+    </div>
+  </section>
+</main>
+
+<footer>
+  Served on 127.0.0.1 only — this page is not reachable from the network, and naudio has no
+  remote management. Settings are written to the configuration file named above; a command-line
+  flag still overrides the file. See <code>na_audio_daemon(1)</code>.
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

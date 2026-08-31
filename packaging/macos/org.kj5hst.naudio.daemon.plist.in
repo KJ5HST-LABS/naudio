@@ -33,12 +33,23 @@
          shipped config file: a service runs until it is stopped, always, and a flag
          cannot be undone by a stray file (flags beat the file, issue #96 item 1).
          Every other setting comes from the config file.
+
+         The mode is control (issue #96 item 4), which is a strict superset of what
+         this agent ran before. Control mode serves the localhost page and captures
+         NOTHING until something asks it to, so logging in with the agent enabled
+         gives the operator a page to click rather than a microphone that is already
+         open. An operator who wants capture to begin at login sets autostart = true
+         in the config file, which the page writes from a checkbox; the choice is
+         theirs to make rather than the package's to assume.
+
          NB: no literal double hyphen may appear in these comments. XML forbids it,
          and while launchd and plutil both accept it anyway (measured), every
          conformant parser rejects the file outright. -->
     <key>ProgramArguments</key>
     <array>
         <string>@NAUDIO_SERVICE_EXEC@</string>
+        <string>--mode</string>
+        <string>control</string>
         <string>--duration-ms</string>
         <string>0</string>
     </array>

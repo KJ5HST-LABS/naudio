@@ -902,6 +902,39 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
                               "${NAUDIO_SERVICE_UNIT_FILE}"
                               "${NAUDIO_SERVICE_EXEC_PATH}")
     endif()
+    # Control-page gate (issue #96 item 4). The page is the surface an operator reaches INSTEAD of
+    # a terminal, so its failures are the ones with no exit code anywhere — a browser shows a
+    # blank panel and nothing else happens. The arm drives the real HTTP server in the built
+    # binary: it asserts the page and its script are served, that the three browser defences (Host,
+    # Origin, Content-Type) each refuse WITH a positive control proving the refusal was for that
+    # reason, that a bad value is refused with the same message the flag parser gives and leaves
+    # the config file untouched, and that a valid write round-trips through the file and back.
+    #
+    # Hardware-free by construction, not by luck: control mode opens no device until something
+    # asks it to, the arm passes --autostart false and asserts the pipeline is idle, and it never
+    # posts a start.
+    #
+    # Two external tools, both LOCATED HERE and passed in rather than assumed by the script: an
+    # HTTP client, and a Python to read JSON out of the responses (a regex over a message that
+    # can contain a quote or a comma is how a harness starts lying). Same discipline as the bash
+    # probe above — where either is missing the arm is not registered at all, because a test that
+    # fails as "unable to find executable" reads like a defect in the daemon.
+    find_program(NAUDIO_GATE_CURL NAMES curl)
+    find_program(NAUDIO_GATE_PYTHON NAMES python3 python)
+    if(NAUDIO_GATE_CURL AND NAUDIO_GATE_PYTHON)
+        add_test(NAME naudio_daemon_controlcheck
+                 COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
+                              "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/controlcheck.sh"
+                              "$<TARGET_FILE:na_audio_daemon>"
+                              "${NAUDIO_GATE_PYTHON}"
+                              "${NAUDIO_GATE_CURL}")
+        # It binds a socket and polls for the daemon's first line; the default 1500 s is far more
+        # than it needs, but a hung daemon should fail the arm rather than the whole suite.
+        set_tests_properties(naudio_daemon_controlcheck PROPERTIES TIMEOUT 180)
+    else()
+        message(STATUS "naudio: the control-page gate needs curl and python3; one is missing, so "
+                       "naudio_daemon_controlcheck is not registered")
+    endif()
 endif()
 
 # ----------------------------------------------------------------------------
@@ -1159,6 +1192,48 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         set(CPACK_NSIS_PACKAGE_NAME "naudio")
         set(CPACK_NSIS_URL_INFO_ABOUT "${CPACK_PACKAGE_HOMEPAGE_URL}")
         set(CPACK_NSIS_CONTACT "${CPACK_PACKAGE_CONTACT}")
+
+        # The Start-menu entry that opens the control page (issue #96 item 4) — the "shortcut"
+        # the issue's acceptance names. It is the same command line the .desktop file and the
+        # macOS .app use, and clicking it twice is safe: control mode finds an already-running
+        # page on the configured port, opens that, and exits 0 rather than failing to bind.
+        #
+        # $SMPROGRAMS/$STARTMENU_FOLDER are NSIS variables, literal to CMake (as $PROGRAMFILES64
+        # is above); the whole command is an NSIS single-quoted string so the inner double quotes
+        # around space-bearing paths are literal.
+        set(CPACK_NSIS_CREATE_ICONS_EXTRA
+            "CreateShortCut '$SMPROGRAMS\\$STARTMENU_FOLDER\\naudio Control.lnk' '$INSTDIR\\bin\\na_audio_daemon.exe' '--mode control --duration-ms 0 --open-page'")
+        set(CPACK_NSIS_DELETE_ICONS_EXTRA
+            "Delete '$SMPROGRAMS\\$MUI_TEMP\\naudio Control.lnk'")
+
+        # Service registration rides the installer here exactly as the .pkg postinstall carries
+        # it on macOS (issue #96 item 2, Windows half). The work is in a PowerShell script the
+        # package ships rather than in escaped one-liners here: it has to substitute the chosen
+        # $INSTDIR into the task XML and write it as UTF-16, and neither is reviewable through
+        # three layers of quoting. See packaging/windows/register-task.ps1.
+        #
+        # A failure is REPORTED, not fatal: a machine where schtasks refuses still gets a working
+        # installation with a Start-menu shortcut, and the release gate asserts the task really
+        # is registered, so a regression reddens CI rather than shipping quietly.
+        #
+        # StrCmp rather than LogicLib's ${If}: CPack's NSIS template includes MUI.nsh, Sections.nsh
+        # and WinMessages.NSH and NOTHING else (checked in the template itself, not assumed), so
+        # ${If} would fail to compile in makensis with an error naming a macro rather than a
+        # missing include. StrCmp is core NSIS and needs nothing.
+        set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "
+    DetailPrint \"Registering the naudio logon task (disabled until you enable it)...\"
+    nsExec::ExecToLog '\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"$INSTDIR\\share\\naudio\\register-task.ps1\" -InstallDir \"$INSTDIR\"'
+    Pop $0
+    StrCmp $0 \"0\" +2 0
+      DetailPrint \"naudio: the logon task could not be registered (code $0). Everything else is installed.\"
+")
+        # The same script with -Unregister, so the task NAME lives in exactly one file. The
+        # release gate asserts the task is gone after an uninstall, which is also what would
+        # catch this running after the payload had already been deleted.
+        set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "
+    nsExec::ExecToLog '\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"$INSTDIR\\share\\naudio\\register-task.ps1\" -InstallDir \"$INSTDIR\" -Unregister'
+    Pop $0
+")
     endif()
 
     include(CPack)

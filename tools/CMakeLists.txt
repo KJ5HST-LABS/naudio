@@ -19,8 +19,48 @@
 # register a service against. The hardware paths stay POSIX-smoked exactly as before — that is a
 # statement about the smoke, not about the compiler.
 if(NAUDIO_BUILD_APPS)
-    add_executable(na_audio_daemon na_audio_daemon.cpp)
+    # ------------------------------------------------------------------------
+    # The control page (issue #96 item 4), embedded rather than installed.
+    #
+    # A page read from disk at runtime is a path to locate on three platforms, a file a package
+    # can fail to install, and — the one that decides it — a file anything with write access to
+    # the install tree could replace with script the browser would then run as same-origin. So
+    # both assets are compiled in. The generated file is a single translation unit holding two
+    # raw string literals.
+    #
+    # The delimiter check below is not ceremony: a `)NAUDIO_ASSET"` appearing in the HTML would
+    # end the literal early and produce a compile error pointing at the GENERATED file, which is
+    # a bad place to learn what went wrong. It fails here instead, naming the source asset.
+    foreach(_asset control_page.html control_page.js)
+        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_asset}")
+            message(FATAL_ERROR "naudio: missing control-page asset ${_asset}")
+        endif()
+        # file(READ) creates no reconfigure dependency the way configure_file's INPUT does, so
+        # editing the page would otherwise leave a stale binary behind until something else
+        # forced a re-run of CMake.
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                     "${CMAKE_CURRENT_SOURCE_DIR}/${_asset}")
+    endforeach()
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/control_page.html" NAUDIO_CONTROL_PAGE_HTML)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/control_page.js" NAUDIO_CONTROL_PAGE_JS)
+    foreach(_content "${NAUDIO_CONTROL_PAGE_HTML}" "${NAUDIO_CONTROL_PAGE_JS}")
+        string(FIND "${_content}" ")NAUDIO_ASSET\"" _clash)
+        if(NOT _clash EQUAL -1)
+            message(FATAL_ERROR
+                    "naudio: a control-page asset contains the raw-string delimiter "
+                    ")NAUDIO_ASSET\" — rename the delimiter in control_page.cpp.in")
+        endif()
+    endforeach()
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/control_page.cpp.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/control_page.cpp" @ONLY)
+
+    add_executable(na_audio_daemon na_audio_daemon.cpp
+                                   "${CMAKE_CURRENT_BINARY_DIR}/control_page.cpp")
     target_link_libraries(na_audio_daemon PRIVATE naudio_net naudio_pa)
+    # The control page names the version it is part of; there is no other way for a tool to know
+    # it, since it links the internal static libraries rather than the versioned shared one.
+    target_compile_definitions(na_audio_daemon
+                               PRIVATE NAUDIO_TOOL_VERSION="${PROJECT_VERSION}")
     # Ships in the binary packages (issue #93): the daemon is the operator-facing
     # surface, and an installer without it is a dev-kit-only installer.
     install(TARGETS na_audio_daemon
@@ -47,16 +87,29 @@ if(NAUDIO_BUILD_APPS)
     # capture is a session privilege on both platforms (TCC on macOS, the per-user
     # PipeWire/PulseAudio socket on Linux). Rationale in full in each template.
     #
-    # Windows has no arm here YET, and the reason is no longer that the daemon is missing —
-    # it builds and ships there since item 3. What is missing is the registration: Windows
-    # has no session-scoped service object equivalent to a launchd Agent or a systemd --user
-    # unit. A real SCM service is the wrong shape for the same reason a LaunchDaemon was, one
-    # layer down: services run in session 0, which has no audio endpoints, so it would install
-    # cleanly and then capture nothing. The session-scoped analogue is a Task Scheduler logon
-    # task (an XML definition, registered by an NSIS section, created disabled) — same three
-    # properties this block already gives the other two platforms.
+    # Windows now has its arm too: a Task Scheduler LOGON TASK. A real SCM service is the wrong
+    # shape for the same reason a LaunchDaemon was, one layer down — services run in session 0,
+    # which has no audio endpoints, so one would install cleanly and then capture nothing. A
+    # logon task runs in the interactive session, where the devices are, and it takes the same
+    # three properties: an absolute program path, generated rather than hand-written; created
+    # DISABLED so installing starts nothing; removed on uninstall.
+    #
+    # One asymmetry Windows forces and the other two do not: its install prefix is chosen by the
+    # operator on the installer's directory page, so the task XML is rendered TWICE — once here
+    # against this build's install path (what the servicecheck arm asserts on), and again by the
+    # installer against $INSTDIR (what actually gets registered). See
+    # packaging/windows/register-task.ps1.
+    #
+    # All three units run `--mode control` since issue #96 item 4. That is a strict superset of
+    # what they ran before: control mode serves the local page and captures NOTHING until asked,
+    # so enabling the service gives the operator something to click rather than an open
+    # microphone. Capture-at-login is `autostart = true`, which the page writes from a checkbox.
     # ------------------------------------------------------------------------
     set(NAUDIO_SERVICE_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/na_audio_daemon")
+    if(WIN32)
+        # The task's <Command> must name a file that exists; without the suffix it names nothing.
+        set(NAUDIO_SERVICE_EXEC "${NAUDIO_SERVICE_EXEC}.exe")
+    endif()
     if(APPLE)
         set(NAUDIO_SERVICE_LOGDIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/log/naudio")
         set(NAUDIO_SERVICE_LOG "${NAUDIO_SERVICE_LOGDIR}/daemon.log")
@@ -65,6 +118,11 @@ if(NAUDIO_BUILD_APPS)
         # /usr/local install prefix and the payload therefore cannot reach it.
         set(NAUDIO_PLIST_PAYLOAD_PATH
             "${CMAKE_INSTALL_FULL_DATADIR}/naudio/org.kj5hst.naudio.daemon.plist")
+        # Where the postinstall will find "naudio Control.app" inside the payload, for the same
+        # reason and by the same route: /Applications is not under /usr/local either. Set HERE
+        # rather than beside the bundle's own configure_file below, because postinstall.in is
+        # configured a few lines down and a variable set after it would expand to nothing.
+        set(NAUDIO_APP_PAYLOAD_PATH "${CMAKE_INSTALL_FULL_DATADIR}/naudio/naudio Control.app")
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/org.kj5hst.naudio.daemon.plist.in"
             "${CMAKE_CURRENT_BINARY_DIR}/org.kj5hst.naudio.daemon.plist" @ONLY)
@@ -82,7 +140,38 @@ if(NAUDIO_BUILD_APPS)
                 DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
         set(NAUDIO_SERVICE_UNIT_FILE
             "${CMAKE_CURRENT_BINARY_DIR}/org.kj5hst.naudio.daemon.plist" PARENT_SCOPE)
-    elseif(NOT WIN32)
+
+        # "naudio Control.app" (issue #96 item 4) — the Applications entry, because macOS has no
+        # .desktop equivalent and the issue's acceptance is that the page opens from an INSTALLED
+        # shortcut. It is a launcher, not a program: a three-line script that execs the daemon in
+        # control mode. Like the plist it ships inside the payload and is copied out by the
+        # postinstall, because /Applications is not under the /usr/local install prefix either.
+        set(NAUDIO_APP_DIR "${CMAKE_CURRENT_BINARY_DIR}/app/naudio Control.app")
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/app/Info.plist.in"
+                       "${NAUDIO_APP_DIR}/Contents/Info.plist" @ONLY)
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/app/naudio-control.in"
+                       "${NAUDIO_APP_DIR}/Contents/MacOS/naudio-control" @ONLY)
+        # configure_file writes 0644. LaunchServices does not report a bundle whose executable is
+        # not executable — it declines to open it, with no error the operator can act on.
+        file(CHMOD "${NAUDIO_APP_DIR}/Contents/MacOS/naudio-control"
+             PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                         GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+        install(DIRECTORY "${NAUDIO_APP_DIR}"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools
+                USE_SOURCE_PERMISSIONS)
+    elseif(WIN32)
+        # For the servicecheck arm: this build's install path, rendered here. The file the
+        # installer actually registers is rendered from the same template against $INSTDIR.
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows/naudio-daemon-task.xml.in"
+                       "${CMAKE_CURRENT_BINARY_DIR}/naudio-daemon-task.xml" @ONLY)
+        # The TEMPLATE ships, not the rendering: the installer needs the unsubstituted token.
+        install(FILES
+                "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows/naudio-daemon-task.xml.in"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows/register-task.ps1"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
+        set(NAUDIO_SERVICE_UNIT_FILE
+            "${CMAKE_CURRENT_BINARY_DIR}/naudio-daemon-task.xml" PARENT_SCOPE)
+    else()
         configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/linux/naudio-daemon.service.in"
                        "${CMAKE_CURRENT_BINARY_DIR}/naudio-daemon.service" @ONLY)
         # lib/systemd/user is spelled out rather than taken from CMAKE_INSTALL_LIBDIR:
@@ -93,6 +182,14 @@ if(NAUDIO_BUILD_APPS)
                 DESTINATION "lib/systemd/user" COMPONENT tools)
         set(NAUDIO_SERVICE_UNIT_FILE
             "${CMAKE_CURRENT_BINARY_DIR}/naudio-daemon.service" PARENT_SCOPE)
+
+        # The desktop entry (issue #96 item 4). Unlike the systemd unit this needs no special
+        # directory reasoning: share/applications IS under the /usr prefix the DEB and RPM use,
+        # so the payload places it directly and no postinst is involved.
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/linux/naudio-control.desktop.in"
+                       "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.desktop" @ONLY)
+        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.desktop"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/applications" COMPONENT tools)
     endif()
     # Both read by the naudio_daemon_servicecheck arm, which asserts the unit names exactly
     # this path — the failure no build-tree test can see.
