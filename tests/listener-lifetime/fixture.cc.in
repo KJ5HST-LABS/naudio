@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+//
+// naudio — the positive control for tests/listener-lifetime/check.cmake. NOT COMPILED, and named
+// .cc.in so no glob, IDE, or build rule picks it up as a translation unit.
+//
+// The gate reports a clean tree by finding nothing unregistered, which is also what a broken
+// extractor produces. So the extractor is first run over this file, where the answer is known:
+// exactly the two calls below must be seen, and the look-alikes must not. Change this file only
+// together with the `fixture_want` list and the count in check.cmake.
+
+void scopeOrder() {
+    SomeListener aListener;
+    SomeOwner owner;
+    owner.addStreamListener(&aListener);   // MUST MATCH — the scope-order shape
+}
+
+void memberOrder(Handle* handle) {
+    handle->addStreamListener(handle->glue.get());   // MUST MATCH — the arrow / .get() shape
+}
+
+// MUST NOT MATCH — prose and a commented-out call, the two shapes that would make this gate
+// over-count. The header documents addStreamListener() in exactly this voice, and a call that
+// somebody commented out is not a call.
+//
+//   owner.addStreamListener(&stale);
+//
+// A listener is handed back with removeStreamListener() when it must die before its owner.

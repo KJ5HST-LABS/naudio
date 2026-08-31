@@ -823,6 +823,30 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
                      "-DNA_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/spec-citations"
                      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/spec-citations/check.cmake")
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/spec-citations")
+
+    # Listener-lifetime gate: every addStreamListener() CALL in the tree must be registered in
+    # tests/listener-lifetime/sites.txt with the mechanism that keeps its borrowed listener alive.
+    # Issue #97.
+    #
+    # The contract is that a listener outlives its owner unless it is handed back with
+    # removeStreamListener(), and breaking it is a use-after-free the compiler cannot see, the
+    # suite passes over, and only a sanitizer catches — intermittently, because it is a race
+    # between the owner's destructor draining the dispatcher and the listener leaving scope. It
+    # has now been broken three times: #28 found two arms in test_server.cpp, #97 found a third
+    # there after fourteen days of green CI, and the sweep #97 asked for found fourteen more in
+    # test_client_e2e.cpp plus one in the SHIPPED na_audio_daemon. The countermeasure both earlier
+    # rounds shipped was a header comment, and this is what a header comment is worth.
+    #
+    # It does NOT read declaration order — that needs a C++ front end. It closes the recurrence
+    # path that has actually recurred every time: a NEW call site written without the contract in
+    # mind. The gate's own limits are stated at the top of check.cmake rather than left implied.
+    #
+    # Runs everywhere, like the spec-citation gate above and for the same reason: pure CMake text
+    # processing, no compiler and no shell.
+    add_test(NAME naudio_listener_lifetime
+             COMMAND "${CMAKE_COMMAND}"
+                     "-DNA_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                     -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/listener-lifetime/check.cmake")
 endif()
 
 # ----------------------------------------------------------------------------

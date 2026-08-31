@@ -1,0 +1,26 @@
+# naudio — the registered addStreamListener() call sites.
+#
+# Read tests/listener-lifetime/check.cmake before editing. Format, one site per line:
+#
+#   <repo-relative path>|<call expression>|<count>|<mechanism>
+#
+# `mechanism` is how THIS site keeps the borrowed listener alive for as long as the owner can
+# reach it. Exactly three are legitimate:
+#
+#   declared-before   the listener is declared before the owner in the same scope, so reverse
+#                     destruction order destroys it after the owner. The common case.
+#   handed-back       the site calls removeStreamListener() before the listener dies. That call
+#                     fences the dispatcher, so it is safe in either declaration order.
+#   member-order      owner and listener are members of the same struct, ordered so the owner is
+#                     destroyed first. Used by the C ABI handles, which cannot use scope order.
+#
+# Adding a call site without adding a line here fails the naudio_listener_lifetime arm. That is
+# the point: the failure is the prompt to decide which mechanism the new site uses, at the moment
+# it is written rather than the next time a sanitizer job happens to lose the race.
+
+src/naudio_c_api.cpp|client->addStreamListener(c->glue.get())|1|member-order
+src/naudio_c_api.cpp|server->addStreamListener(server->glue.get())|1|member-order
+tests/net/test_client_e2e.cpp|client.addStreamListener(&listener)|15|declared-before
+tests/net/test_server.cpp|server.addStreamListener(&listener)|5|declared-before
+tests/net/test_server.cpp|server.addStreamListener(listener.get())|1|handed-back
+tools/na_audio_daemon.cpp|client.addStreamListener(&listener)|1|declared-before
