@@ -568,6 +568,66 @@ install(FILES
     COMPONENT dev)
 
 # ----------------------------------------------------------------------------
+# Licence text, the wire spec, and the conformance vectors — installed so they
+# travel WITH the artifact rather than only living in the repository.
+#
+# Every one of these was measured ABSENT from all six shipped artifact forms
+# (.deb, .rpm, macOS .pkg, both .tar.gz, the .zip) on 2026-08-31. Two distinct
+# defects were hiding behind the same gap:
+#
+#  * LEGAL. naudio is LGPL-2.1-or-later, and five of the six artifacts carried no
+#    licence text at all. Debian Policy 12.5 makes /usr/share/doc/<pkg>/copyright
+#    MANDATORY, so the .deb was non-compliant. CPACK_RESOURCE_FILE_LICENSE is set
+#    (see the CPack block below) and looks like it covers this — it does not. It
+#    is honoured by the NSIS and productbuild generators, which show a licence
+#    PAGE at install time, and IGNORED by the archive, DEB and RPM generators. A
+#    CPack resource variable is per-generator; setting it once does not make the
+#    property true everywhere, which is why this needs real install() rules.
+#
+#  * PROTOCOL. Section 12 of the spec calls the golden vectors "the gate every
+#    reference client must pass" — and neither the spec nor the vectors shipped,
+#    so an implementer holding a release could reach neither. Shipping them makes
+#    the artifact self-sufficient: spec + known-answer vectors + headers is
+#    everything a third party needs to write a compliant client and prove it.
+#
+# The licence is named `copyright` because that is the filename Debian Policy
+# REQUIRES; every other platform treats it as an ordinary doc file, so one file
+# satisfies the hard requirement and the conventions together.
+#
+# Component split: the licence and notices ride `runtime`, because they must
+# accompany the binaries themselves. The spec and vectors ride `dev`, because
+# they are what someone BUILDING against naudio (or re-implementing the wire)
+# needs. A plain `cmake --install` still installs all of it.
+# ----------------------------------------------------------------------------
+set(NAUDIO_DOC_DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/doc/naudio")
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+        DESTINATION "${NAUDIO_DOC_DESTINATION}"
+        RENAME copyright
+        COMPONENT runtime)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
+        DESTINATION "${NAUDIO_DOC_DESTINATION}"
+        COMPONENT runtime)
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/docs/audio-streaming-protocol-v1.md"
+              "${CMAKE_CURRENT_SOURCE_DIR}/docs/protocols.md"
+        DESTINATION "${NAUDIO_DOC_DESTINATION}"
+        COMPONENT dev)
+
+# The vectors keep their repo-relative shape (vectors/, tools/) so the paths the
+# spec and conformance/README.md name still read correctly once installed.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/conformance/README.md"
+        DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/naudio/conformance"
+        COMPONENT dev)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/conformance/vectors/vectors.ini"
+              "${CMAKE_CURRENT_SOURCE_DIR}/conformance/vectors/vectors-v1_2.ini"
+        DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/naudio/conformance/vectors"
+        COMPONENT dev)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/conformance/tools/gen_vectors.py"
+        DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/naudio/conformance/tools"
+        COMPONENT dev)
+
+# ----------------------------------------------------------------------------
 # Tests — GoogleTest (system/Homebrew preferred, FetchContent fallback).
 # Guarded by EXISTS so partial checkouts still configure.
 # ----------------------------------------------------------------------------
@@ -823,6 +883,27 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
                      "-DNA_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/spec-citations"
                      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/spec-citations/check.cmake")
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/spec-citations")
+
+    # Packaged-documentation gate: performs a real `cmake --install` into a scratch prefix and
+    # asserts the licence text, the wire spec and the conformance vectors came out the other side,
+    # byte-identical to their sources. It carries its own negative control (see check.cmake).
+    #
+    # This exists because on 2026-08-31 an audit measured all of them ABSENT from every one of the
+    # six shipped artifact forms, while being present in the repo the whole time and while
+    # CPACK_RESOURCE_FILE_LICENSE was set and appeared to cover the licence. No source-tree grep
+    # and no configuration read could have caught that — what a package contains is a property of
+    # the artifact. So the gate installs and looks.
+    #
+    # Runs everywhere: `cmake --install` and `compare_files` are portable, and the paths are built
+    # from CMAKE_INSTALL_DATAROOTDIR rather than a hard-coded "share".
+    add_test(NAME naudio_packaged_docs
+             COMMAND "${CMAKE_COMMAND}"
+                     "-DNA_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                     "-DNA_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                     "-DNA_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/packaged-docs"
+                     "-DNA_DATAROOTDIR=${CMAKE_INSTALL_DATAROOTDIR}"
+                     -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/packaged-docs/check.cmake")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/packaged-docs")
 
     # Listener-lifetime gate: every addStreamListener() CALL in the tree must be registered in
     # tests/listener-lifetime/sites.txt with the mechanism that keeps its borrowed listener alive.
