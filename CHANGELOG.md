@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.0.0rc4] — 2026-08-31
+
 ### Added
 - **`na_audio_daemon` reads a configuration file.** Every setting flag now has a
   config-file key of the same name (`transport = udp`, `capture-id = 3` — one
