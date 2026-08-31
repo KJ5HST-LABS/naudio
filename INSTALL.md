@@ -281,5 +281,34 @@ target_link_libraries(your_app PRIVATE naudio::naudio)   # the C ABI
 alongside — see the README's *Using naudio as a C++ library* section for the
 `naudio_PORTAUDIO_FOUND` gate that `naudio::naudio_pa` consumers should check.
 
+---
+
+## What else the package installs
+
+Every package carries the licence, the wire specification and the conformance vectors, so
+an installed copy is self-contained — you do not need the repository to implement against
+the protocol or to check an implementation.
+
+| Path (under the install prefix) | What it is |
+|---|---|
+| `share/doc/naudio/copyright` | the full LGPL-2.1 text naudio is licensed under |
+| `share/doc/naudio/THIRD_PARTY_NOTICES.md` | third-party components and their licences |
+| `share/doc/naudio/audio-streaming-protocol-v1.md` | the normative `0xAF01` wire specification |
+| `share/doc/naudio/protocols.md` | the wire format at a glance |
+| `share/naudio/conformance/vectors/` | the language-neutral golden vectors |
+| `share/naudio/conformance/README.md` | the vector file format, field by field |
+
+**Writing a client in another language?** Those last two are the whole kit. The vectors are
+a known-answer test — every expected byte, including the CRCs, is computed independently of
+the implementation under test — so passing them is what makes a client conformant rather
+than merely compatible with this one. §12 of the specification is the contract; the vector
+`README.md` describes the INI format, which is deliberately parseable with any language's
+standard library.
+
+On a system-wide install the prefix is `/usr` (`.deb`/`.rpm`) or `/usr/local` (macOS `.pkg`),
+so the spec is at `/usr/share/doc/naudio/audio-streaming-protocol-v1.md` and the vectors at
+`/usr/share/naudio/conformance/vectors/`. From a tarball or the Windows `.zip` they sit under
+the directory you unpacked.
+
 Next: **[docs/getting-started.md](docs/getting-started.md)** — from an installed toolkit
 to audio streaming end to end.
