@@ -155,6 +155,75 @@ the wrong device or port while looking configured.
 and
 .B \-\-help
 are actions, not settings, and have no key.
+.SH SERVICE REGISTRATION
+The packages install a service definition so the daemon can run without a
+terminal.
+It is installed
+.I inert:
+installing a package must not start capturing a microphone at your next login,
+so you enable the service once, deliberately.
+.PP
+On macOS the installer registers a launchd
+.I agent
+at
+.IR /Library/LaunchAgents/org.kj5hst.naudio.daemon.plist .
+Enable and start it with:
+.PP
+.nf
+.RS
+launchctl enable gui/$(id \-u)/org.kj5hst.naudio.daemon
+launchctl kickstart \-k gui/$(id \-u)/org.kj5hst.naudio.daemon
+.RE
+.fi
+.PP
+On Linux the packages install a systemd
+.I user
+unit at
+.IR /usr/lib/systemd/user/naudio\-daemon.service :
+.PP
+.nf
+.RS
+systemctl \-\-user enable \-\-now naudio\-daemon
+.RE
+.fi
+.PP
+Both are session-scoped rather than system services, because capturing audio
+is a session privilege: a root daemon can never be granted a microphone by
+macOS, and a system-scope unit cannot reach your PipeWire or PulseAudio
+socket.
+Both pass
+.B \-\-duration\-ms 0
+on the command line, so the service runs until it is stopped no matter what
+the configuration file says; every other setting comes from that file.
+.PP
+Windows has no service yet \(em
+.B na_audio_daemon
+is not built for Windows.
+.SS Changing the configuration
+The daemon reads its configuration file once, at startup.
+There is no reload signal, and a change of sample rate, channel count or
+transport could not be applied to a running stream anyway.
+.I Restarting the service is the way to apply a change:
+.PP
+.nf
+.RS
+launchctl kickstart \-k gui/$(id \-u)/org.kj5hst.naudio.daemon
+systemctl \-\-user restart naudio\-daemon
+.RE
+.fi
+.SS When the service will not start
+A configuration error stops the daemon with exit status 2 and a
+.IR file : line
+message naming the offending line.
+The systemd unit treats that status as permanent and stops retrying, leaving
+the unit
+.B failed
+with the message visible in
+.BR "systemctl \-\-user status naudio\-daemon" .
+launchd cannot distinguish exit statuses, so the agent instead retries every
+30 seconds and writes the same message to
+.IR /usr/local/var/log/naudio/daemon.log ,
+which is the file to read when a Mac service will not come up.
 .SH EXIT STATUS
 .TP
 .B 0

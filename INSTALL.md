@@ -45,8 +45,9 @@ run naudio — the programs, the library they share, and (on a Mac) their manual
 What the installers leave out are the files for *building software* against naudio;
 those are in every other format on this page.
 
-- **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`). The installer is
-  signed and notarized by Apple — it opens like any other installer, no warnings. macOS
+- **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`) and registers the
+  daemon as a background service, switched off until you turn it on (see *Running the
+  daemon in the background* below). The installer is signed and notarized by Apple — it opens like any other installer, no warnings. macOS
   installers have no uninstaller; to remove naudio, delete the installed files and
   forget the receipts (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for
   `….tools`).
@@ -170,6 +171,42 @@ that dependency, enabling the bridge, and confirming you actually got it are cov
 A from-source install can be removed with the manifest CMake writes:
 `xargs rm < build/install_manifest.txt` (the package installs above are removed by their
 package manager: `apt-get remove naudio`, `rpm -e naudio`, `brew uninstall naudio`).
+
+## Running the daemon in the background
+
+`na_audio_daemon` normally runs in a terminal window and stops when you close it. The
+packages also install it as a background service, so it starts with your computer and
+keeps serving audio on its own.
+
+The service arrives **switched off**. Installing software should not start listening to
+your microphone, so turning it on is a deliberate, one-time step:
+
+```bash
+# macOS
+launchctl enable gui/$(id -u)/org.kj5hst.naudio.daemon
+launchctl kickstart -k gui/$(id -u)/org.kj5hst.naudio.daemon
+
+# Linux
+systemctl --user enable --now naudio-daemon
+```
+
+Both run the daemon as **you**, not as a system account — that is what lets it reach your
+microphone and your sound system at all. The settings it uses come from the configuration
+file described in `man na_audio_daemon` (*CONFIGURATION FILE*); the service reads that file
+once when it starts, so after changing it, restart the service:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/org.kj5hst.naudio.daemon   # macOS
+systemctl --user restart naudio-daemon                          # Linux
+```
+
+If the service will not start, the usual cause is a mistake in the configuration file, and
+the message names the line: `systemctl --user status naudio-daemon` on Linux, or
+`/usr/local/var/log/naudio/daemon.log` on a Mac. To switch the service off again, use
+`launchctl disable gui/$(id -u)/org.kj5hst.naudio.daemon` or
+`systemctl --user disable --now naudio-daemon`.
+
+Windows has no background service yet — the daemon is not built for Windows.
 
 ## Verify any install
 

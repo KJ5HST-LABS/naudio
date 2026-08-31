@@ -16,6 +16,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   with the file name and line number instead of being skipped. This is the first
   step of the operate-without-a-terminal arc: settings now live somewhere a service
   can read and a control page can write. See `na_audio_daemon(1)`.
+- **`na_audio_daemon` can run as a background service.** The packages install a launchd
+  agent on macOS (registered by the `.pkg`) and a systemd *user* unit on Linux (carried
+  by the DEB and RPM), so the daemon starts with the machine instead of living in a
+  terminal window. Both run as the logged-in user rather than as a system account —
+  capturing audio is a session privilege, and a root service could never be granted a
+  microphone on macOS or reach the user's sound server on Linux. Both arrive **switched
+  off**: installing software must not start listening to a microphone, so enabling is a
+  deliberate one-time step (`launchctl enable …` / `systemctl --user enable --now
+  naudio-daemon`), and an operator's choice survives reinstalling or upgrading. The
+  daemon reads its configuration file once at startup, so restarting the service is how
+  a configuration change is applied; a mistake in that file stops the service with the
+  offending line named rather than leaving it running misconfigured. Windows has no
+  service yet — the daemon is not built for Windows. See `na_audio_daemon(1)`,
+  *SERVICE REGISTRATION*, and INSTALL.md.
 
 ## [1.0.0rc3] — 2026-08-30
 
