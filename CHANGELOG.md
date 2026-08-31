@@ -3,6 +3,20 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- **`na_audio_daemon` reads a configuration file.** Every setting flag now has a
+  config-file key of the same name (`transport = udp`, `capture-id = 3` — one
+  `key = value` per line, `#` comments), read from `--config <file>` or from the
+  platform's conventional location (`~/Library/Application Support/naudio/daemon.conf`
+  on macOS, `%ProgramData%\naudio\daemon.conf` on Windows, `/etc/naudio/daemon.conf`
+  elsewhere); `--no-config` skips it. Flags always override the file. Parsing is
+  strict — an unknown key, malformed line, or out-of-range value stops the daemon
+  with the file name and line number instead of being skipped. This is the first
+  step of the operate-without-a-terminal arc: settings now live somewhere a service
+  can read and a control page can write. See `na_audio_daemon(1)`.
+
 ## [1.0.0rc3] — 2026-08-30
 
 ### Added

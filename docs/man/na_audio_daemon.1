@@ -22,6 +22,8 @@ na_audio_daemon \- serve a real capture device as a naudio stream, or probe it
 .IR N ]
 .RB [ \-\-duration\-ms
 .IR N ]
+.RB [ \-\-config
+.IR file \ |\ \-\-no\-config ]
 .br
 .B na_audio_daemon \-\-list\-devices
 .SH DESCRIPTION
@@ -88,11 +90,71 @@ server port; 0 picks an ephemeral port (default 4533).
 .BI \-\-duration\-ms " N"
 run time in milliseconds; 0 runs until Ctrl-C (default 30000).
 .TP
+.BI \-\-config " file"
+read settings from
+.I file
+(see
+.B CONFIGURATION FILE
+below) instead of the default location.
+The file must exist.
+Flags given on the same command line still override it.
+.TP
+.B \-\-no\-config
+read no configuration file at all, not even the default one.
+.TP
 .B \-\-list\-devices
 enumerate capture and playback devices with their backend ids, then exit.
 .TP
 .BR \-h ", " \-\-help
 print usage and exit.
+.SH CONFIGURATION FILE
+Every option above that takes a value can also be set from a configuration
+file, one
+.B key = value
+per line; the key is the option's name without its leading dashes:
+.PP
+.nf
+.RS
+# the radio's codec, served over UDP until stopped
+capture = USB Audio CODEC
+transport = udp
+port = 4533
+duration\-ms = 0
+.RE
+.fi
+.PP
+Lines starting with
+.B #
+are comments.
+Whitespace around keys and values is trimmed; spaces
+.I inside
+a value are kept, so device patterns need no quoting.
+Command-line flags always override the file.
+.PP
+Unless
+.B \-\-config
+or
+.B \-\-no\-config
+is given, the daemon reads the platform's conventional location when the
+file exists (and simply uses its defaults when it does not):
+.TP
+macOS
+.I ~/Library/Application\ Support/naudio/daemon.conf
+.TP
+Windows
+.I %ProgramData%\enaudio\edaemon.conf
+.TP
+other systems
+.I /etc/naudio/daemon.conf
+.PP
+Parsing is strict: an unknown key, a malformed line, or an out-of-range
+value stops the daemon with the file name and line number rather than
+being skipped \(em a typo'd key silently ignored would run the daemon on
+the wrong device or port while looking configured.
+.B \-\-list\-devices
+and
+.B \-\-help
+are actions, not settings, and have no key.
 .SH EXIT STATUS
 .TP
 .B 0
