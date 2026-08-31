@@ -51,7 +51,27 @@ include(GoogleTest)
 # value is a ceiling, not a wait.
 set(NA_GTEST_DISCOVERY_TIMEOUT 120)
 
-gtest_discover_tests(naudio_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT})
+# A GTEST_SKIP()ped arm exits 0, so ctest counts it as PASSED and prints nothing —
+# `--output-on-failure` shows the output of failures only. An arm that skips itself
+# because its premise cannot be staged is therefore indistinguishable, in a CI log,
+# from one that ran and proved something. That is the exact shape this project keeps
+# being bitten by: an instrument whose silence is read as evidence.
+#
+# SKIP_REGULAR_EXPRESSION matches googletest's own "[  SKIPPED ]" banner and makes
+# ctest report `***Skipped`, the way naudio_c_abi_stride already does via
+# SKIP_RETURN_CODE 77 in the root CMakeLists. Skips still do not fail the run; they
+# just stop being invisible. Applied to every gtest binary, not only the one that
+# prompted it, because the reasoning is not specific to any arm.
+# NOTE the trailing space, which is load-bearing. gtest_discover_tests writes each property
+# value into the generated file as a CMake bracket argument, [[like this]] — so a value
+# ENDING in "]" produces [[...\]]] and the bracket closes one character early, failing the
+# whole generated file with "Argument not separated from preceding token by whitespace".
+# googletest always prints a name after the banner ("[  SKIPPED ] Socket.Foo"), so matching
+# the following space is both correct and enough to keep the value off a "]".
+set(NA_GTEST_PROPERTIES PROPERTIES SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\] ")
+
+gtest_discover_tests(naudio_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT}
+                     ${NA_GTEST_PROPERTIES})
 
 # ----------------------------------------------------------------------------
 # Conformance harness — validates the C/C++ codec against the language-neutral
@@ -65,7 +85,8 @@ add_executable(naudio_conformance_tests conformance/ConformanceTest.cpp)
 target_link_libraries(naudio_conformance_tests PRIVATE naudio_core GTest::gtest_main)
 target_compile_definitions(naudio_conformance_tests
     PRIVATE NA_CONFORMANCE_DIR_DEFAULT="${CMAKE_SOURCE_DIR}/conformance")
-gtest_discover_tests(naudio_conformance_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT})
+gtest_discover_tests(naudio_conformance_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT}
+                     ${NA_GTEST_PROPERTIES})
 
 # ----------------------------------------------------------------------------
 # Net transport tests — exercise the naudio_net layer (sockets, the
@@ -89,4 +110,5 @@ add_executable(naudio_net_tests
     # The lossy-relay fixture (shared with the C stats test's own target).
     client_stats_proxy.cpp)
 target_link_libraries(naudio_net_tests PRIVATE naudio_net GTest::gtest_main Threads::Threads)
-gtest_discover_tests(naudio_net_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT})
+gtest_discover_tests(naudio_net_tests DISCOVERY_TIMEOUT ${NA_GTEST_DISCOVERY_TIMEOUT}
+                     ${NA_GTEST_PROPERTIES})
