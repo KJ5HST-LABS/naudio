@@ -389,10 +389,13 @@ consumer. The byte-identity tell for a correctly received stream is
   no buffer depth converts into throughput). What exists today is **static provisioning**: declare a
   lower server-wide format with `na_server_set_audio_format` (or `--rate`/`--channels` on
   `na_audio_source` and `na_audio_daemon`) before start. Clients discover it via
-  `na_client_get_audio_format` after connect; nothing resamples, and every client gets the same
-  format (per-client negotiation is [issue #91](https://github.com/KJ5HST-LABS/naudio/issues/91)
-  Phase B). Against that measured link (~0.5 Mbps effective — **derived** from 33 % of 1.536 Mbps,
-  not itself measured):
+  `na_client_get_audio_format` after connect. **Since 0.5.0 a client may also ask for less than
+  the server broadcasts**, for its own subscription only: `na_client_request_format` (spec 1.2
+  §6.2.1) requests an integer divisor of the server's rate and/or a reduced channel layout, which
+  the server grants exactly or declines to native — never partially — while every other client
+  keeps the native stream. What still does not exist is mid-stream adaptation and resampling
+  between arbitrary rates; the remaining format breadth is §13.1 of the spec. Against that measured
+  link (~0.5 Mbps effective — **derived** from 33 % of 1.536 Mbps, not itself measured):
 
   | Format | Rate on wire | On that link |
   |---|---|---|

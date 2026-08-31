@@ -235,8 +235,9 @@ included — picks it up from the negotiated format automatically.
 The wire-rate arithmetic is in the README's **Known limitations** table (48 k stereo 1.536 Mbps
 down to 8 k mono 128 kbps). Three properties to keep in mind:
 
-- **Server-wide.** Every client gets the lower format; per-client negotiation is
-  [issue #91](https://github.com/KJ5HST-LABS/naudio/issues/91) Phase B.
+- **Server-wide by default, per-client on request.** The declared format is what every client
+  gets unless a client asks for less: since 0.5.0 `na_client_request_format` (spec 1.2 §6.2.1)
+  reduces one subscription's rate and/or channel layout, leaving every other client native.
 - **No resampling exists.** The capture device must open at the declared rate. If it cannot, the
   run fails loudly — `na_audio_daemon` *refuses* to serve a format other than the one you declared
   (a silent 48 k fallback would ship wrong-rate audio labeled 12 k, and nothing downstream could

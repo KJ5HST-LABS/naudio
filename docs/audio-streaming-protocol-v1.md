@@ -602,7 +602,7 @@ This section compares net-audio v1 with Hamlib's audio streaming (issue/PR #1940
 
 ## 12. Conformance
 
-The executable companion to this spec is the **golden-vector conformance suite** in [`conformance/`](../../conformance/). It contains language-neutral, hand-derived known-answer vectors (with CRCs computed independently of the implementation under test) covering the frame codec, CRC, FEC, jitter, reorder, control messages, and presets. A conformance test loads these vectors and validates encode and decode against them.
+The executable companion to this spec is the **golden-vector conformance suite** in [`conformance/`](../conformance/). It contains language-neutral, hand-derived known-answer vectors (with CRCs computed independently of the implementation under test) covering the frame codec, CRC, FEC, jitter, reorder, control messages, and presets. A conformance test loads these vectors and validates encode and decode against them.
 
 - **C/C++ reference:** `tests/conformance/ConformanceTest.cpp` (built and run as part of the standard `ctest` suite, test `Conformance.GoldenVectors`).
 
