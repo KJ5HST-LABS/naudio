@@ -31,6 +31,16 @@ name: Release
 # The per-platform package gates below are the issue's acceptance criterion:
 # a PACKAGE-BASED install (unpacked tarball, dpkg -i, expanded zip) passes the
 # same external-consumer commands ci.yml runs against a build-tree install.
+#
+# Double-clickable installers (operator-directed, S141): macOS ships a
+# productbuild .pkg and Windows an NSIS setup .exe alongside the archives.
+# Their payload is runtime+tools ONLY — no headers, no .pc, no CMake package
+# (scoped at cpack time in cmake/CPackProjectConfig.cmake); the gates assert
+# that absence as policy, with the archive trees as the positive control that
+# the absence checks can fire. DEB/RPM already are Linux's double-clickable
+# installers and are unchanged. Both installers are UNSIGNED: macOS needs
+# right-click -> Open on first launch, Windows shows a SmartScreen warning —
+# signing is a separate decision requiring certificates.
 
 on:
   push:
@@ -71,7 +81,7 @@ jobs:
           fi
 
   package-macos:
-    name: package (macos, TGZ)
+    name: package (macos, TGZ + installer .pkg)
     runs-on: macos-latest
     needs: version-guard
     steps:
@@ -153,10 +163,63 @@ jobs:
             || { echo "::error::pkg-config consumer did not run"; exit 1; }
           echo "== macOS package gate: PASS =="
 
+      - name: Package (installer — productbuild .pkg, runtime+tools payload)
+        run: cd build && cpack -G productbuild
+
+      - name: "Installer gate: install the .pkg for real, run, scan, assert dev files absent"
+        run: |
+          set -euo pipefail
+          pkg=$(ls build/naudio-*.pkg)
+          echo "installer: $pkg"
+
+          # Positive control FIRST (L222): the dev-absence assertions below can
+          # only mean something if the same paths exist in the full tree — the
+          # TGZ tree gate 1 unpacked carries them.
+          for present in include/naudio.h lib/pkgconfig/naudio.pc lib/libnaudio.dylib; do
+            test -e "${{ runner.temp }}/pkg/$present" \
+              || { echo "::error::control broken: TGZ tree lacks $present — absence checks prove nothing"; exit 1; }
+          done
+
+          # THE install the deliverable promises: Installer.app's command-line
+          # twin placing real files under /usr/local, receipt and all.
+          sudo installer -pkg "$pkg" -target /
+          pkgutil --pkgs | grep -c '^org\.kj5hst\.naudio\.' | grep -qx 2 \
+            || { echo "::error::expected exactly the runtime+tools receipts"; pkgutil --pkgs | grep naudio; exit 1; }
+
+          # The four binaries run from /usr/local/bin with no environment, and
+          # the man pages landed beside them.
+          /usr/local/bin/na_wav_tap --help > /dev/null
+          /usr/local/bin/na_audio_daemon -h > /dev/null 2>&1
+          /usr/local/bin/na_audio_source --help > /dev/null
+          /usr/local/bin/na_c_play_to_speakers --help > /dev/null
+          test -f /usr/local/share/man/man1/na_audio_daemon.1
+
+          # otool self-containment on the INSTALLED files, cardinality 5 (L230).
+          scanned=0
+          for f in /usr/local/bin/na_wav_tap /usr/local/bin/na_audio_daemon \
+                   /usr/local/bin/na_audio_source /usr/local/bin/na_c_play_to_speakers \
+                   /usr/local/lib/libnaudio.*.*.*.dylib; do
+            scanned=$((scanned+1))
+            bad=$(otool -L "$f" | tail -n +2 | grep -v '@rpath\|/usr/lib/\|/System/' || true)
+            if [ -n "$bad" ]; then echo "::error::$f references non-system libraries:"; echo "$bad"; exit 1; fi
+          done
+          [ "$scanned" -eq 5 ] || { echo "::error::expected to scan 5 installed binaries, scanned $scanned"; exit 1; }
+
+          # Payload policy is runtime+tools ONLY — the absence half of the
+          # control proven fireable above.
+          for absent in /usr/local/include/naudio.h /usr/local/lib/pkgconfig/naudio.pc \
+                        /usr/local/lib/cmake/naudio /usr/local/lib/libnaudio.dylib; do
+            if [ -e "$absent" ]; then
+              echo "::error::installer shipped dev file $absent — payload must be runtime+tools only"; exit 1; fi
+          done
+          echo "== macOS installer gate: PASS =="
+
       - uses: actions/upload-artifact@v4
         with:
           name: package-macos
-          path: build/naudio-*.tar.gz
+          path: |
+            build/naudio-*.tar.gz
+            build/naudio-*.pkg
           if-no-files-found: error
 
   package-linux:
@@ -315,7 +378,7 @@ jobs:
           if-no-files-found: error
 
   package-windows:
-    name: package (windows, ZIP — lib + headers + na_wav_tap + the demo pair)
+    name: package (windows, ZIP + installer .exe — lib + headers + na_wav_tap + the demo pair)
     runs-on: windows-latest
     needs: version-guard
     steps:
@@ -384,10 +447,74 @@ jobs:
             Write-Output "::error::consume_cxx did not run"; exit 1 }
           Write-Output "== Windows package gate: PASS =="
 
+      - name: Ensure NSIS is present (preinstalled on the runner image; installed here only if the image drops it)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y --no-progress }
+          makensis /VERSION
+
+      - name: Package (installer — NSIS setup .exe, runtime+tools payload)
+        run: cd build; cpack -G NSIS -C Release
+
+      - name: "Installer gate: silent-install the .exe, run, stream, assert dev files absent, uninstall"
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem build/naudio-*.exe | Select-Object -First 1
+          if (-not $exe) { Write-Output "::error::no NSIS installer produced"; exit 1 }
+          Write-Output "installer: $($exe.Name)"
+
+          # Positive control FIRST (L222): the dev-absence assertions below can
+          # only fire if the full tree really carries those paths — the ZIP
+          # tree the package gate expanded does.
+          $zipTree = Get-ChildItem "${{ runner.temp }}/pkgroot" | Select-Object -First 1
+          foreach ($present in 'include/naudio.h','lib/naudio.lib') {
+            if (-not (Test-Path "$($zipTree.FullName)/$present")) {
+              Write-Output "::error::control broken: ZIP tree lacks $present — absence checks prove nothing"; exit 1 } }
+
+          $proc = Start-Process -PassThru -Wait -FilePath $exe.FullName -ArgumentList '/S'
+          if ($proc.ExitCode -ne 0) { Write-Output "::error::silent install exited $($proc.ExitCode)"; exit 1 }
+          $I = "$env:ProgramFiles\naudio"
+
+          # The shipped binaries and the uninstaller are in place; the tools run
+          # from the installed tree (naudio.dll beside them in bin/).
+          foreach ($f in 'bin/na_wav_tap.exe','bin/na_audio_source.exe','bin/na_c_play_to_speakers.exe','bin/naudio.dll','Uninstall.exe') {
+            if (-not (Test-Path "$I/$f")) { Write-Output "::error::installed tree is missing $f"; exit 1 } }
+          & "$I/bin/na_wav_tap.exe" --help
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::installed na_wav_tap.exe will not run"; exit 1 }
+
+          # Runtime proof on the INSTALLED layout: test-tone server -> null
+          # client, byte-tell asserted — same discipline as the ZIP gate.
+          $srv = Start-Process -PassThru -NoNewWindow -FilePath "$I/bin/na_audio_source.exe" `
+                 -ArgumentList '--test-tone','--seconds','25'
+          Start-Sleep -Seconds 3
+          & "$I/bin/na_c_play_to_speakers.exe" --backend null --seconds 5 2>&1 |
+            Tee-Object -FilePath inst-demo.log
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::installed demo client exited $LASTEXITCODE"; exit 1 }
+          if (-not (Select-String -Path inst-demo.log -Pattern 'first_frame_hex=68c569c66ac76bc8' -Quiet)) {
+            Write-Output "::error::byte-tell missing — the installed pair did not stream"; exit 1 }
+          Stop-Process -Id $srv.Id -ErrorAction SilentlyContinue
+
+          # Payload policy is runtime+tools ONLY.
+          foreach ($absent in 'include','lib/naudio.lib','lib/cmake') {
+            if (Test-Path "$I/$absent") {
+              Write-Output "::error::installer shipped dev path $absent — payload must be runtime+tools only"; exit 1 } }
+
+          # And the uninstaller actually removes what was installed. _?= makes
+          # the NSIS uninstaller run synchronously in place (it then cannot
+          # delete its own .exe — only the payload is asserted gone).
+          # The _?= path contains a space; Start-Process joins -ArgumentList
+          # with spaces and no quoting, so the quotes ride inside the string.
+          $un = Start-Process -PassThru -Wait -FilePath "$I/Uninstall.exe" -ArgumentList '/S',"`"_?=$I`""
+          if ($un.ExitCode -ne 0) { Write-Output "::error::silent uninstall exited $($un.ExitCode)"; exit 1 }
+          if (Test-Path "$I/bin/na_wav_tap.exe") { Write-Output "::error::uninstaller left the tools behind"; exit 1 }
+          Write-Output "== Windows installer gate: PASS =="
+
       - uses: actions/upload-artifact@v4
         with:
           name: package-windows
-          path: build/naudio-*.zip
+          path: |
+            build/naudio-*.zip
+            build/naudio-*.exe
           if-no-files-found: error
 
   release:
@@ -420,7 +547,7 @@ jobs:
           case "$tag" in *rc[0-9]*) pre="--prerelease" ;; esac
           if ! gh release view "$tag" > /dev/null 2>&1; then
             gh release create "$tag" --verify-tag $pre --title "naudio $tag" \
-              --notes "Binary packages for $tag. See CHANGELOG.md for what changed. The DEB/RPM install under /usr; the tarballs are relocatable (tools find libnaudio via a relative rpath). The Hamlib bridge (na_hamlib_bridge) is not included: it needs a streaming-capable libhamlib no released Hamlib provides yet, and it will join the packages — linked against the system's real libhamlib — once one does. Until then it builds from source: docs/hamlib-streaming-bridge.md."
+              --notes "Binary packages for $tag. See CHANGELOG.md for what changed. Want it to just work? Take the .pkg (macOS) or the setup .exe (Windows) — double-click installers carrying the runtime library and tools, no build files; on Linux the .deb/.rpm are the equivalent. Both installers are unsigned: macOS needs right-click -> Open the first time, Windows shows a SmartScreen warning (More info -> Run anyway). Developers: the tarballs/ZIP carry headers, pkg-config and the CMake package; DEB/RPM install under /usr, tarballs are relocatable (tools find libnaudio via a relative rpath). The Hamlib bridge (na_hamlib_bridge) is not included: it needs a streaming-capable libhamlib no released Hamlib provides yet, and it will join the packages — linked against the system's real libhamlib — once one does. Until then it builds from source: docs/hamlib-streaming-bridge.md."
           fi
           gh release upload "$tag" dist/naudio-* dist/sha256sums.txt --clobber
           gh release view "$tag" --json assets --jq '.assets[].name'
