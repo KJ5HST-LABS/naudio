@@ -11,9 +11,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   program (man pages included on macOS) with a guided, no-questions flow — no unpacking,
   no build files. The development files (headers, `naudio.pc`, the CMake package) stay in
   the archives, Linux packages, and Homebrew, which are unchanged. The macOS `.pkg` is
-  **signed** (Developer ID Installer) but not yet notarized, so Gatekeeper still asks for
-  right-click → Open on first launch; the Windows installer is unsigned (no signing
-  certificate available) and SmartScreen answers More info → Run anyway. The release
+  **signed and notarized** (Developer ID; hardened-runtime binaries, microphone
+  entitlement on the capture tools) — Gatekeeper opens it with no warnings; the Windows
+  installer is unsigned (no signing certificate available) and SmartScreen answers
+  More info → Run anyway. The release
   pipeline installs each installer for real on its platform — `installer -pkg` on macOS,
   a silent NSIS install *and uninstall* on Windows — and gates on the installed result
   before anything is published.

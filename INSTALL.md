@@ -46,10 +46,10 @@ What the installers leave out are the files for *building software* against naud
 those are in every other format on this page.
 
 - **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`). The installer is
-  signed, but Apple has not notarized it yet, so the first open needs one extra step:
-  right-click the `.pkg`, choose *Open*, then *Open* again. macOS installers have no
-  uninstaller; to remove naudio, delete the installed files and forget the receipts
-  (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
+  signed and notarized by Apple — it opens like any other installer, no warnings. macOS
+  installers have no uninstaller; to remove naudio, delete the installed files and
+  forget the receipts (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for
+  `….tools`).
 - **Windows** installs into `C:\Program Files\naudio`, registers an uninstaller
   (*Add or remove programs*, or `Uninstall.exe` in the install directory), and offers to
   add the programs to `PATH`. The installer is unsigned, so SmartScreen warns: choose
