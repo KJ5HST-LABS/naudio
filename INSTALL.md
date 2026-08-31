@@ -2,19 +2,19 @@
 
 # Installing naudio
 
-Every install path below delivers the shared `naudio` library (the stable `na_*` C ABI)
-and the command-line programs — the demo pair (`na_audio_source`,
-`na_c_play_to_speakers`: hear audio across two machines with no code), the
-device-serving daemon (`na_audio_daemon`), and the stream recorder (`na_wav_tap`) — with
-man pages on the platforms that read them. The archives, Linux packages, and Homebrew
-additionally carry the development files: headers, the C++ static archives, `naudio.pc`
-for pkg-config, and the CMake package for `find_package(naudio)`. The double-click
-installers deliberately do not — they are for running naudio, not compiling against it.
-(The optional Hamlib bridge is a from-source build only for now; see the note under
-Option C.)
+**Just want it to work?** Download the installer for your system from the
+[Releases page](https://github.com/KJ5HST-LABS/naudio/releases) and run it: the `.pkg` on
+a Mac, the setup `.exe` on Windows, the `.deb` or `.rpm` on Linux. Each one installs the
+ready-to-run programs — a demo server and player that put audio across two machines with
+no code, the audio-serving daemon, and the stream recorder — along with everything they
+need. Then **[docs/getting-started.md](docs/getting-started.md)** walks you from there to
+audio moving across your network.
 
-Once installed, **[docs/getting-started.md](docs/getting-started.md)** is the walkthrough
-from an installed toolkit to audio streaming end to end.
+**Writing software that uses naudio?** The tarballs, the Linux packages, and Homebrew
+also carry the developer files — the C headers, `naudio.pc` for pkg-config, and the CMake
+package for `find_package(naudio)`. The double-click installers deliberately leave those
+out; pick any other format. (The optional Hamlib bridge is a from-source build only for
+now; see the note under Option C.)
 
 > **Current availability (2026-08).** naudio is not yet public — the repository is
 > private ahead of its planned Hamlib contribution. The current packaged release,
@@ -31,29 +31,28 @@ from an installed toolkit to audio streaming end to end.
 Packages are attached to tagged releases on the
 [Releases page](https://github.com/KJ5HST-LABS/naudio/releases), named
 `naudio-<version>-<os>-<arch>` with a `sha256sums.txt` beside them. They are
-self-contained — PortAudio is built into the library, and nothing in a package depends on
-anything a package manager cannot satisfy. Deliberately **not** in the packages:
-`na_hamlib_bridge`, which needs a streaming-capable libhamlib that no released Hamlib
-provides yet. Shipping it would mean embedding a frozen pre-release hamlib beside
-whatever hamlib your other applications carry; instead it joins the packages — linked
-against the system's real libhamlib — once a released Hamlib ships the streaming API.
+self-contained: the audio engine is built in, and nothing needs to be installed first.
+One thing is deliberately **not** in the packages: the optional Hamlib radio bridge
+(`na_hamlib_bridge`), because it needs a version of Hamlib that has not been released
+yet. It joins the packages the day one is; until then it builds from source
+(`docs/hamlib-streaming-bridge.md`).
 
 ### Double-click installers — macOS (.pkg) and Windows (setup .exe)
 
 The "make it just work" path: download `naudio-<version>-macos-<arch>.pkg` or
-`naudio-<version>-windows-x86_64.exe` and double-click it. Both carry the runtime
-library and all the command-line programs (with man pages on macOS) and none of the
-development files — to compile against naudio, use an archive, the Linux packages, or
-Homebrew instead.
+`naudio-<version>-windows-x86_64.exe` and double-click it. You get everything needed to
+run naudio — the programs, the library they share, and (on a Mac) their manual pages.
+What the installers leave out are the files for *building software* against naudio;
+those are in every other format on this page.
 
 - **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`). The installer is
-  signed (Developer ID Installer) but not yet notarized, so Gatekeeper still objects on
-  first open: right-click the `.pkg`, choose *Open*, then *Open* again. macOS packages
-  have no uninstaller; to remove naudio, delete the installed files and forget the
-  receipts (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
+  signed, but Apple has not notarized it yet, so the first open needs one extra step:
+  right-click the `.pkg`, choose *Open*, then *Open* again. macOS installers have no
+  uninstaller; to remove naudio, delete the installed files and forget the receipts
+  (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
 - **Windows** installs into `C:\Program Files\naudio`, registers an uninstaller
   (*Add or remove programs*, or `Uninstall.exe` in the install directory), and offers to
-  add the tools to `PATH`. SmartScreen warns on the unsigned installer: choose
+  add the programs to `PATH`. The installer is unsigned, so SmartScreen warns: choose
   *More info* → *Run anyway*.
 
 ### Debian / Ubuntu (.deb)
@@ -62,10 +61,10 @@ Homebrew instead.
 sudo apt-get install ./naudio-<version>-linux-x86_64.deb
 ```
 
-Installs under `/usr`; runtime dependencies (ALSA) are declared by the package and
-resolved by `apt`. `pkg-config --modversion naudio` and `man na_wav_tap` work
-immediately — `/usr/lib/pkgconfig` is on pkg-config's default search path on
-Debian-family systems.
+Installs under `/usr`; anything it needs (ALSA) is pulled in by `apt` automatically. The
+programs and their man pages work immediately, and for developers so does
+`pkg-config --modversion naudio` — `/usr/lib/pkgconfig` is on pkg-config's default
+search path on Debian-family systems.
 
 ### Fedora / RPM distributions (.rpm)
 
@@ -73,7 +72,8 @@ Debian-family systems.
 sudo rpm -i naudio-<version>-linux-x86_64.rpm
 ```
 
-This is a GitHub convenience RPM, not distro-official packaging: it installs under
+The programs and man pages work immediately. This is a GitHub convenience RPM, not
+distro-official packaging — developers building against it should note it installs under
 `/usr` with `lib/` (not `lib64/`), so tell pkg-config where the `.pc` file is:
 
 ```bash
@@ -174,9 +174,9 @@ package manager: `apt-get remove naudio`, `rpm -e naudio`, `brew uninstall naudi
 ## Verify any install
 
 ```bash
-pkg-config --modversion naudio        # prints the installed version
-na_wav_tap --help                     # the tools run (add the prefix's bin/ to PATH if needed)
+na_wav_tap --help                     # the programs run (add the prefix's bin/ to PATH if needed)
 man na_wav_tap                        # man pages are on the install path
+pkg-config --modversion naudio        # developers: prints the installed version
 ```
 
 And from CMake:
