@@ -1070,5 +1070,40 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CPACK_RPM_PACKAGE_GROUP "Applications/Communications")
     set(CPACK_RPM_FILE_NAME "${CPACK_PACKAGE_FILE_NAME}.rpm")
 
+    # Double-clickable installers: macOS .pkg (productbuild) and Windows setup
+    # .exe (NSIS), produced by the release workflow alongside the archives.
+    # Their payload is scoped to runtime+tools at cpack time — see the project
+    # config file below; a configure-time set() cannot vary by generator.
+    set(CPACK_PROJECT_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CPackProjectConfig.cmake")
+    if(APPLE)
+        # Receipt identity: `pkgutil --pkgs` lists org.kj5hst.naudio.* after
+        # install — also how an operator removes the receipt if they hand-delete
+        # the files (macOS packages have no uninstaller by design).
+        set(CPACK_PRODUCTBUILD_IDENTIFIER "org.kj5hst.naudio")
+        # productbuild's license pane accepts only .rtf/.html/.txt/.rtfd — the
+        # repo's extension-less LICENSE is rejected outright (measured: "Bad
+        # file extension specified"). Stage a .txt copy; the project config
+        # file points productbuild at it, leaving every other generator on the
+        # original files.
+        configure_file(LICENSE "${CMAKE_CURRENT_BINARY_DIR}/cpack-resources/LICENSE.txt" COPYONLY)
+        set(CPACK_NAUDIO_LICENSE_TXT "${CMAKE_CURRENT_BINARY_DIR}/cpack-resources/LICENSE.txt")
+        set(CPACK_NAUDIO_PKG_README_TXT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/productbuild-readme.txt")
+    endif()
+    if(WIN32)
+        # $PROGRAMFILES64 is an NSIS variable, literal to CMake: 64-bit
+        # binaries must not default into the x86 Program Files.
+        set(CPACK_NSIS_INSTALL_ROOT "$PROGRAMFILES64")
+        # Stable, unversioned directory so upgrades replace instead of accrete.
+        set(CPACK_PACKAGE_INSTALL_DIRECTORY "naudio")
+        set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+        # The tools are console programs: offer PATH so they run from any
+        # prompt — the one thing a CLI payload needs from a GUI installer.
+        set(CPACK_NSIS_MODIFY_PATH ON)
+        set(CPACK_NSIS_DISPLAY_NAME "naudio")
+        set(CPACK_NSIS_PACKAGE_NAME "naudio")
+        set(CPACK_NSIS_URL_INFO_ABOUT "${CPACK_PACKAGE_HOMEPAGE_URL}")
+        set(CPACK_NSIS_CONTACT "${CPACK_PACKAGE_CONTACT}")
+    endif()
+
     include(CPack)
 endif()
