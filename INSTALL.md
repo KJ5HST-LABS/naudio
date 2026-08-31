@@ -18,12 +18,11 @@ from an installed toolkit to audio streaming end to end.
 
 > **Current availability (2026-08).** naudio is not yet public — the repository is
 > private ahead of its planned Hamlib contribution. The current packaged release,
-> **v1.0.0rc2** (a prerelease), carries the full package set: TGZ for Linux and macOS,
-> DEB, RPM, a Windows ZIP, and `sha256sums.txt`. The double-click installers (.pkg /
-> setup .exe) described below join the artifacts at the first tag after rc2 — the
-> pipeline that builds and gates them is in place. While the repository is private,
+> **v1.0.0rc3** (a prerelease), carries everything on this page: the double-click
+> installers (a signed macOS `.pkg` and a Windows setup `.exe`), TGZ for Linux and
+> macOS, DEB, RPM, a Windows ZIP, and `sha256sums.txt`. While the repository is private,
 > collaborators with access fetch packages with
-> `gh release download v1.0.0rc2 -R KJ5HST-LABS/naudio` rather than anonymous URLs, and
+> `gh release download v1.0.0rc3 -R KJ5HST-LABS/naudio` rather than anonymous URLs, and
 > the Homebrew tap installs over ssh. Everything else on this page is written for the
 > durable, public state and works unchanged once the repository is public.
 
@@ -48,10 +47,10 @@ development files — to compile against naudio, use an archive, the Linux packa
 Homebrew instead.
 
 - **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`). The installer is
-  not signed or notarized, so Gatekeeper objects on first open: right-click the `.pkg`,
-  choose *Open*, then *Open* again. macOS packages have no uninstaller; to remove
-  naudio, delete the installed files and forget the receipts
-  (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
+  signed (Developer ID Installer) but not yet notarized, so Gatekeeper still objects on
+  first open: right-click the `.pkg`, choose *Open*, then *Open* again. macOS packages
+  have no uninstaller; to remove naudio, delete the installed files and forget the
+  receipts (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
 - **Windows** installs into `C:\Program Files\naudio`, registers an uninstaller
   (*Add or remove programs*, or `Uninstall.exe` in the install directory), and offers to
   add the tools to `PATH`. SmartScreen warns on the unsigned installer: choose
