@@ -47,9 +47,14 @@ if(NAUDIO_BUILD_APPS)
     # capture is a session privilege on both platforms (TCC on macOS, the per-user
     # PipeWire/PulseAudio socket on Linux). Rationale in full in each template.
     #
-    # Windows has no arm here: na_audio_daemon does not build on Windows at all (the
-    # NOT WIN32 gate above). The Windows service is issue #96 item 3's to add, together
-    # with the NSIS section that would register it.
+    # Windows has no arm here YET, and the reason is no longer that the daemon is missing —
+    # it builds and ships there since item 3. What is missing is the registration: Windows
+    # has no session-scoped service object equivalent to a launchd Agent or a systemd --user
+    # unit. A real SCM service is the wrong shape for the same reason a LaunchDaemon was, one
+    # layer down: services run in session 0, which has no audio endpoints, so it would install
+    # cleanly and then capture nothing. The session-scoped analogue is a Task Scheduler logon
+    # task (an XML definition, registered by an NSIS section, created disabled) — same three
+    # properties this block already gives the other two platforms.
     # ------------------------------------------------------------------------
     set(NAUDIO_SERVICE_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/na_audio_daemon")
     if(APPLE)

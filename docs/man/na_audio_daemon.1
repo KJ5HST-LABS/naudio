@@ -196,9 +196,10 @@ Both pass
 on the command line, so the service runs until it is stopped no matter what
 the configuration file says; every other setting comes from that file.
 .PP
-Windows has no service yet \(em
 .B na_audio_daemon
-is not built for Windows.
+runs on Windows and reads the same configuration file there, but nothing
+registers it to start at logon yet: run it from a terminal, or start it with
+whatever the machine already uses for scheduled tasks.
 .SS Changing the configuration
 The daemon reads its configuration file once, at startup.
 There is no reload signal, and a change of sample rate, channel count or

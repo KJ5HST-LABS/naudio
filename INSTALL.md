@@ -109,9 +109,9 @@ cmake -S . -B build -DCMAKE_PREFIX_PATH=~/naudio
 ### Windows (.zip)
 
 The ZIP carries the library (`naudio.dll` + import library), the headers, the CMake
-package, and three programs: the demo pair (`na_audio_source.exe`,
-`na_c_play_to_speakers.exe`) and the stream recorder (`na_wav_tap.exe`). Expand it
-anywhere:
+package, and four programs: the daemon (`na_audio_daemon.exe`), the demo pair
+(`na_audio_source.exe`, `na_c_play_to_speakers.exe`) and the stream recorder
+(`na_wav_tap.exe`). Expand it anywhere:
 
 ```powershell
 Expand-Archive naudio-<version>-windows-x86_64.zip -DestinationPath C:\naudio
@@ -119,8 +119,11 @@ C:\naudio\<unpacked-dir>\bin\na_audio_source.exe --test-tone     # then play it 
 ```
 
 Consume it from CMake with `-DCMAKE_PREFIX_PATH=<unpacked-dir>`; `naudio.dll` sits in
-`bin\` beside the programs. (`na_audio_daemon` and the Hamlib bridge are not built on
-Windows.)
+`bin\` beside the programs. The daemon reads its settings from
+`%ProgramData%\naudio\daemon.conf` — the same keys as its command-line options, one
+`key = value` per line — or from any file you name with `--config`. Unlike macOS and
+Linux, Windows has no way yet to start it automatically at logon, so it runs from a
+terminal window for now. (The Hamlib bridge is still not built on Windows.)
 
 ## Option B — Homebrew (macOS)
 
@@ -206,7 +209,13 @@ the message names the line: `systemctl --user status naudio-daemon` on Linux, or
 `launchctl disable gui/$(id -u)/org.kj5hst.naudio.daemon` or
 `systemctl --user disable --now naudio-daemon`.
 
-Windows has no background service yet — the daemon is not built for Windows.
+Windows has no background service yet. The daemon runs there, and reads
+`%ProgramData%\naudio\daemon.conf` the same way, but nothing starts it at logon — open a
+terminal and run `na_audio_daemon` yourself:
+
+```powershell
+"C:\Program Files\naudio\bin\na_audio_daemon.exe" --duration-ms 0
+```
 
 ## Verify any install
 

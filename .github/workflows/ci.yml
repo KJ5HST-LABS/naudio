@@ -600,10 +600,11 @@ jobs:
   windows-wav-tap:
     name: windows na_wav_tap exe (the remote end of the #12 on-air check)
     runs-on: windows-latest
-    # Separate from the `windows` job on purpose. That one guards issue #61 (find_package on MSVC,
-    # no PortAudio target in the installed export) and is deliberately lib-only with
-    # NAUDIO_BUILD_APPS=OFF; this needs APPS=ON, so bolting it on would have meant changing that
-    # job's configure line and putting a shipping gate at risk to produce a convenience binary.
+    # Separate from the `windows` job on purpose, though no longer because that one is lib-only —
+    # it builds apps too since issue #96 item 3. What keeps this job separate now is its PRODUCT:
+    # it uploads a ready-to-run na_wav_tap.exe plus the DLL it needs, for an operator who wants
+    # the remote end of an on-air check without a toolchain. The `windows` job compiles the same
+    # binaries but ships none of them.
     #
     # WHY A WINDOWS BINARY AT ALL. Issue #12 item 1 wants RX audio reaching a REMOTE naudio client.
     # The remote machine is whatever the operator has spare, and here that is Windows. na_wav_tap
@@ -619,8 +620,8 @@ jobs:
       - name: Build na_wav_tap and the shipped demo pair
         # The demo pair (na_audio_source / na_c_play_to_speakers) is Windows-portable
         # since 1.0.0rc1 (POSIX time calls shimmed, MSVC C11 atomics) and ships in the
-        # release ZIP — this is the job that compiles it on every push, since the
-        # lib-only `windows` job runs with NAUDIO_BUILD_APPS=OFF.
+        # release ZIP. The `windows` job now compiles it too; what this build is for is the
+        # runtime byte-tell proof below and the uploaded artifact.
         run: cmake --build build --config RelWithDebInfo --target na_wav_tap na_audio_source na_c_play_to_speakers -j
 
       - name: "Demo pair runtime proof: test-tone loopback, no audio device"

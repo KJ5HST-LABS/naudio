@@ -28,8 +28,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   daemon reads its configuration file once at startup, so restarting the service is how
   a configuration change is applied; a mistake in that file stops the service with the
   offending line named rather than leaving it running misconfigured. Windows has no
-  service yet — the daemon is not built for Windows. See `na_audio_daemon(1)`,
-  *SERVICE REGISTRATION*, and INSTALL.md.
+  service registration yet, though the daemon itself now ships there (below). See
+  `na_audio_daemon(1)`, *SERVICE REGISTRATION*, and INSTALL.md.
+- **`na_audio_daemon` now runs on Windows.** The daemon — the program that captures from a
+  sound device and serves it to the network, and the one an operator actually configures —
+  was excluded from Windows builds, so the Windows package shipped a client and a demo but
+  nothing to run at the other end. It is now built, tested and installed on Windows like
+  everywhere else, and both the ZIP and the setup `.exe` carry it. Its configuration file
+  is read from `%ProgramData%\naudio\daemon.conf`, the location documented since the
+  previous release. Capturing from real hardware is still verified by hand on macOS and
+  Linux only; what changed is that Windows now has the program to verify.
 
 ## [1.0.0rc3] — 2026-08-30
 
