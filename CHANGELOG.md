@@ -5,6 +5,31 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **The licence, the wire specification and the conformance vectors now ship inside
+  every package.** `share/doc/naudio/` carries `copyright` (the full LGPL-2.1 text,
+  under the filename Debian Policy §12.5 requires), `THIRD_PARTY_NOTICES.md`, the
+  `0xAF01` specification and the protocols overview; `share/naudio/conformance/`
+  carries the golden vectors and their generator. Previously none of them appeared
+  in any of the six shipped artifact forms — so a binary release contained no
+  licence text at all except in the two GUI installers, and an implementer holding
+  a release could reach neither the spec nor the known-answer vectors that §12 of
+  that spec calls the gate every reference client must pass. `find_package(naudio)`
+  and pkg-config consumers are unaffected; this only adds files.
+
+### Fixed
+- **A server whose listening socket landed on a file descriptor at or above
+  `FD_SETSIZE` (1024) could not accept connections — and on Linux the process
+  aborted.** The two readiness waits in `Socket` used `select()`, whose POSIX
+  `fd_set` is a bitmap indexed by descriptor number, so a higher descriptor could
+  not be represented: a fortified Linux build (the one released) died in glibc's
+  `__fdelt_chk`, an unfortified one wrote out of bounds and carried on, and macOS
+  got `EINVAL` and stopped accepting for good. Because naudio is a library, the
+  descriptor number is chosen by the host application, so any program already
+  holding a thousand descriptors hit this on its first listen. Both waits now use
+  `poll()` on POSIX, which has no such ceiling. Windows is unchanged and was never
+  affected — its `fd_set` is a counted array rather than a bitmap.
+
 ## [1.0.0rc4] — 2026-08-31
 
 ### Added
