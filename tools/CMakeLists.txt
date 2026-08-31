@@ -21,6 +21,60 @@ if(NAUDIO_BUILD_APPS AND NOT WIN32)
             RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
     install(FILES "${naudio_SOURCE_DIR}/docs/man/na_audio_daemon.1"
             DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
+
+    # ------------------------------------------------------------------------
+    # Service registration (issue #96 item 2) — run the daemon without a terminal.
+    #
+    # The unit files are GENERATED, never shipped verbatim: a launchd plist and a
+    # systemd unit must both name an ABSOLUTE program path, and the only path that is
+    # true is the one this build will install to. configure_file() ties them to
+    # CMAKE_INSTALL_PREFIX, so the DEB/RPM units say /usr/bin and the .pkg's agent says
+    # /usr/local/bin without either being hand-maintained. (A relocatable TGZ unpacked
+    # somewhere else is the one case the generated path cannot follow — the man page
+    # says so; the units exist for the packages.)
+    #
+    # Both are SESSION-scoped — a launchd Agent, a systemd --user unit — because audio
+    # capture is a session privilege on both platforms (TCC on macOS, the per-user
+    # PipeWire/PulseAudio socket on Linux). Rationale in full in each template.
+    #
+    # Windows has no arm here: na_audio_daemon does not build on Windows at all (the
+    # NOT WIN32 gate above). The Windows service is issue #96 item 3's to add, together
+    # with the NSIS section that would register it.
+    # ------------------------------------------------------------------------
+    set(NAUDIO_SERVICE_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/na_audio_daemon")
+    if(APPLE)
+        set(NAUDIO_SERVICE_LOGDIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/log/naudio")
+        set(NAUDIO_SERVICE_LOG "${NAUDIO_SERVICE_LOGDIR}/daemon.log")
+        # Where the postinstall will find the plist inside the installed payload —
+        # share/naudio/, because /Library/LaunchAgents is not under the .pkg's
+        # /usr/local install prefix and the payload therefore cannot reach it.
+        set(NAUDIO_PLIST_PAYLOAD_PATH
+            "${CMAKE_INSTALL_FULL_DATADIR}/naudio/org.kj5hst.naudio.daemon.plist")
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/org.kj5hst.naudio.daemon.plist.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/org.kj5hst.naudio.daemon.plist" @ONLY)
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/postinstall.in"
+                       "${CMAKE_CURRENT_BINARY_DIR}/postinstall" @ONLY)
+        # configure_file() writes 0644; productbuild runs this file as a script, and a
+        # postinstall that is not executable is skipped by the installer rather than
+        # failing it — the registration would silently not happen.
+        file(CHMOD "${CMAKE_CURRENT_BINARY_DIR}/postinstall"
+             PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                         GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+        # Read at cpack time by cmake/CPackProjectConfig.cmake, productbuild branch only.
+        set(NAUDIO_POSTFLIGHT_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/postinstall" PARENT_SCOPE)
+        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/org.kj5hst.naudio.daemon.plist"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
+    elseif(NOT WIN32)
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/linux/naudio-daemon.service.in"
+                       "${CMAKE_CURRENT_BINARY_DIR}/naudio-daemon.service" @ONLY)
+        # lib/systemd/user is spelled out rather than taken from CMAKE_INSTALL_LIBDIR:
+        # on a Debian-family host that variable becomes the multiarch
+        # lib/x86_64-linux-gnu, and systemd does not search multiarch directories —
+        # the unit would install where nothing would ever read it.
+        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/naudio-daemon.service"
+                DESTINATION "lib/systemd/user" COMPONENT tools)
+    endif()
 endif()
 
 # ----------------------------------------------------------------------------
