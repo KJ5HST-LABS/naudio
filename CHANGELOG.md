@@ -414,6 +414,14 @@ breaking an already-compiled consumer.
   nothing acknowledges an acknowledgement.
 
 ### Fixed
+- **`na_audio_daemon` no longer reads its event listener after destroying it.** The listener was
+  declared after the `AudioStreamClient` it was attached to, so it was destroyed first — while
+  `disconnect()` had merely *posted* the final `onClientDisconnected`, whose delivery the client's
+  destructor drains afterwards. Every exit from the streaming loop therefore raced a callback
+  against a freed object, and the early return on a failed `connect()` did it with a fresh
+  `onError` still queued. A use-after-free with no symptom on a quiet machine and no compiler
+  diagnostic; found by the sweep for the same defect in the test suite (issue #97).
+
 - **Control-message retransmission is no longer disrupted by a system clock step.**
   `ControlReliability` was the one reliability component timed by the wall clock, while
   `FecDecoder`, `PacketReorderBuffer` and `JitterEstimator` all use the monotonic clock. An NTP

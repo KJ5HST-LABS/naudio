@@ -327,6 +327,18 @@ TEST(Client, DisconnectWithoutConnect) {
 
 // ===========================================================================
 // End-to-end client <-> server over FakeBackend.
+//
+// EVERY arm below declares its listener BEFORE its AudioStreamClient, so the listener is destroyed
+// AFTER it. That is addStreamListener()'s documented contract and it is not stylistic: the pointer
+// is borrowed, each notify* captures it by value into a task the dispatcher runs later, and the
+// drain + join happen in ~AudioStreamClient. An arm that returns with an event still queued —
+// disconnect() POSTS onClientDisconnected rather than delivering it — then destroys its listener
+// first and the drain reads a dead object. Every arm here had the order reversed until issue #97,
+// which is the same defect the server suite hit twice under #28 and once more under #97; the
+// server's arms carry the same note. Measured, not reasoned: a probe that parks the dispatch
+// thread inside the posted fan-out reports stack-use-after-scope in notifyClientDisconnected's
+// task on the reversed order and nothing on this one. An arm that needs the other order must hand
+// the listener back with removeStreamListener(), which fences.
 // ===========================================================================
 
 // THE GATE (TCP): a real AudioStreamClient connects to a real AudioStreamServer, completes the
@@ -340,14 +352,13 @@ TEST(Client, GateE2eRxBroadcastAndTxEvents) {
     std::string err;
     ASSERT_TRUE(server.start(&err)) << err;
 
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", static_cast<std::uint16_t>(server.port())};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
     client.setCaptureDevice(0);
     client.setCaptureMuted(false);  // enable TX so the capture->send path runs
     client.setAutoReconnect(false);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     std::mutex rxMutex;
@@ -411,12 +422,11 @@ TEST(Client, PlaybackDeviceLostMidStreamIsReportedNotFatal) {
     std::string err;
     ASSERT_TRUE(server.start(&err)) << err;
 
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", static_cast<std::uint16_t>(server.port())};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
     client.setAutoReconnect(false);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     ASSERT_TRUE(client.connect(&err)) << err;
@@ -440,14 +450,13 @@ TEST(Client, CaptureDeviceLostMidStreamIsReportedNotFatal) {
     std::string err;
     ASSERT_TRUE(server.start(&err)) << err;
 
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", static_cast<std::uint16_t>(server.port())};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
     client.setCaptureDevice(0);
     client.setCaptureMuted(false);
     client.setAutoReconnect(false);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     ASSERT_TRUE(client.connect(&err)) << err;
@@ -552,6 +561,7 @@ TEST(Client, GateE2eUdpTransport) {
     std::string err;
     ASSERT_TRUE(server.start(&err)) << err;
 
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", static_cast<std::uint16_t>(server.port())};
     // udpBare() IS the old bare composition (default config + Udp) plus the #92 consent marker,
     // so this arm keeps exercising the raw 3b data path it always did.
@@ -559,8 +569,6 @@ TEST(Client, GateE2eUdpTransport) {
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
     client.setAutoReconnect(false);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     std::mutex rxMutex;
@@ -741,6 +749,7 @@ TEST(Client, GateReconnectAfterServerRestart) {
     ASSERT_TRUE(server1->start(&err)) << err;
     const auto port = static_cast<std::uint16_t>(server1->port());
 
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", port};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
@@ -748,8 +757,6 @@ TEST(Client, GateReconnectAfterServerRestart) {
     client.setReconnectDelayMs(100);
     client.setMaxReconnectDelayMs(500);
     client.setMaxReconnectAttempts(50);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     ASSERT_TRUE(client.connect(&err)) << err;
@@ -788,6 +795,7 @@ TEST(Client, DisconnectDuringReconnectNoResurrection) {
     ASSERT_TRUE(server->start(&err)) << err;
     const auto port = static_cast<std::uint16_t>(server->port());
 
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", port};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
@@ -795,8 +803,6 @@ TEST(Client, DisconnectDuringReconnectNoResurrection) {
     client.setReconnectDelayMs(100);
     client.setMaxReconnectDelayMs(200);
     client.setMaxReconnectAttempts(100);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
     ASSERT_TRUE(client.connect(&err)) << err;
     ASSERT_TRUE(waitFor([&]() { return client.isConnected(); }, 2000));
@@ -836,12 +842,11 @@ TEST(Client, DisconnectStopsReconnect) {
     std::string err;
     ASSERT_TRUE(server.start(&err)) << err;
 
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", static_cast<std::uint16_t>(server.port())};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
     client.setAutoReconnect(true);  // even with auto-reconnect ON...
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
     ASSERT_TRUE(client.connect(&err)) << err;
     ASSERT_TRUE(waitFor([&]() { return client.isConnected(); }, 2000));
@@ -977,11 +982,10 @@ private:
 // rather than left for a reader to infer from a green suite.
 TEST(Client, DisconnectConcurrentWithAConnectCommitTearsDownCleanly) {
     PacedBackend backend;
+    ConnectBlockingListener listener;
     AudioStreamClient client{"127.0.0.1", 4533};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
-
-    ConnectBlockingListener listener;
     client.addStreamListener(&listener);
 
     auto conn = std::make_shared<naudio::test::ScriptedClientConnection>("scripted-peer");
@@ -1120,6 +1124,7 @@ TEST(Client, DisconnectSalvoStopsAfterAFailedFirstSend) {
 // expectation -- a crash IS the detector, because not crashing is precisely the guard's job.
 TEST(Client, ReconnectAttemptSurvivesATransportFactoryThatStartsReturningNothing) {
     PacedBackend backend;
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", 4533};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
@@ -1132,8 +1137,6 @@ TEST(Client, ReconnectAttemptSurvivesATransportFactoryThatStartsReturningNothing
     // with no reconnect at all.
     client.setMaxReconnectAttempts(2);
     client.setReconnectDelayMs(50);  // the attempts fail instantly; this is the only wait
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     std::string err;
@@ -1195,6 +1198,7 @@ TEST(Client, ReconnectAttemptSurvivesATransportFactoryThatStartsReturningNothing
 // AudioStreamClient.cpp:30) instead of by two thread edges that have to coincide (L172).
 TEST(Client, ReconnectExhaustionWakesAWorkerParkedInAnInterruptibleSleep) {
     PacedBackend backend;
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", 4533};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
@@ -1204,8 +1208,6 @@ TEST(Client, ReconnectExhaustionWakesAWorkerParkedInAnInterruptibleSleep) {
     // startReconnection, so reconnectLoop — and the tail under test — is never reached.
     client.setMaxReconnectAttempts(2);
     client.setReconnectDelayMs(50);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     std::string err;
@@ -1290,11 +1292,10 @@ TEST(Client, ReconnectExhaustionWakesAWorkerParkedInAnInterruptibleSleep) {
 // the helper is the single point they share.
 TEST(Client, ConnectionLossWithAutoReconnectOffWakesAWorkerParkedInAnInterruptibleSleep) {
     PacedBackend backend;
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", 4533};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     std::string err;
@@ -1329,6 +1330,7 @@ TEST(Client, ConnectionLossWithAutoReconnectOffWakesAWorkerParkedInAnInterruptib
 
 TEST(Client, UnstableConnectionCutoffWakesAWorkerParkedInAnInterruptibleSleep) {
     PacedBackend backend;
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", 4533};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
@@ -1340,8 +1342,6 @@ TEST(Client, UnstableConnectionCutoffWakesAWorkerParkedInAnInterruptibleSleep) {
     // (Note the premise wait below must therefore stay well under 5000 ms to keep the
     // connection short-lived; at ~3 s it does, with the cutoff at ~3.05 s.)
     client.setMaxReconnectAttempts(1);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     std::string err;
@@ -1405,13 +1405,12 @@ TEST(Client, UnstableConnectionCutoffWakesAWorkerParkedInAnInterruptibleSleep) {
 // never reached the check. After it, the check runs first and trips with no send attempted.
 TEST(Client, HeartbeatWatchdogFiresWhileTheTxWriterHoldsTheSendLock) {
     PacedBackend backend;
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", 4533};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
     client.setTxInjectEnabled(true);  // must precede connect(): it is what starts sendLoop
     client.setAutoReconnect(false);   // defaults TRUE; a reconnect worker would perturb the ledger
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     std::string err;
@@ -1481,12 +1480,11 @@ TEST(Client, HeartbeatWatchdogFiresWhileTheTxWriterHoldsTheSendLock) {
 // probe goes out and the timeout is not reported until the next interval.
 TEST(Client, HeartbeatWatchdogSkipsTheLatencyProbeOnceThePeerIsDeclaredDead) {
     PacedBackend backend;
+    RecordingListener listener;
     AudioStreamClient client{"127.0.0.1", 4533};
     client.setBackend(&backend);
     client.setPlaybackDevice(0);
     client.setAutoReconnect(false);
-
-    RecordingListener listener;
     client.addStreamListener(&listener);
 
     std::string err;

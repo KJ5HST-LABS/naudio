@@ -2091,9 +2091,15 @@ TEST(Server, ARejectedClientReceivesItsReasonWhenItBehavesLikeARealClient) {
 // those is the detector — the roster ALREADY reads 0, because close() erases the session itself.
 // The damage is in the listener's model, not in the server's, so only the event pair can see it.
 TEST(Server, AFailedHandshakeLeavesNoUnpairedConnectEvent) {
+    // Declared before `server` so it is destroyed AFTER it — the same rule the two device-loss
+    // arms above follow, and for the same reason (addStreamListener's contract). This arm had the
+    // order reversed and was the intermittent sanitizer failure filed as issue #97: stop() only
+    // POSTS onServerStopped(), the drain happens in ~AudioStreamServer, so the trailing callback
+    // landed on a listener whose frame had already gone. CI caught it on one run in many; a
+    // parked-dispatcher probe reproduces it on demand.
+    LifecyclePairingListener listener;
     AudioStreamServer server{0};
     server.setInjectOnlyMode(true);
-    LifecyclePairingListener listener;
     server.addStreamListener(&listener);
     std::string err;
     ASSERT_TRUE(server.start(&err)) << err;

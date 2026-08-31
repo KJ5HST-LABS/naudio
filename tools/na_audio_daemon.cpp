@@ -583,6 +583,20 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
     std::printf("server up    : %s 127.0.0.1:%d\n", a.transport.c_str(), boundPort);
 
     // --- In-process RX-only client over loopback. ---
+    // `listener` is declared BEFORE `client` so it is destroyed AFTER it. addStreamListener()
+    // borrows the pointer and every notify* captures it by value into a task the dispatcher runs
+    // later; disconnect() only POSTS onClientDisconnected and the drain happens in
+    // ~AudioStreamClient. With the order reversed — as it was — every exit from this function
+    // RACED that trailing callback against a dead listener, the early `return 1` on a failed
+    // connect() doing it with a freshly posted onError still queued. Nothing orders the two:
+    // waitForWorkers() waits on activeThreads_, which the network workers own, and the dispatch
+    // thread is joined only by the client's destructor. Same defect as issue #97's server arm.
+    // The reversed order is NOT reproducible here — a macOS hardware run wins the race every
+    // time, five for five, and so did the failed-connect path three for three; what settles it is
+    // a probe that parks the dispatch thread inside the posted fan-out, which reports
+    // stack-use-after-scope in notifyClientDisconnected's task on the reversed order and nothing
+    // on this one.
+    SmokeClientListener listener;
     naudio::net::AudioStreamClient client("127.0.0.1", static_cast<std::uint16_t>(boundPort),
                                           "phase3e-smoke");
     client.setConfig(cfg);
@@ -591,7 +605,6 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
     // RX-only: no capture device on the client (no TX). Deterministic single connection.
     client.setAutoReconnect(false);
 
-    SmokeClientListener listener;
     client.addStreamListener(&listener);
     SignalMeter meter;
     client.addAudioListener([&meter, ch = cfg.channels](const std::uint8_t* d, std::size_t n) {
