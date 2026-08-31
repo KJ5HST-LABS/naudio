@@ -45,7 +45,7 @@ while [ $# -gt 0 ]; do
         --identity)         identity="${2-}"; shift 2 ;;
         --keychain-profile) profile="${2-}";  shift 2 ;;
         --dry-run)          dry_run=1; shift ;;
-        -h|--help)          sed -n '2,40p' "$0"; exit 0 ;;
+        -h|--help)          awk '/^set -eu/{exit} NR>2 && /^#/{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
         -*)                 echo "unknown option: $1" >&2; exit 2 ;;
         *)                  tag="$1"; shift ;;
     esac
