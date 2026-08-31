@@ -859,6 +859,17 @@ jobs:
           Write-Output "the uninstaller removed the logon task as well as the payload"
           Write-Output "== Windows installer gate: PASS =="
 
+          # THE VERDICT IS THIS STEP'S OWN. Every failure above exits 1 explicitly, so reaching
+          # here means every assertion passed — and without this line the step would fail anyway,
+          # because a `shell: pwsh` step exits with $LASTEXITCODE, which is set by the last NATIVE
+          # command rather than by anything that decided something. This step now runs one on
+          # purpose: the task's own arguments are handed to the daemon EXPECTING a non-zero exit.
+          # That is L111 wearing a workflow step — a gate that printed PASS and failed anyway.
+          # The inherited value is printed rather than silently discarded, so the next reader sees
+          # what it was instead of finding a bare `exit 0` and wondering what it hid.
+          Write-Output "(gate verdict is explicit; inherited `$LASTEXITCODE was $LASTEXITCODE)"
+          exit 0
+
       - uses: actions/upload-artifact@v4
         with:
           name: package-windows
