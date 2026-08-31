@@ -27,9 +27,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   naudio-daemon`), and an operator's choice survives reinstalling or upgrading. The
   daemon reads its configuration file once at startup, so restarting the service is how
   a configuration change is applied; a mistake in that file stops the service with the
-  offending line named rather than leaving it running misconfigured. Windows has no
-  service registration yet, though the daemon itself now ships there (below). See
-  `na_audio_daemon(1)`, *SERVICE REGISTRATION*, and INSTALL.md.
+  offending line named rather than leaving it running misconfigured. Windows joined them
+  with a Task Scheduler logon task (below). See `na_audio_daemon(1)`, *SERVICE
+  REGISTRATION*, and INSTALL.md.
 - **`na_audio_daemon` now runs on Windows.** The daemon — the program that captures from a
   sound device and serves it to the network, and the one an operator actually configures —
   was excluded from Windows builds, so the Windows package shipped a client and a demo but
@@ -38,6 +38,33 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   is read from `%ProgramData%\naudio\daemon.conf`, the location documented since the
   previous release. Capturing from real hardware is still verified by hand on macOS and
   Linux only; what changed is that Windows now has the program to verify.
+- **A control page: configure and run the daemon from a browser, with no terminal.**
+  `na_audio_daemon --mode control` serves a page on `127.0.0.1` with a device picker built
+  from the same enumeration `--list-devices` reports, every setting as a form field that
+  writes the configuration file, start / stop / restart / quit for the stream, and the live
+  numbers — delivered percentage, connected clients, per-channel levels, gaps, error
+  counters. Every package installs a shortcut that opens it: a **naudio Control** entry in
+  the Windows Start menu, a desktop entry on Linux, and `/Applications/naudio Control.app`
+  on macOS. Nothing captures audio until you press Start, or set the new `autostart`
+  setting. Two more settings come with it, `control-port` (default 8737) and `autostart`,
+  and `--open-page` opens the page in the default browser. The page binds loopback only and
+  naudio still has no remote management; it has no password, and requests carrying another
+  host or origin, or any change not sent as `application/json`, are refused — the defences
+  that matter for a service your own browser can be made to call. See `na_audio_daemon(1)`,
+  *THE CONTROL PAGE*.
+- **Windows registers the daemon to start at logon.** The setup `.exe` creates a Task
+  Scheduler **logon task** (`\naudio\naudio-daemon`), completing the background-service
+  story on the third platform. It is a logon task rather than a Windows service for the
+  same reason the macOS and Linux units are session-scoped: a service runs in session 0,
+  which has no audio endpoints, so it would install cleanly and then capture nothing. Like
+  the other two it arrives **switched off**, and the uninstaller removes it.
+
+### Changed
+- **The background services now run the daemon in control mode.** Enabling the service on
+  any platform gives you the control page at every login and captures nothing until you ask
+  it to, rather than opening a microphone immediately. Capture-at-login is now an explicit
+  choice — `autostart = true` in the configuration file, or the checkbox on the page — so
+  the decision belongs to the operator rather than to the package.
 
 ## [1.0.0rc3] — 2026-08-30
 

@@ -111,9 +111,13 @@ na_audio_source --capture-id <N> --rate 12000 --channels 1    # ~192 kbit/s
 
 `na_audio_daemon` is the heavier sibling of `na_audio_source`, for permanent
 installations and diagnostics: a `capture-probe` mode that tests an input device with no
-network involved (frame counts, overflow detection, signal levels), and a `hardware` mode
-that serves the device while continuously measuring throughput. Its manual page covers
-both. If you only want audio on the network, `na_audio_source` is enough.
+network involved (frame counts, overflow detection, signal levels), a `hardware` mode
+that serves the device while continuously measuring throughput, and a `control` mode that
+serves all of it as a page on `127.0.0.1` — pick the device from a list, save the settings,
+start and stop the stream, and watch it run, without a command line. The binary packages
+install a **naudio Control** shortcut that opens it, and register the daemon to start at
+login (switched off until you turn it on). Its manual page covers all three. If you only
+want audio on the network, `na_audio_source` is enough.
 
 ## 8. For radio amateurs
 

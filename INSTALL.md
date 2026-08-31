@@ -45,16 +45,21 @@ run naudio — the programs, the library they share, and (on a Mac) their manual
 What the installers leave out are the files for *building software* against naudio;
 those are in every other format on this page.
 
-- **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`) and registers the
-  daemon as a background service, switched off until you turn it on (see *Running the
-  daemon in the background* below). The installer is signed and notarized by Apple — it opens like any other installer, no warnings. macOS
-  installers have no uninstaller; to remove naudio, delete the installed files and
-  forget the receipts (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for
-  `….tools`).
-- **Windows** installs into `C:\Program Files\naudio`, registers an uninstaller
-  (*Add or remove programs*, or `Uninstall.exe` in the install directory), and offers to
-  add the programs to `PATH`. The installer is unsigned, so SmartScreen warns: choose
+- **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`), puts **naudio Control**
+  in `/Applications`, and registers the daemon as a background service, switched off until you
+  turn it on (see *Running the daemon in the background* below). The installer is signed and
+  notarized by Apple — it opens like any other installer, no warnings. macOS installers have no
+  uninstaller; to remove naudio, delete the installed files and forget the receipts
+  (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
+- **Windows** installs into `C:\Program Files\naudio`, adds a **naudio Control** entry to the
+  Start menu, registers a logon task for the daemon (switched off until you turn it on), adds an
+  uninstaller (*Add or remove programs*, or `Uninstall.exe` in the install directory), and offers
+  to add the programs to `PATH`. The installer is unsigned, so SmartScreen warns: choose
   *More info* → *Run anyway*.
+
+Once it is installed, open **naudio Control** — the Start-menu entry, the Applications entry, or
+the desktop entry on Linux. It opens a page in your browser where you pick the radio's audio
+device, choose a transport and port, and press Start. Nothing captures audio until you do.
 
 ### Debian / Ubuntu (.deb)
 
@@ -121,9 +126,11 @@ C:\naudio\<unpacked-dir>\bin\na_audio_source.exe --test-tone     # then play it 
 Consume it from CMake with `-DCMAKE_PREFIX_PATH=<unpacked-dir>`; `naudio.dll` sits in
 `bin\` beside the programs. The daemon reads its settings from
 `%ProgramData%\naudio\daemon.conf` — the same keys as its command-line options, one
-`key = value` per line — or from any file you name with `--config`. Unlike macOS and
-Linux, Windows has no way yet to start it automatically at logon, so it runs from a
-terminal window for now. (The Hamlib bridge is still not built on Windows.)
+`key = value` per line — or from any file you name with `--config`. You do not have to write
+that file by hand: `na_audio_daemon --mode control --open-page` opens the control page in your
+browser and writes it for you. The ZIP registers nothing, so nothing starts at logon; the setup
+`.exe` above is the path that registers a logon task. (The Hamlib bridge is still not built on
+Windows.)
 
 ## Option B — Homebrew (macOS)
 
@@ -175,11 +182,36 @@ A from-source install can be removed with the manifest CMake writes:
 `xargs rm < build/install_manifest.txt` (the package installs above are removed by their
 package manager: `apt-get remove naudio`, `rpm -e naudio`, `brew uninstall naudio`).
 
+## The control page — running naudio without a terminal
+
+Every package installs a shortcut called **naudio Control**: the Start menu on Windows, the
+applications menu on Linux, `/Applications/naudio Control.app` on macOS. Opening it starts the
+daemon in *control mode* and opens a page in your browser at `http://127.0.0.1:8737/`.
+
+From that page you can:
+
+- **pick the capture device** — the radio's USB audio interface, chosen from a list rather than
+  typed as a name or an index;
+- **set the transport, port, sample rate and channel count**, and save them, which writes the
+  same configuration file `man na_audio_daemon` describes (so the background service below picks
+  up exactly what you chose);
+- **start, stop and restart the stream**, and watch it: delivered percentage, connected clients,
+  per-channel levels, gaps and error counters;
+- **quit the daemon**, since a program started from a shortcut has no window to close.
+
+Nothing is captured until you press **Start**, or tick *Start streaming automatically when the
+daemon starts*. Opening the shortcut twice is safe: if a control page is already running, the
+second one opens it rather than complaining about the port.
+
+The page is served on `127.0.0.1` only. It is not reachable from your network and naudio has no
+remote management; there is no password, so any program running on this machine can reach it.
+
 ## Running the daemon in the background
 
 `na_audio_daemon` normally runs in a terminal window and stops when you close it. The
 packages also install it as a background service, so it starts with your computer and
-keeps serving audio on its own.
+keeps serving audio on its own — including its control page, so once the service is on, the
+shortcut above just opens the page.
 
 The service arrives **switched off**. Installing software should not start listening to
 your microphone, so turning it on is a deliberate, one-time step:
@@ -209,13 +241,24 @@ the message names the line: `systemctl --user status naudio-daemon` on Linux, or
 `launchctl disable gui/$(id -u)/org.kj5hst.naudio.daemon` or
 `systemctl --user disable --now naudio-daemon`.
 
-Windows has no background service yet. The daemon runs there, and reads
-`%ProgramData%\naudio\daemon.conf` the same way, but nothing starts it at logon — open a
-terminal and run `na_audio_daemon` yourself:
+On **Windows** the installer registers a Task Scheduler **logon task** rather than a Windows
+service, and for the same reason the other two are session-scoped: a Windows service runs in
+session 0, which has no audio devices, so it would install perfectly and then capture nothing.
+It arrives switched off like the others:
 
 ```powershell
-"C:\Program Files\naudio\bin\na_audio_daemon.exe" --duration-ms 0
+schtasks /Change /TN "\naudio\naudio-daemon" /ENABLE
+schtasks /Run    /TN "\naudio\naudio-daemon"
 ```
+
+Turn it off again with `/DISABLE`, or from *Task Scheduler* under the **naudio** folder. Windows
+does not capture a task's output anywhere, so there is no equivalent of the log file above: a
+configuration mistake shows up as `LastTaskResult` 2 on the task, and on the control page.
+
+All three services run the daemon in **control mode**, so turning one on gives you the control
+page at every login and captures nothing until you ask it to. If you want capture to start
+automatically, tick *Start streaming automatically* on the page (it writes `autostart = true`
+into the configuration file).
 
 ## Verify any install
 

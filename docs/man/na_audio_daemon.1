@@ -1,11 +1,11 @@
 .\" SPDX-License-Identifier: LGPL-2.1-or-later
-.TH NA_AUDIO_DAEMON 1 "2026-08-30" "naudio" "naudio manual"
+.TH NA_AUDIO_DAEMON 1 "2026-08-31" "naudio" "naudio manual"
 .SH NAME
 na_audio_daemon \- serve a real capture device as a naudio stream, or probe it
 .SH SYNOPSIS
 .B na_audio_daemon
 .RB [ \-\-mode
-.IR capture\-probe | hardware ]
+.IR capture\-probe | hardware | control ]
 .RB [ \-\-capture
 .IR pat \ |\ \-\-capture\-id
 .IR N ]
@@ -25,6 +25,13 @@ na_audio_daemon \- serve a real capture device as a naudio stream, or probe it
 .RB [ \-\-config
 .IR file \ |\ \-\-no\-config ]
 .br
+.B na_audio_daemon \-\-mode control
+.RB [ \-\-control\-port
+.IR N ]
+.RB [ \-\-autostart
+.IR true | false ]
+.RB [ \-\-open\-page ]
+.br
 .B na_audio_daemon \-\-list\-devices
 .SH DESCRIPTION
 .B na_audio_daemon
@@ -37,7 +44,15 @@ protocol) stream that any naudio client can receive \(em
 the example play-to-speakers clients, or an application linking the naudio
 library.
 .PP
-Two modes:
+Three modes:
+.TP
+.B control
+serve a control page on 127.0.0.1 and do nothing else until it is asked to.
+Pick a capture device, change settings, start and stop the stream and watch it
+run, from a browser \(em the way to operate the daemon without a terminal.
+See
+.B THE CONTROL PAGE
+below.
 .TP
 .B capture\-probe
 open the capture device directly and report frames, overflows and per-channel
@@ -107,6 +122,84 @@ enumerate capture and playback devices with their backend ids, then exit.
 .TP
 .BR \-h ", " \-\-help
 print usage and exit.
+.TP
+.BI \-\-control\-port " N"
+.RB ( control
+mode) the port the control page listens on, 1\(en65535; the default is 8737.
+0 asks the operating system for a free port, which prints a different URL at
+every start and is therefore a poor choice for a service.
+.TP
+.BI \-\-autostart " true" | false
+.RB ( control
+mode) start capturing as soon as the daemon starts, rather than waiting for
+the page's Start button.
+This is how \(lqstream at every login\(rq is expressed: the service itself
+stays inert until you set it.
+Default
+.BR false .
+.TP
+.B \-\-open\-page
+.RB ( control
+mode) open the control page in the default browser at startup.
+Used by the installed shortcuts; it is an error in any other mode, because
+there would be no page to open.
+.SH THE CONTROL PAGE
+.B \-\-mode control
+starts a small web server on
+.I 127.0.0.1
+and nothing else: no device is opened until you press
+.B Start
+on the page (or set
+.BR autostart ).
+The page is where the whole configuration surface lives \(em a device picker
+built from the same enumeration
+.B \-\-list\-devices
+reports, every setting in this manual as a form field, and Start / Stop /
+Restart / Quit for the stream, with the delivered percentage, connected
+clients, per-channel levels and error counters updating as it runs.
+Saving writes the configuration file described below, so what you set on the
+page is what the service reads at your next login.
+.PP
+The installed packages create a shortcut that opens it: a
+.B naudio Control
+entry in the Windows Start menu, a
+.B naudio Control
+desktop entry on Linux, and
+.I /Applications/naudio Control.app
+on macOS.
+All three run the same command, and using one twice is safe \(em if a control
+page is already answering on the configured port, the second launch opens that
+page and exits rather than failing to bind.
+By hand, the equivalent is:
+.PP
+.nf
+.RS
+na_audio_daemon \-\-mode control \-\-duration\-ms 0 \-\-open\-page
+.RE
+.fi
+.SS What it is not
+The page binds
+.I 127.0.0.1
+only and is not reachable from the network; naudio has no remote management,
+by design.
+There is no password: any program running as any user on this machine can
+reach it, which on a shared machine is worth knowing, though such a program
+could open the audio device directly in any case.
+.PP
+What
+.I is
+defended is your browser, because a page on the open internet can make a
+browser send requests to your own machine.
+Requests are refused unless they name this host, come from this page's own
+origin, and \(em for anything that changes something \(em arrive as
+.IR application/json ,
+which an HTML form cannot produce.
+.SS Rescanning devices
+The device list can only be refreshed while the stream is
+.IR stopped :
+PortAudio cannot be re-enumerated safely underneath a run that is opening
+streams on another thread.
+A device plugged in while streaming appears after you stop.
 .SH CONFIGURATION FILE
 Every option above that takes a value can also be set from a configuration
 file, one
@@ -151,10 +244,20 @@ Parsing is strict: an unknown key, a malformed line, or an out-of-range
 value stops the daemon with the file name and line number rather than
 being skipped \(em a typo'd key silently ignored would run the daemon on
 the wrong device or port while looking configured.
-.B \-\-list\-devices
-and
+.B \-\-list\-devices,
 .B \-\-help
+and
+.B \-\-open\-page
 are actions, not settings, and have no key.
+.PP
+The control page writes this file when you save (see
+.B THE CONTROL PAGE
+above), so it is not a file you have to edit by hand.
+It is rewritten whole each time, which means comments you add are lost \(em
+edit it in one place or the other, not both.
+Only settings that differ from their defaults are written: a file listing
+every default would freeze them, so a later naudio that changed one would be
+silently overridden by a value you never chose.
 .SH SERVICE REGISTRATION
 The packages install a service definition so the daemon can run without a
 terminal.
@@ -191,15 +294,41 @@ Both are session-scoped rather than system services, because capturing audio
 is a session privilege: a root daemon can never be granted a microphone by
 macOS, and a system-scope unit cannot reach your PipeWire or PulseAudio
 socket.
-Both pass
+All three pass
 .B \-\-duration\-ms 0
 on the command line, so the service runs until it is stopped no matter what
 the configuration file says; every other setting comes from that file.
 .PP
-.B na_audio_daemon
-runs on Windows and reads the same configuration file there, but nothing
-registers it to start at logon yet: run it from a terminal, or start it with
-whatever the machine already uses for scheduled tasks.
+On Windows the installer registers a Task Scheduler
+.I logon task
+named
+.IR \(rsnaudio\(rsnaudio\-daemon .
+Enable it from Task Scheduler, or with:
+.PP
+.nf
+.RS
+schtasks /Change /TN "\(rsnaudio\(rsnaudio\-daemon" /ENABLE
+schtasks /Run    /TN "\(rsnaudio\(rsnaudio\-daemon"
+.RE
+.fi
+.PP
+It is a logon task and deliberately not a Windows service: services run in
+session 0, which has no audio endpoints, so one would install cleanly and then
+capture nothing.
+Unlike the other two platforms, Task Scheduler does not redirect a task's
+output anywhere, so there is no log file to read \(em a configuration error
+shows as
+.B LastTaskResult
+2 on the task, and on the control page.
+.PP
+All three units run
+.BR "\-\-mode control" ,
+so enabling the service gives you the control page at every login and captures
+nothing until you ask it to.
+Set
+.B autostart
+in the configuration file (the checkbox on the page) if you want capture to
+begin automatically instead.
 .SS Changing the configuration
 The daemon reads its configuration file once, at startup.
 There is no reload signal, and a change of sample rate, channel count or
@@ -210,8 +339,14 @@ transport could not be applied to a running stream anyway.
 .RS
 launchctl kickstart \-k gui/$(id \-u)/org.kj5hst.naudio.daemon
 systemctl \-\-user restart naudio\-daemon
+schtasks /End /TN "\(rsnaudio\(rsnaudio\-daemon" & schtasks /Run /TN "\(rsnaudio\(rsnaudio\-daemon"
 .RE
 .fi
+.PP
+The control page's
+.B Restart
+button does the same thing for the stream without restarting the daemon, which
+is the usual way to apply a change made on the page.
 .SS When the service will not start
 A configuration error stops the daemon with exit status 2 and a
 .IR file : line

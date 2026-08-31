@@ -10,7 +10,8 @@ Three things ship here:
 
 - **Ready-to-run programs.** A demo server and player that put audio across two machines in
   about a minute with no code and (using the built-in test tone) no microphone; a device-serving
-  daemon; a stream recorder. Start at **[docs/getting-started.md](docs/getting-started.md)**.
+  daemon, configured and driven from a local web page rather than a command line; a stream
+  recorder. Start at **[docs/getting-started.md](docs/getting-started.md)**.
 - **A small, stable C library** (`libnaudio`) that any application — in C, C++, Python, Java,
   Rust, or anything with a C foreign-function interface — links to send or receive streams. A
   worked example client exists in each of those five languages.
@@ -74,7 +75,7 @@ documented procedures rather than by CI; see **Known limitations** below.
 | `naudio_pa` | static lib | `naudio_core` + the PortAudio device backend. |
 | `naudio_net` | static lib | The transport layer — TCP/UDP sockets, per-client threads, the multi-tenant `AudioStreamServer`, and `AudioStreamClient`. Backend-agnostic (takes a `DeviceBackend*`). |
 | `naudio` | **shared lib** | The public artifact: the **C ABI** (`include/naudio.h`) over the internal backends, exporting **only** the `na_*` surface (hidden visibility + `SOVERSION`). This is what a C / Hamlib consumer links and what `make install` ships, alongside `naudio.pc`. |
-| `tools/` | apps | The **device-serving daemon** (`na_audio_daemon`), which streams a real capture device and doubles as the hardware diagnostic (it exercises the live-device path the hardware-free test suite cannot reach); the **stream recorder** (`na_wav_tap`), which saves what a client receives as a WAV file; and the optional **Hamlib streaming bridge** (`na_hamlib_bridge`) — a radio-specific bolt-on, off by default, needing a libhamlib no release ships yet: see **[docs/hamlib-streaming-bridge.md](docs/hamlib-streaming-bridge.md)**. |
+| `tools/` | apps | The **device-serving daemon** (`na_audio_daemon`), which streams a real capture device, serves a localhost control page for configuring and running itself, and doubles as the hardware diagnostic (it exercises the live-device path the hardware-free test suite cannot reach); the **stream recorder** (`na_wav_tap`), which saves what a client receives as a WAV file; and the optional **Hamlib streaming bridge** (`na_hamlib_bridge`) — a radio-specific bolt-on, off by default, needing a libhamlib no release ships yet: see **[docs/hamlib-streaming-bridge.md](docs/hamlib-streaming-bridge.md)**. |
 | `examples/` | apps | The **examples suite** — a "play to speakers" client in C, C++, Python, Java, and Rust, plus `na_audio_source`, the demo server. The C client and the demo server **ship in the binary packages** as the out-of-the-box demo pair. Each example links the public shared `naudio` and uses **only** `naudio.h`, proving the C ABI is self-sufficient from C and from any FFI consumer. See **[examples/README.md](examples/README.md)**. |
 
 ---

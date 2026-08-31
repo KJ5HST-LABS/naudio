@@ -38,9 +38,10 @@ name: Release
 # (scoped at cpack time in cmake/CPackProjectConfig.cmake); the gates assert
 # that absence as policy, with the archive trees as the positive control that
 # the absence checks can fire. DEB/RPM already are Linux's double-clickable
-# installers and are unchanged. Both installers are UNSIGNED: macOS needs
-# right-click -> Open on first launch, Windows shows a SmartScreen warning —
-# signing is a separate decision requiring certificates.
+# installers and are unchanged. The macOS .pkg is SIGNED AND NOTARIZED (Developer ID,
+# stapled — it opens with no warning); that is still a MANUAL post-build step, not part
+# of this workflow, so the artifact this job uploads is unsigned until it is done. The
+# Windows installer is unsigned and SmartScreen warns about it.
 
 on:
   push:
@@ -892,7 +893,7 @@ jobs:
           case "$tag" in *rc[0-9]*) pre="--prerelease" ;; esac
           if ! gh release view "$tag" > /dev/null 2>&1; then
             gh release create "$tag" --verify-tag $pre --title "naudio $tag" \
-              --notes "Binary packages for $tag. See CHANGELOG.md for what changed. Want it to just work? Take the .pkg (macOS) or the setup .exe (Windows) — double-click installers carrying the runtime library and tools, no build files; on Linux the .deb/.rpm are the equivalent. Both installers are unsigned: macOS needs right-click -> Open the first time, Windows shows a SmartScreen warning (More info -> Run anyway). Developers: the tarballs/ZIP carry headers, pkg-config and the CMake package; DEB/RPM install under /usr, tarballs are relocatable (tools find libnaudio via a relative rpath). The Hamlib bridge (na_hamlib_bridge) is not included: it needs a streaming-capable libhamlib no released Hamlib provides yet, and it will join the packages — linked against the system's real libhamlib — once one does. Until then it builds from source: docs/hamlib-streaming-bridge.md."
+              --notes "Binary packages for $tag. See CHANGELOG.md for what changed. Want it to just work? Take the .pkg (macOS) or the setup .exe (Windows) — double-click installers carrying the runtime library and tools, no build files; on Linux the .deb/.rpm are the equivalent. The Windows installer is unsigned, so SmartScreen warns: choose More info -> Run anyway. The macOS .pkg is signed and notarized and opens with no warning. Developers: the tarballs/ZIP carry headers, pkg-config and the CMake package; DEB/RPM install under /usr, tarballs are relocatable (tools find libnaudio via a relative rpath). The Hamlib bridge (na_hamlib_bridge) is not included: it needs a streaming-capable libhamlib no released Hamlib provides yet, and it will join the packages — linked against the system's real libhamlib — once one does. Until then it builds from source: docs/hamlib-streaming-bridge.md."
           fi
           gh release upload "$tag" dist/naudio-* dist/sha256sums.txt --clobber
           gh release view "$tag" --json assets --jq '.assets[].name'
