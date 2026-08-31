@@ -29,9 +29,13 @@
     <key>Label</key>
     <string>org.kj5hst.naudio.daemon</string>
 
-    <!-- --duration-ms 0 lives HERE, not in a shipped config file: a service runs until
-         it is stopped, always, and a flag cannot be undone by a stray file (flags beat
-         the file — issue #96 item 1). Every other setting comes from the config file. -->
+    <!-- The run time is pinned to 0 HERE, on the command line, rather than in a
+         shipped config file: a service runs until it is stopped, always, and a flag
+         cannot be undone by a stray file (flags beat the file, issue #96 item 1).
+         Every other setting comes from the config file.
+         NB: no literal double hyphen may appear in these comments. XML forbids it,
+         and while launchd and plutil both accept it anyway (measured), every
+         conformant parser rejects the file outright. -->
     <key>ProgramArguments</key>
     <array>
         <string>@NAUDIO_SERVICE_EXEC@</string>
@@ -61,7 +65,10 @@
     <!-- launchd does not expand ~ or $HOME, so a per-user log path cannot be expressed
          here; the postinstall creates this directory group-writable by staff (every
          local macOS account is in staff) so the agent can write as the logged-in user.
-         systemd needs no equivalent — journald captures the unit's stdout/stderr. -->
+         systemd needs no equivalent — journald captures the unit's stdout/stderr.
+         This directory is load-bearing, not merely diagnostic: if it does not exist,
+         launchd cannot open the log and the job silently never starts (measured). Do
+         not "simplify" the postinstall by dropping the mkdir. -->
     <key>StandardOutPath</key>
     <string>@NAUDIO_SERVICE_LOG@</string>
     <key>StandardErrorPath</key>

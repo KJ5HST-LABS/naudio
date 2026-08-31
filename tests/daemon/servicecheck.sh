@@ -61,6 +61,16 @@ if [ "$KIND" = launchd ]; then
     plutil -lint "$UNIT" > /dev/null 2>&1 \
         && ok "plist parses" || bad "plist does not parse: $(plutil -lint "$UNIT" 2>&1)"
 
+    # plutil is NOT an XML conformance check, and neither is launchd. Both accept a
+    # literal double hyphen inside an XML comment, which the XML spec forbids — measured:
+    # a generated plist that plutil -lint called OK was refused outright by Python's
+    # plistlib, and launchd ran it regardless. So the file can be malformed, work
+    # perfectly, and break the first strict parser that ever reads it (item 4's control
+    # page being the obvious candidate). xmllint is the check plutil cannot be.
+    xmllint --noout "$UNIT" 2>/dev/null \
+        && ok "plist is well-formed XML" \
+        || bad "plist is not well-formed XML: $(xmllint --noout "$UNIT" 2>&1 | head -1)"
+
     # Installing a package must never start capturing a microphone at the next login. Measured
     # during design: a Disabled:true agent refuses to bootstrap at all, so this key IS the
     # inertness, and `launchctl enable` is what overrides it.
