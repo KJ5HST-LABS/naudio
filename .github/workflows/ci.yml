@@ -10,10 +10,14 @@ name: CI
 #   * build-and-test  — Ubuntu + macOS with a SYSTEM PortAudio (the supported path);
 #                       full ctest + install smoke + the external-consumer find_package
 #                       / pkg-config gate.
-#   * windows         — Windows lib-only (tools/ daemon excluded on WIN32 — not built in CI);
+#   * windows         — Windows, full build INCLUDING tools/ and the examples (issue #96 item 3);
 #                       PortAudio via FetchContent (no system dep on Windows). Exercises
 #                       the Winsock transport path (Socket.cpp ws2_32) that POSIX CI never
-#                       compiles.
+#                       compiles, and is the only job on any platform that compiles
+#                       na_audio_daemon with MSVC. It was lib-only until the daemon's WIN32
+#                       build gate came off: the Windows apps were then compiled by release.yml
+#                       alone, so a Windows-breaking edit to a tool stayed invisible until
+#                       somebody cut a tag.
 #   * fetchcontent    — Ubuntu with NO system PortAudio: proves the FetchContent fallback
 #                       (build PortAudio v19.7.0 from source) compiles + passes.
 #   * sanitizers      — Ubuntu: the same hardware-free ctest suite under ASan+UBSan(+LSan) and
@@ -101,22 +105,69 @@ jobs:
         # that the installed package is consumable.
 
   windows:
-    name: build+test (windows-latest, lib-only, FetchContent PortAudio)
+    name: build+test (windows-latest, apps + tools, FetchContent PortAudio)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure (no system PortAudio -> FetchContent; tools/ excluded on WIN32)
-        run: cmake -S . -B build -DNAUDIO_BUILD_APPS=OFF -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/naudio-prefix"
+      - name: Configure (no system PortAudio -> FetchContent; apps ON so the daemon is compiled)
+        run: cmake -S . -B build -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/naudio-prefix"
         # No portaudio-2.0.pc on Windows, so the build fetches + builds PortAudio
         # v19.7.0 from source (MME/WASAPI/DirectSound backends, Windows SDK only).
-        # tools/ (the na_audio_daemon hardware smoke) is guarded out by `if(NOT WIN32)` in CMakeLists;
-        # NAUDIO_BUILD_APPS=OFF additionally drops the demo exes (na_c_play_to_speakers) — this
-        # is a libraries + C ABI + tests build (the C-ABI smokes prove C linkage). The
-        # README snippet gate is POSIX-only (bash) and is not registered on WIN32.
+        #
+        # Apps are ON (the default) rather than NAUDIO_BUILD_APPS=OFF, which is what this job
+        # used to pass. The daemon's WIN32 gate is gone (issue #96 item 3), and leaving apps off
+        # here would have kept the thing the item delivers out of the one workflow that runs on
+        # every push: the Windows tools would be compiled by release.yml alone, i.e. on a tag,
+        # i.e. after the mistake. Building them here is what makes "the daemon builds on Windows"
+        # a claim CI re-checks rather than a claim a release discovers.
+        #
+        # The README snippet gate is POSIX-only (bash) and is not registered on WIN32.
 
       - name: Build
         run: cmake --build build --config RelWithDebInfo -j
+
+      - name: Assert the Windows tools were actually PRODUCED, and run each one
+        shell: pwsh
+        run: |
+          # Never the build's exit code (learning L9): a target that is silently not created
+          # leaves the build green, and "the daemon exists on Windows" is the whole point of
+          # this job. Assert on the BINARY -- then prove it starts, because a .exe that cannot
+          # resolve naudio.dll at load time is produced, present and useless.
+          #
+          # Located by SEARCH rather than by a hardcoded path: this is a multi-config generator
+          # with no RUNTIME_OUTPUT_DIRECTORY set, so each target lands under its own subdirectory
+          # (build/tools/<cfg>, build/examples/<cfg>) and a spelled-out path is a second thing
+          # that can be wrong. A search cannot pass by looking in the wrong place.
+          $dll = Get-ChildItem -Path build -Recurse -Filter naudio.dll -File | Select-Object -First 1
+          if (-not $dll) { Write-Output "::error::naudio.dll was not produced"; exit 1 }
+          # na_wav_tap and the demo pair link the SHARED naudio; in the build tree the DLL is not
+          # beside them (it is beside the library target). The packages install them into one
+          # bin/, so this PATH is the build-tree stand-in for that, not a shipped requirement.
+          $env:PATH = $dll.DirectoryName + ";" + $env:PATH
+
+          $bad = $false
+          foreach ($exe in "na_audio_daemon.exe","na_wav_tap.exe","na_audio_source.exe","na_c_play_to_speakers.exe") {
+            $found = Get-ChildItem -Path build -Recurse -Filter $exe -File
+            if ($found.Count -eq 0) {
+              Write-Output "::error::$exe was not produced anywhere under build/"
+              $bad = $true
+              continue
+            }
+            $path = $found[0].FullName
+            & $path --help *> $null
+            # --help exits 0 for all four. A load-time failure is a negative NTSTATUS
+            # (-1073741515 = STATUS_DLL_NOT_FOUND), which is exactly what this separates from
+            # "the binary is missing".
+            if ($LASTEXITCODE -ne 0) {
+              Write-Output "::error::$exe exists but exited $LASTEXITCODE on --help"
+              $bad = $true
+            } else {
+              Write-Output "$exe : produced and runs"
+            }
+          }
+          if ($bad) { exit 1 }
+          Write-Output "== Windows tools present and startable =="
 
       - name: Test (conformance vectors + Winsock loopback smokes)
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure

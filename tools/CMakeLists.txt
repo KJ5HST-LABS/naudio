@@ -10,17 +10,27 @@
 # (which exports only the na_* C ABI).
 # ----------------------------------------------------------------------------
 
-# NOT WIN32 is the gate that used to sit on this whole directory in the top-level CMakeLists: the
-# daemon is a live-PortAudio hardware smoke that Windows CI never runs. It stays excluded there.
-if(NAUDIO_BUILD_APPS AND NOT WIN32)
+# Built on every platform (issue #96 item 3). The NOT WIN32 gate that used to sit here excluded the
+# daemon because it is a live-PortAudio hardware smoke Windows CI never runs — but that reasons from
+# what CI can EXERCISE to what the build should PRODUCE, and the two are different questions. The
+# same argument would have excluded it from macOS, where CI opens no device either. What the gate
+# actually cost was the Windows operator: the daemon is the configure-and-run surface of the whole
+# toolkit, so a Windows package without it is a dev kit, and #96's "no terminal" arc had nothing to
+# register a service against. The hardware paths stay POSIX-smoked exactly as before — that is a
+# statement about the smoke, not about the compiler.
+if(NAUDIO_BUILD_APPS)
     add_executable(na_audio_daemon na_audio_daemon.cpp)
     target_link_libraries(na_audio_daemon PRIVATE naudio_net naudio_pa)
     # Ships in the binary packages (issue #93): the daemon is the operator-facing
     # surface, and an installer without it is a dev-kit-only installer.
     install(TARGETS na_audio_daemon
             RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
-    install(FILES "${naudio_SOURCE_DIR}/docs/man/na_audio_daemon.1"
-            DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
+    # The man page is POSIX-only even though the tool is not — the Windows ZIP has no man tree and
+    # no man(1) to read one (the same rule as na_wav_tap's and na_audio_source's pages below).
+    if(NOT WIN32)
+        install(FILES "${naudio_SOURCE_DIR}/docs/man/na_audio_daemon.1"
+                DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
+    endif()
 
     # ------------------------------------------------------------------------
     # Service registration (issue #96 item 2) — run the daemon without a terminal.
