@@ -238,10 +238,37 @@ jobs:
           [ "$(plutil -extract Disabled raw -o - "$AGENT")" = "true" ] \
             || { echo "::error::the registered agent is not Disabled — install would auto-start"; exit 1; }
 
-          # ...and it did not start one NOW either. pgrep gets its own control:
-          # an assertion of absence from a tool that finds nothing is worthless.
-          pgrep -x launchd > /dev/null \
-            || { echo "::error::control broken: pgrep -x cannot see launchd"; exit 1; }
+          # ...and it did not start one NOW either. An assertion of absence is
+          # worth nothing from an instrument that finds nothing, so pgrep gets a
+          # control built from the EXACT name searched for: a symlink to sleep,
+          # run, observed, killed, and observed gone. Borrowing a system process
+          # as the sentinel does NOT work — pgrep never matches PID 1, so
+          # `pgrep -x launchd` fails on every Mac (measured). Nor does copying a
+          # binary: an unsigned copy is killed on arm64.
+          ctl_dir=$(mktemp -d)
+          ln -s /bin/sleep "$ctl_dir/na_audio_daemon"
+          "$ctl_dir/na_audio_daemon" 60 &
+          ctl_pid=$!
+          disown "$ctl_pid" 2>/dev/null || true
+          seen=0
+          for _ in 1 2 3 4 5; do
+            if pgrep -x na_audio_daemon > /dev/null; then seen=1; break; fi
+            sleep 1
+          done
+          [ "$seen" -eq 1 ] \
+            || { echo "::error::control broken: pgrep cannot see a process named na_audio_daemon"; exit 1; }
+          kill "$ctl_pid" 2>/dev/null || true
+          gone=0
+          for _ in 1 2 3 4 5; do
+            if pgrep -x na_audio_daemon > /dev/null; then sleep 1; else gone=1; break; fi
+          done
+          # No `wait` here, deliberately: it would block until the stand-in ends
+          # on its own, and a kill that silently failed could then never be
+          # caught by the loop above — the assertion would be dead code.
+          [ "$gone" -eq 1 ] \
+            || { echo "::error::the control stand-in outlived its kill — the check below cannot run"; exit 1; }
+          rm -rf "$ctl_dir"
+
           if pgrep -x na_audio_daemon > /dev/null; then
             echo "::error::the daemon is running after a bare install"; exit 1; fi
 
