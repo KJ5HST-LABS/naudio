@@ -118,11 +118,10 @@ if(NAUDIO_BUILD_APPS)
         # /usr/local install prefix and the payload therefore cannot reach it.
         set(NAUDIO_PLIST_PAYLOAD_PATH
             "${CMAKE_INSTALL_FULL_DATADIR}/naudio/org.kj5hst.naudio.daemon.plist")
-        # Where the postinstall will find "naudio Control.app" inside the payload, for the same
-        # reason and by the same route: /Applications is not under /usr/local either. Set HERE
-        # rather than beside the bundle's own configure_file below, because postinstall.in is
+        # Where the postinstall will find the control app's TWO PIECES inside the payload. Set
+        # HERE rather than beside their configure_file below, because postinstall.in is
         # configured a few lines down and a variable set after it would expand to nothing.
-        set(NAUDIO_APP_PAYLOAD_PATH "${CMAKE_INSTALL_FULL_DATADIR}/naudio/naudio Control.app")
+        set(NAUDIO_APP_PAYLOAD_DIR "${CMAKE_INSTALL_FULL_DATADIR}/naudio")
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/org.kj5hst.naudio.daemon.plist.in"
             "${CMAKE_CURRENT_BINARY_DIR}/org.kj5hst.naudio.daemon.plist" @ONLY)
@@ -144,21 +143,28 @@ if(NAUDIO_BUILD_APPS)
         # "naudio Control.app" (issue #96 item 4) — the Applications entry, because macOS has no
         # .desktop equivalent and the issue's acceptance is that the page opens from an INSTALLED
         # shortcut. It is a launcher, not a program: a three-line script that execs the daemon in
-        # control mode. Like the plist it ships inside the payload and is copied out by the
+        # control mode. Like the plist it rides inside the payload and is placed by the
         # postinstall, because /Applications is not under the /usr/local install prefix either.
-        set(NAUDIO_APP_DIR "${CMAKE_CURRENT_BINARY_DIR}/app/naudio Control.app")
+        #
+        # THE PAYLOAD CARRIES TWO FLAT FILES, NOT A BUNDLE, and that is the whole point. Shipping
+        # the assembled `.app` inside the payload made `pkgbuild` auto-detect it and write
+        # <relocate>, <strict-identifier>, <upgrade-bundle> and <bundle-version> entries into
+        # PackageInfo — machinery that lets macOS Installer decide for itself where, or whether,
+        # to place the bundle by consulting Spotlight for the bundle identifier. It did not place
+        # it on a CI runner, silently, while the payload listing showed the files present. Two
+        # ordinary files cannot be auto-detected as a bundle, so the postinstall's `install`
+        # calls are the only thing that decides where this lands.
         configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/app/Info.plist.in"
-                       "${NAUDIO_APP_DIR}/Contents/Info.plist" @ONLY)
+                       "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.Info.plist" @ONLY)
         configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/app/naudio-control.in"
-                       "${NAUDIO_APP_DIR}/Contents/MacOS/naudio-control" @ONLY)
-        # configure_file writes 0644. LaunchServices does not report a bundle whose executable is
-        # not executable — it declines to open it, with no error the operator can act on.
-        file(CHMOD "${NAUDIO_APP_DIR}/Contents/MacOS/naudio-control"
-             PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
-                         GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-        install(DIRECTORY "${NAUDIO_APP_DIR}"
-                DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools
-                USE_SOURCE_PERMISSIONS)
+                       "${CMAKE_CURRENT_BINARY_DIR}/naudio-control" @ONLY)
+        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.Info.plist"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
+        # PROGRAMS, not FILES: configure_file writes 0644, and LaunchServices does not report a
+        # bundle whose executable is not executable — it declines to open it, with no error the
+        # operator can act on.
+        install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/naudio-control"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
     elseif(WIN32)
         # For the servicecheck arm: this build's install path, rendered here. The file the
         # installer actually registers is rendered from the same template against $INSTDIR.

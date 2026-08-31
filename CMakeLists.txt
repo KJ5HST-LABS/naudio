@@ -1201,10 +1201,19 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # $SMPROGRAMS/$STARTMENU_FOLDER are NSIS variables, literal to CMake (as $PROGRAMFILES64
         # is above); the whole command is an NSIS single-quoted string so the inner double quotes
         # around space-bearing paths are literal.
+        #
+        # FOUR backslashes, not two, and the difference is not cosmetic. CPack writes every
+        # CPACK_* variable into CPackConfig.cmake as `set(VAR "<value>")` with NO escaping, and
+        # cpack then RE-PARSES that file. Two here makes the value hold one backslash, which
+        # lands in CPackConfig.cmake as `\bin` — and cpack dies with `Invalid character escape
+        # '\b'` and `CPack project name not specified`, an error naming neither this variable
+        # nor NSIS. Four makes the value hold two, which survives the round trip as one, which
+        # is what NSIS gets. Reproduced end to end before being believed: two fails and four
+        # round-trips to exactly the single backslashes below.
         set(CPACK_NSIS_CREATE_ICONS_EXTRA
-            "CreateShortCut '$SMPROGRAMS\\$STARTMENU_FOLDER\\naudio Control.lnk' '$INSTDIR\\bin\\na_audio_daemon.exe' '--mode control --duration-ms 0 --open-page'")
+            "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\naudio Control.lnk' '$INSTDIR\\\\bin\\\\na_audio_daemon.exe' '--mode control --duration-ms 0 --open-page'")
         set(CPACK_NSIS_DELETE_ICONS_EXTRA
-            "Delete '$SMPROGRAMS\\$MUI_TEMP\\naudio Control.lnk'")
+            "Delete '$SMPROGRAMS\\\\$MUI_TEMP\\\\naudio Control.lnk'")
 
         # Service registration rides the installer here exactly as the .pkg postinstall carries
         # it on macOS (issue #96 item 2, Windows half). The work is in a PowerShell script the
@@ -1216,22 +1225,30 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # installation with a Start-menu shortcut, and the release gate asserts the task really
         # is registered, so a regression reddens CI rather than shipping quietly.
         #
+        # THE QUOTES ARE ESCAPED TWICE, and this one is worse than the backslashes above because
+        # it does not fail — it CORRUPTS. CPack writes this value into CPackConfig.cmake raw
+        # (CPACK_VERBATIM_VARIABLES is off by default), so a bare double quote inside it closes
+        # the string early; cpack then re-parses the remainder as a LIST and every quote comes
+        # back as a semicolon. The result is a .nsi full of `DetailPrint ;Registering;the;`,
+        # produced with no error at any stage. Measured by mirroring cpack_encode_variables()
+        # exactly and re-parsing its output.
+        #
         # StrCmp rather than LogicLib's ${If}: CPack's NSIS template includes MUI.nsh, Sections.nsh
         # and WinMessages.NSH and NOTHING else (checked in the template itself, not assumed), so
         # ${If} would fail to compile in makensis with an error naming a macro rather than a
         # missing include. StrCmp is core NSIS and needs nothing.
         set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "
-    DetailPrint \"Registering the naudio logon task (disabled until you enable it)...\"
-    nsExec::ExecToLog '\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"$INSTDIR\\share\\naudio\\register-task.ps1\" -InstallDir \"$INSTDIR\"'
+    DetailPrint \\\"Registering the naudio logon task (disabled until you enable it)...\\\"
+    nsExec::ExecToLog '\\\"$SYSDIR\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\\\" -NoProfile -ExecutionPolicy Bypass -File \\\"$INSTDIR\\\\share\\\\naudio\\\\register-task.ps1\\\" -InstallDir \\\"$INSTDIR\\\"'
     Pop $0
-    StrCmp $0 \"0\" +2 0
-      DetailPrint \"naudio: the logon task could not be registered (code $0). Everything else is installed.\"
+    StrCmp $0 \\\"0\\\" +2 0
+      DetailPrint \\\"naudio: the logon task could not be registered (code $0). Everything else is installed.\\\"
 ")
         # The same script with -Unregister, so the task NAME lives in exactly one file. The
         # release gate asserts the task is gone after an uninstall, which is also what would
         # catch this running after the payload had already been deleted.
         set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "
-    nsExec::ExecToLog '\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"$INSTDIR\\share\\naudio\\register-task.ps1\" -InstallDir \"$INSTDIR\" -Unregister'
+    nsExec::ExecToLog '\\\"$SYSDIR\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\\\" -NoProfile -ExecutionPolicy Bypass -File \\\"$INSTDIR\\\\share\\\\naudio\\\\register-task.ps1\\\" -InstallDir \\\"$INSTDIR\\\" -Unregister'
     Pop $0
 ")
     endif()

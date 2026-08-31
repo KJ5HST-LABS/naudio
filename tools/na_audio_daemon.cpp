@@ -186,7 +186,25 @@ struct Args {
     // --- control mode (issue #96 item 4) ---
     int controlPort = 8737;   // localhost-only HTTP control page; see runControl()
     bool autostart = false;   // control mode: begin capturing at startup rather than on a click
+
+    // Which settings BELONG IN THE FILE — the keys the config file already carried, plus the
+    // ones the control page has just been asked to save. Not a setting itself; provenance.
+    //
+    // It exists because the page rewrites the file whole, and without it the rewrite would
+    // persist values that arrived as FLAGS. The service units pass `--mode control` and
+    // `--duration-ms 0` on the command line precisely so that no file can undo them (issue #96
+    // items 1 and 2), so a page that wrote them back into the file would quietly reverse that
+    // decision — and a later plain `na_audio_daemon` would start in control mode because a
+    // service had once saved its settings.
+    std::vector<std::string> persistKeys;
 };
+
+// Mark a setting as one the config file should carry. Idempotent: the same key arriving from
+// the file and then from the page must not appear twice.
+void markPersisted(Args& a, const std::string& key) {
+    if (std::find(a.persistKeys.begin(), a.persistKeys.end(), key) == a.persistKeys.end())
+        a.persistKeys.push_back(key);
+}
 
 std::string defaultConfigPath();  // defined with the config-file loader below
 
@@ -883,6 +901,8 @@ void loadConfigFile(Args& args, const std::string& path) {
             std::fprintf(stderr, "error: %s\n", verr.c_str());
             std::exit(2);
         }
+        // The file said this key, so a rewrite keeps saying it.
+        markPersisted(args, key);
     }
 }
 
@@ -1082,9 +1102,17 @@ std::string settingValue(const Args& a, const std::string& key) {
     return "";
 }
 
-// The config file the page writes. Keys the operator has not set are omitted rather than
-// written at their default: a file full of defaults freezes them, so a later naudio that changes
-// one would be silently overridden by a file the operator never chose to write that value into.
+// The config file the page writes.
+//
+// TWO filters, and each one exists to stop a different wrong line appearing:
+//   * Only keys in `persistKeys` — what the file already carried, plus what the page just saved.
+//     Without this the rewrite would persist FLAGS, and the two flags the service units pass
+//     (`--mode control`, `--duration-ms 0`) are exactly the ones that must never become file
+//     settings: they are on the command line so that no file can undo them.
+//   * Only values that differ from the default. A file full of defaults freezes them, so a
+//     later naudio that changed one would be silently overridden by a value the operator never
+//     chose. A setting returned to its default therefore leaves the file, which is the same
+//     thing as saying it.
 std::string renderConfigFile(const Args& a) {
     const Args defaults;
     std::string out =
@@ -1095,8 +1123,12 @@ std::string renderConfigFile(const Args& a) {
         "#\n"
         "# Hand edits survive a rewrite only as VALUES: this file is regenerated whenever the\n"
         "# control page saves, so comments added below are lost. Edit here or there, not both.\n";
+    // kSettings order, not persistKeys order, so the file's layout is stable across saves
+    // rather than reflecting the order in which keys happened to be touched.
     for (const Setting& st : kSettings) {
         const std::string key = st.name;
+        if (std::find(a.persistKeys.begin(), a.persistKeys.end(), key) == a.persistKeys.end())
+            continue;
         const std::string v = settingValue(a, key);
         if (v.empty() || v == settingValue(defaults, key)) continue;
         out += key + " = " + v + "\n";
@@ -1347,13 +1379,13 @@ public:
         stopping_.store(true);
         listener_.close();
         if (accepter_.joinable()) accepter_.join();
-        std::vector<std::thread> workers;
+        std::vector<Worker> workers;
         {
             std::lock_guard<std::mutex> lock(workersMutex_);
             workers.swap(workers_);
         }
-        for (std::thread& t : workers)
-            if (t.joinable()) t.join();
+        for (Worker& w : workers)
+            if (w.first.joinable()) w.first.join();
     }
 
     ~ControlServer() { stop(); }
@@ -1391,25 +1423,31 @@ private:
             conn.setSendTimeout(5000);
             std::lock_guard<std::mutex> lock(workersMutex_);
             auto sock = std::make_shared<naudio::net::Socket>(std::move(conn));
-            workers_.emplace_back([this, sock] {
-                HttpRequest req;
-                if (readRequest(*sock, req)) handle(*sock, req);
-                sock->close();
-                done_.fetch_add(1);
-            });
+            // Each worker carries its OWN done flag. A single shared counter is not enough:
+            // it says how MANY workers finished, never WHICH, so the reaper below would join
+            // the first joinable thread in the vector — quite possibly one still mid-request —
+            // and block the accept loop behind it for up to the 5 s recv deadline.
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            workers_.emplace_back(std::thread([sock, done, this] {
+                                      HttpRequest req;
+                                      if (readRequest(*sock, req)) handle(*sock, req);
+                                      sock->close();
+                                      done->store(true);
+                                  }),
+                                  done);
         }
     }
 
-    // Joining finished workers from the accept loop keeps the vector from growing for the life of
-    // the process. A worker is only joined once its own thread has recorded completion, so this
-    // never blocks the accept loop on a request still in flight.
+    // Joining finished workers from the accept loop keeps the vector from growing for the life
+    // of the process. A worker is joined ONLY once its own flag says it has returned, so this
+    // never blocks the accept loop behind a request still in flight — which, with a 5 s recv
+    // deadline on every connection, would otherwise stall the whole server for five seconds
+    // because one browser opened a speculative socket and said nothing on it.
     void reapWorkers() {
-        if (done_.load() == 0) return;
         std::lock_guard<std::mutex> lock(workersMutex_);
         for (auto it = workers_.begin(); it != workers_.end();) {
-            if (done_.load() > 0 && it->joinable()) {
-                it->join();
-                done_.fetch_sub(1);
+            if (it->second->load()) {
+                if (it->first.joinable()) it->first.join();
                 it = workers_.erase(it);
             } else {
                 ++it;
@@ -1610,6 +1648,9 @@ private:
                     sendError(sock, 400, "Bad Request", err);
                     return;
                 }
+                // Cleared, not unset-from-the-file: renderConfigFile drops empty values, so
+                // marking it keeps the bookkeeping uniform without emitting a blank line.
+                markPersisted(candidate, key);
                 continue;
             }
             if (value.empty() && key == "capture-id") { candidate.captureId = -1; continue; }
@@ -1618,6 +1659,8 @@ private:
                 sendError(sock, 400, "Bad Request", err);
                 return;
             }
+            // The page asked for this key, so the file should carry it from now on.
+            markPersisted(candidate, key);
         }
         // The same two whole-config checks main() applies to a command line. Without them the
         // page could write a file that makes the daemon refuse to start at the next logon —
@@ -1724,11 +1767,13 @@ private:
     bool devicesStale_ = true;
     std::mutex devicesMutex_;
 
+    // The thread plus the flag it sets on its way out; see reapWorkers().
+    using Worker = std::pair<std::thread, std::shared_ptr<std::atomic<bool>>>;
+
     naudio::net::Socket listener_;
     std::thread accepter_;
-    std::vector<std::thread> workers_;
+    std::vector<Worker> workers_;
     std::mutex workersMutex_;
-    std::atomic<std::size_t> done_{0};
     std::atomic<bool> stopping_{false};
 };
 

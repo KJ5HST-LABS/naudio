@@ -30,17 +30,25 @@ install -d -m 0775 -o root -g staff "$LOGDIR"
 
 # "naudio Control.app" into /Applications (issue #96 item 4) — the shortcut that opens the
 # control page. Same reason as the plist: /Applications is not under the .pkg's /usr/local
-# payload prefix, so the payload carries the bundle in share/naudio/ and this copies it out.
+# payload prefix, so the payload carries the parts in share/naudio/ and this assembles them.
 #
-# cp -R onto a REMOVED destination, not over a live one: a bundle updated in place can end up
-# holding files from both versions, and LaunchServices caches what it finds. Removing first
-# makes an upgrade replace rather than merge.
-APP_SRC="${VOL}@NAUDIO_APP_PAYLOAD_PATH@"
+# ASSEMBLED HERE rather than carried as a bundle. A .app inside the payload is auto-detected by
+# pkgbuild, which writes <relocate>/<strict-identifier>/<upgrade-bundle> into PackageInfo and
+# lets macOS Installer decide for itself where the bundle goes by looking the identifier up in
+# Spotlight. On a CI runner it decided not to place it at all, silently, with the files plainly
+# listed in the payload. Two ordinary files and three install(1) calls have no such opinion.
+#
+# Onto a REMOVED destination, not over a live one: a bundle updated in place can end up holding
+# files from two versions at once, and LaunchServices caches what it finds there.
+APP_SRC="${VOL}@NAUDIO_APP_PAYLOAD_DIR@"
 APP_DST="${VOL}/Applications/naudio Control.app"
-if [ -d "$APP_SRC" ]; then
+if [ -f "$APP_SRC/naudio-control" ] && [ -f "$APP_SRC/naudio-control.Info.plist" ]; then
     rm -rf "$APP_DST"
-    cp -R "$APP_SRC" "$APP_DST"
-    chown -R root:wheel "$APP_DST"
+    install -d -m 0755 -o root -g wheel "$APP_DST/Contents/MacOS"
+    install -m 0644 -o root -g wheel "$APP_SRC/naudio-control.Info.plist" \
+            "$APP_DST/Contents/Info.plist"
+    install -m 0755 -o root -g wheel "$APP_SRC/naudio-control" \
+            "$APP_DST/Contents/MacOS/naudio-control"
 fi
 
 exit 0

@@ -255,6 +255,18 @@ done
 grep -q '^rate' "$CONF" \
     && bad "an unchanged default (rate) was written into the file" \
     || ok "unchanged defaults are left out of the file"
+
+# And a FLAG must never become a file setting. This daemon was started with `--mode control`
+# and `--duration-ms 120000`, both differing from their defaults, so a rewrite that persisted
+# the daemon's effective settings would write them here. It must not: the service units pass
+# exactly these two flags on the command line so that no file can undo them (#96 items 1 and 2),
+# and a page that wrote them back would reverse that silently — a later plain na_audio_daemon
+# would start in control mode because a service had once saved its settings.
+for leaked in mode duration-ms; do
+    grep -q "^$leaked" "$CONF" \
+        && bad "the page persisted '$leaked', which came from a FLAG, not from the file" \
+        || ok "a flag-supplied value ($leaked) did not leak into the file"
+done
 # Spaces in a value survive without quoting — the reason the format is `key = value` at all.
 grep -qx -- 'capture = USB Codec' "$CONF" \
     && ok "a value with a space needs no quoting" || bad "a spaced value did not round-trip"
