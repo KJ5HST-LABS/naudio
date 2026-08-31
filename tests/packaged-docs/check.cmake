@@ -20,6 +20,8 @@
 # runs the same predicate against a path that is deliberately NOT installed and requires it to be
 # reported MISSING. Only then does arm 1's success mean the files are really there.
 
+# NA_CONFIG is deliberately NOT in the required list: single-config generators may resolve
+# $<CONFIG> to an empty string, and passing an empty --config is worse than passing none.
 foreach(var NA_SOURCE_DIR NA_BUILD_DIR NA_WORK_DIR NA_DATAROOTDIR)
     if(NOT DEFINED ${var} OR "${${var}}" STREQUAL "")
         message(FATAL_ERROR "packaged-docs: ${var} was not passed to the script")
@@ -29,10 +31,16 @@ endforeach()
 set(prefix "${NA_WORK_DIR}/prefix")
 file(REMOVE_RECURSE "${prefix}")
 
-execute_process(COMMAND "${CMAKE_COMMAND}" --install "${NA_BUILD_DIR}" --prefix "${prefix}"
+set(install_cmd "${CMAKE_COMMAND}" --install "${NA_BUILD_DIR}" --prefix "${prefix}")
+if(DEFINED NA_CONFIG AND NOT "${NA_CONFIG}" STREQUAL "")
+    list(APPEND install_cmd --config "${NA_CONFIG}")
+endif()
+
+execute_process(COMMAND ${install_cmd}
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
-    message(FATAL_ERROR "packaged-docs: cmake --install failed (rc=${rc})\n${out}\n${err}")
+    message(FATAL_ERROR "packaged-docs: cmake --install failed (rc=${rc})\n"
+                        "  config: '${NA_CONFIG}'  build dir: ${NA_BUILD_DIR}\n${out}\n${err}")
 endif()
 
 # installed-relative path  ->  source-relative path it must be byte-identical to.

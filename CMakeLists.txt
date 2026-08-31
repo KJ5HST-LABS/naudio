@@ -902,6 +902,12 @@ if(NAUDIO_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.t
                      "-DNA_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
                      "-DNA_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/packaged-docs"
                      "-DNA_DATAROOTDIR=${CMAKE_INSTALL_DATAROOTDIR}"
+                     # $<CONFIG> resolves at test time, which is the only way this works on a
+                     # MULTI-CONFIG generator: Visual Studio puts binaries in build/<Config>/,
+                     # and `cmake --install` with no --config silently assumes Release. The
+                     # Windows CI job builds RelWithDebInfo, so the install went looking in
+                     # build/Release/ and failed on a naudio.dll that was never there.
+                     "-DNA_CONFIG=$<CONFIG>"
                      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/packaged-docs/check.cmake")
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/packaged-docs")
 
