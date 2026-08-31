@@ -180,6 +180,13 @@ jobs:
               || { echo "::error::control broken: TGZ tree lacks $present — absence checks prove nothing"; exit 1; }
           done
 
+          # Control for the service-registration assertions below (L222): the
+          # agent must be absent BEFORE the install, or its presence afterwards
+          # proves nothing about who put it there.
+          AGENT=/Library/LaunchAgents/org.kj5hst.naudio.daemon.plist
+          test ! -e "$AGENT" \
+            || { echo "::error::control broken: $AGENT existed before the install"; exit 1; }
+
           # THE install the deliverable promises: Installer.app's command-line
           # twin placing real files under /usr/local, receipt and all.
           sudo installer -pkg "$pkg" -target /
@@ -212,6 +219,38 @@ jobs:
             if [ -e "$absent" ]; then
               echo "::error::installer shipped dev file $absent — payload must be runtime+tools only"; exit 1; fi
           done
+
+          # --- Service registration (#96 item 2): the postinstall ran ---------
+          test -f "$AGENT" \
+            || { echo "::error::the .pkg postinstall did not register the launchd agent"; exit 1; }
+          plutil -lint "$AGENT" > /dev/null \
+            || { echo "::error::the registered agent is not a valid plist"; exit 1; }
+
+          # The agent must name a binary that this install actually placed. A
+          # unit pointing at a path the package does not create is the whole
+          # failure mode, and only the INSTALLED layout can answer it.
+          exec_path=$(plutil -extract ProgramArguments.0 raw -o - "$AGENT")
+          test -x "$exec_path" \
+            || { echo "::error::agent names '$exec_path', which the install did not create"; exit 1; }
+
+          # Installing must not start capturing a microphone at the next login.
+          # Asserted AS POLICY, like the dev-file absence above.
+          [ "$(plutil -extract Disabled raw -o - "$AGENT")" = "true" ] \
+            || { echo "::error::the registered agent is not Disabled — install would auto-start"; exit 1; }
+
+          # ...and it did not start one NOW either. pgrep gets its own control:
+          # an assertion of absence from a tool that finds nothing is worthless.
+          pgrep -x launchd > /dev/null \
+            || { echo "::error::control broken: pgrep -x cannot see launchd"; exit 1; }
+          if pgrep -x na_audio_daemon > /dev/null; then
+            echo "::error::the daemon is running after a bare install"; exit 1; fi
+
+          # The agent logs to an absolute path (launchd expands neither ~ nor
+          # $HOME), so the postinstall must have created that directory.
+          log_dir=$(dirname "$(plutil -extract StandardErrorPath raw -o - "$AGENT")")
+          test -d "$log_dir" \
+            || { echo "::error::agent logs to $log_dir, which the postinstall did not create"; exit 1; }
+          echo "launchd agent registered, inert, and pointing at $exec_path"
           echo "== macOS installer gate: PASS =="
 
       - uses: actions/upload-artifact@v4
@@ -351,6 +390,29 @@ jobs:
              $(pkg-config --libs naudio) -o deb_consume_c_pc
           ./deb_consume_c_pc | grep -q '^consume_c OK' \
             || { echo "::error::pkg-config consumer did not run against the DEB"; exit 1; }
+
+          # --- Service registration (#96 item 2) ------------------------------
+          # The DEB carries the unit itself — no postinst needed, unlike the
+          # .pkg, because /usr/lib/systemd/user IS under the package prefix.
+          UNIT=/usr/lib/systemd/user/naudio-daemon.service
+          test -f "$UNIT" || { echo "::error::the DEB did not install $UNIT"; exit 1; }
+
+          # It must name a binary the package actually placed — the failure a
+          # build-tree test structurally cannot see.
+          unit_exec=$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$UNIT")
+          test -x "$unit_exec" \
+            || { echo "::error::unit names '$unit_exec', which the DEB did not install"; exit 1; }
+
+          # Installing must not start capturing a microphone at the next login:
+          # the unit ships AVAILABLE, never enabled. Absence needs a control, so
+          # the wants directory is first proven to be where an enable would land.
+          grep -q '^WantedBy=default.target$' "$UNIT" \
+            || { echo "::error::control broken: unit does not install into default.target"; exit 1; }
+          for w in /etc/systemd/user/default.target.wants "$HOME/.config/systemd/user/default.target.wants"; do
+            if [ -e "$w/naudio-daemon.service" ]; then
+              echo "::error::the DEB enabled the service — it must ship available, not enabled"; exit 1; fi
+          done
+          echo "systemd user unit installed at $UNIT, not enabled, pointing at $unit_exec"
           echo "== DEB gate: PASS =="
 
       - name: "Package gate 3/3: RPM — content assertions (no rpm host here to install on)"
@@ -360,7 +422,8 @@ jobs:
           rpm -qlp "$rpm" > rpm-contents.txt
           for want in /usr/bin/na_audio_daemon /usr/bin/na_wav_tap \
                       /usr/bin/na_audio_source /usr/bin/na_c_play_to_speakers \
-                      /usr/include/naudio.h /usr/lib/pkgconfig/naudio.pc; do
+                      /usr/include/naudio.h /usr/lib/pkgconfig/naudio.pc \
+                      /usr/lib/systemd/user/naudio-daemon.service; do
             grep -qx "$want" rpm-contents.txt \
               || { echo "::error::RPM is missing $want"; cat rpm-contents.txt; exit 1; }
           done
