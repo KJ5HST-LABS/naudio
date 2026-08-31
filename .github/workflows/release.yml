@@ -186,6 +186,10 @@ jobs:
           AGENT=/Library/LaunchAgents/org.kj5hst.naudio.daemon.plist
           test ! -e "$AGENT" \
             || { echo "::error::control broken: $AGENT existed before the install"; exit 1; }
+          # Same control for the Applications shortcut (#96 item 4).
+          APP="/Applications/naudio Control.app"
+          test ! -e "$APP" \
+            || { echo "::error::control broken: $APP existed before the install"; exit 1; }
 
           # THE install the deliverable promises: Installer.app's command-line
           # twin placing real files under /usr/local, receipt and all.
@@ -278,6 +282,54 @@ jobs:
           test -d "$log_dir" \
             || { echo "::error::agent logs to $log_dir, which the postinstall did not create"; exit 1; }
           echo "launchd agent registered, inert, and pointing at $exec_path"
+
+          # --- The control page (#96 item 4) ---------------------------------
+          # The agent runs the daemon in CONTROL mode now, which is what makes
+          # "enable the service" give an operator a page rather than an open
+          # microphone. Asserted on the registered agent, not on the template.
+          [ "$(plutil -extract ProgramArguments.1 raw -o - "$AGENT")" = "--mode" ] \
+            && [ "$(plutil -extract ProgramArguments.2 raw -o - "$AGENT")" = "control" ] \
+            || { echo "::error::the registered agent does not run --mode control"; exit 1; }
+
+          # The Applications entry the postinstall copies out of the payload —
+          # the shortcut #96's acceptance names, since macOS has no .desktop.
+          test -d "$APP" \
+            || { echo "::error::the .pkg postinstall did not place $APP"; exit 1; }
+          plutil -lint "$APP/Contents/Info.plist" > /dev/null \
+            || { echo "::error::$APP has an invalid Info.plist"; exit 1; }
+          # A bundle whose executable is not executable is not opened by
+          # LaunchServices, and it says nothing about why (configure_file writes
+          # 0644, so this is the mode the CMake file(CHMOD) exists to fix).
+          test -x "$APP/Contents/MacOS/naudio-control" \
+            || { echo "::error::$APP's bundle executable is not executable"; exit 1; }
+          # It must exec a binary this install actually placed.
+          app_exec=$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$APP/Contents/MacOS/naudio-control")
+          test -x "$app_exec" \
+            || { echo "::error::$APP execs '$app_exec', which the install did not create"; exit 1; }
+
+          # BEHAVIOUR on the installed binary: serve the page, fetch it, and
+          # fetch the state the browser polls. Hardware-free — control mode
+          # opens no device until asked, and nothing here asks.
+          "$exec_path" --mode control --control-port 0 --autostart false \
+                       --no-config --duration-ms 20000 > /tmp/ctl.log 2>&1 &
+          ctl_daemon=$!
+          url=""
+          for _ in $(seq 1 50); do
+            url=$(sed -n 's/^control page : //p' /tmp/ctl.log)
+            [ -n "$url" ] && break
+            sleep 0.2
+          done
+          [ -n "$url" ] || { echo "::error::the installed daemon served no control page"; cat /tmp/ctl.log; exit 1; }
+          curl -fsS "$url" | grep -q 'naudio control' \
+            || { echo "::error::the installed daemon's control page is not the control page"; exit 1; }
+          curl -fsS "${url}api/state" | grep -q '"state":"idle"' \
+            || { echo "::error::the installed daemon's /api/state did not report an idle pipeline"; exit 1; }
+          # Control: the same fetch against a port with nothing on it must fail,
+          # or the two assertions above would pass on any reachable machine.
+          if curl -fsS --max-time 3 "http://127.0.0.1:1/" > /dev/null 2>&1; then
+            echo "::error::control broken: a dead port answered"; exit 1; fi
+          kill "$ctl_daemon" 2>/dev/null || true
+          echo "installed daemon serves its control page and reports an idle pipeline"
           echo "== macOS installer gate: PASS =="
 
       - uses: actions/upload-artifact@v4
@@ -439,7 +491,53 @@ jobs:
             if [ -e "$w/naudio-daemon.service" ]; then
               echo "::error::the DEB enabled the service — it must ship available, not enabled"; exit 1; fi
           done
+          # The unit runs CONTROL mode (#96 item 4), which is what makes
+          # enabling the service give an operator a page rather than an open
+          # microphone. Asserted on the INSTALLED unit, not on the template.
+          grep -q '^ExecStart=.* --mode control ' "$UNIT" \
+            || { echo "::error::the installed unit does not run --mode control"; sed -n '/^ExecStart=/p' "$UNIT"; exit 1; }
           echo "systemd user unit installed at $UNIT, not enabled, pointing at $unit_exec"
+
+          # --- The control page (#96 item 4) ---------------------------------
+          # The desktop entry: the shortcut #96's acceptance names. Unlike the
+          # unit it needs no postinst either — share/applications is under /usr.
+          DESKTOP=/usr/share/applications/naudio-control.desktop
+          test -f "$DESKTOP" || { echo "::error::the DEB did not install $DESKTOP"; exit 1; }
+          if command -v desktop-file-validate > /dev/null; then
+            desktop-file-validate "$DESKTOP" \
+              || { echo "::error::$DESKTOP is not a valid desktop entry"; exit 1; }
+          else
+            echo "note: no desktop-file-validate on this runner; structure not validated"
+          fi
+          # It must launch a binary the package actually placed, in control mode.
+          desktop_exec=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' "$DESKTOP")
+          test -x "$desktop_exec" \
+            || { echo "::error::$DESKTOP execs '$desktop_exec', which the DEB did not install"; exit 1; }
+          grep -q '^Exec=.* --mode control ' "$DESKTOP" \
+            || { echo "::error::$DESKTOP does not launch control mode"; exit 1; }
+
+          # BEHAVIOUR on the installed binary: serve the page and answer the
+          # poll the browser makes. Hardware-free — nothing here starts a stream.
+          "$unit_exec" --mode control --control-port 0 --autostart false \
+                       --no-config --duration-ms 20000 > /tmp/ctl.log 2>&1 &
+          ctl_daemon=$!
+          url=""
+          for _ in $(seq 1 50); do
+            url=$(sed -n 's/^control page : //p' /tmp/ctl.log)
+            [ -n "$url" ] && break
+            sleep 0.2
+          done
+          [ -n "$url" ] || { echo "::error::the installed daemon served no control page"; cat /tmp/ctl.log; exit 1; }
+          curl -fsS "$url" | grep -q 'naudio control' \
+            || { echo "::error::the installed daemon's control page is not the control page"; exit 1; }
+          curl -fsS "${url}api/state" | grep -q '"state":"idle"' \
+            || { echo "::error::the installed daemon's /api/state did not report an idle pipeline"; exit 1; }
+          # Control: a port with nothing on it must NOT answer, or the two
+          # assertions above would pass anywhere.
+          if curl -fsS --max-time 3 "http://127.0.0.1:1/" > /dev/null 2>&1; then
+            echo "::error::control broken: a dead port answered"; exit 1; fi
+          kill "$ctl_daemon" 2>/dev/null || true
+          echo "installed daemon serves its control page and reports an idle pipeline"
           echo "== DEB gate: PASS =="
 
       - name: "Package gate 3/3: RPM — content assertions (no rpm host here to install on)"
@@ -450,7 +548,8 @@ jobs:
           for want in /usr/bin/na_audio_daemon /usr/bin/na_wav_tap \
                       /usr/bin/na_audio_source /usr/bin/na_c_play_to_speakers \
                       /usr/include/naudio.h /usr/lib/pkgconfig/naudio.pc \
-                      /usr/lib/systemd/user/naudio-daemon.service; do
+                      /usr/lib/systemd/user/naudio-daemon.service \
+                      /usr/share/applications/naudio-control.desktop; do
             grep -qx "$want" rpm-contents.txt \
               || { echo "::error::RPM is missing $want"; cat rpm-contents.txt; exit 1; }
           done
@@ -575,6 +674,14 @@ jobs:
             if (-not (Test-Path "$($zipTree.FullName)/$present")) {
               Write-Output "::error::control broken: ZIP tree lacks $present — absence checks prove nothing"; exit 1 } }
 
+          # Control for the logon-task assertions below (L222): the task must be
+          # ABSENT before the install, or finding it afterwards says nothing about
+          # who registered it.
+          $TaskPath = '\naudio\'
+          $TaskName = 'naudio-daemon'
+          if (Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            Write-Output "::error::control broken: the logon task existed before the install"; exit 1 }
+
           $proc = Start-Process -PassThru -Wait -FilePath $exe.FullName -ArgumentList '/S'
           if ($proc.ExitCode -ne 0) { Write-Output "::error::silent install exited $($proc.ExitCode)"; exit 1 }
           $I = "$env:ProgramFiles\naudio"
@@ -623,6 +730,108 @@ jobs:
             Write-Output "::error::byte-tell missing — the installed pair did not stream"; exit 1 }
           Stop-Process -Id $srv.Id -ErrorAction SilentlyContinue
 
+          # --- Service registration (#96 item 2, Windows half) ----------------
+          # The installer's NSIS section renders the task XML against the chosen
+          # $INSTDIR and hands it to schtasks. Everything below is read back from
+          # the SCHEDULER, not from the file we wrote: the file being right and
+          # the task being registered are different claims.
+          $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
+          if (-not $task) {
+            Write-Output "::error::the installer did not register the logon task"
+            & schtasks.exe /Query /TN "$TaskPath$TaskName" 2>&1 | Write-Output
+            exit 1 }
+
+          # Installing must not start capturing at the next logon. This is the
+          # Windows spelling of the launchd Disabled key and systemd's
+          # not-enabled state, and it is asserted AS POLICY.
+          if ($task.State -ne 'Disabled') {
+            Write-Output "::error::the registered task is '$($task.State)', not Disabled — logging in would start capturing"; exit 1 }
+
+          # The three defaults that would break a long-running audio service
+          # SILENTLY. Read from the registered task, so a template that had them
+          # and an installer that dropped them are distinguishable.
+          if ($task.Settings.ExecutionTimeLimit -ne 'PT0S') {
+            Write-Output "::error::ExecutionTimeLimit is '$($task.Settings.ExecutionTimeLimit)', not PT0S — the task would be killed after three days"; exit 1 }
+          if ($task.Settings.DisallowStartIfOnBatteries) {
+            Write-Output "::error::DisallowStartIfOnBatteries is set — the task would refuse to start on a laptop"; exit 1 }
+          if ($task.Settings.StopIfGoingOnBatteries) {
+            Write-Output "::error::StopIfGoingOnBatteries is set — unplugging would stop the stream"; exit 1 }
+          if (-not ($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })) {
+            Write-Output "::error::the task has no logon trigger — it would never start by itself"; exit 1 }
+
+          # It must name a binary THIS install actually placed — the failure a
+          # build-tree test structurally cannot see, and the one the operator's
+          # choice of install directory is most likely to cause.
+          $action = $task.Actions[0]
+          if (-not (Test-Path -LiteralPath $action.Execute)) {
+            Write-Output "::error::the task runs '$($action.Execute)', which the install did not create"; exit 1 }
+          if ($action.Execute -ne "$I\bin\na_audio_daemon.exe") {
+            Write-Output "::error::the task runs '$($action.Execute)', expected $I\bin\na_audio_daemon.exe"; exit 1 }
+          if ($action.Arguments -notmatch '--mode\s+control') {
+            Write-Output "::error::the task does not run --mode control: '$($action.Arguments)'"; exit 1 }
+
+          # BEHAVIOUR: the task's OWN argument list, handed to the installed
+          # binary. This is the check that catches a typo'd option — the task
+          # would register perfectly and fail only at the operator's next logon.
+          $taskArgs = $action.Arguments.Split(' ') + @('--mode','zzz','--no-config')
+          & $action.Execute @taskArgs 2>&1 | Tee-Object -FilePath task-args.log
+          if ($LASTEXITCODE -ne 2 -or -not (Select-String -Path task-args.log -Pattern "invalid --mode 'zzz'" -Quiet)) {
+            Write-Output "::error::the task's own arguments did not parse (exit $LASTEXITCODE)"
+            Get-Content task-args.log; exit 1 }
+          Write-Output "logon task registered, disabled, no time limit, battery-safe, running $($action.Execute)"
+
+          # --- The control page (#96 item 4) ----------------------------------
+          # The Start-menu shortcut is the thing #96's acceptance actually names.
+          # Both shell contexts are searched because a silent elevated install
+          # writes the all-users menu and a per-user one does not.
+          $lnk = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\naudio\naudio Control.lnk",
+                   "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\naudio\naudio Control.lnk") |
+                 Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $lnk) {
+            Write-Output "::error::no 'naudio Control' Start-menu shortcut was created"
+            Get-ChildItem "$env:ProgramData\Microsoft\Windows\Start Menu\Programs" -Recurse -Filter *.lnk |
+              ForEach-Object { Write-Output "  found: $($_.FullName)" }
+            exit 1 }
+          $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+          if ($sc.TargetPath -ne "$I\bin\na_audio_daemon.exe") {
+            Write-Output "::error::the shortcut points at '$($sc.TargetPath)'"; exit 1 }
+          if ($sc.Arguments -notmatch '--mode control' -or $sc.Arguments -notmatch '--open-page') {
+            Write-Output "::error::the shortcut does not open the control page: '$($sc.Arguments)'"; exit 1 }
+          Write-Output "Start-menu shortcut opens the control page: $lnk"
+
+          # ...and the page really is served by the INSTALLED binary. Hardware-free:
+          # control mode opens no device until asked, and nothing here asks.
+          $ctlLog = "$env:TEMP\naudio-control.log"
+          $ctl = Start-Process -PassThru -NoNewWindow -FilePath "$I\bin\na_audio_daemon.exe" `
+                 -ArgumentList '--mode','control','--control-port','0','--autostart','false',
+                               '--no-config','--duration-ms','25000' `
+                 -RedirectStandardOutput $ctlLog
+          $url = $null
+          foreach ($i in 1..60) {
+            if (Test-Path $ctlLog) {
+              $line = Select-String -Path $ctlLog -Pattern '^control page : (\S+)' | Select-Object -First 1
+              if ($line) { $url = $line.Matches[0].Groups[1].Value; break }
+            }
+            Start-Sleep -Milliseconds 250
+          }
+          if (-not $url) {
+            Write-Output "::error::the installed daemon served no control page"
+            if (Test-Path $ctlLog) { Get-Content $ctlLog }; exit 1 }
+          $page = (Invoke-WebRequest -UseBasicParsing -Uri $url).Content
+          if ($page -notmatch 'naudio control') {
+            Write-Output "::error::the installed daemon's page is not the control page"; exit 1 }
+          $state = (Invoke-WebRequest -UseBasicParsing -Uri "${url}api/state").Content
+          if ($state -notmatch '"state":"idle"') {
+            Write-Output "::error::/api/state did not report an idle pipeline: $state"; exit 1 }
+          # Control: a port with nothing on it must NOT answer, or the two
+          # assertions above would pass on any machine that has a web server.
+          $dead = $false
+          try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:1/' -TimeoutSec 3 | Out-Null }
+          catch { $dead = $true }
+          if (-not $dead) { Write-Output "::error::control broken: a dead port answered"; exit 1 }
+          Stop-Process -Id $ctl.Id -ErrorAction SilentlyContinue
+          Write-Output "installed daemon serves its control page and reports an idle pipeline"
+
           # Payload policy is runtime+tools ONLY.
           foreach ($absent in 'include','lib/naudio.lib','lib/cmake') {
             if (Test-Path "$I/$absent") {
@@ -637,6 +846,12 @@ jobs:
           if ($un.ExitCode -ne 0) { Write-Output "::error::silent uninstall exited $($un.ExitCode)"; exit 1 }
           foreach ($gone in 'bin/na_wav_tap.exe','bin/na_audio_daemon.exe') {
             if (Test-Path "$I/$gone") { Write-Output "::error::uninstaller left $gone behind"; exit 1 } }
+          # ...including the logon task. This is also what would catch the
+          # uninstall section running AFTER the payload (and therefore the
+          # registration script) had already been deleted.
+          if (Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            Write-Output "::error::the uninstaller left the logon task registered"; exit 1 }
+          Write-Output "the uninstaller removed the logon task as well as the payload"
           Write-Output "== Windows installer gate: PASS =="
 
       - uses: actions/upload-artifact@v4
