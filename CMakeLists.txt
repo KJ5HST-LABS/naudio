@@ -1093,6 +1093,16 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         configure_file(LICENSE "${CMAKE_CURRENT_BINARY_DIR}/cpack-resources/LICENSE.txt" COPYONLY)
         set(CPACK_NAUDIO_LICENSE_TXT "${CMAKE_CURRENT_BINARY_DIR}/cpack-resources/LICENSE.txt")
         set(CPACK_NAUDIO_PKG_README_TXT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/productbuild-readme.txt")
+        # Service registration rides the installer (issue #96 item 2): the payload
+        # cannot place /Library/LaunchAgents/org.kj5hst.naudio.daemon.plist, because
+        # every payload path is rooted at the /usr/local install prefix. A postinstall
+        # script copies it out of share/naudio/ instead. Generated in tools/ (where the
+        # install paths it bakes in are known) and handed to the productbuild branch of
+        # the project config file; empty on a lib-only build, where there is no daemon
+        # to register and CPack must not be given a script path that does not exist.
+        if(NAUDIO_POSTFLIGHT_SCRIPT)
+            set(CPACK_NAUDIO_POSTFLIGHT_SCRIPT "${NAUDIO_POSTFLIGHT_SCRIPT}")
+        endif()
     endif()
     if(WIN32)
         # $PROGRAMFILES64 is an NSIS variable, literal to CMake: 64-bit

@@ -33,6 +33,13 @@ if(CPACK_GENERATOR STREQUAL "productbuild")
     # pane-sized text written for the installer, not the repo README.
     set(CPACK_RESOURCE_FILE_LICENSE "${CPACK_NAUDIO_LICENSE_TXT}")
     set(CPACK_RESOURCE_FILE_README "${CPACK_NAUDIO_PKG_README_TXT}")
+    # Registers the launchd agent after the payload lands (issue #96 item 2) — the
+    # ".pkg postinstall" half of "registration rides the existing installers". Scoped
+    # to this generator: the TGZ has no scripts, and the file is only defined when the
+    # tools component (and so the daemon) is actually being built.
+    if(CPACK_NAUDIO_POSTFLIGHT_SCRIPT)
+        set(CPACK_POSTFLIGHT_TOOLS_SCRIPT "${CPACK_NAUDIO_POSTFLIGHT_SCRIPT}")
+    endif()
 elseif(CPACK_GENERATOR STREQUAL "NSIS")
     set(CPACK_COMPONENTS_ALL runtime tools)
     set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
