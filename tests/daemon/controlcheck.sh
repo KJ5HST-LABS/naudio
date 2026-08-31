@@ -194,9 +194,17 @@ expect "GET /api/state" 200 "/api/state"
 [ "$(jget stream.state)" = "idle" ] \
     && ok "the pipeline is idle at startup (--autostart false)" \
     || bad "the pipeline is not idle at startup: '$(jget stream.state)' — this arm is NOT hardware-free"
-[ "$(jget configPath)" = "$CONF" ] \
-    && ok "the page edits the config file this invocation read" \
-    || bad "configPath is '$(jget configPath)', expected '$CONF'"
+# Matched on the SCRATCH DIRECTORY plus the file name, never on the full path. Git Bash
+# rewrites /tmp/tmp.XXXX/daemon.conf into C:/Users/.../Temp/tmp.XXXX/daemon.conf on the way to
+# a native binary, so the daemon truthfully reports a path this script never typed. The scratch
+# directory's name is unique to this run, which keeps the assertion sharp — it still fails if
+# the daemon reported the DEFAULT location instead of the one it was given. Same rule as
+# configcheck.sh's basename-only path assertions, and for the same reason.
+case "$(jget configPath)" in
+    *"$(basename "$TMP")"[/\\]daemon.conf)
+        ok "the page edits the config file this invocation read" ;;
+    *)  bad "configPath is '$(jget configPath)', which is not this run's scratch daemon.conf" ;;
+esac
 [ "$(jget settings.transport.value)" = "tcp" ] \
     && ok "settings are reported (transport = tcp)" || bad "settings.transport missing"
 

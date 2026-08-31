@@ -67,6 +67,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -961,11 +962,16 @@ std::string jsonEscape(const std::string& in) {
     return out;
 }
 std::string jstr(const std::string& v) { return "\"" + jsonEscape(v) + "\""; }
-std::string jnum(long long v) { return std::to_string(v); }
-// int has to be spelled out: without it every int argument is ambiguous between the two
-// overloads below, and the compiler is right to refuse — a count rendered as "3.00" would
-// be a silent formatting bug rather than an error.
-std::string jnum(int v) { return std::to_string(v); }
+// ONE template rather than an overload per integer type, and the reason is a portability trap
+// worth naming: `int`, `long` and `long long` are three DISTINCT types, and which of them
+// std::int64_t names is platform-dependent — `long` on LP64 Linux, `long long` on macOS and
+// Windows. Overloads for `int` and `long long` are therefore exactly right on macOS and
+// AMBIGUOUS on Linux, where an int64_t argument matches neither exactly and `long -> double`
+// is as good a conversion as `long -> long long` (measured: GCC refused seven call sites that
+// clang had accepted). A constrained template has no such gap, and `double` still binds to its
+// own non-template overload exactly.
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+std::string jnum(T v) { return std::to_string(v); }
 std::string jnum(double v) {
     if (!std::isfinite(v)) return "null";  // JSON has no NaN/Infinity; dbfs() can floor, not blow up
     char b[40];
