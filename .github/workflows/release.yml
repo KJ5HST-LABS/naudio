@@ -807,8 +807,12 @@ jobs:
                  -ArgumentList '--mode','control','--control-port','0','--autostart','false',
                                '--no-config','--duration-ms','25000' `
                  -RedirectStandardOutput $ctlLog
+          # $attempt, NOT $i: PowerShell variable names are CASE-INSENSITIVE, so a loop over
+          # $i silently rebinds $I — the install directory every assertion in this step uses.
+          # It failed as `An error occurred trying to start process '2/Uninstall.exe'`, an error
+          # naming neither the loop nor $I, forty lines below the loop that caused it.
           $url = $null
-          foreach ($i in 1..60) {
+          foreach ($attempt in 1..60) {
             if (Test-Path $ctlLog) {
               $line = Select-String -Path $ctlLog -Pattern '^control page : (\S+)' | Select-Object -First 1
               if ($line) { $url = $line.Matches[0].Groups[1].Value; break }
