@@ -861,6 +861,21 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_audio_daemon)
     add_test(NAME naudio_daemon_configcheck
              COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/configcheck.sh"
                           "$<TARGET_FILE:na_audio_daemon>")
+    # Service-unit gate (issue #96 item 2). A launchd plist and a systemd unit are code nothing
+    # compiles: a typo'd option ships, installs, and fails only on the operator's machine. This
+    # arm extracts the generated unit's OWN argument list and runs it against the built binary,
+    # and asserts the absolute path it names is the path this build installs to — the failure a
+    # build-tree test structurally cannot see. Registered only where the unit was generated, so
+    # a configuration with no daemon has no such test rather than a skip that reads like
+    # coverage; the platform decides WHICH unit, so ubuntu CI covers the systemd arm and macOS
+    # the launchd one.
+    if(NAUDIO_SERVICE_UNIT_FILE)
+        add_test(NAME naudio_daemon_servicecheck
+                 COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/servicecheck.sh"
+                              "$<TARGET_FILE:na_audio_daemon>"
+                              "${NAUDIO_SERVICE_UNIT_FILE}"
+                              "${NAUDIO_SERVICE_EXEC_PATH}")
+    endif()
 endif()
 
 # ----------------------------------------------------------------------------

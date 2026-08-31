@@ -65,6 +65,8 @@ if(NAUDIO_BUILD_APPS AND NOT WIN32)
         set(NAUDIO_POSTFLIGHT_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/postinstall" PARENT_SCOPE)
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/org.kj5hst.naudio.daemon.plist"
                 DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
+        set(NAUDIO_SERVICE_UNIT_FILE
+            "${CMAKE_CURRENT_BINARY_DIR}/org.kj5hst.naudio.daemon.plist" PARENT_SCOPE)
     elseif(NOT WIN32)
         configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/linux/naudio-daemon.service.in"
                        "${CMAKE_CURRENT_BINARY_DIR}/naudio-daemon.service" @ONLY)
@@ -74,7 +76,12 @@ if(NAUDIO_BUILD_APPS AND NOT WIN32)
         # the unit would install where nothing would ever read it.
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/naudio-daemon.service"
                 DESTINATION "lib/systemd/user" COMPONENT tools)
+        set(NAUDIO_SERVICE_UNIT_FILE
+            "${CMAKE_CURRENT_BINARY_DIR}/naudio-daemon.service" PARENT_SCOPE)
     endif()
+    # Both read by the naudio_daemon_servicecheck arm, which asserts the unit names exactly
+    # this path — the failure no build-tree test can see.
+    set(NAUDIO_SERVICE_EXEC_PATH "${NAUDIO_SERVICE_EXEC}" PARENT_SCOPE)
 endif()
 
 # ----------------------------------------------------------------------------
