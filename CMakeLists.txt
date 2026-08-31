@@ -856,6 +856,11 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_audio_daemon)
     add_test(NAME naudio_daemon_argcheck
              COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/argcheck.sh"
                           "$<TARGET_FILE:na_audio_daemon>")
+    # Config-file gate (issue #96 item 1) — same containment as argcheck: every case is decided
+    # before any device work, so the arm is hardware-free despite driving the hardware tool.
+    add_test(NAME naudio_daemon_configcheck
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/configcheck.sh"
+                          "$<TARGET_FILE:na_audio_daemon>")
 endif()
 
 # ----------------------------------------------------------------------------

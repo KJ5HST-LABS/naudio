@@ -26,7 +26,11 @@ fails=0
 # with atoi), the run must still not reach runHardware and open a real device for 30 seconds. It
 # also sharpens each assertion, because every case then keys on WHICH error was reported rather than
 # on the shared exit code 2.
-GUARD=(--transport bogus)
+#
+# --no-config keeps the arm hermetic (issue #96): without it, a daemon.conf sitting at the
+# platform's default location on a developer machine would merge into every case — and one with a
+# bad value would fail them all with ITS error instead of the one under test.
+GUARD=(--no-config --transport bogus)
 
 # Assert: running the daemon with $2.. exits with code $1 and its output matches ERE $2.
 expect() {

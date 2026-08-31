@@ -43,6 +43,11 @@
 //   na_audio_daemon [--mode capture-probe|hardware] [--capture <pat>|--capture-id N]
 //                   [--playback <pat>|--playback-id N] [--transport tcp|udp|dual]
 //                   [--rate HZ] [--channels 1|2] [--port N] [--duration-ms N]
+//                   [--config <file>|--no-config]
+//
+// Every setting flag also has a config-file key of the same name (issue #96 item 1): `key = value`
+// lines read from --config <file>, else from the platform's conventional location; flags override
+// the file. See kSettings / loadConfigFile below.
 
 #include <algorithm>
 #include <atomic>
@@ -55,6 +60,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -149,12 +155,15 @@ struct Args {
     bool formatDeclared = false;  // set by --rate/--channels; arms the capture-probe refusal
 };
 
+std::string defaultConfigPath();  // defined with the config-file loader below
+
 void usage() {
+    const std::string confPath = defaultConfigPath();
     std::fprintf(
         stderr,
         "usage: na_audio_daemon [--mode capture-probe|hardware] [--capture <pat>|--capture-id N]\n"
         "                       [--playback <pat>|--playback-id N] [--transport tcp|udp|dual]\n"
-        "                       [--port N] [--duration-ms N]\n"
+        "                       [--port N] [--duration-ms N] [--config <file>|--no-config]\n"
         "       na_audio_daemon --list-devices\n\n"
         "  modes:\n"
         "    capture-probe  open the capture device directly; report frames/overflow/RMS\n"
@@ -178,9 +187,18 @@ void usage() {
         "  --channels N      1 (mono) | 2 (stereo, default); refused like --rate on mismatch\n"
         "  --port N          server port; 0 = ephemeral (default %d)\n"
         "  --duration-ms N   run time; 0 = until Ctrl-C (default 30000)\n"
+        "  --config <file>   read settings from <file>; flags given here still override it\n"
+        "  --no-config       skip the default config file\n"
         "  --list-devices    enumerate capture + playback devices, then exit\n"
-        "  -h, --help        print this message\n",
-        naudio::AudioStreamConfig::DEFAULT_PORT);
+        "  -h, --help        print this message\n\n"
+        "  config file:      one `key = value` per line, '#' starts a comment line; keys are\n"
+        "                    the setting names above without their leading dashes (e.g.\n"
+        "                    `transport = udp`, `capture-id = 3`). Read from --config <file>,\n"
+        "                    else from %s\n"
+        "                    when that exists. Flags always override the file.\n",
+        naudio::AudioStreamConfig::DEFAULT_PORT,
+        confPath.empty() ? "(the default location is unresolvable: HOME is not set)"
+                         : confPath.c_str());
 }
 
 // Default substrings for the radio's USB-audio capture device (macOS shows "USB Audio CODEC").
@@ -553,27 +571,194 @@ int runHardware(const Args& a) {
 // open device 0 and the RMS gate could then pass on whatever that device happened to hear. A typo
 // must stop the run, not quietly select a different radio. Exits 2 (the usage-error code the rest
 // of the parser uses) rather than returning a sentinel, because there is no in-band value left to
-// mean "invalid".
-long long requireInt(const char* name, const std::string& text, long long lo, long long hi) {
+// mean "invalid". `where` names the source in the message: the flag itself on the command line,
+// "<file>:<line>: <key>" from a config file.
+long long requireInt(const std::string& where, const std::string& text, long long lo,
+                     long long hi) {
     errno = 0;
     char* end = nullptr;
     const long long v = std::strtoll(text.c_str(), &end, 10);
     if (text.empty() || end == text.c_str() || *end != '\0') {
-        std::fprintf(stderr, "error: %s expects an integer, got '%s'\n", name, text.c_str());
+        std::fprintf(stderr, "error: %s expects an integer, got '%s'\n", where.c_str(),
+                     text.c_str());
         std::exit(2);
     }
     if (errno == ERANGE || v < lo || v > hi) {
-        std::fprintf(stderr, "error: %s must be in [%lld, %lld], got '%s'\n", name, lo, hi,
+        std::fprintf(stderr, "error: %s must be in [%lld, %lld], got '%s'\n", where.c_str(), lo, hi,
                      text.c_str());
         std::exit(2);
     }
     return v;
 }
 
+// ---- Config file (issue #96 item 1) --------------------------------------------------------
+// The daemon's whole configuration surface used to be argv; a service or a control page needs
+// the same settings to live in a file a clickable thing can write. Precedence is defaults <
+// config file < flags, implemented by ordering alone: the file is applied to Args first and the
+// flag pass then overwrites whatever it also names.
+
+// The single settings table — one row per setting, shared by the config-file parser and the
+// flag loop, so a flag cannot gain, lose, or re-range a setting without its config key doing
+// the same ("every daemon flag becomes a key", #96). Deliberately NOT settings: --list-devices
+// and --help command an action for one invocation, and a file that latently listed devices on
+// every service start would be a trap; --config/--no-config locate the file and cannot sensibly
+// live inside it.
+struct Setting {
+    const char* name;  // the long flag without its "--"; identical to the config-file key
+    void (*apply)(Args&, const std::string& value, const std::string& where);
+};
+const Setting kSettings[] = {
+    {"mode", [](Args& a, const std::string& v, const std::string&) { a.mode = v; }},
+    {"capture", [](Args& a, const std::string& v, const std::string&) { a.capturePattern = v; }},
+    {"capture-id",
+     [](Args& a, const std::string& v, const std::string& w) {
+         a.captureId = static_cast<int>(requireInt(w, v, 0, INT_MAX));
+     }},
+    {"playback", [](Args& a, const std::string& v, const std::string&) { a.playbackPattern = v; }},
+    {"playback-id",
+     [](Args& a, const std::string& v, const std::string& w) {
+         a.playbackId = static_cast<int>(requireInt(w, v, 0, INT_MAX));
+     }},
+    {"transport", [](Args& a, const std::string& v, const std::string&) { a.transport = v; }},
+    // rate/channels arm the #91 format-declaration refusal from the file exactly as from the
+    // flag: a declared format is declared wherever the operator wrote it down, and the silent
+    // mono/rate fallback would mislabel the audio either way.
+    {"rate",
+     [](Args& a, const std::string& v, const std::string& w) {
+         a.rate = static_cast<int>(requireInt(w, v, 8000, 192000));
+         a.formatDeclared = true;
+     }},
+    {"channels",
+     [](Args& a, const std::string& v, const std::string& w) {
+         a.channels = static_cast<int>(requireInt(w, v, 1, 2));
+         a.formatDeclared = true;
+     }},
+    {"port",
+     [](Args& a, const std::string& v, const std::string& w) {
+         a.port = static_cast<int>(requireInt(w, v, 0, 65535));
+     }},
+    {"duration-ms",
+     [](Args& a, const std::string& v, const std::string& w) {
+         a.durationMs = requireInt(w, v, 0, LLONG_MAX);
+     }},
+};
+
+const Setting* findSetting(const std::string& name) {
+    for (const Setting& s : kSettings)
+        if (name == s.name) return &s;
+    return nullptr;
+}
+
+std::string trim(const std::string& s) {
+    const char* ws = " \t\r\n";
+    const auto b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return "";
+    return s.substr(b, s.find_last_not_of(ws) - b + 1);
+}
+
+// The platform-conventional location (#96 names all three). The _WIN32 branch is written now,
+// ahead of the Windows daemon port (#96 item 3), so lifting the NOT WIN32 build gate does not
+// rework configuration. Empty when the location cannot be resolved (no HOME), in which case no
+// default is read.
+std::string defaultConfigPath() {
+#if defined(_WIN32)
+    const char* base = std::getenv("ProgramData");
+    return std::string(base && *base ? base : "C:\\ProgramData") + "\\naudio\\daemon.conf";
+#elif defined(__APPLE__)
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) return "";
+    return std::string(home) + "/Library/Application Support/naudio/daemon.conf";
+#else
+    return "/etc/naudio/daemon.conf";
+#endif
+}
+
+// Parse `path` into args: one `key = value` per line, '#' starts a comment line, outer
+// whitespace trimmed (inner spaces survive, so device patterns need no quoting). Exits 2 on any
+// malformed line, unknown key, or bad value, naming file:line — a typo'd key skipped silently
+// would be the config-file version of the atoi defect requireInt exists to prevent: the daemon
+// would run, on the wrong device or port, and report green.
+void loadConfigFile(Args& args, const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        std::fprintf(stderr, "error: cannot read config file '%s'\n", path.c_str());
+        std::exit(2);
+    }
+    std::string line;
+    int lineNo = 0;
+    while (std::getline(in, line)) {
+        ++lineNo;
+        const std::string t = trim(line);
+        if (t.empty() || t[0] == '#') continue;
+        const std::string where = path + ":" + std::to_string(lineNo);
+        const auto eq = t.find('=');
+        if (eq == std::string::npos) {
+            std::fprintf(stderr, "error: %s: expected 'key = value', got '%s'\n", where.c_str(),
+                         t.c_str());
+            std::exit(2);
+        }
+        const std::string key = trim(t.substr(0, eq));
+        const std::string value = trim(t.substr(eq + 1));
+        const Setting* s = key.empty() ? nullptr : findSetting(key);
+        if (!s) {
+            std::fprintf(stderr, "error: %s: unknown key '%s'\n", where.c_str(), key.c_str());
+            std::exit(2);
+        }
+        s->apply(args, value, where + ": " + key);
+    }
+}
+
+// `required` distinguishes the operator-named --config file (absence is an error — they asked
+// for THIS file) from the default location (absence means defaults apply). Any failure other
+// than absence is loud either way: a config file that exists but cannot be read, skipped
+// silently, would configure the daemon differently than the file the operator can see says.
+void loadConfigIfPresent(Args& args, const std::string& path, bool required) {
+    errno = 0;
+    std::FILE* probe = std::fopen(path.c_str(), "r");
+    if (!probe) {
+        if (!required && (errno == ENOENT || errno == ENOTDIR)) return;
+        std::fprintf(stderr, "error: cannot read config file '%s': %s\n", path.c_str(),
+                     std::strerror(errno));
+        std::exit(2);
+    }
+    std::fclose(probe);
+    loadConfigFile(args, path);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     Args args;
+
+    // --- Pass 1: locate and apply the config file BEFORE the flag pass — that ordering IS the
+    // precedence rule (defaults < config file < flags). --help suppresses config loading
+    // entirely, so usage still prints on a machine whose config file is broken.
+    std::string configPath;
+    bool noConfig = false, explicitConfig = false, wantHelp = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "-h" || a == "--help") wantHelp = true;
+        else if (a == "--no-config") noConfig = true;
+        else if (a == "--config") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "error: --config needs a value\n");
+                return 2;
+            }
+            configPath = argv[++i];
+            explicitConfig = true;
+        }
+    }
+    if (explicitConfig && noConfig) {
+        std::fprintf(stderr, "error: --config and --no-config are mutually exclusive\n");
+        return 2;
+    }
+    if (!wantHelp && !noConfig) {
+        if (explicitConfig) loadConfigIfPresent(args, configPath, /*required=*/true);
+        else if (const std::string def = defaultConfigPath(); !def.empty())
+            loadConfigIfPresent(args, def, /*required=*/false);
+    }
+
+    // --- Pass 2: flags overwrite whatever the config file set.
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* name) -> std::string {
@@ -583,30 +768,14 @@ int main(int argc, char** argv) {
             }
             return argv[++i];
         };
-        if (a == "--mode") args.mode = next("--mode");
-        else if (a == "--capture") args.capturePattern = next("--capture");
-        else if (a == "--capture-id")
-            args.captureId = static_cast<int>(
-                requireInt("--capture-id", next("--capture-id"), 0, INT_MAX));
-        else if (a == "--playback") args.playbackPattern = next("--playback");
-        else if (a == "--playback-id")
-            args.playbackId = static_cast<int>(
-                requireInt("--playback-id", next("--playback-id"), 0, INT_MAX));
-        else if (a == "--transport") args.transport = next("--transport");
-        else if (a == "--rate") {
-            args.rate = static_cast<int>(requireInt("--rate", next("--rate"), 8000, 192000));
-            args.formatDeclared = true;
-        }
-        else if (a == "--channels") {
-            args.channels = static_cast<int>(requireInt("--channels", next("--channels"), 1, 2));
-            args.formatDeclared = true;
-        }
-        else if (a == "--port")
-            args.port = static_cast<int>(requireInt("--port", next("--port"), 0, 65535));
-        else if (a == "--duration-ms")
-            args.durationMs = requireInt("--duration-ms", next("--duration-ms"), 0, LLONG_MAX);
+        if (a == "--config") { (void)next("--config"); }  // consumed in pass 1
+        else if (a == "--no-config") {}                   // consumed in pass 1
         else if (a == "--list-devices") args.listDevices = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
+        else if (const Setting* s =
+                     a.compare(0, 2, "--") == 0 ? findSetting(a.substr(2)) : nullptr) {
+            s->apply(args, next(a.c_str()), a);
+        }
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
     }
 
