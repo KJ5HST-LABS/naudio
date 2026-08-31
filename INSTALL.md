@@ -19,7 +19,7 @@ now; see the note under Option C.)
 > **Current availability (2026-08).** naudio is not yet public — the repository is
 > private ahead of its planned Hamlib contribution. The current packaged release,
 > **v1.0.0rc3** (a prerelease), carries everything on this page: the double-click
-> installers (a signed macOS `.pkg` and a Windows setup `.exe`), TGZ for Linux and
+> installers (a macOS `.pkg` and a Windows setup `.exe`), TGZ for Linux and
 > macOS, DEB, RPM, a Windows ZIP, and `sha256sums.txt`. While the repository is private,
 > collaborators with access fetch packages with
 > `gh release download v1.0.0rc3 -R KJ5HST-LABS/naudio` rather than anonymous URLs, and
@@ -47,8 +47,10 @@ those are in every other format on this page.
 
 - **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`), puts **naudio Control**
   in `/Applications`, and registers the daemon as a background service, switched off until you
-  turn it on (see *Running the daemon in the background* below). The installer is signed and
-  notarized by Apple — it opens like any other installer, no warnings. macOS installers have no
+  turn it on (see *Running the daemon in the background* below). **Each release's notes say
+  whether that release's `.pkg` is signed and notarized**, and they say it from a check of the
+  file itself rather than from what was intended (issue #99) — a signed one opens like any other
+  installer, and an unsigned one needs a right-click → *Open* the first time. macOS installers have no
   uninstaller; to remove naudio, delete the installed files and forget the receipts
   (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
 - **Windows** installs into `C:\Program Files\naudio`, adds a **naudio Control** entry to the
