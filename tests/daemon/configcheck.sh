@@ -120,10 +120,18 @@ expect 2 'invalid --transport' --config "$TMP/rateover.conf" --rate 12000
 expect_not 2 'divisible by 50' --config "$TMP/rateover.conf" --rate 12000
 
 # --- default-location search -----------------------------------------------------------------
-# On macOS the default path is under $HOME, so it can be pointed at a scratch tree. The
-# /etc/naudio path on other platforms cannot be redirected hermetically — the path construction
-# is the same three-line function either way.
-if [ "$(uname -s)" = "Darwin" ]; then
+# Runnable on exactly the two platforms whose default path comes from the ENVIRONMENT: macOS
+# ($HOME) and Windows (%ProgramData%). Linux's /etc/naudio/daemon.conf is absolute and cannot be
+# redirected hermetically, so it stays a skip — the path construction is the same short function
+# on all three.
+#
+# The polarity is worth stating, because a redirect that silently fails to take is the way this
+# kind of test passes while proving nothing: each case below asserts that the FILE's value is the
+# one that reached the daemon. If the redirect did not take, the daemon runs on defaults, reaches
+# the --mode zzz guard, and reports "invalid --mode" — which matches none of these patterns. A
+# broken redirect fails the arm; it cannot quietly satisfy it.
+case "$(uname -s)" in
+Darwin)
     FAKEHOME="$TMP/home"
     mkdir -p "$FAKEHOME/Library/Application Support/naudio"
     CONF="$FAKEHOME/Library/Application Support/naudio/daemon.conf"
@@ -156,9 +164,55 @@ if [ "$(uname -s)" = "Darwin" ]; then
     else
         echo "FAIL: [absent default] exit $rc"; echo "  output: $out"; fails=$((fails + 1))
     fi
-else
+    ;;
+
+MINGW*|MSYS*|CYGWIN*)
+    # The Windows half of the same search — and the first execution ANYWHERE of the _WIN32
+    # branch of defaultConfigPath(). It was written in item 1 ahead of this port so that lifting
+    # the build gate would not rework configuration; until the daemon compiled on Windows there
+    # was no way to run it, so it shipped in rc3 as code no platform had ever reached.
+    FAKEPD="$TMP/programdata"
+    mkdir -p "$FAKEPD/naudio"
+    CONF="$FAKEPD/naudio/daemon.conf"
+    # cygpath, not the bash path: the daemon is a NATIVE Windows binary and cannot resolve the
+    # /tmp-style path this shell hands out. It appends its own backslash separators to whatever
+    # %ProgramData% holds, so what goes in the environment has to be a real C:\... path.
+    FAKEPD_WIN="$(cygpath -w "$FAKEPD")"
+
+    # The default file is found and applied: its bogus transport is the only argument source.
+    printf 'transport = bogusfile\n' > "$CONF"
+    out="$(ProgramData="$FAKEPD_WIN" "$DAEMON" "${GUARD[@]}" 2>&1)"; rc=$?
+    if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -Eq "invalid --transport 'bogusfile'"; then
+        echo "ok: [default search] -> exit 2, file at %ProgramData% default path applied"
+    else
+        echo "FAIL: [default search] exit $rc"; echo "  output: $out"; fails=$((fails + 1))
+    fi
+
+    # --no-config skips it: a file that would error on load (unknown key) must go unread.
+    printf 'junkkey = 1\n' > "$CONF"
+    out="$(ProgramData="$FAKEPD_WIN" "$DAEMON" --no-config --transport bogus "${GUARD[@]}" 2>&1)"; rc=$?
+    if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -Eq "invalid --transport 'bogus'" \
+        && ! printf '%s' "$out" | grep -Eq 'unknown key'; then
+        echo "ok: [--no-config] -> exit 2, default file left unread"
+    else
+        echo "FAIL: [--no-config] exit $rc"; echo "  output: $out"; fails=$((fails + 1))
+    fi
+
+    # An ABSENT default file is not an error: defaults apply and the run reaches the guard.
+    rm "$CONF"
+    out="$(ProgramData="$FAKEPD_WIN" "$DAEMON" --transport bogus "${GUARD[@]}" 2>&1)"; rc=$?
+    if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -Eq "invalid --transport 'bogus'" \
+        && ! printf '%s' "$out" | grep -Eq 'cannot read config file'; then
+        echo "ok: [absent default] -> exit 2, absence is not an error"
+    else
+        echo "FAIL: [absent default] exit $rc"; echo "  output: $out"; fails=$((fails + 1))
+    fi
+    ;;
+
+*)
     echo "skip: [default search] default path is /etc/naudio/daemon.conf here (not redirectable)"
-fi
+    ;;
+esac
 
 # --help still prints on a machine whose config file is broken (config loading is suppressed).
 printf 'junkkey = 1\n' > "$TMP/broken.conf"

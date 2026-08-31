@@ -848,18 +848,43 @@ add_subdirectory(tools)
 # immediately after it), so this arm opens no PortAudio stream and is safe on a headless runner —
 # unlike naudio_bridge_arm above, it needs no external dependency at all.
 #
-# Registered only where the target exists (NAUDIO_BUILD_APPS, and not Windows), so on a lib-only
-# configuration ctest has no such test rather than a skip that reads like coverage. That is the
-# same discipline as the bridge arm, and it is why per-job ctest totals differ by design.
+# Registered only where the target exists (NAUDIO_BUILD_APPS), so on a lib-only configuration
+# ctest has no such test rather than a skip that reads like coverage. That is the same discipline
+# as the bridge arm, and it is why per-job ctest totals differ by design.
+#
+# Windows is no longer excluded (issue #96 item 3). Both gates drive the built binary and assert
+# on its output, which is platform-neutral — what is NOT neutral is the bash they are written in.
+# Every POSIX host has one; a Windows host has one only if Git for Windows is installed (it ships
+# Git Bash, and it is on PATH on the GitHub runners). So the shell is REQUIRED TO EXIST before the
+# arms are registered, rather than registered unconditionally and left to fail as "unable to find
+# executable" on a developer's machine — a failure that would read like a defect in the daemon
+# instead of a missing tool. Same rule as everywhere else here: no test beats a misleading one.
 # ----------------------------------------------------------------------------
-if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_audio_daemon)
+set(NAUDIO_DAEMON_GATE_SHELL bash)
+if(WIN32)
+    find_program(NAUDIO_GATE_BASH NAMES bash)
+    if(NAUDIO_GATE_BASH)
+        set(NAUDIO_DAEMON_GATE_SHELL "${NAUDIO_GATE_BASH}")
+    else()
+        unset(NAUDIO_DAEMON_GATE_SHELL)
+        message(STATUS "naudio: na_audio_daemon's argcheck/configcheck gates need a bash; none "
+                       "found on this Windows host, so they are not registered (install Git for "
+                       "Windows to get them)")
+    endif()
+endif()
+if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
     add_test(NAME naudio_daemon_argcheck
-             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/argcheck.sh"
+             COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
+                          "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/argcheck.sh"
                           "$<TARGET_FILE:na_audio_daemon>")
     # Config-file gate (issue #96 item 1) — same containment as argcheck: every case is decided
-    # before any device work, so the arm is hardware-free despite driving the hardware tool.
+    # before any device work, so the arm is hardware-free despite driving the hardware tool. On
+    # Windows this is also the ONLY execution anywhere of defaultConfigPath()'s _WIN32 branch:
+    # %ProgramData% is an environment variable, so unlike Linux's absolute /etc/naudio the default
+    # search can be redirected into a scratch tree and actually tested.
     add_test(NAME naudio_daemon_configcheck
-             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/configcheck.sh"
+             COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
+                          "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/configcheck.sh"
                           "$<TARGET_FILE:na_audio_daemon>")
     # Service-unit gate (issue #96 item 2). A launchd plist and a systemd unit are code nothing
     # compiles: a typo'd option ships, installs, and fails only on the operator's machine. This
@@ -871,7 +896,8 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_audio_daemon)
     # the launchd one.
     if(NAUDIO_SERVICE_UNIT_FILE)
         add_test(NAME naudio_daemon_servicecheck
-                 COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/servicecheck.sh"
+                 COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
+                              "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/servicecheck.sh"
                               "$<TARGET_FILE:na_audio_daemon>"
                               "${NAUDIO_SERVICE_UNIT_FILE}"
                               "${NAUDIO_SERVICE_EXEC_PATH}")
