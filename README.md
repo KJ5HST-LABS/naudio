@@ -373,6 +373,15 @@ consumer. The byte-identity tell for a correctly received stream is
 - **No IP multicast; IPv4 only.** RX fan-out to multiple clients is **unicast replication** (O(N)
   egress), not IP multicast, and the transport is IPv4 (`AF_INET`) only. Fan-out should not be read as
   a multicast group.
+- **No server discovery — you supply `host:port`.** naudio ships no discovery service, no beacon
+  and no zero-configuration mechanism: a client is told where its server is (port 4533 by
+  default). The spec's §13.4 is a one-sentence *proposal*, not an implementation
+  ([issue #100](https://github.com/KJ5HST-LABS/naudio/issues/100)). A client that wants to find
+  servers on a LAN today can broadcast a `CONNECT_REQUEST` and collect the source addresses of
+  the replies — this works, and it is **measured**, but note what it costs: the server treats
+  that probe as a real client, so it consumes a slot against `maxClients` and starts an audio
+  stream you must then tear down. It is a workaround, not the answer, and #100 is the answer.
+
 - **Device selection is local, not remote.** A client or server selects its own capture / playback
   device locally; there is no control message to enumerate or choose the *peer's* device over the wire.
 - **Conformance vectors gate C/C++ only.** The language-neutral golden vectors are loaded and checked
