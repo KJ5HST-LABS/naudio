@@ -99,6 +99,40 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* The pre-release tag is what separates a release from the builds leading up to it, and it
+     * is the half of the version a consumer CAN rely on for that: v1.0.0rc5 and the main branch
+     * that added na_discover both encode to 1000000, so the NUMBER cannot tell them apart and
+     * the STRING must. Two properties, checked separately because they fail for different
+     * reasons.
+     *
+     * (a) Whatever the tag is, the string starts with the bare M.N.P — a tag must be a SUFFIX,
+     *     never a replacement, or a consumer parsing the version loses the release it belongs to. */
+    {
+        char bare[64];
+        snprintf(bare, sizeof bare, "%d.%d.%d",
+                 NAUDIO_VERSION_MAJOR, NAUDIO_VERSION_MINOR, NAUDIO_VERSION_PATCH);
+        if (strncmp(vstr, bare, strlen(bare)) != 0) {
+            fprintf(stderr, "FAIL: na_version_string()=\"%s\" does not start with \"%s\"\n",
+                    vstr, bare);
+            return 1;
+        }
+        /* (b) The tag is empty (a release) or begins with '-' (SemVer). A tag missing its dash
+         *     would make "1.0.0rc5" sort and read as a different release entirely. */
+        if (NAUDIO_VERSION_PRERELEASE[0] != '\0' && NAUDIO_VERSION_PRERELEASE[0] != '-') {
+            fprintf(stderr, "FAIL: NAUDIO_VERSION_PRERELEASE=\"%s\" must be empty or start with '-'\n",
+                    NAUDIO_VERSION_PRERELEASE);
+            return 1;
+        }
+        /* (c) And the string is exactly the concatenation — so a tag can never go missing from
+         *     na_version_string() while remaining defined in the header. */
+        if (strlen(vstr) != strlen(bare) + strlen(NAUDIO_VERSION_PRERELEASE)) {
+            fprintf(stderr, "FAIL: na_version_string()=\"%s\" is not \"%s\" + \"%s\"\n",
+                    vstr, bare, NAUDIO_VERSION_PRERELEASE);
+            return 1;
+        }
+        printf("c_abi_smoke: version %s (pre-release tag \"%s\")\n", vstr, NAUDIO_VERSION_PRERELEASE);
+    }
+
     /* Infallible means they do NOT touch the thread's last-error. Establish a NON-OK state first:
      * asserted against NA_OK this would pass even if the accessors cleared it, which is the
      * reading that makes such an assertion worthless. */

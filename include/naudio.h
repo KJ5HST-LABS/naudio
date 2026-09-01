@@ -72,12 +72,50 @@ extern "C" {
  * than the library" and never "does this symbol exist" — a missing symbol is a load-time failure,
  * not something to test for. Both accessors are in the first published ABI for that reason.
  *
+ * THE NUMBER ORDERS RELEASES, NOT BUILDS — and this is the trap that motivated the paragraph.
+ * Every build of an unreleased X.Y.Z reports X.Y.Z: v1.0.0rc5 and the main branch that added
+ * na_discover both answer 1.0.0, from both the macros and the accessors, so neither the number
+ * nor NAUDIO_VERSION_STRING separates them. A gate written against the version you are heading
+ * TOWARD is therefore true on a library that predates the thing you are gating. Compare versions
+ * only for what shipped in an ALREADY-RELEASED version; for anything added during the current
+ * cycle, detect it at configure time (below). NAUDIO_VERSION_PRERELEASE makes the two builds
+ * distinguishable in the STRING, which is the most a version can do here — it cannot help the
+ * number, because a pre-release must sort BELOW its release and the encoding has no room for it.
+ *
+ * DETECTING A SYMBOL IS A CONFIGURE-TIME QUESTION, NEVER A RUNTIME ONE. It bears repeating next
+ * to the example above because the two look alike and are not: a version gate answers "how much
+ * newer am I than the library", and nothing you can write in C answers "does this symbol exist"
+ * from inside a program that references it. The reference is resolved when the image loads, so a
+ * missing symbol aborts the process BEFORE main() — your gate never executes. Measured: a program
+ * built against a header with na_discover and loaded against a library without it dies with
+ * `dyld: Symbol not found: _na_discover` and never reaches its first printf. Test at configure
+ * time instead, where the answer is actionable:
+ *
+ *     include(CheckSymbolExists)                                    # CMake
+ *     check_symbol_exists(na_discover naudio.h HAVE_NA_DISCOVER)
+ *
+ * and only where a genuinely OPTIONAL dependency is wanted, dlopen + dlsym, which is the one way
+ * to ask at run time without a hard reference. Linking directly against the older library also
+ * catches it, at link time, with an undefined-symbol error — that path is already safe.
+ *
  * These macros are held equal to the build's project(VERSION) by a configure-time check in
  * CMakeLists.txt, so they cannot drift from the SONAME or from naudio.pc's Version.
  */
 #define NAUDIO_VERSION_MAJOR 1
 #define NAUDIO_VERSION_MINOR 0
 #define NAUDIO_VERSION_PATCH 0
+
+/* The SemVer pre-release tag, INCLUDING its leading '-', or "" for a released X.Y.Z. It exists
+ * because the three macros above cannot distinguish a release from the builds leading up to it:
+ * v1.0.0rc5 and the main branch after it both say 1.0.0. This is the only part of the version
+ * that separates them, and it is a STRING because na_version_number()'s encoding has no room for
+ * a component that must sort BELOW the release it precedes.
+ *
+ * Set to "" in the same commit that tags a final X.Y.Z, and back to a tag afterwards; the release
+ * procedure in CONTRIBUTING.md says so. It is deliberately NOT read by the CMake version gate,
+ * which compares only MAJOR/MINOR/PATCH against project(VERSION) — a pre-release tag is not part
+ * of the SONAME and must not change it. */
+#define NAUDIO_VERSION_PRERELEASE "-dev"
 
 /* The largest value NA_VERSION_ENCODE accepts for minor and for patch. Above it a lower component
  * would carry into a higher one and the ordering would stop being total; CMakeLists.txt refuses to
@@ -102,7 +140,7 @@ extern "C" {
 #define NAUDIO_VERSION_STRING          \
     NA_VERSION_STRINGIFY(NAUDIO_VERSION_MAJOR) "." \
     NA_VERSION_STRINGIFY(NAUDIO_VERSION_MINOR) "." \
-    NA_VERSION_STRINGIFY(NAUDIO_VERSION_PATCH)
+    NA_VERSION_STRINGIFY(NAUDIO_VERSION_PATCH) NAUDIO_VERSION_PRERELEASE
 
 /* The version of the LIBRARY THIS PROCESS ACTUALLY LOADED, in NA_VERSION_ENCODE form.
  * INFALLIBLE: no allocation, no backend, no failure mode — so it is callable before
@@ -310,8 +348,12 @@ NA_EXPORT int na_linux_auto_configure(char* msg, int msg_len);
 
 /* ---- Server discovery (na_discover) -------------------------------------------------
  *
- * @since 1.0.0 - wire spec 1.4, SS6.8. Gate on
- * na_version_number() >= NA_VERSION_ENCODE(1,0,0).
+ * @since 1.0.0 - wire spec 1.4, SS6.8. DETECT IT AT CONFIGURE TIME - do NOT gate on
+ * na_version_number(). These symbols are newer than v1.0.0rc5, which also reports 1.0.0, so
+ * a version gate is TRUE against a library that does not have them and the process aborts at
+ * load before the gate runs. See "Library version" above.
+ *
+ *     check_symbol_exists(na_discover naudio.h HAVE_NA_DISCOVER)
  *
  * Find naudio servers on the local segment without being told their addresses. One
  * broadcast DISCOVER goes out; every server that hears it answers with one unicast
@@ -686,7 +728,7 @@ NA_EXPORT int na_client_is_connected(na_stream_client* client);
 /* 1 if streaming, else 0 (also 0 on NULL). */
 NA_EXPORT int na_client_is_streaming(na_stream_client* client);
 
-/* --- Introspection (@since 0.5.0 — gate on na_version_number() >= NA_VERSION_ENCODE(0,5,0)) ---
+/* --- Introspection (@since 0.5.0 — new SYMBOLS: detect at configure time, not by version) ---
  *
  * The read-back half of the config setters above, added with the 0.5.0 bare-UDP gate so a
  * consumer or a harness can ASSERT what it configured instead of trusting that it did — the
@@ -720,7 +762,7 @@ NA_EXPORT na_error_t na_client_get_audio_format(na_stream_client* client, int* s
                                                 int* bits_per_sample, int* channels);
 
 /* --- Per-subscription RX format request (@since 0.5.0; wire spec 1.2 SS6.2.1, independent
- *     grants since spec 1.3 — gate on na_version_number() >= NA_VERSION_ENCODE(0,5,0)) ---
+ *     grants since spec 1.3 — new SYMBOLS: detect at configure time, not by version) ---
  *
  * Ask the server to send THIS client a reduced RX format — a lower rate and/or a reduced
  * channel layout — while every other client keeps the native broadcast. The use case is the
@@ -1379,8 +1421,10 @@ NA_EXPORT int na_server_tx_owner(na_audio_server* server, char* buf, int len);
 /* --- Statistics ---
  *
  * @since 0.2.0 — the whole of na_server_stats / na_server_get_stats. A caller that may load an
- * older library must gate on na_version_number() >= NA_VERSION_ENCODE(0, 2, 0); resolving the
- * symbol dynamically will simply fail there.
+ * older library detects na_server_get_stats at CONFIGURE time (check_symbol_exists); a version
+ * gate cannot help, because referencing the symbol at all is what fails, and it fails at load
+ * before any code of yours runs. The version comparison is for the struct's FIELDS — which of
+ * them an older library actually wrote — not for whether the function is there.
  *
  * The server-side mirror of na_client_stats, and it exists because two of that struct's fields
  * carry no information on a client at all. control_retransmits and queue_drops are written by

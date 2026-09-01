@@ -41,6 +41,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   every host on it, to answer a question that is only asked when a client is choosing a
   server.
 
+### Fixed
+- **`na_version_string()` now carries a pre-release tag, and the header no longer tells you to
+  gate a new symbol on the version.** Reported by a consumer, and both halves were real. The
+  three numeric version macros cannot distinguish a release from the builds around it — `v1.0.0rc5`
+  and the main branch that added `na_discover` both reported `1.0.0` from the macros *and* the
+  accessors — so `na_version_number() >= NA_VERSION_ENCODE(1,0,0)`, which four `@since` blocks
+  prescribed, was **true against a library with no `na_discover`**.
+
+  The deeper half is that no version gate could have helped. A referenced symbol is resolved when
+  the image loads, so a missing one aborts the whole process *before* `main()` and the gate never
+  executes — measured as `dyld: Symbol not found: _na_discover`, with the program's first `printf`
+  never reached. Those four blocks now document configure-time detection
+  (`check_symbol_exists`) instead. The fifth site, which gates an **enum value** rather than a
+  symbol, was correct and is unchanged.
+
+  `NAUDIO_VERSION_PRERELEASE` (`"-dev"` on main, `""` in a release) is appended to
+  `NAUDIO_VERSION_STRING`, so `na_version_string()` reports `1.0.0-dev` where rc5 reports `1.0.0`.
+  `na_version_number()` is unchanged and cannot express a pre-release: it must sort *below* its
+  release and the encoding has no room. Consumers comparing versions for struct **fields** are
+  unaffected; consumers testing for a **symbol** should move to `check_symbol_exists`.
+
 ### Changed
 - **Servers answer discovery probes by default, and bind 4533/UDP for it.** A server that
   upgrades to this release begins responding to `DISCOVER` on the segment it is bound to —

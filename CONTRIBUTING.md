@@ -35,6 +35,12 @@ macOS, and Windows — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
 - **Public C ABI changes** must tag new symbols with `NA_EXPORT` and keep `include/naudio.h`
   C-callable (the `naudio_c_abi_smoke` test enforces this). Honor the length-probe / NULL-buffer
   contract on text functions.
+- **Do not tell consumers to gate a NEW SYMBOL on `na_version_number()`.** It cannot work: the
+  reference is resolved when the image loads, so a missing symbol aborts the process before any
+  check of yours runs, and the version of an unreleased cycle does not distinguish the build that
+  has the symbol from the one that does not. Document new symbols as configure-time detections
+  (`check_symbol_exists`). A version comparison is for **struct fields and behaviour** of symbols
+  that already exist — that use is correct and stays.
 
 ## Licensing & provenance (please read)
 
@@ -60,7 +66,16 @@ The byte-identity tell for a correctly received stream is `first_frame_hex=68c56
 
 ## Cutting a release
 
-Push a `v*` tag. `.github/workflows/release.yml` builds every platform, runs the full suite,
+**First, set `NAUDIO_VERSION_PRERELEASE` in `include/naudio.h`** — `""` for a final `X.Y.Z`, or
+the SemVer tag *including its leading dash* (`"-rc6"`) for a pre-release. It is what separates a
+release from the builds around it: the three numeric macros cannot, because every build of an
+unreleased `X.Y.Z` reports `X.Y.Z`. Getting this wrong is how `v1.0.0rc5` and the main branch
+after it both came to answer `1.0.0` from `na_version_string()`, which made a consumer's version
+gate true against a library that lacked the symbol it was gating (see the header's *Library
+version* note). The CMake version gate does **not** check it — a pre-release tag is not part of
+the SONAME — so nothing but this step and `c_abi_smoke`'s shape check stands behind it.
+
+Then push a `v*` tag. `.github/workflows/release.yml` builds every platform, runs the full suite,
 gates the **packages themselves** (a package-based install must pass the same external-consumer
 commands a build-tree install does), and attaches the artifacts to a GitHub Release — prerelease
 automatically for a `v*rc*` tag. `workflow_dispatch` runs the byte-identical dry run without
