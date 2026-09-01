@@ -18,7 +18,12 @@
 # again afterwards — a round trip, because the thing users get is the thing on the release
 # page, not the thing in this temp directory.
 #
-# Requires: a Developer ID Installer identity in the keychain, and a notarytool keychain
+# Requires: a .pkg whose PAYLOAD BINARIES are already Developer ID Application signed with
+# --timestamp and --options runtime. This script signs the installer WRAPPER; the notary
+# validates what is inside it, and CI produces ad-hoc linker signatures, so a .pkg built
+# by CI cannot be notarized as-is. The script refuses up front rather than discovering it
+# three minutes later in a notary rejection. Also requires: a Developer ID Installer
+# identity in the keychain, and a notarytool keychain
 # profile (create one once with:
 #     xcrun notarytool store-credentials <profile> --apple-id <id> \
 #           --team-id <team> --password <app-specific-password>
@@ -82,6 +87,53 @@ before=$("$status_sh" "$pkg")
 if [ "$before" = signed ]; then
     say "the published .pkg is ALREADY signed, notarized and stapled — nothing to sign"
 else
+    # PRE-FLIGHT: the notary service validates the Mach-O binaries INSIDE the package,
+    # not just the installer signature productsign applies to the wrapper. Every payload
+    # executable must carry a Developer ID Application signature, a secure timestamp and
+    # the hardened runtime. CI builds them with none of those — a linker ad-hoc signature
+    # is what you get — and nothing in this repository signs them, so submitting anyway
+    # buys a ~3 minute wait and then `status: Invalid` whose reason is only visible via a
+    # separate `notarytool log <id>` call.
+    #
+    # Found on v1.0.0rc5, the first time this script's write half ever ran. v1.0.0rc3 --
+    # the only signed release -- notarized because its payload binaries had been signed by
+    # hand beforehand, a step that exists in no script and was recorded nowhere. This check
+    # is why that is now visible in one line instead of one round trip to Apple.
+    say "checking the payload binaries the notary will validate"
+    unsigned_payload=""
+    probe="$work/probe"
+    rm -rf "$probe"
+    if pkgutil --expand-full "$pkg" "$probe" >/dev/null 2>&1; then
+        while IFS= read -r bin; do
+            [ -n "$bin" ] || continue
+            if ! codesign -dvv "$bin" 2>&1 | grep -q "Authority=Developer ID Application"; then
+                unsigned_payload="${unsigned_payload}
+    $(basename "$bin")  $(codesign -dvv "$bin" 2>&1 | sed -n 's/^Signature=/signature: /p' | head -1)"
+            fi
+        done <<EOF_BINS
+$(find "$probe" -path '*/Payload/*' -type f -perm -u+x 2>/dev/null | while read -r f; do
+      file "$f" 2>/dev/null | grep -q 'Mach-O' && echo "$f"; done)
+EOF_BINS
+    else
+        die "could not expand $name to inspect its payload"
+    fi
+    if [ -n "$unsigned_payload" ]; then
+        printf '%s\n' "" \
+          "REFUSING TO SUBMIT: the payload binaries are not Developer ID signed." \
+          "" \
+          "productsign signs the installer WRAPPER. Apple's notary service also validates" \
+          "every Mach-O inside it, and these would be rejected:$unsigned_payload" \
+          "" \
+          "Each needs: codesign --sign 'Developer ID Application: ...' --timestamp" \
+          "            --options runtime <binary>" \
+          "before the .pkg is built. That does not happen in CI (no identity there) and no" \
+          "script in this repository does it, so a .pkg downloaded from a release cannot be" \
+          "notarized as-is. Signing has to move into the build that produces the package." \
+          "" >&2
+        die "payload binaries unsigned — see above"
+    fi
+    say "payload binaries carry Developer ID signatures"
+
     say "signing"
     productsign --sign "$identity" "$pkg" "$work/signed.pkg"
 
