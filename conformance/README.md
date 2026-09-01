@@ -23,6 +23,8 @@ conformance/
   README.md                 ← this file
   tools/gen_vectors.py      ← regenerates vectors.ini (independent CRC computation)
   vectors/vectors.ini       ← the golden vectors (committed; source of truth)
+  vectors/vectors-v1_2.ini  ← spec 1.2/1.3 forms (§6.2.1)
+  vectors/vectors-v1_4.ini  ← spec 1.4 discovery (§6.8)
 ```
 
 The conformance loader lives in this repo:
@@ -85,6 +87,15 @@ PARTIAL-grant AUDIO_CONFIG vectors** — a granted rate beside a declined layout
 reverse. They introduce no new field and no new length; they pin field *combinations* that
 1.2's all-or-nothing rule could never produce, and that a 1.2 client must tolerate from a
 1.3 server.
+
+### `kind = control_v14` (in `vectors-v1_4.ini`, loaded by `Conformance.GoldenVectorsV14`)
+Spec-1.4 (§6.8) discovery encode vectors: `controlType` `0x60` (DISCOVER — `token` only) or
+`0x61` (DISCOVER_REPLY — `token/port/transports/sampleRate/bitsPerSample/channels/clientCount/
+maxClients/serverName`), plus `expectedPayloadHex`. Own file, own fail-closed 0-skipped gate,
+for the same reason 1.2 got one: it is what lets `vectors.ini` stay byte-identical across every
+spec revision that only ADDS control types. Note `serverName` may legitimately be empty, and
+one vector pins a server at capacity (`clientCount == maxClients`), which §6.8 requires to
+answer rather than go silent.
 
 ### `kind = control_decode_v1` (in `vectors-v1_2.ini`, loaded by `Conformance.GoldenVectorsV12`)
 Tolerance vectors: `payloadHex` is fed to a **v1** decoder, and the `expected*` fields are the
