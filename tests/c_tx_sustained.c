@@ -137,7 +137,7 @@ int main(void) {
         fprintf(stderr, "  (%s)\n", err);
         return fail("na_client_connect", c, srv);
     }
-    na_client_set_ptt(c, 1);
+    na_client_set_duplex(c, NA_DUPLEX_TALK);
 
     long long injected_first = 0, injected_second = 0;
     long long audible_at_half = 0;
@@ -187,7 +187,7 @@ int main(void) {
     if (clients != 1) return fail("server dropped the client during a sustained TX run", c, srv);
     if (owner_len <= 0) return fail("TX ownership lapsed during continuous injection", c, srv);
 
-    na_client_set_ptt(c, 0);
+    na_client_set_duplex(c, NA_DUPLEX_LISTEN);
     na_client_destroy(c);
     na_server_stop(srv);
     na_server_destroy(srv);

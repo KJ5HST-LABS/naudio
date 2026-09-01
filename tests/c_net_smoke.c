@@ -224,14 +224,33 @@ int main(void) {
      * every connection regardless, so the write would otherwise succeed and be silently dropped —
      * inject must report 0 rather than bytes that can never leave the process. Keyed up first, to
      * prove it is the inject flag being tested here and not the PTT gate. */
-    na_client_set_ptt(client, 1);
+    na_client_set_duplex(client, NA_DUPLEX_TALK);
     if (na_client_inject_tx_audio(client, KNOWN, (int)sizeof KNOWN) != 0) {
         fprintf(stderr, "FAIL: TX inject accepted bytes without na_client_set_tx_inject\n");
         na_client_destroy(client);
         nasmoke_server_stop(server);
         return 1;
     }
-    na_client_set_ptt(client, 0);
+    na_client_set_duplex(client, NA_DUPLEX_LISTEN);
+
+    /* The duplex argument contract, on a LIVE client because the range check sits behind the
+     * NULL check and is unreachable with a null handle. NA_DUPLEX_FULL must be accepted: it is
+     * the mode a relay needs, and it is the one the old boolean API could not express. */
+    if (na_client_set_duplex(NULL, NA_DUPLEX_TALK) != NA_ERR_INVALID ||
+        na_client_set_duplex(client, (na_duplex)3) != NA_ERR_INVALID ||
+        na_client_set_duplex(client, (na_duplex)-1) != NA_ERR_INVALID) {
+        fprintf(stderr, "FAIL: na_client_set_duplex argument contract\n");
+        na_client_destroy(client);
+        nasmoke_server_stop(server);
+        return 1;
+    }
+    if (na_client_set_duplex(client, NA_DUPLEX_FULL) != NA_OK ||
+        na_client_set_duplex(client, NA_DUPLEX_LISTEN) != NA_OK) {
+        fprintf(stderr, "FAIL: a valid duplex mode was rejected\n");
+        na_client_destroy(client);
+        nasmoke_server_stop(server);
+        return 1;
+    }
 
     /* ---- (3) clean disconnect ---- */
 
@@ -329,7 +348,7 @@ int main(void) {
         return 1;
     }
 
-    na_client_set_ptt(txc, 1);  /* key up: capture unmuted => inject accepted */
+    na_client_set_duplex(txc, NA_DUPLEX_TALK);  /* key up: capture unmuted => inject accepted */
     int accepted = na_client_inject_tx_audio(txc, TXSIG, (int)sizeof TXSIG);
     if (accepted <= 0) {
         fprintf(stderr, "FAIL: TX inject accepted %d bytes with PTT active\n", accepted);

@@ -131,7 +131,7 @@ static void sleep_ms(int ms) {
  * probe leaves that whole path unreached, so --tx exists to key up and feed it.
  *
  * The route is public C ABI end to end: na_client_set_tx_inject BEFORE connect (it decides whether
- * the send worker starts, and connect starts the workers once), na_client_set_ptt to key up
+ * the send worker starts, and connect starts the workers once), na_client_set_duplex(NA_DUPLEX_TALK) to open the mic
  * (injected audio obeys exactly the same keying rules as captured audio), then
  * na_client_inject_tx_audio. No capture device is involved — the NULL backend cannot capture, and
  * this is the reason na_client_set_tx_inject exists. */
@@ -203,7 +203,7 @@ static void reset_tx_detector(void) {
 static long transmit_tone(na_stream_client* c, int ms, int peak) {
     unsigned char frame[TX_FRAME_SAMPLES * 2];
     fill_tone(frame, TX_FRAME_SAMPLES, peak);
-    if (na_client_set_ptt(c, 1) != NA_OK) return -1;
+    if (na_client_set_duplex(c, NA_DUPLEX_TALK) != NA_OK) return -1;
     long total = 0;
     for (int t = 0; t < ms / 10; t++) {
         const int w = na_client_inject_tx_audio(c, frame, (int)sizeof frame);
@@ -344,7 +344,7 @@ static int selftest_tx(na_audio_server* srv, na_stream_client* cli) {
     reset_tx_detector();
     unsigned char frame[TX_FRAME_SAMPLES * 2];
     fill_tone(frame, TX_FRAME_SAMPLES, TX_TONE_PEAK);
-    na_client_set_ptt(cli, 0);
+    na_client_set_duplex(cli, NA_DUPLEX_LISTEN);
     long unkeyed = 0;
     for (int t = 0; t < 30; t++) {
         const int w = na_client_inject_tx_audio(cli, frame, (int)sizeof frame);
@@ -390,7 +390,7 @@ static int selftest_tx(na_audio_server* srv, na_stream_client* cli) {
                         "exactly %d — TX audio is not arriving intact\n", peak, TX_TONE_PEAK);
         return EXIT_UNMET;
     }
-    na_client_set_ptt(cli, 0);
+    na_client_set_duplex(cli, NA_DUPLEX_LISTEN);
     return EXIT_MET;
 }
 
