@@ -646,7 +646,7 @@ std::size_t AudioStreamClient::injectTxAudio(const std::uint8_t* pcm, std::size_
     // send worker would succeed and then be silently discarded. Refuse instead: the return value is
     // the caller's only signal, and it must not report bytes that can never leave the process.
     if (!txInjectEnabled_.load()) return 0;
-    // Same gate as captureLoop, so setPTT() governs both TX sources identically.
+    // Same gate as captureLoop, so setDuplex() governs both TX sources identically.
     if (captureMuted_.load()) return 0;
 
     std::shared_ptr<AudioRingBuffer> tx;

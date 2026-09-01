@@ -285,8 +285,8 @@ public:
     // here resamples or converts. Non-blocking: the TX ring overwrites its oldest bytes on overrun,
     // exactly as it does for captured audio.
     //
-    // Gated on the SAME captureMuted_ flag the capture loop uses, so setPTT() governs injected and
-    // captured audio identically — a client that has not asserted PTT transmits nothing either way.
+    // Gated on the SAME captureMuted_ flag the capture loop uses, so setDuplex() governs injected
+    // and captured audio identically — a client in Duplex::Listen transmits nothing either way.
     // Returns bytes accepted: 0 when not connected, when the send worker is not running, or when
     // PTT is inactive.
     std::size_t injectTxAudio(const std::uint8_t* pcm, std::size_t nBytes);

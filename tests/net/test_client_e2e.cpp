@@ -295,10 +295,10 @@ TEST(Client, MutePttAccessors) {
     client.setPlaybackMuted(true);
     EXPECT_TRUE(client.isPlaybackMuted());
 
-    client.setPTT(true);  // transmit: capture unmuted, playback muted
+    client.setDuplex(AudioStreamClient::Duplex::Talk);  // capture unmuted, playback muted
     EXPECT_FALSE(client.isCaptureMuted());
     EXPECT_TRUE(client.isPlaybackMuted());
-    client.setPTT(false);  // receive: capture muted, playback unmuted
+    client.setDuplex(AudioStreamClient::Duplex::Listen);  // capture muted, playback unmuted
     EXPECT_TRUE(client.isCaptureMuted());
     EXPECT_FALSE(client.isPlaybackMuted());
 }
@@ -1418,7 +1418,7 @@ TEST(Client, HeartbeatWatchdogFiresWhileTheTxWriterHoldsTheSendLock) {
     std::string err;
     auto conn = connectOverScriptedTransport(client, &err);
     ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
-    client.setPTT(true);  // captureMuted_ defaults TRUE (RX mode), and gates injectTxAudio
+    client.setDuplex(AudioStreamClient::Duplex::Talk);  // Listen is the default, and gates injectTxAudio
 
     // Wedge the TX writer, holding the send lock.
     conn->stallTxAudioSends();
@@ -1561,7 +1561,7 @@ TEST(Client, DisconnectDeclinesTheSalvoWhileTheTxWriterHoldsTheSendLock) {
     auto conn = connectOverScriptedTransport(client, &err);
     ASSERT_TRUE(conn) << "setup failed before the subject under test: " << err;
     ASSERT_TRUE(client.isConnected());
-    client.setPTT(true);  // captureMuted_ defaults TRUE (RX mode), and gates injectTxAudio
+    client.setDuplex(AudioStreamClient::Duplex::Talk);  // Listen is the default, and gates injectTxAudio
 
     // Wedge the TX writer so it parks HOLDING the send lock, exactly as a real writer parks
     // inside Socket::sendAll under sendPacket's mutex.
@@ -1608,4 +1608,51 @@ TEST(Client, DisconnectDeclinesTheSalvoWhileTheTxWriterHoldsTheSendLock) {
     // on the first succeeding, so a 2 here would mean that gate came undone.
     EXPECT_EQ(conn->controlSendsDeclined(), 1)
         << "the salvo never reached the non-blocking send; " << conn->diagnostics();
+}
+
+// --- Duplex modes -----------------------------------------------------------
+//
+// setDuplex is LOCAL GATING and nothing else — it keys no transmitter and puts
+// nothing on the wire — so what there is to pin is exactly the mute pair each
+// mode produces. Asserted on an UNCONNECTED client on purpose: the mapping must
+// not depend on a session, and the flags are what the capture loop and
+// injectTxAudio both read.
+TEST(Client, DuplexModesSetTheMutePairTheyName) {
+    AudioStreamClient client{"127.0.0.1", 4533, "duplex"};
+
+    // The default is Listen, and that is why NA_DUPLEX_LISTEN is the zero value.
+    EXPECT_TRUE(client.isCaptureMuted()) << "a new client must not be live on the mic";
+    EXPECT_FALSE(client.isPlaybackMuted()) << "a new client must hear RX";
+
+    client.setDuplex(AudioStreamClient::Duplex::Talk);
+    EXPECT_FALSE(client.isCaptureMuted());
+    EXPECT_TRUE(client.isPlaybackMuted()) << "Talk must mute playback, or the speaker feeds the mic";
+
+    client.setDuplex(AudioStreamClient::Duplex::Listen);
+    EXPECT_TRUE(client.isCaptureMuted());
+    EXPECT_FALSE(client.isPlaybackMuted());
+
+    // Full is the mode the old boolean could not express: send while still
+    // hearing. A relay needs it, and reaching it used to mean calling both mute
+    // setters and knowing setPTT would undo them.
+    client.setDuplex(AudioStreamClient::Duplex::Full);
+    EXPECT_FALSE(client.isCaptureMuted()) << "Full must leave the mic live";
+    EXPECT_FALSE(client.isPlaybackMuted()) << "Full must leave playback live — this is the point";
+}
+
+// Every mode is reachable from every other, including back out of Full. A mode
+// setter that could not undo itself would strand a relay in Full for the life of
+// the client.
+TEST(Client, DuplexModesAreReachableFromEachOther) {
+    AudioStreamClient client{"127.0.0.1", 4533, "duplex-cycle"};
+    const AudioStreamClient::Duplex order[] = {
+        AudioStreamClient::Duplex::Full,   AudioStreamClient::Duplex::Talk,
+        AudioStreamClient::Duplex::Listen, AudioStreamClient::Duplex::Full,
+        AudioStreamClient::Duplex::Listen, AudioStreamClient::Duplex::Talk,
+    };
+    for (AudioStreamClient::Duplex m : order) {
+        client.setDuplex(m);
+        EXPECT_EQ(m == AudioStreamClient::Duplex::Listen, client.isCaptureMuted());
+        EXPECT_EQ(m == AudioStreamClient::Duplex::Talk, client.isPlaybackMuted());
+    }
 }
