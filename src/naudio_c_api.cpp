@@ -875,9 +875,6 @@ extern "C" na_error_t na_client_set_duplex(na_stream_client* client, na_duplex m
     });
 }
 
-extern "C" na_error_t na_client_set_ptt(na_stream_client* client, int tx_active) {
-    return na_client_set_duplex(client, tx_active != 0 ? NA_DUPLEX_TALK : NA_DUPLEX_LISTEN);
-}
 
 extern "C" na_error_t na_client_set_capture_muted(na_stream_client* client, int muted) {
     NA_GUARD(NA_ERR_BACKEND, {

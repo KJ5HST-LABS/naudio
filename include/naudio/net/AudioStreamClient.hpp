@@ -272,9 +272,6 @@ public:
         captureMuted_.store(mode == Duplex::Listen);
         playbackMuted_.store(mode == Duplex::Talk);
     }
-    // Superseded by setDuplex(); removed before 1.0.0. Kept only so this rename lands in green
-    // steps rather than in one breaking commit.
-    void setPTT(bool pttActive) { setDuplex(pttActive ? Duplex::Talk : Duplex::Listen); }
 
     // --- TX inject (no capture device) ---
     // Queue TX audio for the send worker directly, for a client that cannot capture (the NULL

@@ -41,6 +41,32 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   every host on it, to answer a question that is only asked when a client is choosing a
   server.
 
+### Changed
+- **`na_client_set_ptt` is renamed `na_client_set_duplex`, and takes a mode rather than a
+  boolean.** The old name claimed authority over a transmitter naudio does not have. The
+  function is two local mute flags: it issues no CAT command, puts nothing on the wire, and the
+  server never learns of it. Actual PTT is rig control — Hamlib's `rig_set_ptt` — and in this
+  tree `na_hamlib_bridge` keys the rig from the server's **TX-arbitration owner**
+  (`na_server_tx_owner`), derived from who is actually sending audio, never from a client flag.
+
+  Two readings the old name invited, and the second is the dangerous one. `set_ptt(c, 1)` does
+  **not** key anything: it lets your audio reach the server, and if nothing keys the rig you are
+  feeding an unkeyed radio with no error anywhere. And `set_ptt(c, 0)` was **not** a transmit
+  inhibit — it stops *that client* sending, while VOX, a CAT controller or another client's
+  audio still keys the rig. The header now states both outright instead of describing only the
+  mechanism.
+
+  `NA_DUPLEX_FULL` is new capability, not just a rename: the old boolean could not express
+  "send while still listening", which is what a relay or an externally echo-cancelled headset
+  needs. `NA_DUPLEX_LISTEN` is 0 because it is already a new client's default.
+
+  **This removes a symbol that shipped in v1.0.0rc5**, deliberately and while 1.0.0 is
+  unreleased — keeping a compatibility alias would have preserved the misleading name, which is
+  the entire thing being fixed. An rc5 consumer gets an undefined-symbol error at link time, or
+  a load failure if it links late; detect the new API at configure time with
+  `check_symbol_exists(na_client_set_duplex naudio.h ...)`, as the header's *Library version*
+  note now describes. `na_version_string()` reports `1.0.0-dev` here against rc5's `1.0.0`.
+
 ### Fixed
 - **`na_version_string()` now carries a pre-release tag, and the header no longer tells you to
   gate a new symbol on the version.** Reported by a consumer, and both halves were real. The

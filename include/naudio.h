@@ -700,9 +700,6 @@ typedef enum na_duplex {
 /* Returns NA_ERR_INVALID for a NULL client or a mode outside the enum. */
 NA_EXPORT na_error_t na_client_set_duplex(na_stream_client* client, na_duplex mode);
 
-/* Superseded by na_client_set_duplex; REMOVED before 1.0.0. Present only so the rename lands in
- * green steps. tx_active != 0 == NA_DUPLEX_TALK, 0 == NA_DUPLEX_LISTEN. */
-NA_EXPORT na_error_t na_client_set_ptt(na_stream_client* client, int tx_active);
 NA_EXPORT na_error_t na_client_set_capture_muted(na_stream_client* client, int muted);
 NA_EXPORT na_error_t na_client_set_playback_muted(na_stream_client* client, int muted);
 

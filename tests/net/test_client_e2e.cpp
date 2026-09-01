@@ -1632,9 +1632,9 @@ TEST(Client, DuplexModesSetTheMutePairTheyName) {
     EXPECT_TRUE(client.isCaptureMuted());
     EXPECT_FALSE(client.isPlaybackMuted());
 
-    // Full is the mode the old boolean could not express: send while still
+    // Full is the mode the old boolean API could not express: send while still
     // hearing. A relay needs it, and reaching it used to mean calling both mute
-    // setters and knowing setPTT would undo them.
+    // setters and knowing the next mode change would undo them.
     client.setDuplex(AudioStreamClient::Duplex::Full);
     EXPECT_FALSE(client.isCaptureMuted()) << "Full must leave the mic live";
     EXPECT_FALSE(client.isPlaybackMuted()) << "Full must leave playback live — this is the point";
