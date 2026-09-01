@@ -667,8 +667,41 @@ NA_EXPORT na_error_t na_client_set_auto_reconnect(na_stream_client* client, int 
 NA_EXPORT na_error_t na_client_set_reconnect_policy(na_stream_client* client, int base_delay_ms,
                                                     int max_delay_ms, int max_attempts);
 
-/* --- Mute / PTT --- */
-/* PTT active => capture unmuted (send voice) + playback muted (no feedback); inactive => reverse. */
+/* --- Mute / duplex --- */
+/*
+ * Which audio directions this client has open.
+ *
+ * READ THIS BEFORE USING IT AS PTT, BECAUSE IT IS NOT PTT. Setting a duplex mode is two local
+ * mute flags and nothing else. It issues no CAT command, puts nothing on the wire, and the
+ * server never learns your mode. Specifically:
+ *
+ *   - NA_DUPLEX_TALK does NOT key a transmitter. It lets your audio reach the server; whether a
+ *     carrier goes up is somebody else's job. If nothing keys the rig, you are feeding audio to
+ *     an unkeyed radio's input and nothing goes on the air, with no error anywhere.
+ *   - NA_DUPLEX_LISTEN is NOT a transmit inhibit. It stops THIS client sending audio. It does not
+ *     stop the radio transmitting -- VOX, a CAT controller, or another client's audio will still
+ *     key it. Never treat this as a safety interlock.
+ *
+ * Actual PTT belongs to rig control: Hamlib's rig_set_ptt. In this project na_hamlib_bridge keys
+ * the rig from the server's TX-ARBITRATION OWNER (na_server_tx_owner), which is derived from who
+ * is actually transmitting audio -- not from any client's duplex mode. naudio is the audio lane;
+ * keeping that boundary is deliberate.
+ *
+ * What it IS good for: half-duplex voice, where the local speaker must not feed the local
+ * microphone. NA_DUPLEX_FULL leaves both directions open for a relay, or for a headset where
+ * echo is handled elsewhere.
+ */
+typedef enum na_duplex {
+    NA_DUPLEX_LISTEN = 0, /* playback live, capture muted -- the DEFAULT for a new client */
+    NA_DUPLEX_TALK   = 1, /* capture live, playback muted (no local feedback)             */
+    NA_DUPLEX_FULL   = 2  /* both live -- relay/bridge, or externally echo-cancelled      */
+} na_duplex;
+
+/* Returns NA_ERR_INVALID for a NULL client or a mode outside the enum. */
+NA_EXPORT na_error_t na_client_set_duplex(na_stream_client* client, na_duplex mode);
+
+/* Superseded by na_client_set_duplex; REMOVED before 1.0.0. Present only so the rename lands in
+ * green steps. tx_active != 0 == NA_DUPLEX_TALK, 0 == NA_DUPLEX_LISTEN. */
 NA_EXPORT na_error_t na_client_set_ptt(na_stream_client* client, int tx_active);
 NA_EXPORT na_error_t na_client_set_capture_muted(na_stream_client* client, int muted);
 NA_EXPORT na_error_t na_client_set_playback_muted(na_stream_client* client, int muted);
@@ -681,8 +714,9 @@ NA_EXPORT na_error_t na_client_set_playback_muted(na_stream_client* client, int 
  * nothing here resamples or converts, exactly as with na_server_inject_audio. Non-blocking: the TX
  * ring overwrites its oldest bytes on overrun, the same as captured audio.
  *
- * Gated on PTT: a client that has not called na_client_set_ptt(client, 1) transmits nothing, so
- * injected and captured audio obey identical keying rules.
+ * Gated on the duplex mode: a client in NA_DUPLEX_LISTEN (the default) sends nothing, so injected
+ * and captured audio obey identical gating. Call na_client_set_duplex(client, NA_DUPLEX_TALK) --
+ * or NA_DUPLEX_FULL for a relay that must keep listening while it sends.
  *
  * LEN-RETURN CONVENTION: returns the bytes accepted (>= 0), or a negative na_error_t. A 0 return is
  * not an error — it means not connected, TX inject not enabled, or PTT inactive. */

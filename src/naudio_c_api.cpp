@@ -858,12 +858,25 @@ extern "C" na_error_t na_client_set_reconnect_policy(na_stream_client* client, i
     });
 }
 
-extern "C" na_error_t na_client_set_ptt(na_stream_client* client, int tx_active) {
+extern "C" na_error_t na_client_set_duplex(na_stream_client* client, na_duplex mode) {
     NA_GUARD(NA_ERR_BACKEND, {
         if (client == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
-        client->client->setPTT(tx_active != 0);
+        naudio::net::AudioStreamClient::Duplex m;
+        switch (mode) {
+            case NA_DUPLEX_LISTEN: m = naudio::net::AudioStreamClient::Duplex::Listen; break;
+            case NA_DUPLEX_TALK:   m = naudio::net::AudioStreamClient::Duplex::Talk;   break;
+            case NA_DUPLEX_FULL:   m = naudio::net::AudioStreamClient::Duplex::Full;   break;
+            default:
+                setError(NA_ERR_INVALID);
+                return NA_ERR_INVALID;
+        }
+        client->client->setDuplex(m);
         return NA_OK;
     });
+}
+
+extern "C" na_error_t na_client_set_ptt(na_stream_client* client, int tx_active) {
+    return na_client_set_duplex(client, tx_active != 0 ? NA_DUPLEX_TALK : NA_DUPLEX_LISTEN);
 }
 
 extern "C" na_error_t na_client_set_capture_muted(na_stream_client* client, int muted) {

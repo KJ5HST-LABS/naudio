@@ -252,16 +252,29 @@ public:
     bool isReconnecting() const { return reconnecting_.load(); }
     int reconnectAttempt() const { return reconnectAttempt_.load(); }
 
-    // --- Mute / PTT ---
+    // Which audio directions this client has open. LOCAL GATING ONLY: see setDuplex().
+    enum class Duplex {
+        Listen = 0,  // playback live, capture muted -- the default (captureMuted_ starts true)
+        Talk = 1,    // capture live, playback muted, so the local speaker cannot feed the local mic
+        Full = 2,    // both live -- a relay, or a headset where echo is handled elsewhere
+    };
+
+    // --- Mute / duplex ---
     void setCaptureMuted(bool m) { captureMuted_.store(m); }
     bool isCaptureMuted() const { return captureMuted_.load(); }
     void setPlaybackMuted(bool m) { playbackMuted_.store(m); }
     bool isPlaybackMuted() const { return playbackMuted_.load(); }
-    // PTT active -> capture unmuted (send voice) + playback muted (no feedback); inactive -> reverse.
-    void setPTT(bool pttActive) {
-        captureMuted_.store(!pttActive);
-        playbackMuted_.store(pttActive);
+    // Sets both mute flags together. This is LOCAL AUDIO GATING and nothing else: it keys no
+    // transmitter, sends no control message, and the server never learns of it. Actual PTT is
+    // Hamlib's rig_set_ptt -- in this project na_hamlib_bridge drives it from the server's
+    // TX-ARBITRATION OWNER (na_server_tx_owner), never from a client's flag.
+    void setDuplex(Duplex mode) {
+        captureMuted_.store(mode == Duplex::Listen);
+        playbackMuted_.store(mode == Duplex::Talk);
     }
+    // Superseded by setDuplex(); removed before 1.0.0. Kept only so this rename lands in green
+    // steps rather than in one breaking commit.
+    void setPTT(bool pttActive) { setDuplex(pttActive ? Duplex::Talk : Duplex::Listen); }
 
     // --- TX inject (no capture device) ---
     // Queue TX audio for the send worker directly, for a client that cannot capture (the NULL
