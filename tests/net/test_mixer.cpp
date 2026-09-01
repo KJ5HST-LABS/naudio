@@ -311,8 +311,8 @@ TEST(Mixer, ARecoveredFrameIsAudibleToItsOwnerButDoesNotExtendTheLease) {
 
 // Row 3: someone else holds it and we outrank them. UNREACHABLE in the shipping server
 // — every ClientSession is hard-wired Normal and canPreempt is strict-greater, pinned
-// normatively at docs/audio-streaming-protocol-v1.md:496 (strict-greater itself is
-// stated at :491) — but reachable here because
+// normatively at docs/audio-streaming-protocol-v1.md:504 (strict-greater itself is
+// stated at :499) — but reachable here because
 // the mixer takes priority from the TxClient. Specified so the proposed §13.3
 // client-settable-priority feature cannot inherit the bug.
 TEST(Mixer, ARecoveredFrameDoesNotPreemptEvenFromAHigherPriorityClient) {
@@ -339,7 +339,7 @@ TEST(Mixer, ARecoveredFrameDoesNotPreemptEvenFromAHigherPriorityClient) {
 }
 
 // Row 4: someone else holds it and we cannot outrank them. Declining must be SILENT.
-// TX_DENIED is sent once per denial episode (docs/audio-streaming-protocol-v1.md:493),
+// TX_DENIED is sent once per denial episode (docs/audio-streaming-protocol-v1.md:501),
 // so a denial fabricated by a repair does not add noise — it SPENDS the client's single
 // message and converts its next genuine denial into silence.
 TEST(Mixer, ARecoveredFrameIsDeclinedWithoutSpendingTheClientsOneTxDenied) {

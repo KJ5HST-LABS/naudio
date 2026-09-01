@@ -473,6 +473,14 @@ The server's **address is not a field**. It is the source address of the reply d
 5. A server MUST NOT treat a `DISCOVER` as registration. It creates no connection and no pending entry, so a probe leaves no trace a subsequent `CONNECT_REQUEST` from the same address could inherit.
 6. Where the transport has no datagram path to an unknown sender — a **TCP-only** server — discovery is **not available**. That is a property of the transport, not an omission: there is no way to broadcast a connection attempt. A DUAL server is discoverable over its UDP half and reports both bits in `transports`.
 
+**Sequence numbers on a connectionless reply.** §3.4 defines the sequence as one monotonic
+counter per *sender*. A `DISCOVER_REPLY` belongs to no connection, so it cannot draw from one; a
+responder SHOULD keep its own counter for these frames. A prober MUST NOT use the sequence to
+correlate a reply with its probe — that is the token's job — and MUST NOT expect the sequences of
+replies from different servers, or of successive replies from one server, to relate to each other
+in any way. The field is present because every `0xAF01` frame has one, not because it carries
+meaning here.
+
 **Interaction with the anti-spoof rule (§2.3).** A UDP server registers a client only on a valid `CONNECT_REQUEST` from an unknown sender, and drops every other datagram from one. Spec 1.4 adds `DISCOVER` as the **second and only other** exempt case, and its exemption is strictly narrower: a `CONNECT_REQUEST` from an unknown sender *creates a connection*, whereas a `DISCOVER` from an unknown sender is *answered and forgotten*. A datagram from an unknown sender that is neither MUST still be dropped, and §2.3's rule is otherwise unchanged.
 
 **Security considerations.**
