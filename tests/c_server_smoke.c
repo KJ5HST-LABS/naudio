@@ -1011,6 +1011,103 @@ int main(void) {
                "reads back, bitmask discriminates (#36 detector live)\n");
     }
 
+    /* ---- (6) discovery, wire spec 1.4 SS6.8 (issue #100) ----
+     *
+     * The whole feature through the C ABI: na_server_set_discoverable / na_server_set_name on
+     * one side, na_discover on the other. Probes 127.0.0.1 rather than a broadcast address --
+     * the code path is identical and a test has no business putting datagrams on the runner's
+     * segment. */
+    {
+        char err[256];
+        na_server_info found[4];
+        int n;
+
+        /* Argument contract first, with no server anywhere. */
+        if (na_discover(NULL, 4533, 10, NULL, 4, sizeof found[0]) != NA_ERR_INVALID ||
+            na_discover(NULL, 0, 10, found, 4, sizeof found[0]) != NA_ERR_INVALID ||
+            na_discover(NULL, 70000, 10, found, 4, sizeof found[0]) != NA_ERR_INVALID ||
+            na_discover(NULL, 4533, 10, found, -1, sizeof found[0]) != NA_ERR_INVALID ||
+            na_discover(NULL, 4533, 10, found, 4, 0) != NA_ERR_INVALID) {
+            fprintf(stderr, "FAIL: na_discover argument contract not NA_ERR_INVALID\n");
+            return 1;
+        }
+        if (na_server_set_discoverable(NULL, 1) != NA_ERR_INVALID ||
+            na_server_set_name(NULL, "x") != NA_ERR_INVALID) {
+            fprintf(stderr, "FAIL: NULL-server discovery setters not NA_ERR_INVALID\n");
+            return 1;
+        }
+
+        na_audio_server* ds = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+        if (ds == NULL) { fprintf(stderr, "FAIL: na_server_create (discovery arm)\n"); return 1; }
+        if (na_server_set_reliability_profile(ds, NA_RELIABILITY_UDP_LAN) != NA_OK ||
+            na_server_set_max_clients(ds, 4) != NA_OK ||
+            na_server_set_name(ds, "c-abi-shack") != NA_OK) {
+            fprintf(stderr, "FAIL: discovery-arm config setters rejected\n");
+            na_server_destroy(ds);
+            return 1;
+        }
+        if (na_server_start(ds, err, (int)sizeof err) != NA_OK) {
+            fprintf(stderr, "FAIL: na_server_start (discovery arm) (%s)\n", err);
+            na_server_destroy(ds);
+            return 1;
+        }
+        const int dport = na_server_port(ds);
+
+        n = na_discover("127.0.0.1", dport, 1000, found, 4, sizeof found[0]);
+        if (n != 1) {
+            fprintf(stderr, "FAIL: na_discover found %d servers, want 1\n", n);
+            na_server_stop(ds); na_server_destroy(ds);
+            return 1;
+        }
+        if (found[0].port != dport || strcmp(found[0].name, "c-abi-shack") != 0 ||
+            strcmp(found[0].host, "127.0.0.1") != 0 || found[0].max_clients != 4 ||
+            found[0].client_count != 0 ||
+            (found[0].transports & NA_DISCOVER_UDP) == 0) {
+            fprintf(stderr, "FAIL: na_discover reply fields wrong (port=%d name=%s host=%s "
+                            "max=%d live=%d tr=0x%x)\n",
+                    found[0].port, found[0].name, found[0].host, found[0].max_clients,
+                    found[0].client_count, found[0].transports);
+            na_server_stop(ds); na_server_destroy(ds);
+            return 1;
+        }
+        /* The acceptance criterion of #100: the probe cost the server nothing. */
+        if (na_server_client_count(ds) != 0) {
+            fprintf(stderr, "FAIL: na_discover consumed a client slot (roster=%d)\n",
+                    na_server_client_count(ds));
+            na_server_stop(ds); na_server_destroy(ds);
+            return 1;
+        }
+        na_server_stop(ds);
+        na_server_destroy(ds);
+
+        /* The opt-out, and its control: the SAME setup with discovery on was just proved
+         * findable above, so silence here is the switch and not a broken probe. */
+        na_audio_server* qs = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+        if (qs == NULL) { fprintf(stderr, "FAIL: na_server_create (opt-out arm)\n"); return 1; }
+        if (na_server_set_reliability_profile(qs, NA_RELIABILITY_UDP_LAN) != NA_OK ||
+            na_server_set_discoverable(qs, 0) != NA_OK ||
+            na_server_start(qs, err, (int)sizeof err) != NA_OK) {
+            fprintf(stderr, "FAIL: opt-out arm setup\n");
+            na_server_destroy(qs);
+            return 1;
+        }
+        n = na_discover("127.0.0.1", na_server_port(qs), 400, found, 4, sizeof found[0]);
+        if (n != 0) {
+            fprintf(stderr, "FAIL: a server with discoverable=0 answered (%d)\n", n);
+            na_server_stop(qs); na_server_destroy(qs);
+            return 1;
+        }
+        if (na_last_error() != NA_OK) {
+            fprintf(stderr, "FAIL: finding nothing set an error; 0 is a normal result\n");
+            na_server_stop(qs); na_server_destroy(qs);
+            return 1;
+        }
+        na_server_stop(qs);
+        na_server_destroy(qs);
+        printf("c_server_smoke: na_discover found the server without consuming a slot, and "
+               "discoverable=0 is silent\n");
+    }
+
     printf("c_server_smoke OK (port=%d, client RX byte-identical, roster=1, TX-extract frames=%d "
            "@ %d bytes, clean disconnect+stop)\n", port, atomic_load(&g_tx_frames),
            atomic_load(&g_tx_bytes));

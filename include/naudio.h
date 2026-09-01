@@ -308,6 +308,75 @@ NA_EXPORT int na_blackhole_installed(void);
  */
 NA_EXPORT int na_linux_auto_configure(char* msg, int msg_len);
 
+/* ---- Server discovery (na_discover) -------------------------------------------------
+ *
+ * @since 1.0.0 - wire spec 1.4, SS6.8. Gate on
+ * na_version_number() >= NA_VERSION_ENCODE(1,0,0).
+ *
+ * Find naudio servers on the local segment without being told their addresses. One
+ * broadcast DISCOVER goes out; every server that hears it answers with one unicast
+ * DISCOVER_REPLY, and the address it answers FROM is the discovery result.
+ *
+ * SIDE-EFFECT-FREE on every server it finds: it creates no connection, consumes no client
+ * slot and starts no stream, so it is safe to call at startup and safe to repeat. That is
+ * the entire point of the exchange -- before spec 1.4 the only way to find a server was to
+ * CONNECT to it, which cost a slot on every server discovered and started an audio stream
+ * from each (issue #100 measured three probes becoming three streaming clients on a
+ * four-client server).
+ *
+ * Two limits worth knowing before you call it. Discovery resolves an ADDRESS, not an
+ * address+port: you must probe the port the servers actually serve on, and 4533 is the
+ * default worth trying first. And a TCP-only server is undiscoverable -- there is no way
+ * to broadcast a connection attempt -- so this finds UDP and DUAL servers only.
+ */
+
+/* Transport bits in na_server_info.transports. A DUAL server sets both. */
+#define NA_DISCOVER_TCP 0x01
+#define NA_DISCOVER_UDP 0x02
+
+typedef struct na_server_info {
+    char host[64];       /* numeric IPv4 of the replying server -- the discovery result   */
+    int  port;           /* the port it serves audio on                                   */
+    int  transports;     /* NA_DISCOVER_* bitmask                                         */
+    int  sample_rate;
+    int  bits_per_sample;
+    int  channels;
+    int  client_count;   /* clients connected right now                                   */
+    int  max_clients;    /* capacity; client_count == max_clients means full but reachable */
+    char name[256];      /* operator-supplied label, "" if the server has none             */
+} na_server_info;
+
+/* The size of na_server_info in the FIRST published ABI, and the floor na_discover
+ * enforces. FROZEN: `name` is this version's last field forever, so appending never
+ * moves it. */
+#define NA_SERVER_INFO_SIZE_V1 (offsetof(na_server_info, name) + 256)
+
+/*
+ * Probe for servers and write up to `max` of them into the array at `out` -- `max` is an
+ * element COUNT, not a byte size. Returns the number written (>= 0), or a negative
+ * na_error_t (NA_ERR_INVALID if out is NULL, max < 0, port is not 1..65535, or
+ * `struct_size` is below NA_SERVER_INFO_SIZE_V1, which is what an accidentally-zero size
+ * gives you).
+ *
+ *     na_server_info found[16];
+ *     int n = na_discover(NULL, 4533, 1000, found, 16, sizeof found[0]);
+ *
+ * `broadcast_addr` NULL or "" means "255.255.255.255", the limited broadcast, which
+ * reaches the local segment without you knowing its subnet. Pass your subnet broadcast
+ * (e.g. "192.168.1.255") where a host or router treats the limited form restrictively.
+ *
+ * `timeout_ms` is a collection WINDOW, not a per-server timeout: the call listens for that
+ * long and then returns everything it heard, so it takes about that long whenever anyone
+ * answers. RETURNING 0 IS NOT AN ERROR -- it is the normal result on a segment with no
+ * naudio servers, and na_last_error() stays NA_OK. A negative return is the error case.
+ *
+ * `struct_size` is sizeof(na_server_info) AS THE CALLER COMPILED IT, and the library
+ * strides the array by it rather than by its own sizeof -- the same contract, and for the
+ * same reason, as na_enumerate above.
+ */
+NA_EXPORT int na_discover(const char* broadcast_addr, int port, int timeout_ms,
+                          na_server_info* out, int max, size_t struct_size);
+
 /* ---- Networking audio-streaming client (na_client_*) -----------------------------------
  *
  * A C consumer — Hamlib, a standalone C client, or a Python ctypes/cffi binding — drives the
@@ -1109,6 +1178,26 @@ NA_EXPORT void na_server_destroy(na_audio_server* server);
 NA_EXPORT na_error_t na_server_set_transport(na_audio_server* server, na_transport transport);
 /* Maximum simultaneous clients (must be > 0). Default 4. */
 NA_EXPORT na_error_t na_server_set_max_clients(na_audio_server* server, int max_clients);
+
+/* @since 1.0.0 - wire spec 1.4, SS6.8. Whether this server answers DISCOVER probes.
+ *
+ * ON BY DEFAULT. A naudio server is discoverable unless you turn it off, and the cost of
+ * that default is worth stating plainly: answering tells an unauthenticated stranger on
+ * the segment that this server exists, what audio format it serves and how full it is.
+ * Pass 0 to go silent -- a server that does not answer cannot be found by a probe, and a
+ * client must then be given host:port some other way.
+ *
+ * Answering is cheap and creates nothing: no connection, no client slot, no stream, and
+ * replies are rate-limited per source address. What it does NOT do is hide the server --
+ * a silent server still accepts connections from anyone who knows its address. This is a
+ * discoverability switch, not an access control. */
+NA_EXPORT na_error_t na_server_set_discoverable(na_audio_server* server, int enabled);
+
+/* @since 1.0.0 - wire spec 1.4, SS6.8. An operator label carried in DISCOVER_REPLY, e.g.
+ * "shack" or "K1ABC 40m". Optional: the default is empty, and a prober then has the
+ * address it heard the reply from, which is the actual discovery result. Truncated to 255
+ * bytes on the wire. NULL clears it. Has no effect on a server that is not discoverable. */
+NA_EXPORT na_error_t na_server_set_name(na_audio_server* server, const char* name);
 /* Audio wire format the server advertises and broadcasts. `bits_per_sample` must be 16 (the v1 wire
  * carries signed 16-bit PCM), `channels` 1 or 2, `sample_rate` > 0. Bytes fed to na_server_inject_audio
  * (and delivered to na_server_tx_audio_cb) MUST match this layout — naudio does not resample or convert.

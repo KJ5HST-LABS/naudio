@@ -26,6 +26,7 @@
 #include "naudio/Types.hpp"
 #include "naudio/VirtualAudioGuide.hpp"
 #include "naudio/net/AudioStreamClient.hpp"  // networking client C ABI
+#include "naudio/net/Discovery.hpp"          // na_discover (wire spec 1.4, SS6.8)
 #include "naudio/net/AudioStreamServer.hpp"  // networking server C ABI
 
 // The audio-backend context. Owns ONE PortAudioBackend (a single Pa_Initialize /
@@ -543,6 +544,58 @@ private:
 }  // namespace
 
 // ---- Create / destroy ------------------------------------------------------------------
+
+extern "C" int na_discover(const char* broadcast_addr, int port, int timeout_ms,
+                           na_server_info* out, int max, std::size_t struct_size) {
+    setError(NA_OK);
+    if (out == nullptr || max < 0 || port <= 0 || port > 65535 ||
+        struct_size < NA_SERVER_INFO_SIZE_V1) {
+        setError(NA_ERR_INVALID);
+        return NA_ERR_INVALID;
+    }
+    try {
+        naudio::net::DiscoveryOptions options;
+        if (broadcast_addr != nullptr && *broadcast_addr != '\0') options.address = broadcast_addr;
+        options.port = static_cast<std::uint16_t>(port);
+        options.timeoutMs = timeout_ms;
+        options.maxServers = static_cast<std::size_t>(max);
+
+        const std::vector<naudio::net::DiscoveredServer> servers =
+            naudio::net::discoverServers(options, nullptr);
+
+        int written = 0;
+        for (const auto& s : servers) {
+            if (written >= max) break;
+            // Stride by the CALLER's element size, never by sizeof(na_server_info) --
+            // the na_enumerate contract, for the same reason. A caller compiled against
+            // a LONGER version of this header gets each element's tail zeroed rather
+            // than left indeterminate.
+            char* base =
+                reinterpret_cast<char*>(out) + static_cast<std::size_t>(written) * struct_size;
+            if (struct_size > sizeof(na_server_info)) {
+                std::memset(base + sizeof(na_server_info), 0,
+                            struct_size - sizeof(na_server_info));
+            }
+            na_server_info& slot = *reinterpret_cast<na_server_info*>(base);
+            copyStr(slot.host, sizeof(slot.host), s.host);
+            slot.port = static_cast<int>(s.port);
+            slot.transports = static_cast<int>(s.transports);
+            slot.sample_rate = static_cast<int>(s.sampleRate);
+            slot.bits_per_sample = static_cast<int>(s.bitsPerSample);
+            slot.channels = static_cast<int>(s.channels);
+            slot.client_count = static_cast<int>(s.clientCount);
+            slot.max_clients = static_cast<int>(s.maxClients);
+            copyStr(slot.name, sizeof(slot.name), s.name);
+            ++written;
+        }
+        // 0 is the NORMAL result on a segment with no servers, and na_last_error() stays
+        // NA_OK for it. Only a negative return is an error (documented in naudio.h).
+        return written;
+    } catch (...) {
+        setError(NA_ERR_BACKEND);
+        return NA_ERR_BACKEND;
+    }
+}
 
 extern "C" na_stream_client* na_client_create(na_client_backend backend, const char* host,
                                               int port, const char* name) {
@@ -1259,6 +1312,26 @@ extern "C" na_error_t na_server_set_max_clients(na_audio_server* server, int max
         if (server == nullptr || max_clients <= 0) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
         if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
         server->pendingConfig.maxClients = max_clients;
+        return NA_OK;
+    });
+}
+
+extern "C" na_error_t na_server_set_discoverable(na_audio_server* server, int enabled) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        server->pendingConfig.discoverable = (enabled != 0);
+        return NA_OK;
+    });
+}
+
+extern "C" na_error_t na_server_set_name(na_audio_server* server, const char* name) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        // NULL clears it, as documented. The codec clamps to 255 bytes on the wire;
+        // storing the whole string keeps config() honest about what the caller set.
+        server->pendingConfig.serverName = (name == nullptr) ? std::string() : std::string(name);
         return NA_OK;
     });
 }
