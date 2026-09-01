@@ -1067,7 +1067,7 @@ TEST(Server, ServerReceiveDrainClearsItsBacklogAfterAFlood) {
 //
 // Where the behaviour they pin is written down, stated precisely because the two halves have
 // different standing: "TX_DENIED is sent once per denial episode" is NORMATIVE
-// (docs/audio-streaming-protocol-v1.md:501), while the treatment of locally reconstructed
+// (docs/audio-streaming-protocol-v1.md:502), while the treatment of locally reconstructed
 // frames is the non-normative implementation note in the same section — the wire cannot see
 // a repair, so it cannot mandate anything about one. The binding promise for a consumer is
 // the one in the frozen public C header (include/naudio.h, the provenance paragraph), and
@@ -1390,7 +1390,7 @@ TEST(Server, ARecoveredTxFrameOnAnUnownedChannelSendsNoTxDenied) {
     EXPECT_EQ(conn->countSent(ControlType::TxDenied), 0)
         << "a declined repair sent TX_DENIED — the denial branch was widened to admit "
            "anything that is not Accepted, so a repair now spends the client's single "
-           "per-episode denial (docs/audio-streaming-protocol-v1.md:501)";
+           "per-episode denial (docs/audio-streaming-protocol-v1.md:502)";
 }
 
 // The spec's actual promise, end to end over two sessions, and the only arm here whose
@@ -1412,7 +1412,7 @@ TEST(Server, ARepairDoesNotSpendADeniedClientsOneTxDenied) {
     ASSERT_TRUE(waitForClientCount(fx.server, 2, 3000));
 
     // A takes the channel, putting B in the mixer's cannot-preempt row (every session is
-    // hard-wired NORMAL priority, docs/audio-streaming-protocol-v1.md:522).
+    // hard-wired NORMAL priority, docs/audio-streaming-protocol-v1.md:523).
     ASSERT_TRUE(deliverTx(*a, Provenance::Live, 1)) << a->diagnostics();
     ASSERT_EQ(fx.server.txOwner(), "audio-1") << "premise: A holds the channel";
 
