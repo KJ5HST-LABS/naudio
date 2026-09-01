@@ -420,7 +420,8 @@ add_library(naudio_net STATIC
     src/net/AudioBroadcaster.cpp
     src/net/AudioMixer.cpp
     src/net/AudioStreamServer.cpp
-    src/net/AudioStreamClient.cpp)
+    src/net/AudioStreamClient.cpp
+    src/net/Discovery.cpp)
 target_include_directories(naudio_net PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")

@@ -17,6 +17,7 @@
 // Hardware-free.
 
 #include "naudio/net/AudioStreamServer.hpp"
+#include "naudio/net/Discovery.hpp"
 #include "naudio/net/Socket.hpp"
 #include "naudio/net/UdpClientTransport.hpp"
 
@@ -195,4 +196,157 @@ TEST(Discovery, ATcpOnlyServerIsUndiscoverable) {
     EXPECT_FALSE(probe(prober, port, 1, 500).has_value())
         << "a TCP server answered a UDP datagram, which it has no path to do";
     server.stop();
+}
+
+// --- The client probe: discoverServers() (spec 1.4, §6.8) --------------------
+//
+// HONEST LIMIT OF THESE ARMS. A real sweep is one broadcast reaching N servers;
+// N servers cannot be staged on one host because they would all need the same
+// port. So the fan-out is exercised with FAKE responders answering from distinct
+// source ports — which proves the collection, token and dedupe logic, and does
+// NOT prove that a broadcast datagram is delivered to several hosts. That last
+// step is the operating system's, and it is unproven here. (P3's shape: say
+// which paths ran.)
+
+namespace {
+
+// A stand-in server: receives one probe on `port` and answers however the caller
+// says. Returns the token it saw, or 0 if none arrived.
+struct FakeResponder {
+    Socket sock;
+    std::uint16_t port = 0;
+
+    explicit FakeResponder(const std::string& host = "127.0.0.1") {
+        sock = Socket::bindUdp(host, 0, false, nullptr);
+        port = sock.localPort();
+    }
+
+    // Waits for a probe, then sends `replies` DISCOVER_REPLYs back — the first
+    // from this socket, any others from fresh sockets so they arrive from
+    // DIFFERENT source endpoints, which is what a multi-server sweep looks like.
+    std::uint32_t answer(int timeoutMs, int replies, std::uint32_t tokenDelta,
+                         std::vector<Socket>* extraSockets) {
+        sock.setRecvTimeout(timeoutMs);
+        std::vector<std::uint8_t> buf(2048);
+        RecvFromResult rr = sock.recvFrom(buf.data(), buf.size());
+        if (rr.status != IoStatus::Ok) return 0;
+        auto packet = AudioPacket::deserialize(buf.data(), rr.bytes);
+        if (!packet) return 0;
+        auto msg = ControlMessage::deserialize(packet->payload());
+        if (!msg) return 0;
+        auto token = msg->parseDiscoverToken();
+        if (!token) return 0;
+
+        for (int i = 0; i < replies; ++i) {
+            ControlMessage reply = ControlMessage::discoverReply(
+                *token + tokenDelta, static_cast<std::uint16_t>(4533 + i), 0x02, 48000, 16, 2,
+                static_cast<std::uint8_t>(i), 4, i == 0 ? "alpha" : "beta");
+            std::vector<std::uint8_t> bytes =
+                AudioPacket::createControl(0, reply.serialize()).serialize();
+            if (i == 0) {
+                sock.sendTo(bytes.data(), bytes.size(), rr.senderHost, rr.senderPort);
+            } else {
+                Socket other = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+                other.sendTo(bytes.data(), bytes.size(), rr.senderHost, rr.senderPort);
+                extraSockets->push_back(std::move(other));  // keep the source port alive
+            }
+        }
+        return *token;
+    }
+};
+
+DiscoveryOptions unicastTo(std::uint16_t port, int timeoutMs) {
+    DiscoveryOptions o;
+    o.address = "127.0.0.1";  // see the note above: loopback, not the segment
+    o.port = port;
+    o.timeoutMs = timeoutMs;
+    o.bindHost = "127.0.0.1";
+    return o;
+}
+
+}  // namespace
+
+// The probe finds a real server and reports what it published.
+TEST(Discovery, DiscoverServersFindsARunningServer) {
+    AudioStreamConfig cfg = udpServerConfig();
+    cfg.serverName = "alpha";
+    AudioStreamServer server(0, cfg);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    auto found = discoverServers(unicastTo(static_cast<std::uint16_t>(server.port()), 1000), &err);
+    ASSERT_EQ(1u, found.size()) << "discoverServers did not find a running server: " << err;
+    EXPECT_EQ("alpha", found[0].name);
+    EXPECT_EQ(server.port(), found[0].port);
+    EXPECT_EQ("127.0.0.1", found[0].host);
+    EXPECT_EQ(4, found[0].maxClients);
+    EXPECT_EQ(0, server.clientCount()) << "the probe consumed a slot";
+    server.stop();
+}
+
+// Nobody answering is a normal outcome, not an error.
+TEST(Discovery, DiscoverServersReturnsEmptyWhenNobodyAnswers) {
+    // A port with nothing on it: bind and immediately release so it is plausibly free.
+    std::uint16_t dead = 0;
+    {
+        Socket s = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+        dead = s.localPort();
+    }
+    std::string err = "sentinel";
+    auto found = discoverServers(unicastTo(dead, 300), &err);
+    EXPECT_TRUE(found.empty());
+    EXPECT_EQ("sentinel", err) << "silence was reported as a send failure";
+}
+
+// §6.8: "MUST ignore a reply whose token it did not send." Staged with a fake
+// responder that echoes token+1 — on a broadcast segment this is the only thing
+// separating our replies from another prober's round.
+TEST(Discovery, DiscoverServersIgnoresAReplyCarryingTheWrongToken) {
+    FakeResponder fake;
+    std::vector<Socket> extra;
+    std::uint32_t seen = 0;
+    std::thread responder([&] { seen = fake.answer(2000, 1, /*tokenDelta=*/1, &extra); });
+
+    std::string err;
+    auto found = discoverServers(unicastTo(fake.port, 800), &err);
+    responder.join();
+
+    ASSERT_NE(0u, seen) << "control: the fake never received the probe, so nothing was ignored";
+    EXPECT_TRUE(found.empty()) << "a reply with a token we never sent was accepted";
+}
+
+// The control for the arm above, and the multi-reply collection path: the SAME
+// fake, echoing the token correctly, is accepted — and two replies from distinct
+// source endpoints come back as two servers.
+TEST(Discovery, DiscoverServersCollectsRepliesFromDistinctEndpoints) {
+    FakeResponder fake;
+    std::vector<Socket> extra;
+    std::uint32_t seen = 0;
+    std::thread responder([&] { seen = fake.answer(2000, 2, /*tokenDelta=*/0, &extra); });
+
+    std::string err;
+    auto found = discoverServers(unicastTo(fake.port, 800), &err);
+    responder.join();
+
+    ASSERT_NE(0u, seen) << "the fake never received the probe";
+    ASSERT_EQ(2u, found.size()) << "two replies from different source ports must be two servers";
+    // Both came from 127.0.0.1; they are distinct because their endpoints are.
+    EXPECT_NE(found[0].port, found[1].port);
+    EXPECT_EQ(0, found[0].clientCount);
+    EXPECT_EQ(1, found[1].clientCount);
+}
+
+// maxServers bounds a hostile segment: the collection loop stops, it does not grow.
+TEST(Discovery, DiscoverServersHonoursMaxServers) {
+    FakeResponder fake;
+    std::vector<Socket> extra;
+    std::thread responder([&] { fake.answer(2000, 2, 0, &extra); });
+
+    DiscoveryOptions opts = unicastTo(fake.port, 800);
+    opts.maxServers = 1;
+    std::string err;
+    auto found = discoverServers(opts, &err);
+    responder.join();
+
+    EXPECT_EQ(1u, found.size()) << "maxServers did not bound the result";
 }
