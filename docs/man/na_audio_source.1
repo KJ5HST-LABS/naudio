@@ -21,6 +21,9 @@ na_audio_source \- broadcast an audio input or a test tone as a naudio stream
 .IR N ]
 .RB [ \-\-seconds
 .IR N ]
+.RB [ \-\-name
+.IR LABEL ]
+.RB [ \-\-no\-discovery ]
 .br
 .B na_audio_source \-\-list\-devices
 .SH DESCRIPTION
@@ -81,6 +84,22 @@ maximum simultaneous listeners (default 4).
 .TP
 .BI \-\-seconds " N"
 run time in seconds; 0 runs until Ctrl-C (default 0).
+.TP
+.BI \-\-name " LABEL"
+operator label reported in discovery replies, e.g. "shack" (default: none). Truncated to
+255 bytes on the wire. Has no effect with
+.BR \-\-no\-discovery .
+.TP
+.B \-\-no\-discovery
+do not answer
+.B DISCOVER
+probes. Servers answer by default (wire spec 1.4, \[u00A7]6.8): a probe creates no
+connection, costs no slot against
+.BR \-\-max\-clients ,
+and starts no stream \(em but answering does tell anyone on the local segment that this
+server exists, what audio format it serves and how full it is. This is a discoverability
+switch, not access control: a silent server still accepts connections from anyone who
+already knows its address.
 .TP
 .B \-\-list\-devices
 print the ids of capture-capable devices, then exit.
