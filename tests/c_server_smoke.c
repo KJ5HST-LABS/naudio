@@ -1104,8 +1104,79 @@ int main(void) {
         }
         na_server_stop(qs);
         na_server_destroy(qs);
-        printf("c_server_smoke: na_discover found the server without consuming a slot, and "
-               "discoverable=0 is silent\n");
+
+        /* Argument contract for the rendezvous setter. 0 is LEGAL here (it means "no
+         * rendezvous listener"), unlike na_server_create's port. */
+        na_audio_server* ps = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+        if (ps == NULL) { fprintf(stderr, "FAIL: na_server_create (rendezvous arm)\n"); return 1; }
+        if (na_server_set_discovery_port(NULL, 4533) != NA_ERR_INVALID ||
+            na_server_set_discovery_port(ps, -1) != NA_ERR_INVALID ||
+            na_server_set_discovery_port(ps, 70000) != NA_ERR_INVALID ||
+            na_server_set_discovery_port(ps, 0) != NA_OK) {
+            fprintf(stderr, "FAIL: na_server_set_discovery_port contract\n");
+            na_server_destroy(ps);
+            return 1;
+        }
+        na_server_destroy(ps);
+
+        /* THE case the rendezvous port exists for, at the C ABI: a server on the DEFAULT
+         * transport (TCP) and an OS-assigned port, found by a probe that knows only the
+         * rendezvous number. Before the rendezvous listener this was undiscoverable by any
+         * means, because TCP has no datagram path to an unknown sender.
+         *
+         * The rendezvous number is taken from a server started and stopped just to learn a
+         * free port -- the same trick the C++ arms use, and for the same reason: hard-coding
+         * 4533 would collide with any naudio server running on the machine. */
+        int rendezvous = 0;
+        {
+            na_audio_server* scratch = na_server_create(NA_SERVER_BACKEND_NULL, 0);
+            if (scratch == NULL ||
+                na_server_set_reliability_profile(scratch, NA_RELIABILITY_UDP_LAN) != NA_OK ||
+                na_server_start(scratch, err, (int)sizeof err) != NA_OK) {
+                fprintf(stderr, "FAIL: could not stage a free rendezvous port\n");
+                if (scratch) na_server_destroy(scratch);
+                return 1;
+            }
+            rendezvous = na_server_port(scratch);
+            na_server_stop(scratch);
+            na_server_destroy(scratch);
+        }
+
+        na_audio_server* ts = na_server_create(NA_SERVER_BACKEND_NULL, 0);  /* TCP default */
+        if (ts == NULL) { fprintf(stderr, "FAIL: na_server_create (tcp arm)\n"); return 1; }
+        if (na_server_set_discovery_port(ts, rendezvous) != NA_OK ||
+            na_server_set_name(ts, "c-abi-tcp") != NA_OK ||
+            na_server_start(ts, err, (int)sizeof err) != NA_OK) {
+            fprintf(stderr, "FAIL: tcp rendezvous arm setup (%s)\n", err);
+            na_server_destroy(ts);
+            return 1;
+        }
+        const int tcp_service_port = na_server_port(ts);
+        if (tcp_service_port == rendezvous) {
+            fprintf(stderr, "FAIL: service and rendezvous ports coincided; arm proves nothing\n");
+            na_server_stop(ts); na_server_destroy(ts);
+            return 1;
+        }
+        n = na_discover("127.0.0.1", rendezvous, 1000, found, 4, sizeof found[0]);
+        if (n != 1) {
+            fprintf(stderr, "FAIL: a TCP server was not found via the rendezvous port (%d)\n", n);
+            na_server_stop(ts); na_server_destroy(ts);
+            return 1;
+        }
+        if (found[0].port != tcp_service_port ||
+            (found[0].transports & NA_DISCOVER_TCP) == 0 ||
+            strcmp(found[0].name, "c-abi-tcp") != 0) {
+            fprintf(stderr, "FAIL: rendezvous reply wrong (port=%d want=%d tr=0x%x name=%s)\n",
+                    found[0].port, tcp_service_port, found[0].transports, found[0].name);
+            na_server_stop(ts); na_server_destroy(ts);
+            return 1;
+        }
+        na_server_stop(ts);
+        na_server_destroy(ts);
+
+        printf("c_server_smoke: na_discover found the server without consuming a slot, "
+               "discoverable=0 is silent, and a TCP server was found via the rendezvous "
+               "port reporting its real service port %d\n", tcp_service_port);
     }
 
     printf("c_server_smoke OK (port=%d, client RX byte-identical, roster=1, TX-extract frames=%d "

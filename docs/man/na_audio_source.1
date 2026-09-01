@@ -24,6 +24,8 @@ na_audio_source \- broadcast an audio input or a test tone as a naudio stream
 .RB [ \-\-name
 .IR LABEL ]
 .RB [ \-\-no\-discovery ]
+.RB [ \-\-discovery\-port
+.IR N ]
 .br
 .B na_audio_source \-\-list\-devices
 .SH DESCRIPTION
@@ -89,6 +91,18 @@ run time in seconds; 0 runs until Ctrl-C (default 0).
 operator label reported in discovery replies, e.g. "shack" (default: none). Truncated to
 255 bytes on the wire. Has no effect with
 .BR \-\-no\-discovery .
+.TP
+.BI \-\-discovery\-port " N"
+the rendezvous port this server also listens on for
+.B DISCOVER
+probes (default 4533; 0 runs no rendezvous listener). A client that knows only this number
+finds the server whatever port it serves audio on, because the reply carries the service
+port. This is also what makes a
+.B TCP
+server discoverable at all \(em TCP has no datagram path to an unknown sender, and TCP and
+UDP port spaces are independent, so a TCP server on 4533 still gets UDP 4533 here. Binding
+it is best effort: where several servers share a host the first to start wins it, and the
+others are found only by a probe aimed at their own port.
 .TP
 .B \-\-no\-discovery
 do not answer

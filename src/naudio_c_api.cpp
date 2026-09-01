@@ -1336,6 +1336,19 @@ extern "C" na_error_t na_server_set_name(na_audio_server* server, const char* na
     });
 }
 
+extern "C" na_error_t na_server_set_discovery_port(na_audio_server* server, int port) {
+    NA_GUARD(NA_ERR_BACKEND, {
+        if (server == nullptr || port < 0 || port > 65535) {
+            setError(NA_ERR_INVALID);
+            return NA_ERR_INVALID;
+        }
+        if (server->startAttempted.load()) { setError(NA_ERR_INVALID); return NA_ERR_INVALID; }
+        // 0 is legal and means "no rendezvous listener", unlike na_server_create's port.
+        server->pendingConfig.discoveryPort = port;
+        return NA_OK;
+    });
+}
+
 extern "C" na_error_t na_server_set_audio_format(na_audio_server* server, int sample_rate,
                                                  int bits_per_sample, int channels) {
     NA_GUARD(NA_ERR_BACKEND, {

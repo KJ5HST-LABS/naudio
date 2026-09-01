@@ -324,10 +324,17 @@ NA_EXPORT int na_linux_auto_configure(char* msg, int msg_len);
  * from each (issue #100 measured three probes becoming three streaming clients on a
  * four-client server).
  *
- * Two limits worth knowing before you call it. Discovery resolves an ADDRESS, not an
- * address+port: you must probe the port the servers actually serve on, and 4533 is the
- * default worth trying first. And a TCP-only server is undiscoverable -- there is no way
- * to broadcast a connection attempt -- so this finds UDP and DUAL servers only.
+ * `port` is the RENDEZVOUS port to probe, not the port a server serves audio on. Every
+ * server also listens for probes on 4533 by default (na_server_set_discovery_port) and
+ * answers with the port it is actually serving on, so probing 4533 finds a server on any
+ * port -- and finds TCP, UDP and DUAL servers alike, since the rendezvous listener owns a
+ * UDP socket whatever the server serves audio over.
+ *
+ * Two limits remain. Only ONE server per host can hold a given rendezvous port; where
+ * several run, the first to start wins it and the others are found only by a probe aimed
+ * at their own service port (an operator running several has already had to choose those
+ * ports). And a broadcast does not leave the local segment: there is no multicast and no
+ * cross-subnet discovery.
  */
 
 /* Transport bits in na_server_info.transports. A DUAL server sets both. */
@@ -1198,6 +1205,22 @@ NA_EXPORT na_error_t na_server_set_discoverable(na_audio_server* server, int ena
  * address it heard the reply from, which is the actual discovery result. Truncated to 255
  * bytes on the wire. NULL clears it. Has no effect on a server that is not discoverable. */
 NA_EXPORT na_error_t na_server_set_name(na_audio_server* server, const char* name);
+
+/* @since 1.0.0 - wire spec 1.4, SS6.8. The RENDEZVOUS port this server also listens on for
+ * DISCOVER probes, so a client that knows only this number can find it whatever port it
+ * serves audio on. Default 4533 - the same number as the default service port, because a
+ * client that knows nothing else knows this one.
+ *
+ * This is what makes a TCP server discoverable at all: TCP has no datagram path to an
+ * unknown sender, so a TCP-only server cannot answer through its own transport. TCP and UDP
+ * port spaces are independent, so a TCP server on 4533 still gets UDP 4533 here.
+ *
+ * BEST EFFORT. Binding it can fail and that is not reported as an error: a UDP server
+ * already serving on this port cannot bind it twice and does not need to, and where several
+ * servers share a host the first to start wins it. Pass 0 to run no rendezvous listener at
+ * all, leaving the server findable only by a probe aimed at its own service port.
+ * na_server_set_discoverable(server, 0) disables discovery entirely, both paths. */
+NA_EXPORT na_error_t na_server_set_discovery_port(na_audio_server* server, int port);
 /* Audio wire format the server advertises and broadcasts. `bits_per_sample` must be 16 (the v1 wire
  * carries signed 16-bit PCM), `channels` 1 or 2, `sample_rate` > 0. Bytes fed to na_server_inject_audio
  * (and delivered to na_server_tx_audio_cb) MUST match this layout — naudio does not resample or convert.

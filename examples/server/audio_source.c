@@ -216,7 +216,7 @@ static void usage(void) {
         "usage: na_audio_source [--port N] [--capture-id N] [--transport tcp|udp]\n"
         "                       [--rate HZ] [--channels 1|2]\n"
         "                       [--test-tone] [--max-clients N] [--seconds N]\n"
-        "                       [--name LABEL] [--no-discovery]\n"
+        "                       [--name LABEL] [--no-discovery] [--discovery-port N]\n"
         "       na_audio_source --list-devices\n\n"
         "  --port N          listen port; 0 = OS-assigned ephemeral (default 4533)\n"
         "  --capture-id N    capture device id to broadcast (default: first capture device)\n"
@@ -231,6 +231,9 @@ static void usage(void) {
         "  --test-tone       hardware-free: broadcast a deterministic sawtooth (no device)\n"
         "  --max-clients N   maximum simultaneous clients (default 4)\n"
         "  --name LABEL      operator label reported in discovery replies (default: none)\n"
+        "  --discovery-port N  rendezvous port also listened on for DISCOVER probes, so a\n"\
+        "                    client that knows only this number finds this server whatever\n"\
+        "                    port it serves on (default 4533; 0 = no rendezvous listener)\n"\
         "  --no-discovery    do NOT answer DISCOVER probes. Servers answer by default\n"
         "                    (wire spec 1.4): a probe costs no client slot and starts no\n"
         "                    stream, but answering does tell anyone on the segment that\n"
@@ -253,6 +256,7 @@ int main(int argc, char** argv) {
     int          format_set  = 0;     // only call na_server_set_audio_format when asked
     const char*  name        = NULL;  // discovery label; NULL => leave it empty
     int          discovery   = 1;     // spec 1.4 SS6.8: servers answer by default
+    int          disc_port   = -1;    // -1 => leave the library default (4533)
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -266,6 +270,7 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--test-tone") == 0)   test_tone = 1;
         else if (strcmp(a, "--name") == 0)        name = NEED_VAL("--name");
         else if (strcmp(a, "--no-discovery") == 0) discovery = 0;
+        else if (strcmp(a, "--discovery-port") == 0) disc_port = atoi(NEED_VAL("--discovery-port"));
         else if (strcmp(a, "--list-devices") == 0) return list_devices();
         else if (strcmp(a, "--reliability") == 0) {
             const char* r = NEED_VAL("--reliability");
@@ -346,6 +351,7 @@ int main(int argc, char** argv) {
     na_server_set_max_clients(server, max_clients);
     // Wire spec 1.4 SS6.8. Set before start(), like every other config call here.
     na_server_set_discoverable(server, discovery);
+    if (disc_port >= 0) na_server_set_discovery_port(server, disc_port);
     if (name != NULL) na_server_set_name(server, name);
     /* Server-wide: EVERY client gets this format (per-client negotiation does not exist yet —
      * issue #91 Phase B). It survives a profile call in either order, so the placement relative
