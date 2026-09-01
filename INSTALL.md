@@ -18,11 +18,11 @@ now; see the note under Option C.)
 
 > **Current availability (2026-08).** naudio is not yet public — the repository is
 > private ahead of its planned Hamlib contribution. The current packaged release,
-> **v1.0.0rc4** (a prerelease), carries everything on this page: the double-click
+> **v1.0.0rc5** (a prerelease), carries everything on this page: the double-click
 > installers (a macOS `.pkg` and a Windows setup `.exe`), TGZ for Linux and
 > macOS, DEB, RPM, a Windows ZIP, and `sha256sums.txt`. While the repository is private,
 > collaborators with access fetch packages with
-> `gh release download v1.0.0rc4 -R KJ5HST-LABS/naudio` rather than anonymous URLs, and
+> `gh release download v1.0.0rc5 -R KJ5HST-LABS/naudio` rather than anonymous URLs, and
 > the Homebrew tap installs over ssh. Everything else on this page is written for the
 > durable, public state and works unchanged once the repository is public.
 

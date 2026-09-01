@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.0.0rc5] — 2026-09-01
+
 ### Removed
 - **`include/naudio/StreamDescription.hpp` is no longer shipped.** It was a
   non-normative value type for spec §13.5 ("stream-fact metadata"), a *proposed*
