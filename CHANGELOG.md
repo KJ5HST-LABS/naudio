@@ -15,6 +15,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   *is* the discovery result — it is deliberately not a field in the reply, because the
   source address of the datagram is the only value a prober can act on.
 
+  **You probe a rendezvous port, not the service port.** Every server also listens on
+  4533 by default (`na_server_set_discovery_port`, `--discovery-port`) whatever port it
+  serves audio on, and answers with its real service port — so a client that knows only
+  the rendezvous number finds a server anywhere. That is also what makes a **TCP** server
+  discoverable at all: TCP has no datagram path to an unknown sender, so it can never
+  answer through its own transport, and TCP is the default. Without the rendezvous
+  listener, discovery would have missed the default configuration entirely.
+
   **The exchange is side-effect-free, which is the entire point.** Answering a probe
   creates no connection, consumes no slot against `maxClients` and starts no stream.
   A broadcast `CONNECT_REQUEST` already found servers before this — that trick is what
@@ -23,21 +31,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   small server. Measured on a `max 4 clients` server: three probes became three streaming
   clients and a fourth would have filled it.
 
-  Three limits are real and are not going away in v1. Discovery resolves an **address,
-  not a port**: you must probe the port the servers serve on (4533 by default). A
-  **TCP-only server is undiscoverable**, because there is no way to broadcast a
-  connection attempt — this finds UDP and DUAL servers. And it reaches **the local
-  segment only**; routers do not forward a broadcast, and naudio implements no multicast
+  Two limits are real and are not going away in v1. Only **one server per host** can hold
+  a given rendezvous port: where several run, the first to start wins it and the rest are
+  found only by a probe aimed at their own service port — which costs nobody anything,
+  since running several servers on one host already meant choosing those ports explicitly.
+  And it reaches **the local segment only**; routers do not forward a broadcast, and naudio implements no multicast
   or cross-subnet discovery. Server-initiated beaconing was considered and rejected on
   the record: it would put periodic broadcast traffic on the segment forever, paid for by
   every host on it, to answer a question that is only asked when a client is choosing a
   server.
 
 ### Changed
-- **Servers answer discovery probes by default.** A server that upgrades to this release
-  begins responding to `DISCOVER` on the segment it is bound to, telling anyone who asks
+- **Servers answer discovery probes by default, and bind 4533/UDP for it.** A server that
+  upgrades to this release begins responding to `DISCOVER` on the segment it is bound to —
+  on its own service port *and* on the rendezvous port — telling anyone who asks
   that it exists, what format it serves and how full it is. Call
-  `na_server_set_discoverable(server, 0)` before `na_server_start` to keep it silent.
+  `na_server_set_discoverable(server, 0)` before `na_server_start` to keep it silent, or
+  `na_server_set_discovery_port(server, 0)` to keep direct-port probes working while
+  running no rendezvous listener.
   Nothing else about the UDP anti-spoof gate is loosened: a datagram from an unknown
   sender that is neither a `CONNECT_REQUEST` nor a `DISCOVER` is still dropped, replies
   are rate-limited per source address over a bounded table, and a probe still creates

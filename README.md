@@ -373,18 +373,23 @@ consumer. The byte-identity tell for a correctly received stream is
 - **No IP multicast; IPv4 only.** RX fan-out to multiple clients is **unicast replication** (O(N)
   egress), not IP multicast, and the transport is IPv4 (`AF_INET`) only. Fan-out should not be read as
   a multicast group.
-- **Discovery finds an address, not a port — and only on the local segment.** Since wire spec
-  1.4 (§6.8) a client broadcasts a `DISCOVER` and every server that hears it answers by unicast:
-  `na_discover()` in C, `naudio::net::discoverServers()` in C++. The exchange is side-effect-free
-  — it creates no connection, consumes no slot against `maxClients` and starts no stream — which
-  is what distinguishes it from the old broadcast-`CONNECT_REQUEST` trick it replaces. Three
-  limits remain, and none of them is going away in v1. It resolves an **address**: you must probe
-  the port the servers actually serve on (4533 by default), so a server on another port is found
-  only by a probe aimed at that port. A **TCP-only server is undiscoverable** — there is no way
-  to broadcast a connection attempt — so this finds UDP and DUAL servers. And it is **local**:
-  routers do not forward a broadcast, and naudio implements no multicast or cross-subnet
-  discovery.
-- **Servers answer discovery by default.** `na_server_set_discoverable(server, 0)` turns it off.
+- **Discovery is local to one segment, and one server per host holds the rendezvous port.**
+  Since wire spec 1.4 (§6.8) a client broadcasts a `DISCOVER` and every server that hears it
+  answers by unicast: `na_discover()` in C, `naudio::net::discoverServers()` in C++. Probe the
+  **rendezvous port** — 4533 by default — and the reply carries the port that server actually
+  serves on, so a server on any port is found by a client that was told nothing. That works for
+  TCP, UDP and DUAL alike, because the rendezvous listener owns a UDP socket whatever the server
+  serves audio over. The exchange is side-effect-free: no connection, no slot against
+  `maxClients`, no stream — which is what distinguishes it from the broadcast-`CONNECT_REQUEST`
+  trick it replaces. Two limits remain. Only **one server per host** can hold a given rendezvous
+  port; where several run, the first to start wins it and the rest are found only by a probe
+  aimed at their own service port (running several already meant choosing those ports). And it is
+  **local**: routers do not forward a broadcast, and naudio implements no multicast or
+  cross-subnet discovery.
+- **Servers answer discovery by default**, and also bind the rendezvous port by default.
+  `na_server_set_discoverable(server, 0)` turns discovery off entirely;
+  `na_server_set_discovery_port(server, 0)` keeps direct-port probes working but runs no
+  rendezvous listener.
   Leaving it on means anyone on the segment can learn that the server exists, what audio format
   it serves and how full it is. That is the point of the feature, and it is worth being explicit
   that it is a *discoverability* switch and not access control: a server that answers nothing
