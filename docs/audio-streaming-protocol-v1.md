@@ -701,6 +701,14 @@ must extract, and that a short trailing run is not a format request). The file i
 `vectors.ini`; `vectors.ini` itself is unchanged by 1.2 — the no-drift check is part of
 regeneration.
 
+**Spec 1.4 vectors.** The §6.8 discovery forms are pinned by a third generated file,
+`conformance/vectors/vectors-v1_4.ini` (same generator, same independence rules), loaded by
+`Conformance.GoldenVectorsV14` under the same fail-closed, 0-skipped gate: one `DISCOVER` probe
+and three `DISCOVER_REPLY` encodings — named, unnamed, and a server **at capacity**, which §6.8
+requires to answer rather than go silent. Neither `vectors.ini` nor `vectors-v1_2.ini` is changed
+by 1.4, and regeneration verifies that: a spec revision that only ADDS control types must leave
+every earlier file byte-identical.
+
 ### 12.3 Determinism rule for byte-exact vectors
 
 Because the frame timestamp is sampled at packet-creation time (§3.5), a byte-exact frame vector MUST pin the timestamp to a fixed value (the vectors use `timestamp = 0`). Conformance MUST NOT assert timestamp equality across implementations for live (non-pinned) frames.

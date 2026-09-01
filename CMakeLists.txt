@@ -622,6 +622,7 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/conformance/README.md"
         COMPONENT dev)
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/conformance/vectors/vectors.ini"
               "${CMAKE_CURRENT_SOURCE_DIR}/conformance/vectors/vectors-v1_2.ini"
+              "${CMAKE_CURRENT_SOURCE_DIR}/conformance/vectors/vectors-v1_4.ini"
         DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/naudio/conformance/vectors"
         COMPONENT dev)
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/conformance/tools/gen_vectors.py"

@@ -52,6 +52,7 @@ set(REQUIRED
     "${NA_DATAROOTDIR}/naudio/conformance/README.md"                  "conformance/README.md"
     "${NA_DATAROOTDIR}/naudio/conformance/vectors/vectors.ini"        "conformance/vectors/vectors.ini"
     "${NA_DATAROOTDIR}/naudio/conformance/vectors/vectors-v1_2.ini"   "conformance/vectors/vectors-v1_2.ini"
+    "${NA_DATAROOTDIR}/naudio/conformance/vectors/vectors-v1_4.ini"   "conformance/vectors/vectors-v1_4.ini"
     "${NA_DATAROOTDIR}/naudio/conformance/tools/gen_vectors.py"       "conformance/tools/gen_vectors.py")
 
 # --- arm 1: every required file is installed, and is the file it claims to be ---------------
