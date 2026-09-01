@@ -8,10 +8,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "naudio/ControlMessage.hpp"  // DiscoveryInfo
+#include "naudio/net/Transport.hpp"  // DiscoveryFacts
 
 namespace naudio::net {
 
@@ -46,6 +48,42 @@ struct DiscoveryOptions {
     // Local interface to bind the probe socket to ("" = let the OS choose). On a
     // host with several interfaces this selects which segment is probed.
     std::string bindHost;
+};
+
+// The server half of §6.8, shared by every path that answers a probe: the
+// per-source rate limiter and the reply frame it builds.
+//
+// It exists because there are TWO such paths and they must not drift apart — the
+// UDP transport answering a probe aimed at its own service port, and the
+// DiscoveryResponder below answering one aimed at the rendezvous port. Neither
+// owns the socket; the caller sends the bytes, because only the caller knows
+// which socket the reply should leave by.
+//
+// NOT thread-safe. Each owner keeps its own instance and touches it from one
+// thread (its own receive loop).
+class DiscoveryReplier {
+public:
+    // §6.8's security note: one reply per source per window, over a BOUNDED table.
+    // The table is the amplification target as much as the reply is — forging a
+    // source address costs an attacker nothing — so it never grows past the cap.
+    static constexpr std::size_t MAX_SOURCES = 64;
+    static constexpr std::int64_t MIN_INTERVAL_MS = 1000;
+
+    // True if this source may be answered now. Records the reply when it returns
+    // true, so a caller that asks must send.
+    bool allow(const std::string& addrKey, std::int64_t nowMs);
+
+    // The serialized 0xAF01 frame carrying the DISCOVER_REPLY for `facts`.
+    // Sequence numbers come from this object's own counter: a discovery reply
+    // belongs to no connection, so it cannot borrow one (§6.8).
+    std::vector<std::uint8_t> buildReply(std::uint32_t token, const DiscoveryFacts& facts);
+
+    // Visible for tests: how many sources the limiter is currently tracking.
+    std::size_t trackedSources() const { return seen_.size(); }
+
+private:
+    std::map<std::string, std::int64_t> seen_;  // addressKey -> last reply time (ms)
+    std::int32_t seq_ = 0;
 };
 
 // Sends ONE DISCOVER and collects DISCOVER_REPLYs until the window closes.

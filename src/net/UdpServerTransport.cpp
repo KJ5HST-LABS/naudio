@@ -50,30 +50,6 @@ std::optional<std::uint32_t> UdpServerTransport::discoverTokenOf(
     return msg->parseDiscoverToken();
 }
 
-bool UdpServerTransport::allowDiscoveryReplyForSource(const std::string& addrKey,
-                                                      std::int64_t now) {
-    auto it = discoverySeen_.find(addrKey);
-    if (it != discoverySeen_.end()) {
-        if (now - it->second < DISCOVERY_MIN_INTERVAL_MS) return false;
-        it->second = now;
-        return true;
-    }
-    // New source. The table is the amplification target as much as the reply is --
-    // a forged source address costs the attacker nothing -- so it is bounded, and
-    // at the cap the OLDEST entry goes rather than the table growing. Evicting
-    // oldest-first means a flood of forged addresses cannot push out a real
-    // client's entry any faster than it ages out anyway.
-    if (discoverySeen_.size() >= MAX_DISCOVERY_SOURCES) {
-        auto oldest = discoverySeen_.begin();
-        for (auto i = discoverySeen_.begin(); i != discoverySeen_.end(); ++i) {
-            if (i->second < oldest->second) oldest = i;
-        }
-        discoverySeen_.erase(oldest);
-    }
-    discoverySeen_[addrKey] = now;
-    return true;
-}
-
 void UdpServerTransport::sendDiscoveryReply(std::uint32_t token, const std::string& host,
                                             std::uint16_t port, const std::string& addrKey) {
     // COPY the provider out under the lock, then release it before calling. Holding a
@@ -91,13 +67,9 @@ void UdpServerTransport::sendDiscoveryReply(std::uint32_t token, const std::stri
     // Checked BEFORE the limiter, so a server that answers nothing also does no
     // table work -- otherwise opting out would still leave a flood a place to write.
     if (!facts.enabled) return;
-    if (!allowDiscoveryReplyForSource(addrKey, nowMs())) return;
+    if (!discoveryReplier_.allow(addrKey, nowMs())) return;
 
-    ControlMessage reply = ControlMessage::discoverReply(
-        token, facts.port, facts.transports, facts.sampleRate, facts.bitsPerSample,
-        facts.channels, facts.clientCount, facts.maxClients, facts.name);
-    AudioPacket packet(PacketType::Control, discoverySeq_++, reply.serialize());
-    const std::vector<std::uint8_t> bytes = packet.serialize();
+    const std::vector<std::uint8_t> bytes = discoveryReplier_.buildReply(token, facts);
     // UNICAST, back to the prober's source address -- never to the segment (§6.8).
     // A failed send is dropped silently: discovery is best-effort by construction,
     // and a prober that hears nothing simply does not list this server.

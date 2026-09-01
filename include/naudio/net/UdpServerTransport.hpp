@@ -18,6 +18,7 @@
 #include <unordered_map>
 
 #include "naudio/AudioPacket.hpp"
+#include "naudio/net/Discovery.hpp"
 #include "naudio/net/Socket.hpp"
 #include "naudio/net/Transport.hpp"
 #include "naudio/net/UdpClientConnection.hpp"
@@ -67,12 +68,7 @@ public:
         discoveryFacts_ = std::move(provider);
     }
 
-    // Discovery reply rate limit (§6.8 security note). One reply per source per
-    // window, over a table that is BOUNDED -- an unbounded one would itself be
-    // the amplification target, since forging a source address costs an attacker
-    // nothing and would cost us an entry. At the cap the oldest entry is evicted.
-    static constexpr std::size_t MAX_DISCOVERY_SOURCES = 64;
-    static constexpr std::int64_t DISCOVERY_MIN_INTERVAL_MS = 1000;
+
 
     bool bind(std::uint16_t port, std::string* err) override;
     bool isBound() const override;
@@ -119,8 +115,6 @@ private:
     // not the sender is known, creates nothing, and routes nothing.
     void sendDiscoveryReply(std::uint32_t token, const std::string& host, std::uint16_t port,
                             const std::string& addrKey);
-    // Rate-limit gate for one source. Demux-thread-only, like discoverySeen_.
-    bool allowDiscoveryReplyForSource(const std::string& addrKey, std::int64_t now);
     static std::int64_t nowMs();
 
     std::string bindHost_;
@@ -145,13 +139,10 @@ private:
     // ordering trivial -- nothing takes discoveryMutex_ while holding anything else.
     mutable std::mutex discoveryMutex_;
     DiscoveryFactsProvider discoveryFacts_;
-    // addressKey -> last reply time (ms). Touched ONLY by the demux thread, which
-    // is why it is not under stateMutex_; bounded by MAX_DISCOVERY_SOURCES.
-    std::unordered_map<std::string, std::int64_t> discoverySeen_;
-    // §3.4 asks a sender's frames to carry a monotonic counter. A discovery reply
-    // belongs to no connection, so it cannot borrow one -- this is the responder's
-    // own. A prober correlates on the TOKEN, never on this. Demux-thread-only.
-    std::int32_t discoverySeq_ = 0;
+    // The limiter and the reply codec, shared with DiscoveryResponder so the two
+    // paths that answer a probe cannot drift apart. Touched ONLY by the demux
+    // thread, which is why it needs no lock of its own.
+    DiscoveryReplier discoveryReplier_;
 };
 
 }  // namespace naudio::net

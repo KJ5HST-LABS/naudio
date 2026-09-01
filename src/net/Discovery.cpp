@@ -42,6 +42,35 @@ std::uint32_t freshToken() {
 
 }  // namespace
 
+bool DiscoveryReplier::allow(const std::string& addrKey, std::int64_t nowMs) {
+    auto it = seen_.find(addrKey);
+    if (it != seen_.end()) {
+        if (nowMs - it->second < MIN_INTERVAL_MS) return false;
+        it->second = nowMs;
+        return true;
+    }
+    // New source. At the cap the OLDEST entry goes rather than the table growing:
+    // evicting oldest-first means a flood of forged addresses cannot push out a
+    // real prober's entry any faster than it would have aged out anyway.
+    if (seen_.size() >= MAX_SOURCES) {
+        auto oldest = seen_.begin();
+        for (auto i = seen_.begin(); i != seen_.end(); ++i) {
+            if (i->second < oldest->second) oldest = i;
+        }
+        seen_.erase(oldest);
+    }
+    seen_[addrKey] = nowMs;
+    return true;
+}
+
+std::vector<std::uint8_t> DiscoveryReplier::buildReply(std::uint32_t token,
+                                                       const DiscoveryFacts& facts) {
+    ControlMessage reply = ControlMessage::discoverReply(
+        token, facts.port, facts.transports, facts.sampleRate, facts.bitsPerSample,
+        facts.channels, facts.clientCount, facts.maxClients, facts.name);
+    return AudioPacket(PacketType::Control, seq_++, reply.serialize()).serialize();
+}
+
 std::vector<DiscoveredServer> discoverServers(const DiscoveryOptions& options,
                                               std::string* err) {
     std::vector<DiscoveredServer> found;
