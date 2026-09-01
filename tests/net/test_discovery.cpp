@@ -350,3 +350,159 @@ TEST(Discovery, DiscoverServersHonoursMaxServers) {
 
     EXPECT_EQ(1u, found.size()) << "maxServers did not bound the result";
 }
+
+// --- The rendezvous listener: DiscoveryResponder ----------------------------
+//
+// The component that makes discovery resolve a PORT. Tested here in isolation,
+// on an ephemeral rendezvous port rather than 4533, so a run never collides with
+// a real naudio server on the developer's machine.
+
+namespace {
+
+DiscoveryFacts factsReporting(std::uint16_t servicePort, std::uint8_t transports,
+                              const char* name) {
+    DiscoveryFacts f;
+    f.enabled = true;
+    f.port = servicePort;
+    f.transports = transports;
+    f.sampleRate = 48000;
+    f.bitsPerSample = 16;
+    f.channels = 2;
+    f.clientCount = 0;
+    f.maxClients = 4;
+    f.name = name;
+    return f;
+}
+
+}  // namespace
+
+// THE point of the whole change: the reply names a service port that is NOT the
+// port the probe was sent to, so a client that knew only the rendezvous port
+// learns where to connect.
+TEST(Discovery, TheRendezvousReplyNamesADifferentServicePort) {
+    DiscoveryResponder responder;
+    std::string err;
+    ASSERT_TRUE(responder.start("127.0.0.1", 0, [] { return factsReporting(45411, 0x02, "elsewhere"); },
+                                &err))
+        << err;
+    const auto rendezvous = static_cast<std::uint16_t>(responder.port());
+    ASSERT_GT(rendezvous, 0);
+    ASSERT_NE(rendezvous, 45411) << "the two ports must differ or this proves nothing";
+
+    Socket prober = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    auto info = probe(prober, rendezvous, 0xFEEDu, 2000);
+    ASSERT_TRUE(info.has_value()) << "the rendezvous listener did not answer";
+    EXPECT_EQ(0xFEEDu, info->token);
+    EXPECT_EQ(45411, info->port) << "the reply must carry the SERVICE port, not the probed one";
+    EXPECT_EQ("elsewhere", info->name);
+    responder.stop();
+}
+
+// A TCP-only server is discoverable through the rendezvous listener — the hole
+// the transport-side responder cannot close, and the one that mattered most
+// because TCP is the DEFAULT transport.
+TEST(Discovery, TheRendezvousListenerCanAdvertiseATcpOnlyServer) {
+    DiscoveryResponder responder;
+    std::string err;
+    ASSERT_TRUE(responder.start("127.0.0.1", 0,
+                                [] {
+                                    return factsReporting(
+                                        45412, static_cast<std::uint8_t>(DiscoveryTransport::Tcp),
+                                        "tcp-shack");
+                                },
+                                &err))
+        << err;
+
+    Socket prober = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    auto info = probe(prober, static_cast<std::uint16_t>(responder.port()), 1, 2000);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(45412, info->port);
+    EXPECT_EQ(static_cast<std::uint8_t>(DiscoveryTransport::Tcp), info->transports)
+        << "a TCP-only server must advertise itself as TCP";
+    EXPECT_EQ(0, info->transports & static_cast<std::uint8_t>(DiscoveryTransport::Udp));
+    responder.stop();
+}
+
+// The opt-out reaches the rendezvous listener too, with the usual live control.
+TEST(Discovery, TheRendezvousListenerHonoursTheOptOut) {
+    DiscoveryResponder off;
+    std::string err;
+    ASSERT_TRUE(off.start("127.0.0.1", 0,
+                          [] {
+                              DiscoveryFacts f = factsReporting(45411, 0x02, "quiet");
+                              f.enabled = false;
+                              return f;
+                          },
+                          &err));
+    Socket p1 = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    EXPECT_FALSE(probe(p1, static_cast<std::uint16_t>(off.port()), 1, 400).has_value());
+    off.stop();
+
+    DiscoveryResponder on;
+    ASSERT_TRUE(on.start("127.0.0.1", 0, [] { return factsReporting(45411, 0x02, "loud"); }, &err));
+    Socket p2 = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    EXPECT_TRUE(probe(p2, static_cast<std::uint16_t>(on.port()), 1, 2000).has_value())
+        << "control failed: the probe helper cannot elicit a reply from a responder at all";
+    on.stop();
+}
+
+// Rate limiting is the same shared limiter, so it must behave the same here.
+TEST(Discovery, TheRendezvousListenerRateLimitsPerSource) {
+    DiscoveryResponder responder;
+    std::string err;
+    ASSERT_TRUE(responder.start("127.0.0.1", 0, [] { return factsReporting(45411, 0x02, "r"); },
+                                &err));
+    const auto rp = static_cast<std::uint16_t>(responder.port());
+
+    Socket prober = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    ASSERT_TRUE(probe(prober, rp, 1, 2000).has_value()) << "the first probe must be answered";
+    EXPECT_FALSE(probe(prober, rp, 2, 400).has_value()) << "a second probe inside the window";
+
+    Socket other = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    EXPECT_TRUE(probe(other, rp, 3, 2000).has_value()) << "the limit must be per-source";
+    responder.stop();
+}
+
+// FIRST SERVER ON THE HOST WINS THE RENDEZVOUS PORT. Stated as a test because it
+// is the one surprising property of the design, and an operator meeting it for
+// the first time should find it documented rather than infer it from a restart.
+TEST(Discovery, ASecondResponderOnTheSameRendezvousPortRefusesToStart) {
+    DiscoveryResponder first;
+    std::string err;
+    ASSERT_TRUE(first.start("127.0.0.1", 0, [] { return factsReporting(1, 0x02, "first"); }, &err));
+    const auto held = static_cast<std::uint16_t>(first.port());
+
+    DiscoveryResponder second;
+    std::string secondErr;
+    EXPECT_FALSE(second.start("127.0.0.1", held, [] { return factsReporting(2, 0x02, "second"); },
+                              &secondErr))
+        << "two responders bound the same rendezvous port; replies would be split between them";
+    EXPECT_FALSE(second.isRunning());
+    EXPECT_EQ(-1, second.port());
+    EXPECT_FALSE(secondErr.empty()) << "a refused bind must say why";
+
+    // The control: the first is still answering, so the refusal above cost nothing.
+    Socket prober = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    auto info = probe(prober, held, 1, 2000);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ("first", info->name);
+    first.stop();
+}
+
+// Lifecycle: stop is idempotent, and a stopped responder releases its port.
+TEST(Discovery, TheRendezvousListenerReleasesItsPortOnStop) {
+    std::uint16_t held = 0;
+    std::string err;
+    {
+        DiscoveryResponder r;
+        ASSERT_TRUE(r.start("127.0.0.1", 0, [] { return factsReporting(1, 0x02, "x"); }, &err));
+        held = static_cast<std::uint16_t>(r.port());
+        r.stop();
+        r.stop();  // idempotent
+        EXPECT_FALSE(r.isRunning());
+    }
+    DiscoveryResponder again;
+    EXPECT_TRUE(again.start("127.0.0.1", held, [] { return factsReporting(1, 0x02, "y"); }, &err))
+        << err;
+    again.stop();
+}

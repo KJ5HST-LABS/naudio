@@ -6,13 +6,16 @@
 //
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "naudio/ControlMessage.hpp"  // DiscoveryInfo
+#include "naudio/net/Socket.hpp"
 #include "naudio/net/Transport.hpp"  // DiscoveryFacts
 
 namespace naudio::net {
@@ -84,6 +87,64 @@ public:
 private:
     std::map<std::string, std::int64_t> seen_;  // addressKey -> last reply time (ms)
     std::int32_t seq_ = 0;
+};
+
+// Answers DISCOVER probes on a RENDEZVOUS port, independently of any transport.
+//
+// This is what lets discovery resolve a PORT and not merely an address. A client
+// probes a port it already knows (4533, the default service port), and the reply
+// carries the port the server is ACTUALLY serving on — so a server on 45411 is
+// found by a client that was told nothing.
+//
+// It also closes a hole the transport-side responder cannot: a TCP-only server has
+// no datagram path to an unknown sender and is undiscoverable through its own
+// transport — and TCP is the DEFAULT transport, so that was the common case. This
+// listener owns a UDP socket regardless of what the server serves audio over, and
+// TCP and UDP port spaces are independent, so a TCP server on 4533 can still be
+// found on UDP 4533.
+//
+// BEST EFFORT BY DESIGN. start() failing is normal and not an error worth
+// reporting: the usual cause is that this server's own UDP service socket already
+// holds the rendezvous port, in which case the transport already answers probes
+// aimed at it. The other cause is a second naudio server on the same host, where
+// the first to start wins the rendezvous port and the others stay findable by a
+// probe aimed at their own port — an operator running two servers on one host has
+// already had to choose ports explicitly, so they already know them.
+//
+// The facts provider arrives through start() and there is deliberately NO setter:
+// it is written before the thread launches and only read after, and having no way
+// to write it later is what makes that true, rather than a comment asking callers
+// to be careful (the mistake fixed in 5b9e4b1).
+class DiscoveryResponder {
+public:
+    // The default rendezvous port — the same number as the default service port,
+    // because a client that knows nothing else knows this one.
+    static constexpr std::uint16_t DEFAULT_PORT = 4533;
+
+    DiscoveryResponder() = default;
+    ~DiscoveryResponder();
+    DiscoveryResponder(const DiscoveryResponder&) = delete;
+    DiscoveryResponder& operator=(const DiscoveryResponder&) = delete;
+
+    // Binds `port` on `bindHost` ("" = wildcard) and starts the listener thread.
+    // Returns false and fills `err` when the port is unavailable; see the
+    // best-effort note above before treating that as a failure.
+    bool start(const std::string& bindHost, std::uint16_t port,
+               DiscoveryFactsProvider provider, std::string* err);
+    // Idempotent. Stops the thread and closes the socket.
+    void stop();
+    bool isRunning() const { return running_.load(); }
+    // The bound rendezvous port, or -1 when not running.
+    int port() const;
+
+private:
+    void loop();
+
+    Socket socket_;
+    std::atomic<bool> running_{false};
+    std::thread thread_;
+    DiscoveryFactsProvider provider_;
+    DiscoveryReplier replier_;
 };
 
 // Sends ONE DISCOVER and collects DISCOVER_REPLYs until the window closes.
