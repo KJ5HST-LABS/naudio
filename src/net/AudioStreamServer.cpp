@@ -210,7 +210,7 @@ private:
     // lastReceiveTime_ (AudioProtocolHandler.cpp), i.e. on what WE last received; this
     // applies the same window to a peer that will not DRAIN. The coupling is
     // deliberate and is a real coupling: CONNECTION_TIMEOUT_MS is frozen by the wire spec
-    // (docs/audio-streaming-protocol-v1.md:375-376 and the constants table at :673-674), so
+    // (docs/audio-streaming-protocol-v1.md:406-407 and the constants table at :704-705), so
     // moving it there moves this cap with it. That is the intended behaviour, not a
     // side effect — but it means this line is not free to retune locally.
     //
@@ -397,40 +397,61 @@ bool AudioStreamServer::ClientSession::performHandshake() {
         clientInfo_ = info;
     }
 
-    // Spec 1.2 (§6.2.1): a format request is granted EXACTLY or answered native — never a
-    // partial or substituted grant. An unservable request never rejects the connection.
+    // Spec 1.3 (§6.2.1): rate and layout are granted INDEPENDENTLY — each dimension is
+    // answered on its own merits, and an unservable one leaves the other standing. An
+    // unservable request still never rejects the connection.
+    //
+    // 1.2 made this ONE conjunction, so a client that asked for a rate AND a layout and could
+    // only be given the rate got neither. That is not a theoretical sharp edge: WSJT-X asks
+    // for (12000, MONO_DOWNMIX), and against a MONO-native server — the obvious way to halve
+    // bandwidth at the source — layouts 1-3 are unservable, so the whole request was declined
+    // and the client was answered native 48 kHz. It then refused to start. Reproduced here
+    // 2026-08-31 against `na_audio_source --channels 1`: (12000, MONO_DOWNMIX) -> 48000 at
+    // 1920 B/callback, while (12000, NATIVE) -> 12000 at 480. The most sensible server
+    // configuration broke the client hardest, and asking for MORE returned LESS, which is
+    // what made a speculative optimisation request unsafe to send.
+    //
+    // Nothing about the wire moves: the 15-byte AUDIO_CONFIG already carries the granted rate
+    // and the granted layout in separate fields, so a partial grant was always expressible —
+    // 1.2 simply never produced one.
     if (auto freq = msg->parseConnectRequestFormatRequest()) {
         formatRequested_ = true;
         const AudioStreamConfig& native = server_->config_;
-        // Requested rate: 0 keeps the native rate (factor 1). Otherwise it must be a
-        // positive integer divisor of the native rate whose samplesPerFrame stays integral,
-        // AND a divisor the Decimator implements — any other divisor is declined-to-native,
-        // which the spec permits ("MAY decline any request for any reason").
-        bool rateOk = true;
+        // Requested rate: 0 keeps the native rate (factor 1 — nothing asked, nothing to
+        // decline). Otherwise it must be a positive integer divisor of the native rate whose
+        // samplesPerFrame stays integral, AND a divisor the Decimator implements. Anything
+        // else leaves factor at 1, which IS the declined-to-native answer for this dimension.
         int factor = 1;
         if (freq->sampleRate != 0) {
             const auto rate = static_cast<std::int64_t>(freq->sampleRate);
-            rateOk = rate > 0 && rate <= native.sampleRate && native.sampleRate % rate == 0 &&
-                     (rate * native.frameDurationMs) % 1000 == 0;
-            if (rateOk) {
-                factor = static_cast<int>(native.sampleRate / rate);
-                rateOk = Decimator::supportsFactor(factor);
+            const bool divisor = rate > 0 && rate <= native.sampleRate &&
+                                 native.sampleRate % rate == 0 &&
+                                 (rate * native.frameDurationMs) % 1000 == 0;
+            if (divisor) {
+                const int f = static_cast<int>(native.sampleRate / rate);
+                if (Decimator::supportsFactor(f)) factor = f;
             }
         }
-        // Layouts 1-3 reduce native stereo to one channel; unknown layout bytes decline.
-        const bool layoutOk = freq->layout == 0 || (freq->layout <= 3 && native.channels == 2);
-        // The conversion units are int16-only; a non-16-bit native (e.g. a future IQ form)
-        // declines any request that would actually change the stream.
-        const bool changes = factor != 1 || freq->layout != 0;
-        if (rateOk && layoutOk && (!changes || native.bitsPerSample == 16)) {
-            grantedLayout_ = freq->layout;
-            sessionConfig_.sampleRate = native.sampleRate / factor;
-            const int convChannels = (freq->layout != 0) ? 1 : native.channels;
-            sessionConfig_.channels = convChannels;
-            if (factor > 1) decimator_.emplace(factor, convChannels);
+        // Layouts 1-3 reduce native stereo to one channel. A native mono, or a layout byte
+        // this revision does not know, declines the LAYOUT only — the rate above survives it.
+        std::uint8_t layout = (freq->layout != 0 && freq->layout <= 3 && native.channels == 2)
+                                  ? freq->layout
+                                  : static_cast<std::uint8_t>(0);
+        // The conversion units are int16-only, so a non-16-bit native (e.g. a future IQ form)
+        // declines BOTH dimensions rather than one: either would have to convert.
+        if (native.bitsPerSample != 16) {
+            factor = 1;
+            layout = 0;
         }
-        // Declined: grantedLayout_ stays 0 and sessionConfig_ keeps the native format
-        // fields, so the 15-byte reply states native + layout 0 — "understood, declined".
+
+        grantedLayout_ = layout;
+        sessionConfig_.sampleRate = native.sampleRate / factor;
+        const int convChannels = (layout != 0) ? 1 : native.channels;
+        sessionConfig_.channels = convChannels;
+        if (factor > 1) decimator_.emplace(factor, convChannels);
+        // With neither dimension granted these assignments restore the values sessionConfig_
+        // already held — performHandshake forces the native format fields above — so the
+        // 15-byte reply states native + layout 0, "understood, declined", exactly as in 1.2.
     }
     return true;
 }

@@ -186,7 +186,9 @@ public:
     // --- Per-subscription RX format request (wire spec 1.2, §6.2.1) ---
     // Ask the server for a reduced RX format: rate 0 keeps the native rate; layout is an
     // RxLayout wire byte. Sent with EVERY handshake once set (a reconnect renews the same
-    // subscription intent). The server grants exactly or answers native — the granted format
+    // subscription intent). Since spec 1.3 the rate and the layout are granted INDEPENDENTLY
+    // — either may be granted without the other, so read what was actually granted rather
+    // than assuming the request was answered whole. The granted format
     // lands in config() via the AUDIO_CONFIG merge, exactly like any negotiated format.
     // A (0, Native) request is the 1.2 probe: it changes nothing but makes the server reveal
     // whether it understands format requests at all (see grantedRxLayout).

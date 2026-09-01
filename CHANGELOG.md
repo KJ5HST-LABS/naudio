@@ -5,6 +5,30 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **Wire spec 1.3 — a format request's rate and channel layout are now granted
+  independently.** Under spec 1.2 the server granted a `na_client_request_format`
+  request exactly or not at all, so a client that asked for a rate *and* a layout
+  and could only be given the rate received **neither**. That made an optimisation
+  request unsafe to send speculatively — asking for more could return less — and it
+  bit hardest in the most sensible configuration: against a **mono-native** server,
+  the obvious way to halve bandwidth at the source, layouts 1–3 are unservable, so
+  `(12000, MONO_DOWNMIX)` was answered native 48 kHz. Reported by the WSJT-X
+  network-audio ingress work, which measured a client refusing to start on exactly
+  that while `(12000, NATIVE)` against the same server was granted. Each dimension
+  is now answered on its own merits and an unservable one leaves the other standing.
+
+  **No wire change:** the 15-byte `AUDIO_CONFIG` already carried the granted rate and
+  the granted layout in separate fields, so a partial grant was always expressible —
+  1.2 simply never produced one. Every byte layout, type number, CRC semantic and
+  golden vector is untouched, and `vectors.ini` is byte-identical. A spec-1.2 client
+  talking to a 1.3 server may now receive a partial grant, which is harmless because
+  `AUDIO_CONFIG` has always been the sole authority for what a connection's payloads
+  carry; only a client that inferred the format from `grantedLayout` rather than from
+  the fields could be surprised, and 1.2 already forbade that. Two conformance
+  vectors pin the new field combinations, and `na_client_get_granted_rx_layout`'s
+  contract now names all four outcomes explicitly.
+
 ### Added
 - **The licence, the wire specification and the conformance vectors now ship inside
   every package.** `share/doc/naudio/` carries `copyright` (the full LGPL-2.1 text,

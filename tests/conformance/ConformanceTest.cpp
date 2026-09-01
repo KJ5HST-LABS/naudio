@@ -669,8 +669,11 @@ TEST(Conformance, GoldenVectorsV12) {
         }
     }
     std::cerr << "conformance v1.2: " << ran << " ran, " << skipped << " skipped\n";
-    // Full gate: all 8 vectors run, 0 skipped — 5 control_v12 encode (3
-    // connect-request + 2 audio-config) + 3 control_decode_v1 tolerance.
-    EXPECT_EQ(8, ran) << "expected all 8 spec-1.2 vectors to run";
+    // Full gate: all 10 vectors run, 0 skipped — 7 control_v12 encode (3 connect-request +
+    // 2 audio-config + 2 spec-1.3 PARTIAL-grant audio-config) + 3 control_decode_v1 tolerance.
+    // The literal is the point: it is what stops a vector going missing from the .ini and the
+    // suite reporting green over a smaller corpus, so it must be raised deliberately whenever
+    // gen_vectors.py gains a record.
+    EXPECT_EQ(10, ran) << "expected all 10 spec-1.2/1.3 vectors to run";
     EXPECT_EQ(0, skipped) << "expected 0 skipped vectors";
 }

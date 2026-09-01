@@ -390,10 +390,12 @@ consumer. The byte-identity tell for a correctly received stream is
   lower server-wide format with `na_server_set_audio_format` (or `--rate`/`--channels` on
   `na_audio_source` and `na_audio_daemon`) before start. Clients discover it via
   `na_client_get_audio_format` after connect. **Since 0.5.0 a client may also ask for less than
-  the server broadcasts**, for its own subscription only: `na_client_request_format` (spec 1.2
-  §6.2.1) requests an integer divisor of the server's rate and/or a reduced channel layout, which
-  the server grants exactly or declines to native — never partially — while every other client
-  keeps the native stream. What still does not exist is mid-stream adaptation and resampling
+  the server broadcasts**, for its own subscription only: `na_client_request_format`
+  (spec 1.2 §6.2.1) requests an integer divisor of the server's rate and/or a reduced channel
+  layout, while every other client keeps the native stream. **Since spec 1.3 the two are granted
+  independently**, so an unservable layout no longer withdraws a servable rate and a request is
+  safe to make speculatively; read what you actually got from `na_client_get_audio_format`,
+  which is the only authority for what the callbacks carry. What still does not exist is mid-stream adaptation and resampling
   between arbitrary rates; the remaining format breadth is §13.1 of the spec. Against that measured
   link (~0.5 Mbps effective — **derived** from 33 % of 1.536 Mbps, not itself measured):
 

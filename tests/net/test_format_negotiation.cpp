@@ -4,7 +4,7 @@
 //
 // Copyright (C) 2025-2026 Terrell Deppe
 //
-// Server-side B3 (#91): the grant matrix (exact-grant-or-native, decline paths,
+// Server-side B3 (#91): the grant matrix (per-dimension grants since spec 1.3, decline paths,
 // the 15-byte-reply-only-to-requesters rule), converted-stream bit-exactness
 // against the B2 conversion units, the native path's byte-identity while a
 // converted subscriber shares the same broadcast, and FEC recovery of a
@@ -143,7 +143,7 @@ std::vector<std::uint8_t> expectedMonoDecimated(const std::vector<std::int16_t>&
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// The grant matrix (§6.2.1): exact-grant-or-native over one stereo server.
+// The grant matrix (§6.2.1): independent per-dimension grants, over one stereo server.
 // ---------------------------------------------------------------------------
 
 TEST(FormatNegotiation, GrantMatrixOnAStereoServer) {
@@ -171,13 +171,15 @@ TEST(FormatNegotiation, GrantMatrixOnAStereoServer) {
         {"granted-12k-downmix", RxFormatRequest{12000, 1}, 15, 12000, 1, 1},
         {"granted-24k-native-layout", RxFormatRequest{24000, 0}, 15, 24000, 2, 0},
         {"granted-8k-left", RxFormatRequest{8000, 2}, 15, 8000, 1, 2},
-        // Declines: answered native, never rejected, never partially granted.
-        {"declined-non-divisor", RxFormatRequest{9000, 1}, 15, 48000, 2, 0},
+        // Declines are per DIMENSION since 1.3, never a connection rejection.
         {"declined-unsupported-divisor", RxFormatRequest{9600, 0}, 15, 48000, 2, 0},
-        {"declined-unknown-layout", RxFormatRequest{0, 7}, 15, 48000, 2, 0},
-        // A decline is TOTAL: the servable rate must not be granted beside the
-        // unservable layout (exact-grant-or-native, no substitution).
-        {"declined-mixed-good-rate-bad-layout", RxFormatRequest{12000, 7}, 15, 48000, 2, 0},
+        {"declined-both", RxFormatRequest{9000, 7}, 15, 48000, 2, 0},
+        // PARTIAL GRANTS — the whole point of 1.3. Each dimension is answered on its own
+        // merits, so an unservable one must leave the other STANDING. Under 1.2 every one of
+        // these read 48000/2/0, and the first is the shape that broke a real client.
+        {"partial-rate-kept-layout-declined", RxFormatRequest{12000, 7}, 15, 12000, 2, 0},
+        {"partial-layout-kept-rate-declined", RxFormatRequest{9000, 1}, 15, 48000, 1, 1},
+        {"partial-layout-kept-rate-unsupported", RxFormatRequest{9600, 2}, 15, 48000, 1, 2},
     };
 
     for (const Case& c : cases) {
@@ -201,24 +203,44 @@ TEST(FormatNegotiation, GrantMatrixOnAStereoServer) {
     server.stop();
 }
 
-TEST(FormatNegotiation, StereoLayoutsDeclineOnAMonoServer) {
+// THE REGRESSION ARM FOR THE 1.2 TRAP, in the exact configuration that produced it.
+//
+// A mono-native server is the obvious way to halve bandwidth at the source, and it is the one
+// configuration where layouts 1-3 cannot be served. Under 1.2's single conjunction that made
+// the sensible server break the client hardest: WSJT-X asks for (12000, MONO_DOWNMIX), the
+// unservable LAYOUT discarded the perfectly servable RATE, and the client was answered native
+// 48 kHz and refused to start. Measured against a shipped na_audio_source before the fix:
+// (12000, MONO_DOWNMIX) -> 48000 at 1920 B/callback; (12000, NATIVE) -> 12000 at 480.
+//
+// Note what the client asked for is not even unreasonable here — on a mono native the downmix
+// is a no-op, so it wanted a stream the server could always have produced.
+TEST(FormatNegotiation, AMonoNativeGrantsTheRateAndDeclinesOnlyTheLayout) {
     AudioStreamConfig scfg{};
-    scfg.channels = 1;  // mono native: layouts 1-3 are undefined reductions
+    scfg.channels = 1;  // mono native: layouts 1-3 have nothing to reduce
     AudioStreamServer server{0, scfg};
     server.setInjectOnlyMode(true);
     std::string err;
     ASSERT_TRUE(server.start(&err)) << err;
 
-    TcpClientTransport client;
-    auto cc = client.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
-    ASSERT_TRUE(cc) << err;
-    auto reply = handshake(*cc, "mono-downmix-ask", RxFormatRequest{12000, 1});
-    ASSERT_TRUE(reply.has_value());
-    EXPECT_EQ(15u, reply->configDataBytes);
-    EXPECT_EQ(48000, reply->config.sampleRate) << "decline must be total (no rate substitution)";
-    EXPECT_EQ(1, reply->config.channels);
-    ASSERT_TRUE(reply->grantedLayout.has_value());
-    EXPECT_EQ(0, *reply->grantedLayout);
+    // Every layout a client might pair with the rate, including one this revision does not
+    // know: the rate must survive all of them.
+    for (std::uint8_t layout : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3},
+                                std::uint8_t{7}}) {
+        SCOPED_TRACE(static_cast<int>(layout));
+        TcpClientTransport client;
+        auto cc =
+            client.connect("127.0.0.1", static_cast<std::uint16_t>(server.port()), 2000, &err);
+        ASSERT_TRUE(cc) << err;
+        auto reply = handshake(*cc, "mono-ask", RxFormatRequest{12000, layout});
+        ASSERT_TRUE(reply.has_value());
+        EXPECT_EQ(15u, reply->configDataBytes);
+        EXPECT_EQ(12000, reply->config.sampleRate)
+            << "the servable RATE must survive an unservable layout (1.3 §6.2.1)";
+        EXPECT_EQ(1, reply->config.channels) << "already mono; the layout changes nothing";
+        ASSERT_TRUE(reply->grantedLayout.has_value());
+        EXPECT_EQ(0, *reply->grantedLayout) << "the layout itself is declined, and says so";
+        cc->close();
+    }
     server.stop();
 }
 

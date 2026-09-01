@@ -276,6 +276,29 @@ rec12("control-audioconfig-v12-declined-native", kind="control_v12", controlType
       bufferTargetMs=100, bufferMinMs=40, bufferMaxMs=300, grantedLayout=0,
       expectedPayloadHex=h(ctrl_audio_config_v12(48000, 16, 2, 20, 100, 40, 300, 0)))
 
+# --- Spec 1.3: PARTIAL grants (§6.2.1) ---------------------------------------------------
+# 1.3 answers the rate and the layout independently, so an AUDIO_CONFIG may now state a
+# granted value for one dimension and the native value for the other. No new field and no new
+# length -- these are the same 15 bytes as above in a combination 1.2 could never produce,
+# which is exactly why they are pinned: they are what a 1.2 client must tolerate from a 1.3
+# server, and 1.2's own text does not name them.
+
+# Rate granted, layout declined. THE case that motivated 1.3: a mono-native server (channels=1)
+# cannot serve layouts 1-3, and under 1.2 that discarded the servable 12 kHz rate as well.
+rec12("control-audioconfig-v13-partial-rate-granted-layout-declined", kind="control_v12",
+      controlType=0x04,
+      sampleRate=12000, bitsPerSample=16, channels=1, frameDurationMs=20,
+      bufferTargetMs=100, bufferMinMs=40, bufferMaxMs=300, grantedLayout=0,
+      expectedPayloadHex=h(ctrl_audio_config_v12(12000, 16, 1, 20, 100, 40, 300, 0)))
+
+# Layout granted, rate declined -- the same independence in the other direction (e.g. a
+# non-divisor rate asked beside a servable MONO_DOWNMIX on a stereo native).
+rec12("control-audioconfig-v13-partial-layout-granted-rate-declined", kind="control_v12",
+      controlType=0x04,
+      sampleRate=48000, bitsPerSample=16, channels=1, frameDurationMs=20,
+      bufferTargetMs=100, bufferMinMs=40, bufferMaxMs=300, grantedLayout=1,
+      expectedPayloadHex=h(ctrl_audio_config_v12(48000, 16, 1, 20, 100, 40, 300, 1)))
+
 # v1 view of the full 1.2 request: buffer prefs + ClientInfo extracted, the 5-byte tail ignored.
 rec12("control-decode-v1-view-of-v12-request", kind="control_decode_v1", controlType=0x01,
       payloadHex=h(_cr12_full),

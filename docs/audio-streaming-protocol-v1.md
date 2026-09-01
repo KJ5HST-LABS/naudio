@@ -1,8 +1,8 @@
 # net-audio Audio Streaming Protocol — Specification v1
 
 **Status:** Stable / frozen wire contract (`0xAF01`, version byte = 1).
-**Spec version:** 1.2 (2026-08-22) — per-subscription RX format negotiation, adopted from §13.1 in reduced scope (rate + channel layout only; RX only): appended `CONNECT_REQUEST` fields, an extended `AUDIO_CONFIG` form, and the grant rules — all via the §11 minor-extension path, so the frame layout, type numbering, CRC semantics, and every existing golden vector still hold. See §6.2.1. The 1.2 vectors in `conformance/vectors/vectors-v1_2.ini` are loaded by the conformance suite (`Conformance.GoldenVectorsV12`) alongside the reference implementation.
-**Spec version history:** 1.1 (2026-08-15) — §8.4 only: `CONNECT_REQUEST` became a critical (ARQ'd) control type.
+**Spec version:** 1.3 (2026-08-31) — §6.2.1 only, and **no wire change whatsoever**: the rate and the channel layout of a format request are now granted **independently** of one another, where 1.2 granted the request exactly or not at all. The 15-byte `AUDIO_CONFIG` already carried the granted rate and the granted layout in separate fields, so a partial grant was always *expressible* — 1.2 simply never produced one, and an unservable layout therefore discarded a servable rate. Every byte layout, type number, CRC semantic and golden vector is untouched. See §6.2.1.
+**Spec version history:** 1.2 (2026-08-22) — per-subscription RX format negotiation, adopted from §13.1 in reduced scope (rate + channel layout only; RX only): appended `CONNECT_REQUEST` fields, an extended `AUDIO_CONFIG` form, and the grant rules — all via the §11 minor-extension path. The 1.2 vectors in `conformance/vectors/vectors-v1_2.ini` are loaded by the conformance suite (`Conformance.GoldenVectorsV12`) alongside the reference implementation. · 1.1 (2026-08-15) — §8.4 only: `CONNECT_REQUEST` became a critical (ARQ'd) control type.
 **Scope:** The *audio* half of a radio-streaming toolkit.
 **Provenance:** This document is the normative, field-by-field definition of the `0xAF01` audio wire. Every normative value here is implemented and pinned by the language-neutral golden-vector conformance suite (see §12), so the wire is byte-deterministic and independently checkable. Where the toolkit *plan* describes capabilities that are **not** in the v1 wire, they are isolated in §13 (Proposed extensions) and are explicitly **non-normative**.
 
@@ -268,7 +268,7 @@ bufferMaxMs      u16
 
 A backward-compatible **8-byte legacy form** omits the three trailing buffer shorts (sampleRate, bits, channels, frameDurationMs only); decoders MUST accept both lengths.
 
-### 6.2.1 Per-subscription RX format request (since spec 1.2)
+### 6.2.1 Per-subscription RX format request (since spec 1.2; independent grants since 1.3)
 
 A client MAY append a **format request** to its `CONNECT_REQUEST`, asking for a lower sample
 rate and/or a reduced channel layout for the audio the server sends *to it*. Scope is
@@ -308,29 +308,57 @@ existing `sampleRate` / `channels` / `frameDurationMs` fields carry the **grante
 `AUDIO_CONFIG` remains the sole authority for what that connection's `AUDIO_RX` payloads carry,
 extended form or not, and the client-side merge rule of §6.3 is unchanged.
 
-**Grant rules (normative).** The server either grants the request **exactly** or answers with
-its **native** format — never a partial or substituted grant:
+**Grant rules (normative).** The request carries two independent dimensions, and **since 1.3
+the server answers each on its own merits**: it grants the rate if it can serve the rate, grants
+the layout if it can serve the layout, and declines either **alone** by answering native for
+*that dimension only*. It never substitutes a value the client did not ask for.
 
 - It MUST NOT grant a `requestedRate` unless `requestedRate` is a positive integer divisor of
   the native rate **and** `requestedRate × frameDurationMs` is divisible by 1000 (the granted
-  `samplesPerFrame` stays integral).
+  `samplesPerFrame` stays integral). A `requestedRate` of 0 asks for nothing and is therefore
+  never declined.
 - It MUST NOT grant layouts 1–3 unless the native channel count is 2. (`MONO_DOWNMIX`, at
-  native mono, is declined like the rest — answered native.)
-- It MAY decline any request for any reason by answering native. It MUST NOT reject the
-  connection merely because a format request is unservable (`CONNECT_REJECT
+  native mono, is declined like the rest.) A layout byte this revision does not define is
+  likewise declined. **Declining the layout MUST NOT withdraw a granted rate.**
+- Where the native `bitsPerSample` is not 16, the server MUST decline **both** dimensions: the
+  reduction units are int16-only, and either dimension would have to convert.
+- It MAY decline either dimension for any reason by answering native for it. It MUST NOT reject
+  the connection merely because a format request is unservable (`CONNECT_REJECT
   FORMAT_NOT_SUPPORTED` remains for configurations that are incompatible outright, as in v1).
 - A granted connection's `AUDIO_RX` frames are produced from that subscription's own converted
   payload stream: its sequence numbers, FEC parity (§5.2), and frame sizes are computed over
   **what that connection is sent**, exactly as the per-connection framing of §2.4 already
   implies. The native broadcast path (§6.4) is unaffected for every non-requesting client.
 
+> **Why 1.3 changed this.** Under 1.2's all-or-nothing rule a client that asked for a rate *and*
+> a layout, and could only be given the rate, received **neither**. That made an optimisation
+> request unsafe to send speculatively — asking for more could return less — and it bit hardest
+> in the most sensible configuration: against a **mono-native** server, the obvious way to halve
+> bandwidth at the source, layouts 1–3 are unservable, so `(12000, MONO_DOWNMIX)` was answered
+> native 48 kHz. A real client (WSJT-X) was measured refusing to start on exactly that, while
+> `(12000, NATIVE)` against the same server was granted. Independent grants remove the coupling
+> without moving a single byte on the wire.
+
 **Detection semantics (client side).** The reply's *form* says who answered; its *fields* say
 what was granted:
 
 - 14-byte (or 8-byte legacy) `AUDIO_CONFIG` → the server predates 1.2 (or the request was not
   parsed); the format fields carry the native format. The client proceeds exactly as v1.
-- 15-byte form → the server understood the request. `grantedLayout` + the format fields either
-  equal the request (granted) or state the native format with `grantedLayout = 0` (declined).
+- 15-byte form → the server understood the request. Read the **fields**, not the form, for what
+  was granted; since 1.3 there are three outcomes, and a client MUST cope with all of them:
+  fully granted (both dimensions equal the request), **partially granted** (one dimension equals
+  the request, the other states native), or fully declined (native rate with
+  `grantedLayout = 0`). A client detects a declined *layout* as `grantedLayout = 0` after
+  requesting a non-zero one, and a declined *rate* as `sampleRate` equal to the native rate
+  after requesting a lower one.
+
+**`AUDIO_CONFIG` is the sole authority (normative, restating §6.2).** Whatever the grant outcome,
+the connection's `AUDIO_RX` payloads carry exactly the `sampleRate` / `channels` /
+`bitsPerSample` this message states. A client MUST size and interpret its buffers from those
+fields and MUST NOT infer the stream format from `grantedLayout`, from what it requested, or from
+the server's native format. This was already the rule in 1.2; 1.3 is the revision where ignoring
+it becomes observable, because a partial grant is the first reply whose format fields match
+neither the request nor the native format.
 
 **Decoder tolerance (normative, restating §11 for these two messages).** A `CONNECT_REQUEST`
 decoder MUST ignore trailing bytes it does not recognize; a trailing run of **fewer than 5
@@ -349,7 +377,10 @@ requirement, which is what lets these fields append compatibly.)
 | 1.2, no request | any | unchanged | Byte-identical to v1. |
 | 1.2, request | v1 | appended request bytes ignored by the server | 14-byte `AUDIO_CONFIG`, native format; client detects "not understood" and proceeds native. |
 | v1 | 1.2 | no request → v1 form reply | Byte-identical to v1. |
-| 1.2, request | 1.2 | appended fields both ways | Grant-or-native per the rules above; 15-byte `AUDIO_CONFIG` either way. |
+| 1.2, request | 1.2 | appended fields both ways | All-or-nothing grant; 15-byte `AUDIO_CONFIG` either way. |
+| 1.2, request | **1.3** | unchanged bytes | May receive a **partial** grant, which 1.2's own text does not name. Harmless: `AUDIO_CONFIG` is the sole authority (above) and states the stream truthfully, so a conformant 1.2 client sizes its buffers correctly and decodes correctly. The only client that can be surprised is one that inferred the format from `grantedLayout` rather than from the fields — which 1.2 already forbade. |
+| 1.3, request | 1.2 | unchanged bytes | All-or-nothing, as 1.2 has always answered. A 1.3 client sees a full grant or a full decline and needs no special case: the three outcomes it already handles simply never include the partial one. |
+| 1.3, request | 1.3 | unchanged bytes | Independent per-dimension grants per the rules above. |
 
 ### 6.3 Connect sequence
 

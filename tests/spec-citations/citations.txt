@@ -32,13 +32,13 @@
 # that catches drift.
 #
 # citing file                          | spec | anchor
-include/naudio/net/AudioMixer.hpp      | 409     | sent once per denial episode
-src/net/AudioMixer.cpp                 | 409     | sent once per denial episode
-src/net/AudioMixer.cpp                 | 412     | locally reconstructed frames
-src/net/AudioStreamServer.cpp          | 375-376 | heartbeat interval
-src/net/AudioStreamServer.cpp          | 673-674 | interval / timeout
-tests/net/test_mixer.cpp               | 407     | Preemption is strict-greater
-tests/net/test_mixer.cpp               | 409     | sent once per denial episode
-tests/net/test_mixer.cpp               | 412     | locally reconstructed frames
-tests/net/test_server.cpp              | 409     | sent once per denial episode
-tests/net/test_server.cpp              | 430     | session priority is fixed at
+include/naudio/net/AudioMixer.hpp      | 440     | sent once per denial episode
+src/net/AudioMixer.cpp                 | 440     | sent once per denial episode
+src/net/AudioMixer.cpp                 | 443     | locally reconstructed frames
+src/net/AudioStreamServer.cpp          | 406-407 | heartbeat interval
+src/net/AudioStreamServer.cpp          | 704-705 | interval / timeout
+tests/net/test_mixer.cpp               | 438     | Preemption is strict-greater
+tests/net/test_mixer.cpp               | 440     | sent once per denial episode
+tests/net/test_mixer.cpp               | 443     | locally reconstructed frames
+tests/net/test_server.cpp              | 440     | sent once per denial episode
+tests/net/test_server.cpp              | 461     | session priority is fixed at

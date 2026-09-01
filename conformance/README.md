@@ -78,9 +78,13 @@ A `ControlMessage` payload (the bytes inside a `CONTROL` frame).
   `sequence`; CONNECT_REJECT → `rejectReason/message`.
 
 ### `kind = control_v12` (in `vectors-v1_2.ini`, loaded by `Conformance.GoldenVectorsV12`)
-Spec-1.2 (§6.2.1) encode vectors: the `control` schema plus `requestedRate`/`requestedLayout`
+Spec-1.2 (§6.2.1) and spec-1.3 encode vectors: the `control` schema plus `requestedRate`/`requestedLayout`
 (the 5-byte CONNECT_REQUEST tail) or `grantedLayout` (the 15-byte AUDIO_CONFIG). Loaded since
-issue #91 B3 under the same fail-closed, 0-skipped gate as `vectors.ini`.
+issue #91 B3 under the same fail-closed, 0-skipped gate as `vectors.ini`. **Spec 1.3 adds two
+PARTIAL-grant AUDIO_CONFIG vectors** — a granted rate beside a declined layout, and the
+reverse. They introduce no new field and no new length; they pin field *combinations* that
+1.2's all-or-nothing rule could never produce, and that a 1.2 client must tolerate from a
+1.3 server.
 
 ### `kind = control_decode_v1` (in `vectors-v1_2.ini`, loaded by `Conformance.GoldenVectorsV12`)
 Tolerance vectors: `payloadHex` is fed to a **v1** decoder, and the `expected*` fields are the
