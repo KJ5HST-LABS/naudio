@@ -252,6 +252,17 @@ public:
     // same footing and for the same reason.
     bool setSendTimeout(int ms);
 
+    // Permits sending to a broadcast address (SO_BROADCAST). Off by default in every
+    // OS, and its absence is not a tuning gap — it is why no naudio client could probe
+    // for servers before spec 1.4: sendTo() to 255.255.255.255 or a subnet broadcast
+    // fails with EACCES until this is set, and `grep -rn SO_BROADCAST src/ include/`
+    // returned nothing across the whole tree (issue #100).
+    //
+    // Only ever needed for the DISCOVER probe (§6.8). A streaming socket has a unicast
+    // peer and must NOT set it: the flag turns a typo'd destination into a segment-wide
+    // transmission instead of an error.
+    bool setBroadcast(bool enable);
+
     // Raises SO_SNDBUF / SO_RCVBUF to at least `bytes` (never lowers an already-larger
     // buffer). Returns false if the resulting buffer is still smaller than `bytes`.
     //

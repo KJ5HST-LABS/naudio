@@ -1033,3 +1033,58 @@ TEST(Socket, AcceptsOnAListenerWhoseDescriptorIsAboveFdSetsize) {
     EXPECT_EQ(got, sent);
 }
 #endif
+
+// --- SO_BROADCAST (spec 1.4, §6.8) ------------------------------------------
+
+// The flag whose absence is why no naudio client could probe for servers:
+// `grep -rn SO_BROADCAST src/ include/` returned nothing across the whole tree
+// (issue #100), and DiscoveryOptions defaults to the limited broadcast address.
+//
+// MEASURED, not assumed (macOS, 2026-09-01, with a unicast control in the same
+// program):
+//
+//     127.255.255.255  no flag -> SENT        <- loopback bcast needs NO flag
+//     127.255.255.255  flag    -> SENT
+//     255.255.255.255  no flag -> EACCES(13)  <- the only destination that
+//     255.255.255.255  flag    -> SENT           actually observes the option
+//     127.0.0.1        no flag -> SENT        <- control: the harness works
+//
+// The first two rows are why this arm cannot use loopback and stay meaningful:
+// an earlier draft targeted 127.255.255.255, and the "without" send SUCCEEDED,
+// which would have made the option look load-bearing when nothing was testing it.
+//
+// The cost is two 1-byte datagrams to port 4533 on the local segment per run.
+// A limited broadcast is not forwarded by routers, so it goes no further than a
+// single discovery probe does — which is the very thing this option exists for.
+TEST(SocketTest, SoBroadcastIsWhatPermitsALimitedBroadcastSend) {
+    const std::uint8_t byte = 0x2A;
+
+    Socket without = Socket::bindUdp("", 0, false, nullptr);
+    ASSERT_TRUE(without.valid());
+    const bool sentWithout = without.sendTo(&byte, 1, "255.255.255.255", 4533);
+
+    Socket with = Socket::bindUdp("", 0, false, nullptr);
+    ASSERT_TRUE(with.valid());
+    ASSERT_TRUE(with.setBroadcast(true)) << "setsockopt(SO_BROADCAST) failed outright";
+    const bool sentWith = with.sendTo(&byte, 1, "255.255.255.255", 4533);
+
+    if (!sentWith) {
+        // No broadcast route at all — a CI container with only loopback. The
+        // asymmetry is unobservable here, so say so: this project configures
+        // SKIP_REGULAR_EXPRESSION precisely so a skip reports ***Skipped instead
+        // of looking exactly like an arm that ran and proved something (b5f98db).
+        GTEST_SKIP() << "no broadcast route on this host: a limited-broadcast send failed "
+                        "even WITH SO_BROADCAST, so this arm proves nothing here";
+    }
+    EXPECT_FALSE(sentWithout)
+        << "a limited-broadcast send succeeded WITHOUT SO_BROADCAST — then the flag is not "
+           "what was stopping a naudio client from probing, and Socket.hpp says otherwise";
+    EXPECT_TRUE(with.setBroadcast(false)) << "the flag must be clearable, not one-way";
+}
+
+// A closed socket reports failure rather than pretending the option took effect.
+TEST(SocketTest, BroadcastOnAnInvalidSocketFails) {
+    Socket s;
+    ASSERT_FALSE(s.valid());
+    EXPECT_FALSE(s.setBroadcast(true));
+}

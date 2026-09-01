@@ -708,6 +708,19 @@ int resizeSocketBuffer(socket_t h, int optname, int bytes) {
 // descriptor silently reconfigures whatever socket now owns that number — a buffer size or a
 // timeout applied to an unrelated connection, with no error anywhere. That is a quieter failure
 // than a stray recv, not a smaller one.
+bool Socket::setBroadcast(bool enable) {
+    IoScope io(*this);
+    if (!io.entered()) return false;
+    const socket_t h = io.handle();
+    const int on = enable ? 1 : 0;
+#ifdef _WIN32
+    return ::setsockopt(h, SOL_SOCKET, SO_BROADCAST,
+                        reinterpret_cast<const char*>(&on), sizeof(on)) == 0;
+#else
+    return ::setsockopt(h, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on)) == 0;
+#endif
+}
+
 bool Socket::setSendBufferAtLeast(int bytes) {
     IoScope io(*this);
     return io.entered() && raiseSocketBuffer(io.handle(), SO_SNDBUF, bytes);
