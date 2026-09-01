@@ -259,9 +259,16 @@ class ServerTransport {
 public:
     virtual ~ServerTransport() = default;
 
-    // Installs the source of DISCOVER_REPLY facts (§6.8). Call BEFORE bind():
-    // bind() starts the demux thread, and a provider installed after it races
-    // with the first probe.
+    // Installs the source of DISCOVER_REPLY facts (§6.8). Safe to call at ANY
+    // time, including while the transport is serving.
+    //
+    // It did once say "call before bind()", on the theory that a write before the
+    // demux thread starts needs no synchronisation. That contract is unusable and
+    // was already being violated by this project's own tests: the facts include
+    // the bound PORT, so a caller that asked for port 0 cannot build them until
+    // AFTER bind() has returned. CI's ubuntu TSan job found the resulting race in
+    // std::function's guts (a swap on the main thread against a read on the demux
+    // thread). Implementations must therefore synchronise this against their read.
     //
     // Defaulted to a no-op, and deliberately NOT pure virtual like the counters
     // below. Their rule is that a silent 0 is indistinguishable from a real

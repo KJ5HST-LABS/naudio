@@ -59,8 +59,11 @@ public:
 
     // Spec 1.4 §6.8. Unset (the default) means DISCOVER is not answered at all,
     // which is what keeps every transport built without a server -- the tests'
-    // bare transports included -- silent. Call before bind().
+    // bare transports included -- silent. Callable at any time, including while
+    // serving; see the base-class comment for why "before bind()" was not a
+    // workable contract.
     void setDiscoveryFacts(DiscoveryFactsProvider provider) override {
+        std::lock_guard<std::mutex> lock(discoveryMutex_);
         discoveryFacts_ = std::move(provider);
     }
 
@@ -135,9 +138,12 @@ private:
 
     std::thread demuxThread_;
 
-    // Written once before bind() starts demuxThread_, then only read -- so it needs
-    // no lock, and setDiscoveryFacts documents the before-bind() requirement that
-    // makes that true.
+    // Guarded by discoveryMutex_, NOT by stateMutex_: the demux thread copies the
+    // provider out from under it and then calls the copy with no lock held, so a
+    // provider that reaches back into the server (ours takes sessionsMutex_) cannot
+    // deadlock against the routing lock. A dedicated leaf mutex also keeps the
+    // ordering trivial -- nothing takes discoveryMutex_ while holding anything else.
+    mutable std::mutex discoveryMutex_;
     DiscoveryFactsProvider discoveryFacts_;
     // addressKey -> last reply time (ms). Touched ONLY by the demux thread, which
     // is why it is not under stateMutex_; bounded by MAX_DISCOVERY_SOURCES.

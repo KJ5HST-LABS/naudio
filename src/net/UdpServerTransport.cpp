@@ -76,7 +76,18 @@ bool UdpServerTransport::allowDiscoveryReplyForSource(const std::string& addrKey
 
 void UdpServerTransport::sendDiscoveryReply(std::uint32_t token, const std::string& host,
                                             std::uint16_t port, const std::string& addrKey) {
-    const DiscoveryFacts facts = discoveryFacts_();
+    // COPY the provider out under the lock, then release it before calling. Holding a
+    // lock across a caller-supplied callback is a deadlock waiting for the first
+    // provider that reaches back into this transport; copying costs one allocation on
+    // a path the limiter already bounds.
+    DiscoveryFactsProvider provider;
+    {
+        std::lock_guard<std::mutex> lock(discoveryMutex_);
+        provider = discoveryFacts_;
+    }
+    if (!provider) return;  // no responder installed: stay silent
+
+    const DiscoveryFacts facts = provider();
     // Checked BEFORE the limiter, so a server that answers nothing also does no
     // table work -- otherwise opting out would still leave a flood a place to write.
     if (!facts.enabled) return;
@@ -153,11 +164,13 @@ void UdpServerTransport::demuxLoop() {
         // sender is known, and it is never delivered to a connection. discoverTokenOf
         // checks the PACKET type first, so an audio datagram does not pay for a
         // control parse here.
-        if (discoveryFacts_) {
-            if (std::optional<std::uint32_t> token = discoverTokenOf(packet)) {
-                sendDiscoveryReply(*token, rr.senderHost, rr.senderPort, key);
-                continue;
-            }
+        //
+        // Note this `continue`s whether or not a responder is installed: a DISCOVER is
+        // never routed to a connection either way (§6.8), and reading discoveryFacts_
+        // to decide would put a locked read on the path of every datagram.
+        if (std::optional<std::uint32_t> token = discoverTokenOf(packet)) {
+            sendDiscoveryReply(*token, rr.senderHost, rr.senderPort, key);
+            continue;
         }
 
         std::shared_ptr<UdpClientConnection> conn;
