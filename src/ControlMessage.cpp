@@ -38,6 +38,8 @@ std::optional<ControlType> controlTypeFromValue(std::uint8_t value) {
         case 0x43: return ControlType::TxReleased;
         case 0x44: return ControlType::ClientsUpdate;
         case 0x50: return ControlType::Nack;
+        case 0x60: return ControlType::Discover;
+        case 0x61: return ControlType::DiscoverReply;
         case 0x51: return ControlType::ControlAck;
         case 0xFE: return ControlType::Error;
         case 0xFF: return ControlType::Disconnect;
@@ -65,6 +67,8 @@ const char* controlTypeName(ControlType type) {
         case ControlType::TxPreempted: return "TX_PREEMPTED";
         case ControlType::TxReleased: return "TX_RELEASED";
         case ControlType::ClientsUpdate: return "CLIENTS_UPDATE";
+        case ControlType::Discover: return "DISCOVER";
+        case ControlType::DiscoverReply: return "DISCOVER_REPLY";
         case ControlType::Nack: return "NACK";
         case ControlType::ControlAck: return "CONTROL_ACK";
         case ControlType::Error: return "ERROR";
@@ -429,6 +433,71 @@ std::optional<std::string> ControlMessage::parseErrorMessage() const {
         return std::string(data_.begin(), data_.end());
     }
     return std::nullopt;
+}
+
+// --- Discovery (spec 1.4, §6.8) ---
+
+ControlMessage ControlMessage::discover(std::uint32_t token) {
+    ByteWriter w(4);
+    w.putU32(token);
+    return ControlMessage(ControlType::Discover, w.take());
+}
+
+std::optional<std::uint32_t> ControlMessage::parseDiscoverToken() const {
+    if (type_ != ControlType::Discover || data_.size() < 4) return std::nullopt;
+    ByteReader r(data_);
+    return static_cast<std::uint32_t>(r.getI32());
+}
+
+ControlMessage ControlMessage::discoverReply(std::uint32_t token, std::uint16_t port,
+                                             std::uint8_t transports, std::uint32_t sampleRate,
+                                             std::uint8_t bitsPerSample, std::uint8_t channels,
+                                             std::uint8_t clientCount, std::uint8_t maxClients,
+                                             const std::string& serverName) {
+    // Clamp the name to fit its u8 length prefix. strBytes() does NOT clamp, and a
+    // 256-byte name would wrap the prefix to 0 and mis-frame the reply — the same
+    // overflow the W1 fix closed for CLIENTS_UPDATE's clientInfo. Clamped by BYTES,
+    // matching serializeClientInfo and gen_vectors.py, so every implementation
+    // reproduces the same wire bytes for an over-long name.
+    auto nameBytes = strBytes(serverName);
+    if (nameBytes.size() > 255) nameBytes.resize(255);
+
+    ByteWriter w(16 + nameBytes.size());
+    w.putU32(token);
+    w.putU16(port);
+    w.putU8(transports);
+    w.putU32(sampleRate);
+    w.putU8(bitsPerSample);
+    w.putU8(channels);
+    w.putU8(clientCount);
+    w.putU8(maxClients);
+    w.putU8(static_cast<std::uint8_t>(nameBytes.size()));
+    w.putBytes(nameBytes);
+    return ControlMessage(ControlType::DiscoverReply, w.take());
+}
+
+std::optional<DiscoveryInfo> ControlMessage::parseDiscoverReply() const {
+    // 16 = the fixed part through nameLen; the name itself may be empty.
+    if (type_ != ControlType::DiscoverReply || data_.size() < 16) return std::nullopt;
+    ByteReader r(data_);
+    DiscoveryInfo info;
+    info.token = static_cast<std::uint32_t>(r.getI32());
+    info.port = r.getU16();
+    info.transports = r.getU8();
+    info.sampleRate = static_cast<std::uint32_t>(r.getI32());
+    info.bitsPerSample = r.getU8();
+    info.channels = r.getU8();
+    info.clientCount = r.getU8();
+    info.maxClients = r.getU8();
+    const std::size_t nameLen = r.getU8();
+    // A declared name the payload does not carry is malformed, not tolerable: unlike
+    // a trailing extension (§11), the length prefix promises bytes that are absent.
+    if (nameLen > r.remaining()) return std::nullopt;
+    if (nameLen > 0) info.name = r.readString(nameLen);
+    if (r.truncated()) return std::nullopt;
+    // info.host is left empty deliberately — the server's address is not a wire
+    // field (§6.8); the prober fills it from the reply datagram's source address.
+    return info;
 }
 
 // --- NACK / control ACK ---

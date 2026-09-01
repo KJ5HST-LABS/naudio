@@ -37,6 +37,8 @@ enum class ControlType : std::uint8_t {
     TxPreempted = 0x42,      // Client preempted by a higher priority client.
     TxReleased = 0x43,       // TX channel released.
     ClientsUpdate = 0x44,    // Client list update (broadcast).
+    Discover = 0x60,         // Client probe for servers on the segment (spec 1.4, §6.8).
+    DiscoverReply = 0x61,    // Server's unicast answer to a DISCOVER (spec 1.4, §6.8).
     Nack = 0x50,             // Request retransmission of a missing control packet.
     ControlAck = 0x51,       // Acknowledge a critical control packet.
     Error = 0xFE,            // Error notification.
@@ -79,6 +81,36 @@ enum class RxLayout : std::uint8_t {
 struct RxFormatRequest {
     std::uint32_t sampleRate = 0;  // 0 = no rate preference (keep native).
     std::uint8_t layout = 0;       // RxLayout wire byte.
+};
+
+// Transport bits carried in a DISCOVER_REPLY (§6.8). A DUAL server sets both.
+enum class DiscoveryTransport : std::uint8_t {
+    Tcp = 0x01,
+    Udp = 0x02,
+};
+
+// Parsed data from a DISCOVER_REPLY (§6.8, since spec 1.4).
+//
+// Deliberately narrow: this message is answerable to an unauthenticated stranger
+// over a broadcast, so it carries what a chooser needs to pick a server and
+// nothing that would reward harvesting it. The spec forbids extending it with
+// client-identifying fields -- no roster, no callsigns, no clientInfo, no station
+// location, no TX-owner state, no statistics.
+struct DiscoveryInfo {
+    std::uint32_t token = 0;      // Echoed from the DISCOVER that caused this reply.
+    std::uint16_t port = 0;       // The port this server serves audio on.
+    std::uint8_t transports = 0;  // DiscoveryTransport bitmask (DUAL sets both).
+    std::uint32_t sampleRate = 0;
+    std::uint8_t bitsPerSample = 0;
+    std::uint8_t channels = 0;
+    std::uint8_t clientCount = 0;  // Saturates at 255 on the wire.
+    std::uint8_t maxClients = 0;   // Saturates at 255 on the wire.
+    std::string name;              // Operator-supplied label; MAY be empty.
+
+    // NOT a wire field. The spec omits the server's address deliberately (§6.8) --
+    // the only trustworthy value is the source address of the reply datagram, so
+    // the prober fills this in from the datagram, never from the payload.
+    std::string host;
 };
 
 // Client identification (callsign, name, location) so connected clients can see
@@ -180,6 +212,25 @@ public:
     static ControlMessage error(const std::string& errorMessage = "");
     std::optional<std::string> parseErrorMessage() const;
     static ControlMessage disconnect() { return ofType(ControlType::Disconnect); }
+
+    // --- Discovery (§6.8, since spec 1.4) ---
+    // The probe. `token` is opaque and echoed verbatim by every answering server;
+    // a prober MUST ignore a reply carrying a token it did not send.
+    static ControlMessage discover(std::uint32_t token);
+    // The probe's token, or nullopt if this is not a well-formed DISCOVER.
+    std::optional<std::uint32_t> parseDiscoverToken() const;
+    // The answer. Sent by UNICAST to the prober's source address, never broadcast,
+    // and it creates nothing: no connection, no client slot, no stream.
+    // `serverName` is clamped to 255 bytes to fit its u8 length prefix.
+    static ControlMessage discoverReply(std::uint32_t token, std::uint16_t port,
+                                        std::uint8_t transports, std::uint32_t sampleRate,
+                                        std::uint8_t bitsPerSample, std::uint8_t channels,
+                                        std::uint8_t clientCount, std::uint8_t maxClients,
+                                        const std::string& serverName);
+    // Parsed reply, or nullopt if the type is wrong or the message is malformed
+    // (short fixed part, or a nameLen the payload does not actually carry).
+    // `host` is left empty -- the caller fills it from the datagram's source address.
+    std::optional<DiscoveryInfo> parseDiscoverReply() const;
 
     // --- NACK / control ACK ---
     static ControlMessage nack(std::int32_t missingSeq);

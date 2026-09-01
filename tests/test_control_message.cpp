@@ -297,3 +297,111 @@ TEST(ControlMessage, V1AudioConfigCarriesNoGrantedLayout) {
     auto m = ControlMessage::audioConfig(AudioStreamConfig{});
     EXPECT_FALSE(m.parseAudioConfigGrantedLayout().has_value());
 }
+
+// --- Discovery (spec 1.4, §6.8) ---------------------------------------------
+//
+// The expected bytes below are derived BY HAND from §6.8's field table, not by
+// printing what the encoder produced. A round-trip alone would pass just as
+// happily against a wrong-but-self-consistent layout.
+
+TEST(ControlMessage, DiscoverVector) {
+    // 0x60 | token u32 BE. Nothing else -- a probe carries no identity.
+    auto m = ControlMessage::discover(0xDEADBEEFu);
+    EXPECT_EQ("60deadbeef", hex(m.serialize()));
+
+    auto d = ControlMessage::deserialize(m.serialize());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(ControlType::Discover, d->messageType());
+    auto token = d->parseDiscoverToken();
+    ASSERT_TRUE(token.has_value());
+    EXPECT_EQ(0xDEADBEEFu, *token);
+}
+
+TEST(ControlMessage, DiscoverReplyVector) {
+    // 0x61 | token deadbeef | port 4533=0x11b5 | transports 0x03 (TCP|UDP)
+    //      | rate 48000=0x0000bb80 | bits 0x10 | ch 0x02 | clients 0x01
+    //      | max 0x04 | nameLen 0x05 | "shack" = 736861636b
+    auto m = ControlMessage::discoverReply(0xDEADBEEFu, 4533, 0x03, 48000, 16, 2, 1, 4, "shack");
+    EXPECT_EQ("61deadbeef11b5030000bb801002010405736861636b", hex(m.serialize()));
+
+    auto d = ControlMessage::deserialize(m.serialize());
+    ASSERT_TRUE(d.has_value());
+    ASSERT_EQ(ControlType::DiscoverReply, d->messageType());
+    auto info = d->parseDiscoverReply();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(0xDEADBEEFu, info->token);
+    EXPECT_EQ(4533, info->port);
+    EXPECT_EQ(0x03, info->transports);
+    EXPECT_EQ(48000u, info->sampleRate);
+    EXPECT_EQ(16, info->bitsPerSample);
+    EXPECT_EQ(2, info->channels);
+    EXPECT_EQ(1, info->clientCount);
+    EXPECT_EQ(4, info->maxClients);
+    EXPECT_EQ("shack", info->name);
+    // The address is NOT a wire field (§6.8) -- the prober fills it from the
+    // datagram's source address, so the codec must leave it empty.
+    EXPECT_EQ("", info->host);
+}
+
+TEST(ControlMessage, DiscoverReplyEmptyNameIsTheMinimalValidForm) {
+    auto m = ControlMessage::discoverReply(0, 4533, 0x02, 48000, 16, 2, 0, 4, "");
+    // 1 type + 16 fixed, no name.
+    EXPECT_EQ(17u, m.serialize().size());
+    auto info = ControlMessage::deserialize(m.serialize())->parseDiscoverReply();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ("", info->name);
+    EXPECT_EQ(0, info->clientCount);
+}
+
+TEST(ControlMessage, DiscoverReplyNameCannotOverflowItsLengthPrefix) {
+    // strBytes() does not clamp. A 300-byte name written behind a u8 prefix would
+    // wrap to 300-256 = 44 and mis-frame the reply -- the CLIENTS_UPDATE W1 bug.
+    const std::string huge(300, 'x');
+    auto m = ControlMessage::discoverReply(1, 4533, 0x02, 48000, 16, 2, 0, 4, huge);
+    const auto bytes = m.serialize();
+    EXPECT_EQ(1u + 16u + 255u, bytes.size());
+    EXPECT_EQ(255, bytes[16]);  // the nameLen byte: last of the 16-byte fixed part
+    auto info = ControlMessage::deserialize(bytes)->parseDiscoverReply();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(255u, info->name.size());
+}
+
+TEST(ControlMessage, DiscoverReplyRejectsANameLengthThePayloadDoesNotCarry) {
+    // A declared name that is not there is malformed, not a tolerable trailing
+    // extension (§11): the prefix promises bytes that are absent.
+    auto good = ControlMessage::discoverReply(1, 4533, 0x02, 48000, 16, 2, 0, 4, "shack").serialize();
+    ASSERT_TRUE(ControlMessage::deserialize(good)->parseDiscoverReply().has_value())
+        << "control: the un-truncated reply must parse, or this test proves nothing";
+
+    std::vector<std::uint8_t> truncated(good.begin(), good.end() - 3);  // nameLen still says 5
+    auto d = ControlMessage::deserialize(truncated);
+    ASSERT_TRUE(d.has_value()) << "the CONTROL envelope itself is still well-formed";
+    EXPECT_FALSE(d->parseDiscoverReply().has_value());
+}
+
+TEST(ControlMessage, DiscoverReplyRejectsAShortFixedPart) {
+    auto good = ControlMessage::discoverReply(1, 4533, 0x02, 48000, 16, 2, 0, 4, "").serialize();
+    ASSERT_EQ(17u, good.size());
+    std::vector<std::uint8_t> shortened(good.begin(), good.end() - 1);  // 15 data bytes, need 16
+    EXPECT_FALSE(ControlMessage::deserialize(shortened)->parseDiscoverReply().has_value());
+}
+
+TEST(ControlMessage, DiscoveryParsersRejectTheWrongType) {
+    // Each parser is keyed to its own type -- a DISCOVER is not half a reply.
+    auto probe = ControlMessage::discover(7);
+    EXPECT_FALSE(probe.parseDiscoverReply().has_value());
+    auto reply = ControlMessage::discoverReply(7, 4533, 0x02, 48000, 16, 2, 0, 4, "");
+    EXPECT_FALSE(reply.parseDiscoverToken().has_value());
+    EXPECT_FALSE(ControlMessage::disconnect().parseDiscoverToken().has_value());
+    EXPECT_FALSE(ControlMessage::disconnect().parseDiscoverReply().has_value());
+}
+
+TEST(ControlMessage, DiscoveryTypeBytesResolve) {
+    // 0x60/0x61 must be known to the envelope decoder, or a DISCOVER from the wire
+    // is rejected at deserialize() and never reaches the demux gate.
+    auto probe = ControlMessage::deserialize(std::vector<std::uint8_t>{0x60, 0, 0, 0, 1});
+    ASSERT_TRUE(probe.has_value());
+    EXPECT_EQ(ControlType::Discover, probe->messageType());
+    EXPECT_STREQ("DISCOVER", naudio::controlTypeName(ControlType::Discover));
+    EXPECT_STREQ("DISCOVER_REPLY", naudio::controlTypeName(ControlType::DiscoverReply));
+}
