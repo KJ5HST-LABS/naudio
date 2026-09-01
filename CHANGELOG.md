@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.0.0rc6] — 2026-09-01
+
 ### Added
 - **Server discovery — wire spec 1.4, §6.8.** A client can now find naudio servers on
   its local segment without being told their addresses: `na_discover()` in C,
