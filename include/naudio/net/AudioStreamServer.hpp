@@ -25,6 +25,7 @@
 #include "naudio/net/AudioBroadcaster.hpp"
 #include "naudio/net/AudioMixer.hpp"
 #include "naudio/net/CallbackDispatcher.hpp"
+#include "naudio/net/Discovery.hpp"
 #include "naudio/net/Transport.hpp"
 
 namespace naudio::net {
@@ -239,6 +240,17 @@ public:
 private:
     class ClientSession;  // defined in the .cpp
     friend class ClientSession;
+
+    // Builds the facts published in a DISCOVER_REPLY, read LIVE at each probe.
+    // Shared by both responders: the transport answers probes aimed at the service
+    // port, the rendezvous listener answers those aimed at discoveryPort.
+    DiscoveryFactsProvider makeDiscoveryProvider(ServerTransport* transport);
+
+    // The §6.8 rendezvous listener. Owned HERE and not by the transport, because it
+    // is independent OF transport: a TCP-only server has no datagram path to an
+    // unknown sender and cannot answer through its own transport, and TCP is the
+    // default. Started best-effort in start(), stopped in stop().
+    DiscoveryResponder discoveryResponder_;
 
     std::shared_ptr<ServerTransport> createTransport();
     bool initializeSharedAudio(std::string* err);

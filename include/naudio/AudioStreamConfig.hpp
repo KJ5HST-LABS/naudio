@@ -108,6 +108,18 @@ struct AudioStreamConfig {
     // Set false (na_server_set_discoverable(server, 0)) to go silent.
     bool discoverable = true;
 
+    // The RENDEZVOUS port a server also listens on for DISCOVER probes, so a client
+    // that knows only this number can find a server serving audio on any other port.
+    //
+    // 4533 -- the same number as the default service port, because a client that
+    // knows nothing else knows this one. A server already serving UDP on 4533 simply
+    // fails to bind it a second time and answers through its transport instead, which
+    // is why the responder is started best-effort and its failure is not reported.
+    //
+    // Set 0 to run no rendezvous listener at all (the server is then findable only by
+    // a probe aimed at its own service port). `discoverable = false` disables both.
+    std::int32_t discoveryPort = 4533;
+
     // Operator label carried in DISCOVER_REPLY, e.g. "shack" or "K1ABC 40m".
     // Empty is fine and is the default -- a prober then has the address it heard
     // the reply from, which is the actual discovery result. Clamped to 255 bytes

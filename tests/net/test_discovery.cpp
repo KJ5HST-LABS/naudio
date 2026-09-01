@@ -182,11 +182,13 @@ TEST(Discovery, ADualServerReportsBothTransports) {
     server.stop();
 }
 
-// A TCP-only server is undiscoverable — §6.8 item 6. Stated as a test so the
-// limitation is a measured fact rather than a sentence in the spec.
-TEST(Discovery, ATcpOnlyServerIsUndiscoverable) {
+// A TCP server does not answer on its OWN port — it has no datagram path to an
+// unknown sender. That is still true and is why the rendezvous listener exists;
+// the arm below proves the same server IS findable through it.
+TEST(Discovery, ATcpServerDoesNotAnswerOnItsOwnPort) {
     AudioStreamConfig cfg;  // defaults to TCP
     cfg.maxClients = 2;
+    cfg.discoveryPort = 0;  // rendezvous off, so this arm tests exactly one thing
     AudioStreamServer server(0, cfg);
     std::string err;
     ASSERT_TRUE(server.start(&err)) << err;
@@ -194,7 +196,7 @@ TEST(Discovery, ATcpOnlyServerIsUndiscoverable) {
 
     Socket prober = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
     EXPECT_FALSE(probe(prober, port, 1, 500).has_value())
-        << "a TCP server answered a UDP datagram, which it has no path to do";
+        << "a TCP server answered a UDP datagram on its own port, which it cannot do";
     server.stop();
 }
 
@@ -505,4 +507,139 @@ TEST(Discovery, TheRendezvousListenerReleasesItsPortOnStop) {
     EXPECT_TRUE(again.start("127.0.0.1", held, [] { return factsReporting(1, 0x02, "y"); }, &err))
         << err;
     again.stop();
+}
+
+// --- The rendezvous port, through a real server ------------------------------
+
+namespace {
+
+// A port nothing holds right now. Bound and released, so there is a small race
+// window; the alternative is hard-coding 4533, which would put test traffic on
+// the operator's real discovery port and collide with any naudio server running.
+std::uint16_t pickFreePort() {
+    Socket s = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    return s.localPort();
+}
+
+}  // namespace
+
+// THE case this whole change is for: a server on the DEFAULT transport (TCP) and
+// a non-default port, found by a client that knew only the rendezvous port.
+// Before the rendezvous listener this was undiscoverable by any means.
+TEST(Discovery, ATcpServerOnAnyPortIsFoundThroughTheRendezvousPort) {
+    const std::uint16_t rendezvous = pickFreePort();
+    AudioStreamConfig cfg;  // TCP — the default for AudioStreamConfig and na_audio_source
+    cfg.maxClients = 2;
+    cfg.discoveryPort = rendezvous;
+    cfg.serverName = "tcp-default";
+    AudioStreamServer server(0, cfg);  // port 0 => an OS-assigned service port
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+    const int servicePort = server.port();
+    ASSERT_GT(servicePort, 0);
+    ASSERT_NE(servicePort, rendezvous) << "the two ports must differ or this proves nothing";
+
+    Socket prober = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    auto info = probe(prober, rendezvous, 0x5150u, 2000);
+
+    ASSERT_TRUE(info.has_value())
+        << "a TCP server was not found through the rendezvous port — the default "
+           "configuration is undiscoverable";
+    EXPECT_EQ(0x5150u, info->token);
+    EXPECT_EQ(servicePort, info->port)
+        << "the reply must name the SERVICE port, which is the point of the rendezvous";
+    EXPECT_EQ(static_cast<std::uint8_t>(DiscoveryTransport::Tcp), info->transports);
+    EXPECT_EQ("tcp-default", info->name);
+    EXPECT_EQ(0, server.clientCount()) << "the probe consumed a slot";
+    server.stop();
+}
+
+// The same for a UDP server on a non-default port: found through the rendezvous,
+// and told where to actually connect.
+TEST(Discovery, AUdpServerOnANonDefaultPortIsFoundThroughTheRendezvousPort) {
+    const std::uint16_t rendezvous = pickFreePort();
+    AudioStreamConfig cfg = AudioStreamConfig::udpLan();
+    cfg.maxClients = 3;
+    cfg.discoveryPort = rendezvous;
+    AudioStreamServer server(0, cfg);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+    const int servicePort = server.port();
+
+    Socket prober = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    auto info = probe(prober, rendezvous, 2, 2000);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(servicePort, info->port);
+    EXPECT_NE(rendezvous, info->port) << "the reply echoed the probed port, not the service port";
+    EXPECT_EQ(static_cast<std::uint8_t>(DiscoveryTransport::Udp), info->transports);
+    EXPECT_EQ(3, info->maxClients);
+    server.stop();
+}
+
+// discoveryPort = 0 runs no rendezvous listener at all, with the usual control.
+TEST(Discovery, ARendezvousPortOfZeroStartsNoListener) {
+    const std::uint16_t rendezvous = pickFreePort();
+    AudioStreamConfig off;
+    off.maxClients = 2;
+    off.discoveryPort = 0;
+    AudioStreamServer quiet(0, off);
+    std::string err;
+    ASSERT_TRUE(quiet.start(&err)) << err;
+    Socket p1 = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    EXPECT_FALSE(probe(p1, rendezvous, 1, 400).has_value());
+    quiet.stop();
+
+    // Control: the same config WITH a rendezvous port is found on that port, so the
+    // silence above is discoveryPort=0 and not a port nobody was ever listening on.
+    AudioStreamConfig on;
+    on.maxClients = 2;
+    on.discoveryPort = rendezvous;
+    AudioStreamServer loud(0, on);
+    ASSERT_TRUE(loud.start(&err)) << err;
+    Socket p2 = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    EXPECT_TRUE(probe(p2, rendezvous, 1, 2000).has_value())
+        << "control failed: nothing answers on the rendezvous port even when enabled";
+    loud.stop();
+}
+
+// The opt-out reaches the rendezvous listener: discoverable=false must silence
+// BOTH responders, not just the transport-side one.
+TEST(Discovery, TheOptOutSilencesTheRendezvousListenerToo) {
+    const std::uint16_t rendezvous = pickFreePort();
+    AudioStreamConfig cfg;
+    cfg.maxClients = 2;
+    cfg.discoveryPort = rendezvous;
+    cfg.discoverable = false;
+    AudioStreamServer server(0, cfg);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+
+    Socket prober = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    EXPECT_FALSE(probe(prober, rendezvous, 1, 400).has_value())
+        << "discoverable=false left the rendezvous listener answering";
+    server.stop();
+}
+
+// A stopped server releases the rendezvous port, so a restart (or another server)
+// can take it. The listener holds a raw ServerTransport*, so this also exercises
+// the ordering that stops it before the transport is released.
+TEST(Discovery, AStoppedServerReleasesTheRendezvousPort) {
+    const std::uint16_t rendezvous = pickFreePort();
+    AudioStreamConfig cfg;
+    cfg.maxClients = 2;
+    cfg.discoveryPort = rendezvous;
+    std::string err;
+    {
+        AudioStreamServer first(0, cfg);
+        ASSERT_TRUE(first.start(&err)) << err;
+        Socket p = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+        ASSERT_TRUE(probe(p, rendezvous, 1, 2000).has_value()) << "the first server never answered";
+        first.stop();
+    }
+    AudioStreamServer second(0, cfg);
+    ASSERT_TRUE(second.start(&err)) << err;
+    Socket p2 = Socket::bindUdp("127.0.0.1", 0, false, nullptr);
+    EXPECT_TRUE(probe(p2, rendezvous, 2, 2000).has_value())
+        << "the rendezvous port was not released by the first server's stop()";
+    second.stop();
 }

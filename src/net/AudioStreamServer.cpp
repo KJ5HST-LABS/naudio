@@ -909,39 +909,7 @@ bool AudioStreamServer::start(std::string* err) {
     // INSIDE the transport, so a shared_ptr here would be a reference cycle and the
     // transport would never be destroyed. Its lifetime is exactly the transport's.
     ServerTransport* transportRaw = transport.get();
-    transport->setDiscoveryFacts([this, transportRaw] {
-        DiscoveryFacts f;
-        f.enabled = config_.discoverable;
-        const int bound = transportRaw->port();
-        f.port = bound > 0 ? static_cast<std::uint16_t>(bound) : 0;
-        switch (config_.transportType) {
-            case TransportType::Udp:
-                f.transports = static_cast<std::uint8_t>(DiscoveryTransport::Udp);
-                break;
-            case TransportType::Dual:
-                f.transports = static_cast<std::uint8_t>(DiscoveryTransport::Tcp) |
-                               static_cast<std::uint8_t>(DiscoveryTransport::Udp);
-                break;
-            case TransportType::Tcp:
-            default:
-                // Unreachable in practice -- a TCP transport never answers a probe
-                // (§6.8 item 6) -- but a supplied transport factory can pair a UDP
-                // transport with a TCP config, so report the bit rather than 0.
-                f.transports = static_cast<std::uint8_t>(DiscoveryTransport::Tcp);
-                break;
-        }
-        f.sampleRate = static_cast<std::uint32_t>(config_.sampleRate);
-        f.bitsPerSample = static_cast<std::uint8_t>(config_.bitsPerSample);
-        f.channels = static_cast<std::uint8_t>(config_.channels);
-        // Saturate rather than wrap: a u8 that wrapped would report a busy server
-        // as empty, which is the one direction a chooser must never be misled in.
-        const int live = clientCount();
-        f.clientCount = static_cast<std::uint8_t>(live > 255 ? 255 : (live < 0 ? 0 : live));
-        const std::int32_t cap = config_.maxClients;
-        f.maxClients = static_cast<std::uint8_t>(cap > 255 ? 255 : (cap < 0 ? 0 : cap));
-        f.name = config_.serverName;
-        return f;
-    });
+    transport->setDiscoveryFacts(makeDiscoveryProvider(transportRaw));
 
     if (!transport->bind(port_, err)) return false;
     {
@@ -959,8 +927,78 @@ bool AudioStreamServer::start(std::string* err) {
     }
 
     acceptThread_ = std::thread(&AudioStreamServer::acceptLoop, this);
+
+    // §6.8 rendezvous listener. Started LAST, so no failure path above has to
+    // unwind it, and BEST EFFORT: its bind failing is the ordinary case, not an
+    // error. A UDP server already serving on discoveryPort cannot bind it twice and
+    // does not need to, because its own transport answers probes aimed there; and a
+    // second naudio server on the host loses the race for it, which costs nothing
+    // because running two servers already required choosing ports explicitly.
+    //
+    // This is what makes a TCP-ONLY server discoverable at all — it has no datagram
+    // path to an unknown sender, and TCP is the default transport. TCP and UDP port
+    // spaces are independent, so a TCP server on 4533 still gets UDP 4533 here.
+    if (config_.discoverable && config_.discoveryPort > 0) {
+        std::string discoveryErr;
+        discoveryResponder_.start(bindHost_,
+                                  static_cast<std::uint16_t>(config_.discoveryPort),
+                                  makeDiscoveryProvider(transportRaw), &discoveryErr);
+    }
+
     notifyServerStarted(transport->port());
     return true;
+}
+
+DiscoveryFactsProvider AudioStreamServer::makeDiscoveryProvider(ServerTransport* transport) {
+    // Invoked on a responder's receive thread, once per probe, so it must be cheap
+    // and must not block. Two lock notes, both load-bearing:
+    //
+    //  - It reads the port from the TRANSPORT rather than from AudioStreamServer::
+    //    port(). That is lock-free where port() takes runMutex_, and it is also the
+    //    only correct answer after a port-0 bind: port_ is still 0, and the
+    //    OS-assigned port is what a prober needs in order to connect.
+    //  - clientCount() takes sessionsMutex_ briefly. Safe from these threads because
+    //    neither holds a transport lock when it calls the provider, and no path holds
+    //    sessionsMutex_ while waiting on them (teardownSessions snapshots under the
+    //    lock and releases before closing; stop() releases runMutex_ before the joins).
+    //
+    // The transport is captured as a RAW pointer on purpose: the transport stores one
+    // copy of this provider, so a shared_ptr would be a reference cycle and the
+    // transport would never be destroyed. Its lifetime is exactly the transport's, and
+    // the rendezvous responder is stopped in stop() before the transport is released.
+    return [this, transport] {
+        DiscoveryFacts f;
+        f.enabled = config_.discoverable;
+        const int bound = transport->port();
+        f.port = bound > 0 ? static_cast<std::uint16_t>(bound) : 0;
+        switch (config_.transportType) {
+            case TransportType::Udp:
+                f.transports = static_cast<std::uint8_t>(DiscoveryTransport::Udp);
+                break;
+            case TransportType::Dual:
+                f.transports = static_cast<std::uint8_t>(DiscoveryTransport::Tcp) |
+                               static_cast<std::uint8_t>(DiscoveryTransport::Udp);
+                break;
+            case TransportType::Tcp:
+            default:
+                // Reachable, and the case that matters most: a TCP-only server cannot
+                // answer through its own transport but IS advertised by the rendezvous
+                // listener, which is the whole reason that listener exists.
+                f.transports = static_cast<std::uint8_t>(DiscoveryTransport::Tcp);
+                break;
+        }
+        f.sampleRate = static_cast<std::uint32_t>(config_.sampleRate);
+        f.bitsPerSample = static_cast<std::uint8_t>(config_.bitsPerSample);
+        f.channels = static_cast<std::uint8_t>(config_.channels);
+        // Saturate rather than wrap: a u8 that wrapped would report a busy server as
+        // empty, which is the one direction a chooser must never be misled in.
+        const int live = clientCount();
+        f.clientCount = static_cast<std::uint8_t>(live > 255 ? 255 : (live < 0 ? 0 : live));
+        const std::int32_t cap = config_.maxClients;
+        f.maxClients = static_cast<std::uint8_t>(cap > 255 ? 255 : (cap < 0 ? 0 : cap));
+        f.name = config_.serverName;
+        return f;
+    };
 }
 
 void AudioStreamServer::teardownSessions() {
@@ -985,6 +1023,11 @@ void AudioStreamServer::teardownSessions() {
 
 void AudioStreamServer::stop() {
     if (!running_.exchange(false)) return;
+
+    // FIRST, and before the transport is released: the rendezvous provider holds a
+    // raw ServerTransport*, so the listener thread must be joined while that pointer
+    // is still valid. stop() is idempotent and safe when it never started.
+    discoveryResponder_.stop();
 
     teardownSessions();
     stopSharedAudio();
