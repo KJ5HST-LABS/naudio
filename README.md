@@ -373,14 +373,22 @@ consumer. The byte-identity tell for a correctly received stream is
 - **No IP multicast; IPv4 only.** RX fan-out to multiple clients is **unicast replication** (O(N)
   egress), not IP multicast, and the transport is IPv4 (`AF_INET`) only. Fan-out should not be read as
   a multicast group.
-- **No server discovery — you supply `host:port`.** naudio ships no discovery service, no beacon
-  and no zero-configuration mechanism: a client is told where its server is (port 4533 by
-  default). The spec's §13.4 is a one-sentence *proposal*, not an implementation
-  ([issue #100](https://github.com/KJ5HST-LABS/naudio/issues/100)). A client that wants to find
-  servers on a LAN today can broadcast a `CONNECT_REQUEST` and collect the source addresses of
-  the replies — this works, and it is **measured**, but note what it costs: the server treats
-  that probe as a real client, so it consumes a slot against `maxClients` and starts an audio
-  stream you must then tear down. It is a workaround, not the answer, and #100 is the answer.
+- **Discovery finds an address, not a port — and only on the local segment.** Since wire spec
+  1.4 (§6.8) a client broadcasts a `DISCOVER` and every server that hears it answers by unicast:
+  `na_discover()` in C, `naudio::net::discoverServers()` in C++. The exchange is side-effect-free
+  — it creates no connection, consumes no slot against `maxClients` and starts no stream — which
+  is what distinguishes it from the old broadcast-`CONNECT_REQUEST` trick it replaces. Three
+  limits remain, and none of them is going away in v1. It resolves an **address**: you must probe
+  the port the servers actually serve on (4533 by default), so a server on another port is found
+  only by a probe aimed at that port. A **TCP-only server is undiscoverable** — there is no way
+  to broadcast a connection attempt — so this finds UDP and DUAL servers. And it is **local**:
+  routers do not forward a broadcast, and naudio implements no multicast or cross-subnet
+  discovery.
+- **Servers answer discovery by default.** `na_server_set_discoverable(server, 0)` turns it off.
+  Leaving it on means anyone on the segment can learn that the server exists, what audio format
+  it serves and how full it is. That is the point of the feature, and it is worth being explicit
+  that it is a *discoverability* switch and not access control: a server that answers nothing
+  still accepts connections from anyone who already knows its address.
 
 - **Device selection is local, not remote.** A client or server selects its own capture / playback
   device locally; there is no control message to enumerate or choose the *peer's* device over the wire.

@@ -5,6 +5,45 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **Server discovery — wire spec 1.4, §6.8.** A client can now find naudio servers on
+  its local segment without being told their addresses: `na_discover()` in C,
+  `naudio::net::discoverServers()` in C++. One broadcast `DISCOVER` goes out and every
+  server that hears it answers with one unicast `DISCOVER_REPLY`, carrying the port it
+  serves on, its transports, its native audio format, its current and maximum client
+  count, and an optional operator label (`na_server_set_name`). The address that answers
+  *is* the discovery result — it is deliberately not a field in the reply, because the
+  source address of the datagram is the only value a prober can act on.
+
+  **The exchange is side-effect-free, which is the entire point.** Answering a probe
+  creates no connection, consumes no slot against `maxClients` and starts no stream.
+  A broadcast `CONNECT_REQUEST` already found servers before this — that trick is what
+  the README used to document — but it cost a client slot and started an audio stream on
+  every server it found, so a discovery sweep could deny service to real listeners on a
+  small server. Measured on a `max 4 clients` server: three probes became three streaming
+  clients and a fourth would have filled it.
+
+  Three limits are real and are not going away in v1. Discovery resolves an **address,
+  not a port**: you must probe the port the servers serve on (4533 by default). A
+  **TCP-only server is undiscoverable**, because there is no way to broadcast a
+  connection attempt — this finds UDP and DUAL servers. And it reaches **the local
+  segment only**; routers do not forward a broadcast, and naudio implements no multicast
+  or cross-subnet discovery. Server-initiated beaconing was considered and rejected on
+  the record: it would put periodic broadcast traffic on the segment forever, paid for by
+  every host on it, to answer a question that is only asked when a client is choosing a
+  server.
+
+### Changed
+- **Servers answer discovery probes by default.** A server that upgrades to this release
+  begins responding to `DISCOVER` on the segment it is bound to, telling anyone who asks
+  that it exists, what format it serves and how full it is. Call
+  `na_server_set_discoverable(server, 0)` before `na_server_start` to keep it silent.
+  Nothing else about the UDP anti-spoof gate is loosened: a datagram from an unknown
+  sender that is neither a `CONNECT_REQUEST` nor a `DISCOVER` is still dropped, replies
+  are rate-limited per source address over a bounded table, and a probe still creates
+  nothing. Note this is a *discoverability* switch and not access control — a silent
+  server still accepts connections from anyone who already knows its address.
+
 ## [1.0.0rc5] — 2026-09-01
 
 ### Removed
