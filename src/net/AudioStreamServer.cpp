@@ -890,6 +890,59 @@ bool AudioStreamServer::start(std::string* err) {
         if (err) *err = "Transport factory returned no transport";
         return false;
     }
+    // Spec 1.4 §6.8 -- installed BEFORE bind(), which starts the demux thread.
+    //
+    // Invoked ON that thread, once per probe, so it must be cheap and must not
+    // block. Two lock notes, both load-bearing:
+    //
+    //  - It reads the port from the TRANSPORT, not from AudioStreamServer::port().
+    //    That is lock-free (atomics + getsockname), whereas port() takes runMutex_,
+    //    and it is also the only correct answer after a port-0 bind: port_ is still
+    //    0 here, and the OS-assigned port is what a prober needs to connect to.
+    //  - clientCount() takes sessionsMutex_ briefly. Safe from this thread because
+    //    the demux loop holds NO transport lock when it calls the provider, and no
+    //    path holds sessionsMutex_ while waiting on the demux thread (teardown-
+    //    Sessions snapshots under the lock and releases before closing; stop()
+    //    releases runMutex_ before transport->close() joins).
+    //
+    // The transport is captured as a RAW pointer on purpose: the provider is stored
+    // INSIDE the transport, so a shared_ptr here would be a reference cycle and the
+    // transport would never be destroyed. Its lifetime is exactly the transport's.
+    ServerTransport* transportRaw = transport.get();
+    transport->setDiscoveryFacts([this, transportRaw] {
+        DiscoveryFacts f;
+        f.enabled = config_.discoverable;
+        const int bound = transportRaw->port();
+        f.port = bound > 0 ? static_cast<std::uint16_t>(bound) : 0;
+        switch (config_.transportType) {
+            case TransportType::Udp:
+                f.transports = static_cast<std::uint8_t>(DiscoveryTransport::Udp);
+                break;
+            case TransportType::Dual:
+                f.transports = static_cast<std::uint8_t>(DiscoveryTransport::Tcp) |
+                               static_cast<std::uint8_t>(DiscoveryTransport::Udp);
+                break;
+            case TransportType::Tcp:
+            default:
+                // Unreachable in practice -- a TCP transport never answers a probe
+                // (§6.8 item 6) -- but a supplied transport factory can pair a UDP
+                // transport with a TCP config, so report the bit rather than 0.
+                f.transports = static_cast<std::uint8_t>(DiscoveryTransport::Tcp);
+                break;
+        }
+        f.sampleRate = static_cast<std::uint32_t>(config_.sampleRate);
+        f.bitsPerSample = static_cast<std::uint8_t>(config_.bitsPerSample);
+        f.channels = static_cast<std::uint8_t>(config_.channels);
+        // Saturate rather than wrap: a u8 that wrapped would report a busy server
+        // as empty, which is the one direction a chooser must never be misled in.
+        const int live = clientCount();
+        f.clientCount = static_cast<std::uint8_t>(live > 255 ? 255 : (live < 0 ? 0 : live));
+        const std::int32_t cap = config_.maxClients;
+        f.maxClients = static_cast<std::uint8_t>(cap > 255 ? 255 : (cap < 0 ? 0 : cap));
+        f.name = config_.serverName;
+        return f;
+    });
+
     if (!transport->bind(port_, err)) return false;
     {
         std::lock_guard<std::mutex> lock(runMutex_);

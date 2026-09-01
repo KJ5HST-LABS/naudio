@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "naudio/AudioPacket.hpp"  // UDP_MAX_PAYLOAD / udpMaxAudioPayload — the MTU advisory this
                                    // struct derives its UDP chunk size from, rather than restating
@@ -88,6 +89,30 @@ struct AudioStreamConfig {
     // hand may set the field directly. Every other preset leaves it false, and it gates nothing
     // when any reliability component is on or the transport is TCP.
     bool explicitBareUdp = false;
+
+    // --- Discovery (spec 1.4, §6.8) ---
+
+    // ON by default: a naudio server answers DISCOVER probes unless told not to.
+    //
+    // That is a deliberate choice and it has a cost, stated rather than buried:
+    // answering tells an unauthenticated stranger on the segment that this server
+    // exists, what format it serves and how full it is (§6.8, Disclosure). The
+    // alternative default was opt-in, which is safer and which makes discovery a
+    // feature almost nobody would ever switch on -- a server you must configure
+    // before it can be found does not solve the problem discovery exists to solve.
+    //
+    // What ON does NOT weaken: a probe still creates no connection, consumes no
+    // client slot and starts no stream, replies are rate-limited per source, and
+    // the anti-spoof gate is otherwise untouched -- a datagram from an unknown
+    // sender that is neither a CONNECT_REQUEST nor a DISCOVER is still dropped.
+    // Set false (na_server_set_discoverable(server, 0)) to go silent.
+    bool discoverable = true;
+
+    // Operator label carried in DISCOVER_REPLY, e.g. "shack" or "K1ABC 40m".
+    // Empty is fine and is the default -- a prober then has the address it heard
+    // the reply from, which is the actual discovery result. Clamped to 255 bytes
+    // by the codec, so a long label is truncated rather than mis-framing the reply.
+    std::string serverName;
 
     // --- Derived calculations ---
     std::int32_t samplesPerFrame() const { return (sampleRate * frameDurationMs) / 1000; }

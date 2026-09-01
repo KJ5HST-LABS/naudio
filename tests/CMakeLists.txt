@@ -101,6 +101,7 @@ add_executable(naudio_net_tests
     net/test_tcp_transport.cpp
     net/test_udp_connection.cpp
     net/test_udp_transport.cpp
+    net/test_discovery.cpp
     net/test_dual_transport.cpp
     net/test_broadcaster.cpp
     net/test_mixer.cpp
