@@ -10,16 +10,11 @@
 // and buffer settings — there is no conformance vector for the presets, so this
 // GTest is the gate.
 #include "naudio/AudioStreamConfig.hpp"
-#include "naudio/StreamDescription.hpp"
 #include "naudio/TransportType.hpp"
 
 #include <gtest/gtest.h>
 
 using naudio::AudioStreamConfig;
-using naudio::ChannelLayout;
-using naudio::SampleFormat;
-using naudio::SourceKind;
-using naudio::StreamDescription;
 using naudio::TransportType;
 
 TEST(AudioStreamConfig, DefaultIsTcp48kStereo) {
@@ -161,27 +156,4 @@ TEST(TransportType, NameAndValueOf) {
     EXPECT_EQ(TransportType::Udp, naudio::transportTypeFromName("UDP").value());
     EXPECT_EQ(TransportType::Dual, naudio::transportTypeFromName("DUAL").value());
     EXPECT_FALSE(naudio::transportTypeFromName("SCTP").has_value());
-}
-
-TEST(StreamDescription, DefaultsAreNativeAudio) {
-    StreamDescription d;
-    EXPECT_EQ(48000, d.sampleRate);
-    EXPECT_EQ(ChannelLayout::Stereo, d.channelLayout);
-    EXPECT_EQ(SampleFormat::Int16, d.sampleFormat);
-    EXPECT_EQ(SourceKind::Audio, d.sourceKind);
-    EXPECT_FALSE(d.hasRfCenterHz);
-    EXPECT_FALSE(d.hasTimeAnchorNs);
-}
-
-TEST(StreamDescription, CarriesOptionalRfCenterAndAnchor) {
-    StreamDescription d;
-    d.sourceKind = SourceKind::IQ;
-    d.sampleFormat = SampleFormat::Float32;
-    d.hasRfCenterHz = true;
-    d.rfCenterHz = 14'074'000.0;
-    d.hasTimeAnchorNs = true;
-    d.timeAnchorNs = 1234567890;
-    EXPECT_EQ(SourceKind::IQ, d.sourceKind);
-    EXPECT_DOUBLE_EQ(14'074'000.0, d.rfCenterHz);
-    EXPECT_EQ(1234567890, d.timeAnchorNs);
 }

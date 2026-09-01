@@ -5,6 +5,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Removed
+- **`include/naudio/StreamDescription.hpp` is no longer shipped.** It was a
+  non-normative value type for spec §13.5 ("stream-fact metadata"), a *proposed*
+  extension that is not on the wire and has no conformance vector — its own header
+  said "do not serialize this onto the wire until the D6 handshake extension is
+  specified". Nothing in naudio included it and its only consumers were two unit
+  tests. Meanwhile its `ChannelLayout` enum predated spec 1.2 and had come to
+  duplicate the normative `RxLayout` under different names and different values, so
+  anyone implementing §13.5 today would reuse `RxLayout` and not this type.
+
+  Removed now rather than after 1.0.0, because a designed-and-shipped type reads as
+  a commitment even when its header says otherwise: a downstream project (the WSJT-X
+  network-audio ingress work) planned a wire extension against it on the strength of
+  "matching fields waiting", then withdrew that plan on the grounds that nobody had
+  measured a need. §13.5 stays in the specification, where the design — including its
+  deliberate exclusion of station topology — is recorded; the type can be rebuilt
+  from it, against the normative layout enum, if a measured need ever appears. The C
+  ABI is unaffected, and the C++ API carries no binary-stability promise (see the
+  README's *Binary compatibility*).
+
 ### Changed
 - **Wire spec 1.3 — a format request's rate and channel layout are now granted
   independently.** Under spec 1.2 the server granted a `na_client_request_format`
