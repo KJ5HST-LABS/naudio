@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -235,9 +236,41 @@ public:
 // Server-side transport — binds a port and yields one ClientConnection per
 // client. TCP uses one socket per client with an accept loop; UDP uses a single
 // socket with address-based demultiplexing.
+// The facts a server publishes in a DISCOVER_REPLY (spec 1.4, §6.8). Gathered
+// FRESH at each probe rather than cached at bind: clientCount changes, and a
+// stale occupancy is exactly the field a chooser would act on wrongly.
+struct DiscoveryFacts {
+    bool enabled = false;         // false = stay silent (the operator opted out).
+    std::uint16_t port = 0;
+    std::uint8_t transports = 0;  // DiscoveryTransport bitmask (DUAL sets both).
+    std::uint32_t sampleRate = 0;
+    std::uint8_t bitsPerSample = 0;
+    std::uint8_t channels = 0;
+    std::uint8_t clientCount = 0;  // Saturated to 255 by the caller.
+    std::uint8_t maxClients = 0;   // Saturated to 255 by the caller.
+    std::string name;
+};
+
+// Supplies those facts on demand. Invoked on the demux thread, once per probe,
+// so it MUST NOT block and MUST NOT re-enter the transport.
+using DiscoveryFactsProvider = std::function<DiscoveryFacts()>;
+
 class ServerTransport {
 public:
     virtual ~ServerTransport() = default;
+
+    // Installs the source of DISCOVER_REPLY facts (§6.8). Call BEFORE bind():
+    // bind() starts the demux thread, and a provider installed after it races
+    // with the first probe.
+    //
+    // Defaulted to a no-op, and deliberately NOT pure virtual like the counters
+    // below. Their rule is that a silent 0 is indistinguishable from a real
+    // measurement -- but here a silent no-op IS the truthful answer for a
+    // transport with no datagram path to an unknown sender: §6.8 item 6 says a
+    // TCP-only server is undiscoverable, which is a property of TCP, not a
+    // forgotten override. Making it pure would also break every out-of-tree
+    // ServerTransport, which setTransportFactory makes a supported thing to have.
+    virtual void setDiscoveryFacts(DiscoveryFactsProvider provider) { (void)provider; }
 
     // Binds to a port (0 for ephemeral). Returns false and fills err on failure.
     virtual bool bind(std::uint16_t port, std::string* err) = 0;

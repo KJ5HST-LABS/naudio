@@ -63,6 +63,13 @@ public:
     // well clear of the block widths those hosts typically reserve.
     static constexpr int kPort0BindAttempts = 32;
 
+    // §6.8: a DUAL server is discoverable over its UDP half -- the TCP half has no
+    // datagram path to an unknown sender. Forwarded rather than reimplemented, so
+    // there is exactly one responder in the tree.
+    void setDiscoveryFacts(DiscoveryFactsProvider provider) override {
+        udp_.setDiscoveryFacts(std::move(provider));
+    }
+
     // Binds TCP, then binds UDP to the port TCP was actually assigned. TCP and UDP port
     // spaces are independent at the OS level, which is what makes one port number serve
     // both — a contract the C ABI publishes (naudio.h: "a DUAL server serves TCP+UDP on

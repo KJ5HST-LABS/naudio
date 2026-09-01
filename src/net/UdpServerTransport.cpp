@@ -10,6 +10,13 @@
 // the owning connection, and registers a new connection only on a CONNECT_REQUEST
 // from an unknown sender (anti-spoof). All map/pending mutation is under one lock;
 // enqueueReceived runs outside it.
+//
+// Spec 1.4 (§6.8) adds the one other datagram an unknown sender may send: a
+// DISCOVER is ANSWERED AND FORGOTTEN -- no connection, no pending entry, no
+// routing, no client slot, no stream. That makes its exemption strictly narrower
+// than CONNECT_REQUEST's, which exists to create exactly those things. It is
+// handled before the routing lock because the reply does socket I/O and calls out
+// to the server for live facts, and neither belongs under stateMutex_.
 
 #include "naudio/net/UdpServerTransport.hpp"
 
@@ -33,6 +40,57 @@ bool UdpServerTransport::isConnectRequest(const std::optional<AudioPacket>& pack
     if (!packet || packet->packetType() != PacketType::Control) return false;
     std::optional<ControlMessage> msg = ControlMessage::deserialize(packet->payload());
     return msg && msg->messageType() == ControlType::ConnectRequest;
+}
+
+std::optional<std::uint32_t> UdpServerTransport::discoverTokenOf(
+    const std::optional<AudioPacket>& packet) {
+    if (!packet || packet->packetType() != PacketType::Control) return std::nullopt;
+    std::optional<ControlMessage> msg = ControlMessage::deserialize(packet->payload());
+    if (!msg || msg->messageType() != ControlType::Discover) return std::nullopt;
+    return msg->parseDiscoverToken();
+}
+
+bool UdpServerTransport::allowDiscoveryReplyForSource(const std::string& addrKey,
+                                                      std::int64_t now) {
+    auto it = discoverySeen_.find(addrKey);
+    if (it != discoverySeen_.end()) {
+        if (now - it->second < DISCOVERY_MIN_INTERVAL_MS) return false;
+        it->second = now;
+        return true;
+    }
+    // New source. The table is the amplification target as much as the reply is --
+    // a forged source address costs the attacker nothing -- so it is bounded, and
+    // at the cap the OLDEST entry goes rather than the table growing. Evicting
+    // oldest-first means a flood of forged addresses cannot push out a real
+    // client's entry any faster than it ages out anyway.
+    if (discoverySeen_.size() >= MAX_DISCOVERY_SOURCES) {
+        auto oldest = discoverySeen_.begin();
+        for (auto i = discoverySeen_.begin(); i != discoverySeen_.end(); ++i) {
+            if (i->second < oldest->second) oldest = i;
+        }
+        discoverySeen_.erase(oldest);
+    }
+    discoverySeen_[addrKey] = now;
+    return true;
+}
+
+void UdpServerTransport::sendDiscoveryReply(std::uint32_t token, const std::string& host,
+                                            std::uint16_t port, const std::string& addrKey) {
+    const DiscoveryFacts facts = discoveryFacts_();
+    // Checked BEFORE the limiter, so a server that answers nothing also does no
+    // table work -- otherwise opting out would still leave a flood a place to write.
+    if (!facts.enabled) return;
+    if (!allowDiscoveryReplyForSource(addrKey, nowMs())) return;
+
+    ControlMessage reply = ControlMessage::discoverReply(
+        token, facts.port, facts.transports, facts.sampleRate, facts.bitsPerSample,
+        facts.channels, facts.clientCount, facts.maxClients, facts.name);
+    AudioPacket packet(PacketType::Control, discoverySeq_++, reply.serialize());
+    const std::vector<std::uint8_t> bytes = packet.serialize();
+    // UNICAST, back to the prober's source address -- never to the segment (§6.8).
+    // A failed send is dropped silently: discovery is best-effort by construction,
+    // and a prober that hears nothing simply does not list this server.
+    socket_.sendTo(bytes.data(), bytes.size(), host, port);
 }
 
 bool UdpServerTransport::bind(std::uint16_t port, std::string* err) {
@@ -89,6 +147,18 @@ void UdpServerTransport::demuxLoop() {
 
         const std::string key = addressKey(rr.senderHost, rr.senderPort);
         std::optional<AudioPacket> packet = AudioPacket::deserialize(buf.data(), rr.bytes);
+
+        // §6.8. Deliberately BEFORE the routing lookup and outside the lock: a probe
+        // is orthogonal to connection state, so it is answered whether or not this
+        // sender is known, and it is never delivered to a connection. discoverTokenOf
+        // checks the PACKET type first, so an audio datagram does not pay for a
+        // control parse here.
+        if (discoveryFacts_) {
+            if (std::optional<std::uint32_t> token = discoverTokenOf(packet)) {
+                sendDiscoveryReply(*token, rr.senderHost, rr.senderPort, key);
+                continue;
+            }
+        }
 
         std::shared_ptr<UdpClientConnection> conn;
         {
