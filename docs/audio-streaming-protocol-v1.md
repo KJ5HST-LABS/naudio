@@ -1,8 +1,8 @@
 # net-audio Audio Streaming Protocol — Specification v1
 
 **Status:** Stable / frozen wire contract (`0xAF01`, version byte = 1).
-**Spec version:** 1.3 (2026-08-31) — §6.2.1 only, and **no wire change whatsoever**: the rate and the channel layout of a format request are now granted **independently** of one another, where 1.2 granted the request exactly or not at all. The 15-byte `AUDIO_CONFIG` already carried the granted rate and the granted layout in separate fields, so a partial grant was always *expressible* — 1.2 simply never produced one, and an unservable layout therefore discarded a servable rate. Every byte layout, type number, CRC semantic and golden vector is untouched. See §6.2.1.
-**Spec version history:** 1.2 (2026-08-22) — per-subscription RX format negotiation, adopted from §13.1 in reduced scope (rate + channel layout only; RX only): appended `CONNECT_REQUEST` fields, an extended `AUDIO_CONFIG` form, and the grant rules — all via the §11 minor-extension path. The 1.2 vectors in `conformance/vectors/vectors-v1_2.ini` are loaded by the conformance suite (`Conformance.GoldenVectorsV12`) alongside the reference implementation. · 1.1 (2026-08-15) — §8.4 only: `CONNECT_REQUEST` became a critical (ARQ'd) control type.
+**Spec version:** 1.4 (2026-09-01) — **discovery is adopted from §13.4** as the new normative §6.8, via the §11 minor-extension path: two new control types (`DISCOVER` `0x60`, `DISCOVER_REPLY` `0x61`) carried in ordinary `CONTROL` frames. The framing, the type enum (0x00–0x04), the CRC semantics and every pre-existing golden vector are **untouched** — a pre-1.4 endpoint ignores both new types, which is exactly what §11 requires of it. The exchange is **client-initiated and side-effect-free**: a server answers a probe without creating a connection, consuming a client slot or starting a stream, and it **never** transmits unsolicited. See §6.8.
+**Spec version history:** 1.3 (2026-08-31) — §6.2.1 only, and **no wire change whatsoever**: the rate and the channel layout of a format request are now granted **independently** of one another, where 1.2 granted the request exactly or not at all. The 15-byte `AUDIO_CONFIG` already carried the granted rate and the granted layout in separate fields, so a partial grant was always *expressible* — 1.2 simply never produced one, and an unservable layout therefore discarded a servable rate. Every byte layout, type number, CRC semantic and golden vector is untouched. See §6.2.1. · 1.2 (2026-08-22) — per-subscription RX format negotiation, adopted from §13.1 in reduced scope (rate + channel layout only; RX only): appended `CONNECT_REQUEST` fields, an extended `AUDIO_CONFIG` form, and the grant rules — all via the §11 minor-extension path. The 1.2 vectors in `conformance/vectors/vectors-v1_2.ini` are loaded by the conformance suite (`Conformance.GoldenVectorsV12`) alongside the reference implementation. · 1.1 (2026-08-15) — §8.4 only: `CONNECT_REQUEST` became a critical (ARQ'd) control type.
 **Scope:** The *audio* half of a radio-streaming toolkit.
 **Provenance:** This document is the normative, field-by-field definition of the `0xAF01` audio wire. Every normative value here is implemented and pinned by the language-neutral golden-vector conformance suite (see §12), so the wire is byte-deterministic and independently checkable. Where the toolkit *plan* describes capabilities that are **not** in the v1 wire, they are isolated in §13 (Proposed extensions) and are explicitly **non-normative**.
 
@@ -70,7 +70,7 @@ On UDP, a client is registered **only** upon receipt of a valid, deserializable 
 ### 2.5 Ports
 
 - **Default service port: `4533`** (TCP, UDP, or both for DUAL).
-- There is **no discovery mechanism in this spec** (no multicast beacon, no broadcast probe). Service discovery, if any, is provided out-of-band by the host application. (A UDP discovery port is *proposed* in §13.4.)
+- **Discovery** uses this same service port: a client broadcasts a `DISCOVER` to it and each server answers by unicast (§6.8, since spec 1.4). Discovery therefore resolves an *address*, not an address+port — a prober must already know which port to probe, and `4533` is the default it should try first. A server on a non-default port is found only by a probe aimed at that port. There is deliberately **no separate discovery port** and **no beacon**: a server never transmits unsolicited.
 
 ---
 
@@ -213,17 +213,20 @@ Total control-message length = `1 + M`. An empty payload (length < 1) or an unkn
 
 | Name | Value | Name | Value |
 |------|------:|------|------:|
-| `CONNECT_REQUEST` | `0x01` | `LATENCY_RESPONSE` | `0x23` |
-| `CONNECT_ACCEPT` | `0x02` | `STATS_UPDATE` | `0x30` |
-| `CONNECT_REJECT` | `0x03` | `TX_GRANTED` | `0x40` |
-| `AUDIO_CONFIG` | `0x04` | `TX_DENIED` | `0x41` |
-| `STREAM_START` | `0x10` | `TX_PREEMPTED` | `0x42` |
-| `STREAM_STOP` | `0x11` | `TX_RELEASED` | `0x43` |
-| `STREAM_PAUSE` | `0x12` | `CLIENTS_UPDATE` | `0x44` |
-| `STREAM_RESUME` | `0x13` | `NACK` | `0x50` |
-| `HEARTBEAT` | `0x20` | `CONTROL_ACK` | `0x51` |
-| `HEARTBEAT_ACK` | `0x21` | `ERROR` | `0xFE` |
-| `LATENCY_PROBE` | `0x22` | `DISCONNECT` | `0xFF` |
+| `CONNECT_REQUEST` | `0x01` | `STATS_UPDATE` | `0x30` |
+| `CONNECT_ACCEPT` | `0x02` | `TX_GRANTED` | `0x40` |
+| `CONNECT_REJECT` | `0x03` | `TX_DENIED` | `0x41` |
+| `AUDIO_CONFIG` | `0x04` | `TX_PREEMPTED` | `0x42` |
+| `STREAM_START` | `0x10` | `TX_RELEASED` | `0x43` |
+| `STREAM_STOP` | `0x11` | `CLIENTS_UPDATE` | `0x44` |
+| `STREAM_PAUSE` | `0x12` | `NACK` | `0x50` |
+| `STREAM_RESUME` | `0x13` | `CONTROL_ACK` | `0x51` |
+| `HEARTBEAT` | `0x20` | `DISCOVER` | `0x60` |
+| `HEARTBEAT_ACK` | `0x21` | `DISCOVER_REPLY` | `0x61` |
+| `LATENCY_PROBE` | `0x22` | `ERROR` | `0xFE` |
+| `LATENCY_RESPONSE` | `0x23` | `DISCONNECT` | `0xFF` |
+
+> `DISCOVER` / `DISCOVER_REPLY` are **since spec 1.4** (§6.8). A pre-1.4 endpoint does not know them and ignores them, per §11.
 
 > `STREAM_START/STOP/PAUSE/RESUME` and `STATS_UPDATE` are defined in the vocabulary but are **not dispatched** by v1 endpoints (reserved). Implementations MUST tolerate (ignore) them if received.
 
@@ -428,6 +431,56 @@ numClients    u8
 - `DISCONNECT` (0xFF): empty data; graceful teardown.
 - `ERROR` (0xFE): raw UTF-8 message bytes, **no length prefix** (consumes the remainder of the data).
 
+### 6.8 Discovery (`DISCOVER` 0x60 / `DISCOVER_REPLY` 0x61) — since spec 1.4
+
+Adopted from §13.4. The exchange lets a client find servers on a local segment without being told their addresses, and it is **side-effect-free by construction**: answering a probe MUST NOT create a connection, consume a client slot, start a stream, or change any server state a client can observe.
+
+**Client-initiated only — a server MUST NOT transmit unsolicited.** There is no beacon and no periodic announcement; a server nobody is probing sends nothing. A discovery round therefore costs N+1 datagrams, on demand: one broadcast (or multicast) `DISCOVER` from the client, and one **unicast** `DISCOVER_REPLY` from each server that hears it, sent back to the prober rather than to the segment.
+
+**`DISCOVER` (0x60) data:**
+
+```
+token   u32     opaque; echoed verbatim in the reply
+```
+
+The token correlates replies with the probe round that caused them. A client SHOULD choose it unpredictably, and MUST ignore a reply whose token it did not send.
+
+**`DISCOVER_REPLY` (0x61) data (16 bytes + name):**
+
+```
+token           u32     echoed from the DISCOVER
+port            u16     the port this server serves audio on
+transports      u8      bitmask: 0x01 TCP, 0x02 UDP (a DUAL server sets both)
+sampleRate      u32     native RX sample rate
+bitsPerSample   u8
+channels        u8
+clientCount     u8      clients connected now (saturating at 255)
+maxClients      u8      capacity (saturating at 255)
+nameLen         u8
+name            name[nameLen]    (UTF-8 operator-supplied label; MAY be empty)
+```
+
+The server's **address is not a field**. It is the source address of the reply datagram — the only value the prober can act on, and the only one that stays correct when the server is bound to one of several interfaces.
+
+**What the reply deliberately does not carry.** The roster and client identities (§6.6), callsigns, `clientInfo`, station location, TX-owner state, statistics, and any credential or token beyond the echoed one. A `DISCOVER_REPLY` is answerable to an unauthenticated stranger, so it carries what a chooser needs to pick a server and nothing that would reward harvesting it. An implementation MUST NOT extend the reply with client-identifying fields.
+
+**Server behavior (normative):**
+
+1. A server MAY answer `DISCOVER`; whether it does is a local policy knob. (The reference implementation answers **by default**, and can be turned off — see the disclosure note below.)
+2. A server that answers MUST reply by **unicast to the source address of the probe**, and MUST NOT broadcast the reply.
+3. A server MUST answer **regardless of occupancy**. A server at `maxClients` still replies, reporting `clientCount == maxClients`; occupancy is a fact the chooser needs, not a reason for silence.
+4. A server MUST rate-limit replies per source address (see Security considerations).
+5. A server MUST NOT treat a `DISCOVER` as registration. It creates no connection and no pending entry, so a probe leaves no trace a subsequent `CONNECT_REQUEST` from the same address could inherit.
+6. Where the transport has no datagram path to an unknown sender — a **TCP-only** server — discovery is **not available**. That is a property of the transport, not an omission: there is no way to broadcast a connection attempt. A DUAL server is discoverable over its UDP half and reports both bits in `transports`.
+
+**Interaction with the anti-spoof rule (§2.3).** A UDP server registers a client only on a valid `CONNECT_REQUEST` from an unknown sender, and drops every other datagram from one. Spec 1.4 adds `DISCOVER` as the **second and only other** exempt case, and its exemption is strictly narrower: a `CONNECT_REQUEST` from an unknown sender *creates a connection*, whereas a `DISCOVER` from an unknown sender is *answered and forgotten*. A datagram from an unknown sender that is neither MUST still be dropped, and §2.3's rule is otherwise unchanged.
+
+**Security considerations.**
+
+- **Amplification.** A `DISCOVER` frame is 28 bytes on the wire and a `DISCOVER_REPLY` is 40 bytes plus the name, so the exchange amplifies by roughly 1.4× — small, but not 1×, and the source address of a UDP datagram is unverified. A server MUST rate-limit replies per source address, and that limiter's own state MUST be bounded, so that probing from many forged source addresses cannot exhaust it. The reference implementation allows one reply per source per second over a bounded table of recent sources, and drops the oldest entry rather than growing.
+- **Disclosure.** Answering discovery tells an unauthenticated stranger that a server exists, what format it serves, and how full it is. That is the point of the feature, and it is why (1) is a knob. An operator who does not wish to be found turns it off; a server on an untrusted segment SHOULD additionally be bound to a specific interface rather than the wildcard address.
+- **No accumulated state.** Because a reply creates nothing, a discovery flood costs a server only the replies its limiter permits. It cannot fill the bounded pending-connection registry, which is the resource a `CONNECT_REQUEST` flood consumes.
+
 ---
 
 ## 7. TX arbitration
@@ -625,7 +678,7 @@ This section compares net-audio v1 with Hamlib's audio streaming (issue/PR #1940
 ## 11. Versioning & compatibility
 
 - The `0xAF01` magic + version byte = 1 frame is a **frozen contract**. Field offsets, sizes, the type enum (0x00–0x04), and CRC semantics MUST NOT change under version 1.
-- **Extensions** that preserve the frame layout (new control message types, new AUDIO_CONFIG **or CONNECT_REQUEST** fields appended after the v1 fields, new flags bits, new presets) are **minor** and backward compatible: unknown control types/flags are ignored, and control-message decoders MUST ignore trailing bytes they do not recognize (normative since 1.2 — §6.2.1; the v1 reference parsers already parse prefix-only). AUDIO_CONFIG already supports length-based forward/backward compatibility (§6.2). Spec 1.2's per-subscription format request (§6.2.1) is an instance of exactly this path.
+- **Extensions** that preserve the frame layout (new control message types, new AUDIO_CONFIG **or CONNECT_REQUEST** fields appended after the v1 fields, new flags bits, new presets) are **minor** and backward compatible: unknown control types/flags are ignored, and control-message decoders MUST ignore trailing bytes they do not recognize (normative since 1.2 — §6.2.1; the v1 reference parsers already parse prefix-only). AUDIO_CONFIG already supports length-based forward/backward compatibility (§6.2). Spec 1.2's per-subscription format request (§6.2.1) and spec 1.4's discovery exchange (§6.8) are instances of exactly this path: both add control types and fields only, and neither touches the frame layout, the packet-type enum or the CRC.
 - **Breaking** changes (header layout, type renumbering, CRC change, audio sample-format renegotiation that changes the audio-payload contract) require **bumping the version byte to 2** and a frame-layer version gate (§3.7). Such changes MUST be specified before the first such frame is emitted.
 - The jitter, FEC, reorder, and ARQ algorithms and their constants (EMA 1/16, FEC N∈[2,10] default 5, parity header 5 bytes, ARQ ring 16 / timeout 500 ms / 3 attempts) are part of the contract for interoperating reliability and are versioned with the spec.
 
@@ -656,7 +709,7 @@ Because the frame timestamp is sampled at packet-creation time (§3.5), a byte-e
 
 ## 13. Proposed extensions (NON-NORMATIVE — not in v1)
 
-These are the toolkit-plan capabilities that are **not** in the v1 wire. They are recorded here so the spec is honest about the gap and so future versions have a starting point. Nothing in this section is implemented or conformance-tested.
+These are the toolkit-plan capabilities that are **not** in the v1 wire. They are recorded here so the spec is honest about the gap and so future versions have a starting point. Nothing that is still *proposed* here is implemented or conformance-tested. Two entries have since been adopted in whole or in part and say so in their own headings — §13.1 (the rate/layout half, spec 1.2 §6.2.1) and §13.4 (in full, spec 1.4 §6.8); an adopted item keeps its heading here so that a reader arriving from an older citation is sent forward rather than left believing it is still a proposal.
 
 ### 13.1 Format breadth (the remainder — rate/layout negotiation was adopted in spec 1.2)
 Spec 1.2 adopted the rate + channel-layout half of this proposal as §6.2.1 (server-side
@@ -671,8 +724,8 @@ Deliver explicit gap markers to high-rate/SDR consumers instead of silence-filli
 ### 13.3 Client-settable TX priority
 A control message to let a client declare/raise its `TxPriority` over the wire (today fixed at `NORMAL`, §7).
 
-### 13.4 Discovery
-An optional UDP discovery/beacon (an application-defined discovery port is one such mechanism today, outside this spec).
+### 13.4 Discovery — **ADOPTED in spec 1.4; see §6.8**
+No longer proposed. Discovery was specified as §6.8 on 2026-09-01 (issue #100) in a deliberately narrow form: a **client-initiated, side-effect-free** `DISCOVER` / `DISCOVER_REPLY` exchange on the existing service port, with **no beacon** — the word this section used to use, and the wrong architecture. Server-initiated announcement was considered and **rejected on the record**: it would put periodic broadcast traffic on the segment forever, paid for by every host on it, to answer a question that is only asked at the moment a client is choosing a server. What remains outside the spec is discovery of the *port* (a probe resolves an address, §2.5) and any cross-subnet or multicast-routed mechanism.
 
 ### 13.5 Stream-fact metadata (`StreamDescription`)
 Carry stream facts — sample rate, channel layout, sample format, source kind, optional RF-center frequency, and a precise time anchor (adopting a VITA-49-style UTC convention where it aids interop) — **explicitly excluding** station topology (receiver count, phase-coherence, transverter offsets), which is Hamlib's or the host app's. Closes the §10 metadata gap.
@@ -709,6 +762,11 @@ Carry stream facts — sample rate, channel layout, sample format, source kind, 
 | Channel layouts (spec 1.2, §6.2.1) | NATIVE 0, MONO_DOWNMIX 1, LEFT_ONLY 2, RIGHT_ONLY 3 |
 | Format-request tail (spec 1.2, §6.2.1) | `requestedRate` u32 BE + `requestedLayout` u8 (5 bytes, appended to CONNECT_REQUEST) |
 | Extended AUDIO_CONFIG (spec 1.2, §6.2.1) | 15 bytes: the 14-byte form + `grantedLayout` u8 |
+| Discovery control types (spec 1.4, §6.8) | `DISCOVER` 0x60, `DISCOVER_REPLY` 0x61 |
+| DISCOVER data (spec 1.4, §6.8) | `token` u32 BE (4 bytes) |
+| DISCOVER_REPLY data (spec 1.4, §6.8) | 16 bytes + name: `token` u32, `port` u16, `transports` u8, `sampleRate` u32, `bitsPerSample` u8, `channels` u8, `clientCount` u8, `maxClients` u8, `nameLen` u8, `name` |
+| Discovery transport bits (spec 1.4, §6.8) | TCP 0x01, UDP 0x02 |
+| Discovery reply rate limit (reference impl) | 1 reply per source address per 1000 ms, bounded table |
 
 ---
 

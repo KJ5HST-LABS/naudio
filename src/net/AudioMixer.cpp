@@ -125,7 +125,7 @@ AudioMixer::TxResult AudioMixer::submitTxAudio(const std::string& clientId,
             if (canPreempt(ourPriority, txOwnership_->priority)) {
                 // Someone else holds it and we outrank them. Unreachable in the shipping
                 // server — every session is hard-wired Normal and canPreempt is strict-
-                // greater, and the frozen spec pins that (audio-streaming-protocol-v1.md:443)
+                // greater, and the frozen spec pins that (audio-streaming-protocol-v1.md:496)
                 // — but specified so the proposed §13.3 priority feature cannot inherit the bug.
                 if (recovered) {
                     result = TxResult::DeclinedRecovered;
@@ -144,7 +144,7 @@ AudioMixer::TxResult AudioMixer::submitTxAudio(const std::string& clientId,
                     // while the onTxConflict listener is wired to an empty lambda
                     // (AudioStreamServer.cpp). So returning DeclinedRecovered rather than
                     // Rejected is what stops a repair from spending the client's single
-                    // per-episode TX_DENIED (spec :440) and silencing its next genuine one.
+                    // per-episode TX_DENIED (spec :493) and silencing its next genuine one.
                     // Skipping the notification matters for any OTHER listener a consumer
                     // installs, which is why both are done.
                     result = TxResult::DeclinedRecovered;

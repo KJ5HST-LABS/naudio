@@ -65,7 +65,7 @@ public:
     // refused, so it owes that client a TX_DENIED. DeclinedRecovered answers a frame the
     // FEC layer reconstructed, which carries no client intent at all — nobody asked, so
     // nobody is owed an answer, and sending one would consume the client's single
-    // per-episode TX_DENIED (docs/audio-streaming-protocol-v1.md:440) and silence its
+    // per-episode TX_DENIED (docs/audio-streaming-protocol-v1.md:493) and silence its
     // next genuine denial.
     //
     // NOTE: Preempted predates this change and is never returned — the preempt branch
