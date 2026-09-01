@@ -467,6 +467,57 @@ std::string locateVectors() { return locateVectorsFile("vectors.ini"); }
 // ---- spec-1.2 (§6.2.1) handlers — vectors-v1_2.ini ----
 
 // Encode vectors: the extended CONNECT_REQUEST / AUDIO_CONFIG forms, byte-exact.
+// Spec 1.4 (SS6.8) discovery encode vectors. Byte-exact against a payload the
+// generator built with Python struct.pack, independently of this implementation.
+void runControlV14(const Section& v) {
+    bool ok = true;
+    long controlType = intLoose(req(v, "controlType", ok));
+    auto expected = hexToBytes(req(v, "expectedPayloadHex", ok));
+    if (!ok) return;
+    if (controlType == 0x60) {
+        auto token = static_cast<std::uint32_t>(std::stoul(req(v, "token", ok)));
+        if (!ok) return;
+        auto m = ControlMessage::discover(token);
+        EXPECT_EQ(toHex(expected), toHex(m.serialize())) << "DISCOVER serialize";
+        auto d = ControlMessage::deserialize(expected);
+        ASSERT_TRUE(d.has_value()) << "DISCOVER decode failed";
+        auto got = d->parseDiscoverToken();
+        ASSERT_TRUE(got.has_value()) << "DISCOVER token missing on decode";
+        EXPECT_EQ(token, *got) << "token";
+    } else if (controlType == 0x61) {
+        auto token = static_cast<std::uint32_t>(std::stoul(req(v, "token", ok)));
+        auto port = static_cast<std::uint16_t>(std::stoul(req(v, "port", ok)));
+        auto transports = static_cast<std::uint8_t>(std::stoul(req(v, "transports", ok)));
+        auto rate = static_cast<std::uint32_t>(std::stoul(req(v, "sampleRate", ok)));
+        auto bits = static_cast<std::uint8_t>(std::stoul(req(v, "bitsPerSample", ok)));
+        auto channels = static_cast<std::uint8_t>(std::stoul(req(v, "channels", ok)));
+        auto clients = static_cast<std::uint8_t>(std::stoul(req(v, "clientCount", ok)));
+        auto maxClients = static_cast<std::uint8_t>(std::stoul(req(v, "maxClients", ok)));
+        if (!ok) return;
+        const std::string name = get(v, "serverName");  // may legitimately be empty
+        auto m = ControlMessage::discoverReply(token, port, transports, rate, bits, channels,
+                                               clients, maxClients, name);
+        EXPECT_EQ(toHex(expected), toHex(m.serialize())) << "DISCOVER_REPLY serialize";
+        auto d = ControlMessage::deserialize(expected);
+        ASSERT_TRUE(d.has_value()) << "DISCOVER_REPLY decode failed";
+        auto info = d->parseDiscoverReply();
+        ASSERT_TRUE(info.has_value()) << "DISCOVER_REPLY parse failed";
+        EXPECT_EQ(token, info->token) << "token";
+        EXPECT_EQ(port, info->port) << "port";
+        EXPECT_EQ(transports, info->transports) << "transports";
+        EXPECT_EQ(rate, info->sampleRate) << "sampleRate";
+        EXPECT_EQ(bits, info->bitsPerSample) << "bitsPerSample";
+        EXPECT_EQ(channels, info->channels) << "channels";
+        EXPECT_EQ(clients, info->clientCount) << "clientCount";
+        EXPECT_EQ(maxClients, info->maxClients) << "maxClients";
+        EXPECT_EQ(name, info->name) << "serverName";
+        // The address is not a wire field (SS6.8): a decoder must not invent one.
+        EXPECT_EQ("", info->host) << "host must be left for the prober to fill";
+    } else {
+        ADD_FAILURE() << "unknown spec-1.4 controlType: " << controlType;
+    }
+}
+
 void runControlV12(const Section& v) {
     bool ok = true;
     long controlType = intLoose(req(v, "controlType", ok));
@@ -675,5 +726,41 @@ TEST(Conformance, GoldenVectorsV12) {
     // suite reporting green over a smaller corpus, so it must be raised deliberately whenever
     // gen_vectors.py gains a record.
     EXPECT_EQ(10, ran) << "expected all 10 spec-1.2/1.3 vectors to run";
+    EXPECT_EQ(0, skipped) << "expected 0 skipped vectors";
+}
+
+TEST(Conformance, GoldenVectorsV14) {
+    // The spec-1.4 (SS6.8) discovery vectors, on the same fail-closed, 0-skipped
+    // contract as the two files above: vendored and git-tracked, so absence is a
+    // broken checkout and never a skip.
+    std::string path = locateVectorsFile("vectors-v1_4.ini");
+    ASSERT_FALSE(path.empty())
+        << "spec-1.4 conformance vectors not found at NA_CONFORMANCE_DIR / the vendored "
+           "default (conformance/vectors/vectors-v1_4.ini).";
+    std::ifstream in(path);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    auto vectors = parseIni(ss.str());
+    ASSERT_FALSE(vectors.empty()) << "no vectors parsed from " << path;
+
+    int ran = 0;
+    int skipped = 0;
+    for (const auto& [name, sec] : vectors) {
+        SCOPED_TRACE("vector [" + name + "]");
+        std::string kind = get(sec, "kind");
+        if (kind == "control_v14") {
+            runControlV14(sec);
+            ++ran;
+        } else {
+            ADD_FAILURE() << "unknown kind: " << kind;
+        }
+    }
+    std::cerr << "conformance v1.4: " << ran << " ran, " << skipped << " skipped\n";
+    // Full gate: all 4 vectors run, 0 skipped — 1 DISCOVER probe + 3 DISCOVER_REPLY
+    // (named, unnamed, and a FULL server, which must still answer). The literal is the
+    // point, exactly as above: it is what stops a vector going missing from the .ini and
+    // the suite reporting green over a smaller corpus, so it must be raised deliberately
+    // whenever gen_vectors.py gains a record.
+    EXPECT_EQ(4, ran) << "expected all 4 spec-1.4 vectors to run";
     EXPECT_EQ(0, skipped) << "expected 0 skipped vectors";
 }
