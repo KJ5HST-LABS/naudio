@@ -380,39 +380,40 @@ jobs:
           echo "installed daemon serves its control page and reports an idle pipeline"
           echo "== macOS installer gate: PASS =="
 
-      - name: "Payload signatures: measured on the .pkg, never on the build's exit code"
+      - name: "Payload signatures: measured on the INSTALLED binaries a user gets"
         run: |
           set -euo pipefail
-          pkg=$(ls build/naudio-*.pkg)
           if [ -z "${NAUDIO_CODESIGN_IDENTITY:-}" ]; then
             echo "::warning::no identity was imported — skipping the payload assertion"
             exit 0
           fi
-          rm -rf "$RUNNER_TEMP/probe"
-          pkgutil --expand-full "$pkg" "$RUNNER_TEMP/probe" > /dev/null
-          # A FILE, not a heredoc: heredoc bodies must sit at column 0, which terminates
-          # the YAML block scalar this step is written in.
-          find "$RUNNER_TEMP/probe" -path '*/Payload/*' -type f -perm -u+x 2>/dev/null \
-            | while read -r f; do file "$f" 2>/dev/null | grep -q 'Mach-O' && echo "$f"; done \
-            > "$RUNNER_TEMP/machos.txt"
+          # Measured on what the installer gate above just placed under /usr/local, not on a
+          # re-expansion of the .pkg. Two reasons. It is the stronger claim — these are the
+          # bytes a user ends up running — and it needs no pkgutil --expand-full, whose
+          # failure on this runner was invisible because its diagnostics go to STDOUT and an
+          # earlier draft redirected that to /dev/null. Nothing here swallows output.
           n=0
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
+          for f in /usr/local/bin/na_wav_tap /usr/local/bin/na_audio_daemon \
+                   /usr/local/bin/na_audio_source /usr/local/bin/na_c_play_to_speakers \
+                   /usr/local/lib/libnaudio.*.*.*.dylib; do
+            test -e "$f" || { echo "::error::$f is not installed — the gate above should have"; exit 1; }
             n=$((n+1))
             desc=$(codesign -dvv "$f" 2>&1)
             case "$desc" in
               *"Authority=Developer ID Application"*) ;;
-              *) echo "::error::$(basename "$f") is not Developer ID signed — the notary would reject it"; exit 1 ;;
+              *) echo "::error::$(basename "$f") is not Developer ID signed — the notary would reject it"
+                 echo "$desc"; exit 1 ;;
             esac
             case "$desc" in
               *runtime*) ;;
-              *) echo "::error::$(basename "$f") lacks the hardened runtime"; exit 1 ;;
+              *) echo "::error::$(basename "$f") lacks the hardened runtime"; echo "$desc"; exit 1 ;;
             esac
-          done < "$RUNNER_TEMP/machos.txt"
-          # Cardinality (L230): four executables plus libnaudio. A probe that found nothing
-          # would otherwise walk this loop zero times and report success.
-          [ "$n" -eq 5 ] || { echo "::error::expected 5 signed payload binaries, saw $n"; exit 1; }
-          echo "== payload: $n binaries Developer ID signed with the hardened runtime =="
+            echo "  ok: $(basename "$f")"
+          done
+          # Cardinality (L230), the same 5 the installer gate scans: four executables plus
+          # libnaudio. A loop that matched nothing would otherwise report success.
+          [ "$n" -eq 5 ] || { echo "::error::expected 5 signed binaries, saw $n"; exit 1; }
+          echo "== payload: $n installed binaries Developer ID signed with the hardened runtime =="
 
       - name: Remove the signing keychain
         if: always()
