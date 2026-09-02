@@ -41,8 +41,10 @@ name: Release
 # installers and are unchanged.
 #
 # SIGNING IS MEASURED, NEVER ASSERTED (issue #99). Signing and notarizing the macOS .pkg
-# is a MANUAL post-build step this workflow does not perform — no signing identity is
-# available to it — so the .pkg it uploads is unsigned. The note therefore does not claim
+# still has a MANUAL half. Since 2026-09-02 this workflow DOES sign the payload binaries
+# (package-macos imports DEVELOPER_ID_CERTIFICATE_P12 into a throwaway keychain and
+# CPACK_PRE_BUILD_SCRIPTS signs them), but it does not yet productsign the wrapper or
+# notarize — so the .pkg it uploads is still unsigned as a package. The note therefore does not claim
 # otherwise: package-macos runs packaging/macos/signing-status.sh against the artifact and
 # the release job writes the macOS sentence from that measurement. The note used to assert
 # "signed and notarized and opens with no warning" unconditionally, which was false at the
@@ -103,11 +105,46 @@ jobs:
       - name: Derive the pre-release suffix from the tag (empty on final tags and dry runs)
         run: echo "NAUDIO_PKG_SUFFIX=$(echo "${GITHUB_REF_NAME}" | sed -n 's/^v[0-9.]*\(rc[0-9][0-9]*\)$/\1/p')" >> "$GITHUB_ENV"
 
+      - name: Import the Developer ID Application certificate (throwaway keychain)
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # No secret -> build unsigned, loudly. Degrading silently is the one thing this
+          # must not do: the signing-status step measures the artifact either way, so the
+          # release note stays honest, but a human reading the log must see which happened.
+          if [ -z "${P12:-}" ]; then
+            echo "::warning::DEVELOPER_ID_CERTIFICATE_P12 is empty — the payload will NOT be signed"
+            exit 0
+          fi
+          kc="$RUNNER_TEMP/naudio-signing.keychain-db"
+          pw=$(uuidgen)
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Without this, codesign blocks on a keychain-access prompt a runner has no UI to
+          # answer — the job burns its timeout instead of failing, which is strictly worse.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          # PROVE an identity landed rather than trusting `security import`'s exit code: a
+          # wrong password or a non-base64 secret can leave an empty keychain behind a 0.
+          id=$(security find-identity -v -p codesigning "$kc" \
+               | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
+          [ -n "$id" ] || { echo "::error::no Developer ID Application identity after import"; exit 1; }
+          echo "NAUDIO_KEYCHAIN=$kc" >> "$GITHUB_ENV"
+          echo "NAUDIO_CODESIGN_IDENTITY=$id" >> "$GITHUB_ENV"
+          echo "imported: $id"
+
       - name: Configure (release shape — no bridge, no hamlib; PortAudio bundled)
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
                 -DNAUDIO_BUNDLE_PORTAUDIO=ON \
                 -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DNAUDIO_CODESIGN_IDENTITY="${{ env.NAUDIO_CODESIGN_IDENTITY }}" \
                 -DNAUDIO_PKG_VERSION_SUFFIX="${{ env.NAUDIO_PKG_SUFFIX }}"
 
       - name: Build
@@ -342,6 +379,45 @@ jobs:
           kill "$ctl_daemon" 2>/dev/null || true
           echo "installed daemon serves its control page and reports an idle pipeline"
           echo "== macOS installer gate: PASS =="
+
+      - name: "Payload signatures: measured on the .pkg, never on the build's exit code"
+        run: |
+          set -euo pipefail
+          pkg=$(ls build/naudio-*.pkg)
+          if [ -z "${NAUDIO_CODESIGN_IDENTITY:-}" ]; then
+            echo "::warning::no identity was imported — skipping the payload assertion"
+            exit 0
+          fi
+          rm -rf "$RUNNER_TEMP/probe"
+          pkgutil --expand-full "$pkg" "$RUNNER_TEMP/probe" > /dev/null
+          # A FILE, not a heredoc: heredoc bodies must sit at column 0, which terminates
+          # the YAML block scalar this step is written in.
+          find "$RUNNER_TEMP/probe" -path '*/Payload/*' -type f -perm -u+x 2>/dev/null \
+            | while read -r f; do file "$f" 2>/dev/null | grep -q 'Mach-O' && echo "$f"; done \
+            > "$RUNNER_TEMP/machos.txt"
+          n=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            n=$((n+1))
+            desc=$(codesign -dvv "$f" 2>&1)
+            case "$desc" in
+              *"Authority=Developer ID Application"*) ;;
+              *) echo "::error::$(basename "$f") is not Developer ID signed — the notary would reject it"; exit 1 ;;
+            esac
+            case "$desc" in
+              *runtime*) ;;
+              *) echo "::error::$(basename "$f") lacks the hardened runtime"; exit 1 ;;
+            esac
+          done < "$RUNNER_TEMP/machos.txt"
+          # Cardinality (L230): four executables plus libnaudio. A probe that found nothing
+          # would otherwise walk this loop zero times and report success.
+          [ "$n" -eq 5 ] || { echo "::error::expected 5 signed payload binaries, saw $n"; exit 1; }
+          echo "== payload: $n binaries Developer ID signed with the hardened runtime =="
+
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          if [ -n "${NAUDIO_KEYCHAIN:-}" ]; then security delete-keychain "$NAUDIO_KEYCHAIN" || true; fi
 
       - name: "Signing status: measured on the .pkg, never assumed (#99)"
         run: |

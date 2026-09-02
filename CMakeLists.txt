@@ -1272,6 +1272,27 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # install — also how an operator removes the receipt if they hand-delete
         # the files (macOS packages have no uninstaller by design).
         set(CPACK_PRODUCTBUILD_IDENTIFIER "org.kj5hst.naudio")
+
+        # --- Payload code signing -------------------------------------------------
+        # Apple's notary validates every Mach-O INSIDE the .pkg, not just the wrapper
+        # productsign covers. Signing cannot happen at build time here: CMAKE_INSTALL_RPATH
+        # above makes install_name_tool rewrite the load commands and CPACK_STRIP_FILES
+        # strips symbols, and either invalidates an earlier signature — silently, until the
+        # notary rejects it (2ae8cbb). CPACK_PRE_BUILD_SCRIPTS runs after CPack installs and
+        # strips into its staging tree and before the package is assembled, which is the one
+        # window where a signature applies to the final bytes AND survives to the artifact.
+        #
+        # EMPTY BY DEFAULT, deliberately: with no identity nothing is signed and nothing
+        # changes, so every build that does not ask for this is byte-for-byte unaffected.
+        set(NAUDIO_CODESIGN_IDENTITY "" CACHE STRING
+            "Developer ID Application identity for signing macOS payload binaries (empty = unsigned)")
+        if(NAUDIO_CODESIGN_IDENTITY)
+            # Carried as a CPACK_ variable so it reaches the script's separate cmake -P
+            # context via CPackConfig.cmake; a plain variable would not survive.
+            set(CPACK_NAUDIO_CODESIGN_IDENTITY "${NAUDIO_CODESIGN_IDENTITY}")
+            set(CPACK_PRE_BUILD_SCRIPTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CodesignPayload.cmake")
+            message(STATUS "naudio: macOS payload will be signed as '${NAUDIO_CODESIGN_IDENTITY}'")
+        endif()
         # productbuild's license pane accepts only .rtf/.html/.txt/.rtfd — the
         # repo's extension-less LICENSE is rejected outright (measured: "Bad
         # file extension specified"). Stage a .txt copy; the project config
