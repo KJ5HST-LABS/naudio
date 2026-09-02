@@ -5,6 +5,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **A DUAL server bound to port 0 no longer gives up inside a reserved UDP block wider than
+  its retry budget** (issue #101). The retry #73 added asked the OS for a fresh port each
+  time, and the OS hands ephemeral ports out sequentially — measured at +1 on 99.8 % of
+  20,000 consecutive picks on windows-latest — so every retry stepped exactly one port
+  further into the block that had just refused it. On three GitHub Windows runners that
+  block is 200 contiguous ports (two adjacent 100-port WinNAT reservations), which 32
+  sequential picks cannot leave; three CI arms failed that way on a documentation-only
+  commit. The first attempt still takes the OS's pick; every retry now **draws** a port at
+  random from the IANA dynamic range (49152–65535) and binds both halves to it explicitly,
+  so no reserved block of any width can absorb the budget. The obvious alternative — let UDP
+  pick and TCP follow — was measured on the same runners and rejected: the UDP allocator
+  walks a 200-port TCP-excluded block at another address in exactly the same way. A named
+  port still gets exactly one attempt; `bindAttempts()` keeps its meaning.
+
 ## [1.0.0rc6] — 2026-09-01
 
 ### Added

@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 
@@ -52,16 +53,38 @@ public:
 
     // Paired binds attempted when the caller named NO port. See bind().
     //
-    // The number has to clear a CONTIGUOUS reserved block, not just one unlucky port,
-    // because the OS hands out ephemeral ports SEQUENTIALLY: measured on macOS/arm64,
-    // 24 close-then-rebind cycles advanced by exactly +1 every time and never re-issued
-    // a just-released port (0/11 immediate repeats, twice). That measurement is what
-    // rules out parking the failed ports to force distinct ones — the allocator already
-    // does — but it also means each retry steps just ONE port further into a reserved
-    // range. A budget of "a few" would walk into a 16-port WinNAT block and give up
-    // inside it, fixing nothing. Attempts cost two syscalls each, so the budget is set
-    // well clear of the block widths those hosts typically reserve.
+    // The FIRST attempt is the OS's own pick; every later one DRAWS a port at random from
+    // kDrawLow..kDrawHigh and binds both halves to it explicitly. The draw is the whole
+    // point: it makes this budget independent of how wide a reserved block is (issue #101).
+    //
+    // MEASURED, twice, and the second measurement retired the design that preceded this one.
+    // Ephemeral ports are handed out SEQUENTIALLY — macOS/arm64 advanced +1 on 24/24
+    // close-then-rebind cycles (issue #73); windows-latest advanced +1 on 99.8 % of 20,000
+    // consecutive port-0 picks and wrapped at 65535 (2026-09-02, three runners). So a retry
+    // that asks the OS again steps exactly ONE port further into whatever just refused it.
+    // On those three runners the TCP allocator walked straight through a UDP-excluded block
+    // of exactly 200 contiguous ports — two adjacent 100-port WinNAT reservations — and
+    // every one of the ~204 UDP refusals per 20,000 was WSAEACCES inside it. A sequential
+    // budget of 32 cannot leave a block of 200, and no fixed budget clears a block whose
+    // width the host chooses. The design #101 expected to ship instead — let UDP pick and
+    // TCP follow — was measured on the same runners and is WORSE: the UDP allocator walks a
+    // 200-port TCP-excluded block at a different address in exactly the same way, and the
+    // TCP follower also collides with 27–49 in-use ports per 20,000 that a UDP follower
+    // never meets. Swapping the picker swaps which block bites.
+    //
+    // An independent draw does not walk. Each retry lands on a reserved or occupied port
+    // with the probability of the excluded FRACTION of the range — under 3 % on those
+    // runners (~440 of 16,384) — so 31 draws all failing is that fraction to the 31st
+    // power. The constant is a ceiling on wasted syscalls, not a guess about block widths.
     static constexpr int kPort0BindAttempts = 32;
+
+    // Where the retries draw from: the IANA dynamic/private range (RFC 6335 §6), which is
+    // also the Windows default dynamic range for both protocols (netsh: start 49152, 16,384
+    // ports, read on the runners above). Linux's ephemeral range sits lower (32768–60999);
+    // a port above it is still bindable, it is simply never handed out for 0 — and a draw
+    // is not asking the OS to pick.
+    static constexpr std::uint16_t kDrawLow = 49152;
+    static constexpr std::uint16_t kDrawHigh = 65535;
 
     // §6.8: a DUAL server is discoverable over its UDP half -- the TCP half has no
     // datagram path to an unknown sender. Forwarded rather than reimplemented, so
@@ -70,22 +93,26 @@ public:
         udp_.setDiscoveryFacts(std::move(provider));
     }
 
-    // Binds TCP, then binds UDP to the port TCP was actually assigned. TCP and UDP port
-    // spaces are independent at the OS level, which is what makes one port number serve
-    // both — a contract the C ABI publishes (naudio.h: "a DUAL server serves TCP+UDP on
-    // one port").
+    // Binds TCP, then binds UDP to the same number. TCP and UDP port spaces are independent
+    // at the OS level, which is what makes one port number serve both — a contract the C
+    // ABI publishes (naudio.h: "a DUAL server serves TCP+UDP on one port").
     //
-    // WHEN THE CALLER NAMED NO PORT (issue #73) the OS picks the TCP port freely, and
-    // nothing then guarantees the same number is available on UDP. On Windows hosts
+    // WHEN THE CALLER NAMED NO PORT (issues #73, #101) the OS picks the TCP port freely,
+    // and nothing then guarantees the same number is available on UDP. On Windows hosts
     // running WinNAT / Hyper-V, whole blocks of UDP ports are reserved, and a bind into
     // one returns WSAEACCES (10013, "permission denied") rather than WSAEADDRINUSE — so
     // whenever the OS's free TCP pick lands in a reserved UDP block, the paired bind
     // fails. It is a function of which port the OS chose, so it is intermittent by
     // construction and unrelated to the caller. Five CI arms failed this way on a
-    // documentation-only commit.
+    // documentation-only commit (#73), and three more on another after #73's retry had
+    // spent all 32 of its OS-assigned picks inside one 200-port block (#101).
     //
-    // So a port-0 caller gets the pair retried on a fresh OS-assigned port. That is
-    // behaviour-preserving: it asked for "any port", and it still gets any port.
+    // So a port-0 caller gets the pair retried — and the retry DRAWS the port rather than
+    // asking the OS again, because the OS would answer with the next port along, still
+    // inside the block (see kPort0BindAttempts). That is behaviour-preserving: it asked
+    // for "any port" and still gets any port; only the first attempt is the OS's own pick.
+    // A drawn port that TCP refuses (another socket holds it, or it sits in a TCP-reserved
+    // block) costs one attempt and is drawn again; there is nothing to roll back.
     //
     // A caller that NAMED a port gets exactly one attempt — that port or nothing. It
     // asked for a specific number, and silently serving a different one would break the
@@ -95,24 +122,35 @@ public:
     // path that does not retry. The OS never hands out a privileged port for 0.
     bool bind(std::uint16_t port, std::string* err) override {
         const int attempts = (port == 0) ? kPort0BindAttempts : 1;
-        std::string udpErr;
+        std::string lastErr;
+        std::minstd_rand rng{std::random_device{}()};
+        std::uniform_int_distribution<int> draw(kDrawLow, kDrawHigh);
         for (int attempt = 1; attempt <= attempts; ++attempt) {
-            if (!tcp_.bind(port, err)) return false;  // TCP itself refused — not our business
+            const bool drawn = attempt > 1;
+            const auto ask = drawn ? static_cast<std::uint16_t>(draw(rng)) : port;
+            if (!bindTcpTo(ask, drawn ? &lastErr : err)) {
+                if (!drawn) return false;  // TCP refused the caller's own ask — not our business
+                continue;                  // a drawn port TCP refused: draw again
+            }
             // Resolve the actual port (handles ephemeral port 0), bind UDP to it.
             const int actualPort = tcp_.port();
-            if (bindUdpTo(static_cast<std::uint16_t>(actualPort), &udpErr)) {
+            if (bindUdpTo(static_cast<std::uint16_t>(actualPort), &lastErr)) {
                 bindAttempts_ = attempt;
                 return true;
             }
             tcp_.close();  // rollback so a partial bind never strands TCP
         }
         bindAttempts_ = attempts;
-        // Report the UDP refusal itself, never a summary of it: the retry must not turn a
+        // Report the refusal itself, never a summary of it: the retry must not turn a
         // diagnosable error into "bind failed". The attempt count is what distinguishes an
         // exhausted retry from a single refusal.
         if (err) {
-            *err = "UDP bind failed on " + std::to_string(attempts) +
-                   (attempts == 1 ? " attempt: " : " OS-assigned ports, last error: ") + udpErr;
+            *err = attempts == 1
+                       ? "UDP bind failed on 1 attempt: " + lastErr
+                       : "paired bind failed on " + std::to_string(attempts) +
+                             " ports (1 OS-assigned, " + std::to_string(attempts - 1) +
+                             " drawn from " + std::to_string(kDrawLow) + "-" +
+                             std::to_string(kDrawHigh) + "), last error: " + lastErr;
         }
         return false;
     }
@@ -178,13 +216,16 @@ public:
     }
 
 protected:
-    // TEST SEAM (issue #73). The paired UDP bind, as one overridable call.
+    // TEST SEAMS (issues #73, #101). Each half of the paired bind, as one overridable call.
     //
-    // The retry above exists for a refusal NO TEST CAN PROVOKE ON DEMAND: it needs the OS
-    // to reserve the exact port its own allocator just handed out, which is why the bug
-    // only ever appeared as an intermittent on Windows CI. Overriding this is the only way
-    // to assert the retry does what it claims. Production behaviour is one non-virtual-in-
-    // practice call to udp_.bind — a test double is the sole other implementation.
+    // The retry above exists for refusals NO TEST CAN PROVOKE ON DEMAND: the OS reserving
+    // the exact port its own allocator just handed out, or already holding a drawn one —
+    // which is why the bug only ever appeared as an intermittent on Windows CI. Overriding
+    // these is the only way to assert the retry does what it claims, and to keep its
+    // attempt-count arms EXACT when a real bind is refused underneath them (#98).
+    // Production behaviour is one non-virtual-in-practice call to each sub-transport's
+    // bind — a test double is the sole other implementation.
+    virtual bool bindTcpTo(std::uint16_t port, std::string* err) { return tcp_.bind(port, err); }
     virtual bool bindUdpTo(std::uint16_t port, std::string* err) { return udp_.bind(port, err); }
 
 private:
