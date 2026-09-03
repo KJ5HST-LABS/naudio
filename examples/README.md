@@ -32,6 +32,8 @@ ABI. It can broadcast a local audio input, or (with `--test-tone`) a fixed,
 hardware-free tone so a client works end to end on a headless box. Start it, point a
 client at it, and you hear what it sends.
 
+With `--playback-id N` it also plays the clients' transmit audio — the one TX channel the server arbitrates among them — on a local output device: the radio's TX audio input at a station, or the speakers on a desk. `--list-devices` lists the playback ids beside the capture ids; the option is capture-mode only, and an id that is not a playback-capable device is refused before the server starts.
+
 ## Quick start
 
 Build the toolkit (apps are on by default), then run the demo source and a client:

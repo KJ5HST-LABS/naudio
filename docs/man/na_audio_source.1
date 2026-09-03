@@ -1,5 +1,5 @@
 .\" SPDX-License-Identifier: LGPL-2.1-or-later
-.TH NA_AUDIO_SOURCE 1 "2026-08-30" "naudio" "naudio manual"
+.TH NA_AUDIO_SOURCE 1 "2026-09-02" "naudio" "naudio manual"
 .SH NAME
 na_audio_source \- broadcast an audio input or a test tone as a naudio stream
 .SH SYNOPSIS
@@ -7,6 +7,8 @@ na_audio_source \- broadcast an audio input or a test tone as a naudio stream
 .RB [ \-\-port
 .IR N ]
 .RB [ \-\-capture\-id
+.IR N ]
+.RB [ \-\-playback\-id
 .IR N ]
 .RB [ \-\-transport
 .IR tcp | udp ]
@@ -42,6 +44,13 @@ plays the stream on another machine's speakers,
 records it to a WAV file.
 .PP
 With
+.B \-\-playback\-id
+the server also plays the clients' transmit audio on a local output device.
+naudio arbitrates one transmit channel among its clients; whichever client
+holds it is heard on that device \(em the radio's transmit audio input at a
+station, or the speakers on a desk.
+.PP
+With
 .B \-\-test\-tone
 it is the out-of-the-box demo and the first thing to run on a new install:
 start it on one machine, point the player at that machine from anywhere on
@@ -56,6 +65,16 @@ port to listen on; 0 lets the OS pick one (default 4533).
 audio input device to broadcast, by the id shown by
 .B \-\-list\-devices
 (default: the first capture device).
+.TP
+.BI \-\-playback\-id " N"
+output device to also play the clients' transmit audio on, by the id shown in
+the playback list of
+.B \-\-list\-devices
+(default: transmit audio is not played).
+Capture mode only \(em the test tone opens no device.
+The device is opened at the server's rate and channel count, like the capture
+device, and an id that no playback-capable device carries is refused before the
+server starts.
 .TP
 .BI \-\-transport " tcp\fR|\fPudp"
 network transport (default tcp).
@@ -116,7 +135,7 @@ switch, not access control: a silent server still accepts connections from anyon
 already knows its address.
 .TP
 .B \-\-list\-devices
-print the ids of capture-capable devices, then exit.
+print the ids of capture-capable devices, then of playback-capable ones, then exit.
 .TP
 .BR \-h ", " \-\-help
 print usage and exit.
@@ -134,6 +153,16 @@ Broadcast the first microphone on the machine over UDP with loss recovery:
 .nf
 .RS
 na_audio_source \-\-transport udp \-\-reliability wan
+.RE
+.fi
+.PP
+Serve a microphone and play the clients' transmit audio on the speakers (both
+ids from
+.BR \-\-list\-devices ):
+.PP
+.nf
+.RS
+na_audio_source \-\-capture\-id 1 \-\-playback\-id 2
 .RE
 .fi
 .SH SEE ALSO

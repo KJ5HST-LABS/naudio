@@ -5,6 +5,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **`na_audio_source --playback-id N` plays the clients' transmit audio on a local output device.** The server arbitrates one TX channel among its clients (`na_server_tx_owner`); with this option that channel is played on the chosen device — the radio's TX audio input at a station, or the speakers on a desk — through `na_server_set_playback_device`, which nothing shipped had called until now. `--list-devices` now lists playback-capable devices by their playback id beside the capture list. The option is capture-mode only and is refused by name before the server starts, both with `--test-tone` (the hardware-free NULL backend opens no output device) and with an id no playback-capable device carries, rather than accepted by the setter and failed at start.
+
 ## [1.0.0rc7] — 2026-09-02
 
 ### Changed
