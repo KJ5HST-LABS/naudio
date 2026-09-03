@@ -1186,6 +1186,21 @@ endif()
 # ----------------------------------------------------------------------------
 add_subdirectory(examples)
 
+# na_audio_source --playback-id refusal gate. Same containment as the daemon's argcheck: every
+# case is decided before any device work (the --test-tone pairing is refused straight after the
+# parse loop's range checks), so the arm is hardware-free although it drives the SYSTEM-backend
+# example. The one case that starts anything is the positive control, a one-second test tone on
+# an ephemeral port, on the NULL backend. Registered only where the target and a bash exist, for
+# the reasons given above the daemon gates: no test beats a misleading one. It sits AFTER
+# add_subdirectory(examples) because that is where the target comes into existence — placed
+# beside the daemon gates it silently registered nothing (the TARGET test was false there).
+if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_source)
+    add_test(NAME naudio_source_argcheck
+             COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
+                          "${CMAKE_CURRENT_SOURCE_DIR}/tests/examples/source_argcheck.sh"
+                          "$<TARGET_FILE:na_audio_source>")
+endif()
+
 # ----------------------------------------------------------------------------
 # CPack — binary packages (issue #93). TGZ is the default, relocatable shape on
 # every platform (the installed tools self-locate libnaudio through the relative

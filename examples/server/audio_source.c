@@ -20,6 +20,10 @@
 //      PulseAudio/PipeWire null sink on Linux) so you can stream whatever the
 //      machine is already playing. Run `--list-devices` first to find the id;
 //      with no `--capture-id` the first capture-capable device is used.
+//      Add `--playback-id N` and the server also PLAYS the clients' TX audio — the
+//      one TX channel it arbitrates among them (na_server_tx_owner) — on that output
+//      device: the radio's TX audio input at a station, or the speakers on a desk.
+//      Both devices are opened at the server format; naudio does not resample.
 //
 //   2. Test-tone mode — a hardware-free deterministic tone.
 //        na_audio_source --test-tone --port 4533
@@ -164,7 +168,7 @@ static const char* cap_name(int capability) {
     }
 }
 
-// Print every capture-capable device; returns 0 on success, 1 on failure.
+// Print every capture-capable device, then every playback-capable one; 0 on success, 1 on failure.
 static int list_devices(void) {
     na_context* ctx = na_context_create();
     if (ctx == NULL) {
@@ -190,6 +194,20 @@ static int list_devices(void) {
     }
     if (shown == 0)
         printf("  (none — use --test-tone for a hardware-free source)\n");
+    // The playback id is a SEPARATE column: a device the backend reports as split records
+    // (ALSA-style) carries different ids per direction, and a capture-only device has -1 here.
+    printf("Playback-capable devices (use the id with --playback-id):\n");
+    shown = 0;
+    for (int i = 0; i < n; i++) {
+        if (devs[i].capability == NA_CAP_PLAYBACK || devs[i].capability == NA_CAP_DUPLEX) {
+            printf("  [%2d] %-40s %-12s %s%s\n", devs[i].playback_backend_id, devs[i].name,
+                   cap_name(devs[i].capability), devs[i].host_api,
+                   devs[i].is_virtual ? "  (virtual loopback)" : "");
+            shown++;
+        }
+    }
+    if (shown == 0)
+        printf("  (none — the server can still capture; without --playback-id TX is not played)\n");
     na_context_destroy(ctx);
     return 0;
 }
@@ -211,15 +229,40 @@ static int default_capture_id(void) {
     return id;
 }
 
+// Look `id` up among the playback-capable devices. Returns 1 (and copies the device name) if a
+// playback-capable device carries it as its PLAYBACK id, 0 if none does — a capture-only device's
+// playback id is -1, so its capture id never matches — or -1 if enumeration itself failed.
+static int find_playback_device(int id, char* name, size_t name_len) {
+    na_context* ctx = na_context_create();
+    if (ctx == NULL) return -1;
+    na_device devs[MAX_DEVICES];
+    int n = na_enumerate(ctx, devs, MAX_DEVICES, sizeof devs[0]);
+    int found = n < 0 ? -1 : 0;
+    for (int i = 0; i < n; i++) {
+        if ((devs[i].capability == NA_CAP_PLAYBACK || devs[i].capability == NA_CAP_DUPLEX) &&
+            devs[i].playback_backend_id == id) {
+            snprintf(name, name_len, "%s", devs[i].name);
+            found = 1;
+            break;
+        }
+    }
+    na_context_destroy(ctx);
+    return found;
+}
+
 static void usage(void) {
     fprintf(stderr,
-        "usage: na_audio_source [--port N] [--capture-id N] [--transport tcp|udp]\n"
-        "                       [--rate HZ] [--channels 1|2]\n"
+        "usage: na_audio_source [--port N] [--capture-id N] [--playback-id N]\n"
+        "                       [--transport tcp|udp] [--rate HZ] [--channels 1|2]\n"
         "                       [--test-tone] [--max-clients N] [--seconds N]\n"
         "                       [--name LABEL] [--no-discovery] [--discovery-port N]\n"
         "       na_audio_source --list-devices\n\n"
         "  --port N          listen port; 0 = OS-assigned ephemeral (default 4533)\n"
         "  --capture-id N    capture device id to broadcast (default: first capture device)\n"
+        "  --playback-id N   output device to also PLAY the clients' TX audio on — the one TX\n"
+        "                    channel the server arbitrates among them; capture mode only, and\n"
+        "                    opened at the server format like the capture device (default:\n"
+        "                    TX is not played)\n"
         "  --transport T     tcp (default) | udp\n"
         "  --reliability P   lan | wan  (UDP profiles: FEC/reorder/jitter). UDP/DUAL needs\n"
         "                    one: a bare start is refused since 0.5.0\n"
@@ -239,13 +282,14 @@ static void usage(void) {
         "                    stream, but answering does tell anyone on the segment that\n"
         "                    this server exists, its format and how full it is\n"
         "  --seconds N       run time; 0 = until Ctrl-C (default 0)\n"
-        "  --list-devices    print capture-capable device ids, then exit\n"
+        "  --list-devices    print capture- and playback-capable device ids, then exit\n"
         "  -h, --help        print this message\n");
 }
 
 int main(int argc, char** argv) {
     int          port        = 4533;  // AudioStreamConfig default audio port
     int          capture_id  = -1;    // -1 => auto-select the first capture device
+    int          playback_id = -1;    // -1 => TX is not played to a device
     na_transport transport   = NA_TRANSPORT_TCP;
     int          test_tone   = 0;
     int          max_clients = 4;
@@ -263,6 +307,7 @@ int main(int argc, char** argv) {
         #define NEED_VAL(opt) (i + 1 < argc ? argv[++i] : (fprintf(stderr, "error: %s needs a value\n", opt), exit(2), ""))
         if      (strcmp(a, "--port") == 0)        port = atoi(NEED_VAL("--port"));
         else if (strcmp(a, "--capture-id") == 0)  capture_id = atoi(NEED_VAL("--capture-id"));
+        else if (strcmp(a, "--playback-id") == 0) playback_id = atoi(NEED_VAL("--playback-id"));
         else if (strcmp(a, "--max-clients") == 0) max_clients = atoi(NEED_VAL("--max-clients"));
         else if (strcmp(a, "--seconds") == 0)     seconds = atoll(NEED_VAL("--seconds"));
         else if (strcmp(a, "--rate") == 0)        { rate = atoi(NEED_VAL("--rate")); format_set = 1; }
@@ -300,6 +345,15 @@ int main(int argc, char** argv) {
         fprintf(stderr, "error: invalid --channels %d (1|2)\n", channels);
         return 2;
     }
+    // --playback-id is a SYSTEM-backend setting: the test-tone server runs on the hardware-free
+    // NULL backend, which opens no output device (its TX goes to na_server_tx_audio_cb instead),
+    // and na_server_set_playback_device would answer a bare NA_ERR_UNSUPPORTED. Refuse the
+    // pairing by name, here, before anything is created.
+    if (test_tone && playback_id >= 0) {
+        fprintf(stderr, "error: --playback-id needs capture mode: --test-tone opens no audio "
+                        "device at all (drop --test-tone, or drop --playback-id)\n");
+        return 2;
+    }
 
     // Frame geometry for the effective format (at the defaults: 960 / 1920 / 3840).
     const int samples_per_frame = rate * FRAME_MS / 1000;
@@ -322,6 +376,26 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr, "[source] auto-selected capture device id=%d "
                         "(run --list-devices to choose another)\n", capture_id);
+    }
+
+    // Resolve the playback device up front too: an id that no playback-capable device carries is
+    // refused HERE, by name, rather than accepted by the setter and failed at start. A capture-
+    // only device's playback id is -1, so its capture id is never a valid answer to --playback-id.
+    // (The daemon's --playback, which falls back silently when its pattern matches nothing, is the
+    // shape this avoids: a misspelled sink there reports a pass that fed nothing.)
+    char playback_name[256] = "";
+    if (playback_id >= 0) {
+        const int found = find_playback_device(playback_id, playback_name, sizeof playback_name);
+        if (found < 0) {
+            fprintf(stderr, "error: device enumeration: %s\n", na_strerror(na_last_error()));
+            return 1;
+        }
+        if (found == 0) {
+            fprintf(stderr, "error: --playback-id %d is not a playback-capable device id "
+                            "(run --list-devices and use an id from its playback list)\n",
+                    playback_id);
+            return 2;
+        }
     }
 
     na_audio_server* server = na_server_create(backend, port);
@@ -371,15 +445,23 @@ int main(int argc, char** argv) {
             na_server_destroy(server);
             return 1;
         }
+        // TX: the mixed, arbitrated TX audio plays on this device (SYSTEM backend only). After the
+        // capture device and before start, like every other setter here.
+        if (playback_id >= 0 && na_server_set_playback_device(server, playback_id) != NA_OK) {
+            fprintf(stderr, "error: na_server_set_playback_device(%d): %s\n",
+                    playback_id, na_strerror(na_last_error()));
+            na_server_destroy(server);
+            return 1;
+        }
     }
 
     char err[256];
     if (na_server_start(server, err, (int)sizeof err) != NA_OK) {
         fprintf(stderr, "error: na_server_start failed: %s\n", err);
         if (format_set && !test_tone)
-            fprintf(stderr, "hint: the capture device may not support %d Hz / %d ch — naudio "
+            fprintf(stderr, "hint: the capture%s device may not support %d Hz / %d ch — naudio "
                             "does not resample. Pick a rate the device supports, or --test-tone.\n",
-                    rate, channels);
+                    playback_id >= 0 ? " or playback" : "", rate, channels);
         na_server_destroy(server);
         return 1;
     }
@@ -420,6 +502,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[source] capturing device id=%d (%d Hz / %d ch) -> broadcasting on "
                         "%s:%d (max %d clients)\n",
                 capture_id, rate, channels, transport_name, bound_port, max_clients);
+        if (playback_id >= 0)
+            fprintf(stderr, "[source] playing TX to device id=%d (%s) at %d Hz / %d ch\n",
+                    playback_id, playback_name, rate, channels);
     }
     fprintf(stderr, "[source] running %s ...\n",
             seconds > 0 ? "for a fixed time" : "until Ctrl-C");
