@@ -17,8 +17,22 @@
 # the example must refuse the pairing by name, before start, instead of surfacing that code.
 set -u
 
-SOURCE="${1:?usage: source_argcheck.sh <path-to-na_audio_source>}"
+SOURCE="${1:?usage: source_argcheck.sh <path-to-na_audio_source> [dir-of-libnaudio]}"
 [ -x "$SOURCE" ] || { echo "FAIL: not executable: $SOURCE"; exit 1; }
+
+# Optional: the directory holding the shared library. On Windows the examples land in
+# build/examples/<Config>/ while naudio.dll lands beside the library target, so from ctest's
+# environment the exe cannot load (exit 127, "naudio.dll: cannot open shared object file"). The
+# CMake registration passes $<TARGET_FILE_DIR:naudio>; it is prepended to PATH here, through
+# cygpath because the exe is a NATIVE Windows binary (the same rule as tests/daemon/configcheck.sh).
+# On POSIX the rpath already resolves the library and the entry is harmless.
+LIBDIR="${2:-}"
+if [ -n "$LIBDIR" ]; then
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) LIBDIR="$(cygpath -u "$LIBDIR")" ;;
+    esac
+    export PATH="$LIBDIR:$PATH"
+fi
 
 fails=0
 

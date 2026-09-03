@@ -13,10 +13,24 @@
 # sends NOTHING: the server must name no owner, because ownership follows audio, not connection.
 set -u
 
-SOURCE="${1:?usage: tx_owner_line.sh <na_audio_source> <na_c_inject_tone>}"
-TONE="${2:?usage: tx_owner_line.sh <na_audio_source> <na_c_inject_tone>}"
+SOURCE="${1:?usage: tx_owner_line.sh <na_audio_source> <na_c_inject_tone> [dir-of-libnaudio]}"
+TONE="${2:?usage: tx_owner_line.sh <na_audio_source> <na_c_inject_tone> [dir-of-libnaudio]}"
 [ -x "$SOURCE" ] || { echo "FAIL: not executable: $SOURCE"; exit 1; }
 [ -x "$TONE" ]   || { echo "FAIL: not executable: $TONE"; exit 1; }
+
+# Optional: the directory holding the shared library. On Windows the examples land in
+# build/examples/<Config>/ while naudio.dll lands beside the library target, so from ctest's
+# environment the exe cannot load (exit 127, "naudio.dll: cannot open shared object file"). The
+# CMake registration passes $<TARGET_FILE_DIR:naudio>; it is prepended to PATH here, through
+# cygpath because the exe is a NATIVE Windows binary (the same rule as tests/daemon/configcheck.sh).
+# On POSIX the rpath already resolves the library and the entry is harmless.
+LIBDIR="${3:-}"
+if [ -n "$LIBDIR" ]; then
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) LIBDIR="$(cygpath -u "$LIBDIR")" ;;
+    esac
+    export PATH="$LIBDIR:$PATH"
+fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -28,9 +42,14 @@ fails=0
 lf() { tr -d '\r' < "$1" > "$1.lf" && mv "$1.lf" "$1"; }
 STAMP='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}[+-][0-9]{4}'
 
-# Start the test-tone server for $1 seconds on an ephemeral port; sets $SRV and $port.
+# Start the test-tone server on an ephemeral port; sets $SRV and $port. It runs until stop_server,
+# with a 60 s ceiling so a dead arm cannot leave it behind. The FIRST version of this arm gave the
+# server a fixed 8 s and the client 2 s; on macos-latest the client took long enough that the
+# server's deadline fell before the client's disconnect, the release was never logged, and a
+# correct server failed the arm. The server's lifetime is now the client's, not a guess at runner
+# speed.
 start_server() {
-    "$SOURCE" --test-tone --port 0 --seconds "$1" > "$work/srv.out" 2> "$work/srv.err" &
+    "$SOURCE" --test-tone --port 0 --seconds 60 > "$work/srv.out" 2> "$work/srv.err" &
     SRV=$!
     port=""
     for _ in $(seq 1 100); do
@@ -43,6 +62,24 @@ start_server() {
         exit 1
     fi
     sleep 0.5
+}
+
+# Give the server up to $1 seconds to log an ERE $2, then stop it (TERM, then KILL) and reap it.
+# The lines the assertions read are already on disk — stderr is unbuffered — so how the server
+# dies does not matter to them, and its exit code is not asserted.
+stop_server_after() {
+    local secs="$1" re="$2"
+    for _ in $(seq 1 $((secs * 10))); do
+        if tr -d '\r' < "$work/srv.err" | grep -Eq "$re"; then break; fi
+        sleep 0.1
+    done
+    kill "$SRV" 2>/dev/null
+    for _ in $(seq 1 50); do
+        kill -0 "$SRV" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -9 "$SRV" 2>/dev/null
+    wait "$SRV" 2>/dev/null
 }
 
 # Assert a file matches (or, with "not", does not match) an ERE.
@@ -59,12 +96,13 @@ expect_not() {
 }
 
 # --- arm 1: a client that sends for two seconds is named owner, stamped, then released ---------
-start_server 8
+start_server
+t0=$(date +%s)
 "$TONE" --port "$port" --seconds 2 > "$work/tone.out" 2> "$work/tone.err"; rc=$?
-wait "$SRV"; srv_rc=$?
+echo "tone client ran $(( $(date +%s) - t0 )) s wall-clock for --seconds 2 (diagnostic, not asserted)"
+stop_server_after 15 'tx owner=none'
 for f in srv.out srv.err tone.out tone.err; do lf "$work/$f"; done
-[ "$rc" -eq 0 ]     && echo "ok: tone client exit 0" || { echo "FAIL: tone client exit $rc"; fails=$((fails + 1)); }
-[ "$srv_rc" -eq 0 ] && echo "ok: server exit 0"      || { echo "FAIL: server exit $srv_rc"; fails=$((fails + 1)); }
+[ "$rc" -eq 0 ] && echo "ok: tone client exit 0" || { echo "FAIL: tone client exit $rc"; fails=$((fails + 1)); }
 expect "$work/tone.out" '^RESULT injected_bytes=[1-9][0-9]* frames=[1-9]' "the client injected audio"
 expect "$work/srv.err"  "^\[source\] $STAMP tx owner=audio-[0-9]+$" "the server named an owner, stamped"
 expect "$work/srv.err"  "^\[source\] $STAMP tx owner=none$"         "the server released it, stamped"
@@ -80,9 +118,9 @@ fi
 echo "--- arm 1 server log"; cat "$work/srv.err"
 
 # --- negative control: a client that connects and sends nothing is never named owner ----------
-start_server 4
+start_server
 "$TONE" --port "$port" --seconds 0 > "$work/tone0.out" 2> "$work/tone0.err"; rc=$?
-wait "$SRV"
+stop_server_after 5 'client disconnected'
 for f in srv.out srv.err tone0.out tone0.err; do lf "$work/$f"; done
 [ "$rc" -eq 1 ] && echo "ok: send-nothing client exit 1" || { echo "FAIL: send-nothing client exit $rc, expected 1"; fails=$((fails + 1)); }
 expect "$work/tone0.out"    '^RESULT injected_bytes=0 frames=0' "the control injected nothing"

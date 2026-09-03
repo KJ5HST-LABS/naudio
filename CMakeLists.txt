@@ -1195,10 +1195,15 @@ add_subdirectory(examples)
 # add_subdirectory(examples) because that is where the target comes into existence — placed
 # beside the daemon gates it silently registered nothing (the TARGET test was false there).
 if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_source)
+    # The trailing argument is the shared library's directory: on Windows the examples land in
+    # build/examples/<Config>/ and naudio.dll beside the library target, so without it both arms
+    # exit 127 from ctest ("naudio.dll: cannot open shared object file") — seen on the first CI run
+    # of this arm. The script prepends it to PATH (through cygpath, the exe being native).
     add_test(NAME naudio_source_argcheck
              COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
                           "${CMAKE_CURRENT_SOURCE_DIR}/tests/examples/source_argcheck.sh"
-                          "$<TARGET_FILE:na_audio_source>")
+                          "$<TARGET_FILE:na_audio_source>"
+                          "$<TARGET_FILE_DIR:naudio>")
 endif()
 # The TX-owner line, end to end and hardware-free: the test-tone server on the NULL backend, the
 # tone client transmitting from the NULL backend, and the assertion on the LOG LINE a station reads
@@ -1210,8 +1215,12 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_source AN
              COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
                           "${CMAKE_CURRENT_SOURCE_DIR}/tests/examples/tx_owner_line.sh"
                           "$<TARGET_FILE:na_audio_source>"
-                          "$<TARGET_FILE:na_c_inject_tone>")
-    set_tests_properties(naudio_tx_owner_line PROPERTIES TIMEOUT 60)
+                          "$<TARGET_FILE:na_c_inject_tone>"
+                          "$<TARGET_FILE_DIR:naudio>")
+    # The servers now live until the client is done (a 60 s ceiling each); the arm's own budget
+    # covers two of them plus the release poll with room, and a hung one still fails the arm
+    # rather than the suite.
+    set_tests_properties(naudio_tx_owner_line PROPERTIES TIMEOUT 150)
 endif()
 
 # ----------------------------------------------------------------------------
