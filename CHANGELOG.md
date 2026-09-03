@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.0.0rc7] — 2026-09-02
+
 ### Changed
 - **The macOS `.pkg` is signed, notarized and stapled by the release pipeline itself.** Every
   payload binary carries a Developer ID Application signature with the hardened runtime and a
