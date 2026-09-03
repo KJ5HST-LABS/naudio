@@ -34,6 +34,8 @@ client at it, and you hear what it sends.
 
 With `--playback-id N` it also plays the clients' transmit audio — the one TX channel the server arbitrates among them — on a local output device: the radio's TX audio input at a station, or the speakers on a desk. `--list-devices` lists the playback ids beside the capture ids; the option is capture-mode only, and an id that is not a playback-capable device is refused before the server starts. In either mode the server logs every change of TX owner with a wall-clock stamp (`[source] 2026-09-02T23:46:03.890-0400 tx owner=<id>`, or `none` on release) — local time with the UTC offset, the shape `rigctld -Z` uses, so a station running both on one host reads its PTT-to-audio latency as the difference between the two logs.
 
+[`c/inject_tone.c`](c/inject_tone.c) — `na_c_inject_tone`, the sending client: it injects a 1 kHz sawtooth as TX audio at the server's format from the hardware-free `null` backend, so the TX path is proved with no digital-mode application in the loop (see [`c/README.md`](c/README.md)). Built with the examples, not shipped.
+
 ## Quick start
 
 Build the toolkit (apps are on by default), then run the demo source and a client:
