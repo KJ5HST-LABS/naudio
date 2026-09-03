@@ -32,7 +32,7 @@ ABI. It can broadcast a local audio input, or (with `--test-tone`) a fixed,
 hardware-free tone so a client works end to end on a headless box. Start it, point a
 client at it, and you hear what it sends.
 
-With `--playback-id N` it also plays the clients' transmit audio — the one TX channel the server arbitrates among them — on a local output device: the radio's TX audio input at a station, or the speakers on a desk. `--list-devices` lists the playback ids beside the capture ids; the option is capture-mode only, and an id that is not a playback-capable device is refused before the server starts.
+With `--playback-id N` it also plays the clients' transmit audio — the one TX channel the server arbitrates among them — on a local output device: the radio's TX audio input at a station, or the speakers on a desk. `--list-devices` lists the playback ids beside the capture ids; the option is capture-mode only, and an id that is not a playback-capable device is refused before the server starts. In either mode the server logs every change of TX owner with a wall-clock stamp (`[source] 2026-09-02T23:46:03.890-0400 tx owner=<id>`, or `none` on release) — local time with the UTC offset, the shape `rigctld -Z` uses, so a station running both on one host reads its PTT-to-audio latency as the difference between the two logs.
 
 ## Quick start
 

@@ -49,6 +49,15 @@ the server also plays the clients' transmit audio on a local output device.
 naudio arbitrates one transmit channel among its clients; whichever client
 holds it is heard on that device \(em the radio's transmit audio input at a
 station, or the speakers on a desk.
+Every change of transmit owner is logged with a wall-clock stamp
+(\fB[source] 2026-09-02T23:46:03.890-0400 tx owner=\fIid\fR, or
+\fBnone\fR when the channel is released) \(em local time with the UTC offset,
+the shape
+.BR rigctld (1)
+uses with
+.BR \-Z ,
+so a station running both on one host can read its PTT-to-audio latency as the
+difference between the two logs.
 .PP
 With
 .B \-\-test\-tone

@@ -7,6 +7,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 - **`na_audio_source --playback-id N` plays the clients' transmit audio on a local output device.** The server arbitrates one TX channel among its clients (`na_server_tx_owner`); with this option that channel is played on the chosen device — the radio's TX audio input at a station, or the speakers on a desk — through `na_server_set_playback_device`, which nothing shipped had called until now. `--list-devices` now lists playback-capable devices by their playback id beside the capture list. The option is capture-mode only and is refused by name before the server starts, both with `--test-tone` (the hardware-free NULL backend opens no output device) and with an id no playback-capable device carries, rather than accepted by the setter and failed at start.
+- **`na_audio_source` logs every change of TX owner with a wall-clock stamp** — `[source] 2026-09-02T23:46:03.890-0400 tx owner=<id>`, or `none` when the channel is released — polled from `na_server_tx_owner` at the run loop's cadence (10 ms in capture mode, one 20 ms frame in test-tone mode). The stamp is local time with the UTC offset, the shape `rigctld -Z` writes, so a station running both on one host reads its PTT-to-audio latency as the difference between the CAT command in one log and the first TX audio in the other. The periodic status line carries the owner too.
 
 ## [1.0.0rc7] — 2026-09-02
 

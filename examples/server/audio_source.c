@@ -24,6 +24,8 @@
 //      one TX channel it arbitrates among them (na_server_tx_owner) — on that output
 //      device: the radio's TX audio input at a station, or the speakers on a desk.
 //      Both devices are opened at the server format; naudio does not resample.
+//      Whichever mode, every change of TX owner is logged with a wall-clock stamp
+//      (`[source] <stamp> tx owner=<id|none>`) — see stamp_now below for why that shape.
 //
 //   2. Test-tone mode — a hardware-free deterministic tone.
 //        na_audio_source --test-tone --port 4533
@@ -155,6 +157,37 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 #endif
+
+// ---- wall-clock stamp for the TX-owner line -----------------------------------------------
+// Local time, ISO 8601 with milliseconds and the UTC offset: 2026-09-02T23:46:03.890-0400. That
+// is the shape Hamlib's `rigctld -Z` stamps its debug log with (it prints microseconds), so a
+// station running both on one host reads its PTT-to-audio latency as a subtraction between the
+// two logs — the CAT PTT command in rigctld's, the first TX audio in this one — instead of from a
+// meter watched across the room. Monotonic time would be right for pacing and useless for that.
+static void stamp_now(char* out, size_t n) {
+#ifdef _WIN32
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    TIME_ZONE_INFORMATION tz;
+    const DWORD kind = GetTimeZoneInformation(&tz);
+    // Bias is in minutes and UTC = local + Bias, so the printed offset is its negation.
+    const long bias = (long)tz.Bias + (kind == TIME_ZONE_ID_DAYLIGHT ? (long)tz.DaylightBias
+                                                                       : (long)tz.StandardBias);
+    const long off = -bias;
+    snprintf(out, n, "%04d-%02d-%02dT%02d:%02d:%02d.%03d%c%02ld%02ld", st.wYear, st.wMonth,
+             st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, off < 0 ? '-' : '+',
+             labs(off) / 60, labs(off) % 60);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    char base[32], zone[8];
+    strftime(base, sizeof base, "%Y-%m-%dT%H:%M:%S", &tm);
+    strftime(zone, sizeof zone, "%z", &tm);
+    snprintf(out, n, "%s.%03ld%s", base, ts.tv_nsec / 1000000, zone);
+#endif
+}
 
 // ---- device listing / default-capture selection (capture mode) ---------------------------
 #define MAX_DEVICES 128
@@ -511,11 +544,19 @@ int main(int argc, char** argv) {
 
     // Run loop. Test-tone injects one frame every FRAME_MS (the library captures + broadcasts
     // automatically in capture mode, so there we just wait). A periodic status line shows life.
+    //
+    // Every pass also polls the TX owner — the one client whose audio the server is mixing to
+    // the playback device (or the tx callback) right now — and logs each CHANGE with a wall-clock
+    // stamp. Polled rather than taken from a callback so the line carries the time it was seen
+    // on this thread, at the loop's cadence: 10 ms in capture mode, one FRAME_MS tone frame in
+    // test-tone mode. "none" is the released channel.
 
     const long long start    = now_ms();
     const long long deadline = seconds > 0 ? start + seconds * 1000 : 0;
     long long frames_injected = 0;
     long long next_status = start + 2000;
+    char owner[128] = "";       // the id as last logged; "" == none
+    char stamp[48];
 
     while (!g_stop && (deadline == 0 || now_ms() < deadline)) {
         if (test_tone) {
@@ -526,12 +567,20 @@ int main(int argc, char** argv) {
             frames_injected++;
             sleep_ms(FRAME_MS);
         } else {
-            sleep_ms(100);
+            sleep_ms(10);
+        }
+        char now_owner[128] = "";
+        if (na_server_tx_owner(server, now_owner, (int)sizeof now_owner) <= 0) now_owner[0] = '\0';
+        if (strcmp(now_owner, owner) != 0) {
+            stamp_now(stamp, sizeof stamp);
+            fprintf(stderr, "[source] %s tx owner=%s\n", stamp,
+                    now_owner[0] ? now_owner : "none");
+            snprintf(owner, sizeof owner, "%s", now_owner);
         }
         const long long t = now_ms();
         if (t >= next_status) {
-            fprintf(stderr, "  t=%2llds  clients=%d  %s\n", (t - start) / 1000,
-                    atomic_load(&g_clients),
+            fprintf(stderr, "  t=%2llds  clients=%d  owner=%s  %s\n", (t - start) / 1000,
+                    atomic_load(&g_clients), owner[0] ? owner : "none",
                     test_tone ? "(test tone)" : "(capturing)");
             next_status = t + 2000;
         }
