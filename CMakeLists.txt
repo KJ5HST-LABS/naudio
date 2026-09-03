@@ -1200,6 +1200,19 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_source)
                           "${CMAKE_CURRENT_SOURCE_DIR}/tests/examples/source_argcheck.sh"
                           "$<TARGET_FILE:na_audio_source>")
 endif()
+# The TX-owner line, end to end and hardware-free: the test-tone server on the NULL backend, the
+# tone client transmitting from the NULL backend, and the assertion on the LOG LINE a station reads
+# its PTT-to-audio latency from — present and stamped while a client's audio is mixed, "none" once
+# released, absent for a client that connects and sends nothing (the negative control). Two
+# servers of eight and four seconds on ephemeral ports; the timeout is for a hung one.
+if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_source AND TARGET na_c_inject_tone)
+    add_test(NAME naudio_tx_owner_line
+             COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
+                          "${CMAKE_CURRENT_SOURCE_DIR}/tests/examples/tx_owner_line.sh"
+                          "$<TARGET_FILE:na_audio_source>"
+                          "$<TARGET_FILE:na_c_inject_tone>")
+    set_tests_properties(naudio_tx_owner_line PROPERTIES TIMEOUT 60)
+endif()
 
 # ----------------------------------------------------------------------------
 # CPack — binary packages (issue #93). TGZ is the default, relocatable shape on

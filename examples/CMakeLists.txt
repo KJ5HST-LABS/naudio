@@ -58,6 +58,19 @@ if(NAUDIO_BUILD_APPS)
                 DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
     endif()
 
+    # na_c_inject_tone — the SENDING client: a NULL-backend TX client that injects a sawtooth
+    # at the server's format for N seconds, so the TX path (na_audio_source --playback-id, or
+    # a bridge's tx callback) is proved with no digital-mode application in the loop and a
+    # silent bench splits into a naudio-side or an application-side fault. Pure C over the
+    # na_client_* ABI, Windows-portable like the demo pair (one sleep shim; no atomics, so no
+    # MSVC flag). Built with the examples and driven by the naudio_tx_owner_line ctest arm,
+    # NOT installed: the packages ship the RX demo pair, and a program that puts audio into a
+    # radio's TX input is a bench tool, not an out-of-the-box demo.
+    add_executable(na_c_inject_tone c/inject_tone.c)
+    target_link_libraries(na_c_inject_tone PRIVATE naudio)
+    set_target_properties(na_c_inject_tone PROPERTIES LINKER_LANGUAGE CXX
+                          C_STANDARD 11 C_STANDARD_REQUIRED ON)
+
     if(NOT WIN32)
         # na_cpp_play_to_speakers — the C++ client of the examples suite. The SAME program as
         # na_c_play_to_speakers, compiled as C++: it #includes only naudio.h and links only the
