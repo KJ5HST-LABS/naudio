@@ -21,6 +21,11 @@ TONE="${2:?usage: tx_owner_line.sh <na_audio_source> <na_c_inject_tone>}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 fails=0
+
+# Windows writes text-mode stdio with CRLF, and every pattern below anchors on $ — so the logs are
+# normalised to LF before they are read, here and in the LISTENING wait. Same binaries, same
+# assertions on both platforms; only the line ending differs.
+lf() { tr -d '\r' < "$1" > "$1.lf" && mv "$1.lf" "$1"; }
 STAMP='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}[+-][0-9]{4}'
 
 # Start the test-tone server for $1 seconds on an ephemeral port; sets $SRV and $port.
@@ -29,7 +34,7 @@ start_server() {
     SRV=$!
     port=""
     for _ in $(seq 1 100); do
-        port="$(sed -n 's/^LISTENING port=\([0-9][0-9]*\)$/\1/p' "$work/srv.out")"
+        port="$(tr -d '\r' < "$work/srv.out" | sed -n 's/^LISTENING port=\([0-9][0-9]*\)$/\1/p')"
         [ -n "$port" ] && break
         sleep 0.1
     done
@@ -57,6 +62,7 @@ expect_not() {
 start_server 8
 "$TONE" --port "$port" --seconds 2 > "$work/tone.out" 2> "$work/tone.err"; rc=$?
 wait "$SRV"; srv_rc=$?
+for f in srv.out srv.err tone.out tone.err; do lf "$work/$f"; done
 [ "$rc" -eq 0 ]     && echo "ok: tone client exit 0" || { echo "FAIL: tone client exit $rc"; fails=$((fails + 1)); }
 [ "$srv_rc" -eq 0 ] && echo "ok: server exit 0"      || { echo "FAIL: server exit $srv_rc"; fails=$((fails + 1)); }
 expect "$work/tone.out" '^RESULT injected_bytes=[1-9][0-9]* frames=[1-9]' "the client injected audio"
@@ -77,6 +83,7 @@ echo "--- arm 1 server log"; cat "$work/srv.err"
 start_server 4
 "$TONE" --port "$port" --seconds 0 > "$work/tone0.out" 2> "$work/tone0.err"; rc=$?
 wait "$SRV"
+for f in srv.out srv.err tone0.out tone0.err; do lf "$work/$f"; done
 [ "$rc" -eq 1 ] && echo "ok: send-nothing client exit 1" || { echo "FAIL: send-nothing client exit $rc, expected 1"; fails=$((fails + 1)); }
 expect "$work/tone0.out"    '^RESULT injected_bytes=0 frames=0' "the control injected nothing"
 expect "$work/srv.err"      'client connected id=audio-'         "the control did connect (its own control)"
