@@ -147,7 +147,7 @@ jobs:
           $env:PATH = $dll.DirectoryName + ";" + $env:PATH
 
           $bad = $false
-          foreach ($exe in "na_audio_daemon.exe","na_wav_tap.exe","na_audio_source.exe","na_c_play_to_speakers.exe") {
+          foreach ($exe in "na_audio_daemon.exe","na_wav_tap.exe","na_audio_source.exe","na_c_play_to_speakers.exe","na_c_inject_tone.exe") {
             $found = Get-ChildItem -Path build -Recurse -Filter $exe -File
             if ($found.Count -eq 0) {
               Write-Output "::error::$exe was not produced anywhere under build/"
@@ -156,7 +156,7 @@ jobs:
             }
             $path = $found[0].FullName
             & $path --help *> $null
-            # --help exits 0 for all four. A load-time failure is a negative NTSTATUS
+            # --help exits 0 for all five. A load-time failure is a negative NTSTATUS
             # (-1073741515 = STATUS_DLL_NOT_FOUND), which is exactly what this separates from
             # "the binary is missing".
             if ($LASTEXITCODE -ne 0) {
@@ -617,7 +617,7 @@ jobs:
           path: bridge-ctest.log
 
   windows-wav-tap:
-    name: windows na_wav_tap exe (the remote end of the #12 on-air check)
+    name: windows tools artifact (na_wav_tap, the demo pair, na_c_inject_tone — the station-host end)
     runs-on: windows-latest
     # Separate from the `windows` job on purpose, though no longer because that one is lib-only —
     # it builds apps too since issue #96 item 3. What keeps this job separate now is its PRODUCT:
@@ -630,18 +630,29 @@ jobs:
     # opens no audio device (NA_CLIENT_BACKEND_NULL), so it needs nothing from the platform beyond
     # sockets — it records what the client RECEIVES, which is exactly the evidence the item wants,
     # and the WAV can be decoded anywhere afterwards.
+    #
+    # WHY THE DEMO PAIR AND THE TONE CLIENT RIDE ALONG. Since --playback-id, na_audio_source is
+    # the STATION-HOST end too: it captures the radio's RX and plays the clients' TX into the
+    # radio's TX input, and logs the TX owner with a wall-clock stamp. The operator's spare
+    # Windows machine is that host, so the artifact carries the source and the player beside the
+    # tap, plus na_c_inject_tone to prove the TX path with no digital-mode application in the
+    # loop — four exes and the one DLL they share, from every push. The release ZIP ships the
+    # pair as well, but a release is a tag away and this is each commit; and the tone client is
+    # in no package at all (a bench tool, not a demo), so this is the only place it is built for
+    # Windows and handed over ready to run.
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure (apps on, tests off — this job builds one binary)
         run: cmake -S . -B build -DNAUDIO_BUILD_APPS=ON -DNAUDIO_BUILD_TESTS=OFF
 
-      - name: Build na_wav_tap and the shipped demo pair
+      - name: Build na_wav_tap, the shipped demo pair and the tone client
         # The demo pair (na_audio_source / na_c_play_to_speakers) is Windows-portable
         # since 1.0.0rc1 (POSIX time calls shimmed, MSVC C11 atomics) and ships in the
-        # release ZIP. The `windows` job now compiles it too; what this build is for is the
-        # runtime byte-tell proof below and the uploaded artifact.
-        run: cmake --build build --config RelWithDebInfo --target na_wav_tap na_audio_source na_c_play_to_speakers -j
+        # release ZIP; na_c_inject_tone is portable the same way (one sleep shim). The
+        # `windows` job compiles all of them too; what this build is for is the runtime
+        # byte-tell proof below and the uploaded artifact.
+        run: cmake --build build --config RelWithDebInfo --target na_wav_tap na_audio_source na_c_play_to_speakers na_c_inject_tone -j
 
       - name: "Demo pair runtime proof: test-tone loopback, no audio device"
         shell: pwsh
@@ -664,28 +675,39 @@ jobs:
           Stop-Process -Id $srv.Id -ErrorAction SilentlyContinue
           Write-Output "demo pair streams on windows-latest (byte-tell verified)"
 
-      - name: Collect the exe and the DLL it needs
+      - name: Collect the four exes and the DLL they need
         shell: pwsh
         run: |
-          # naudio is a SHARED target, so the exe cannot run without naudio.dll beside it. Collect
-          # by search rather than by a hard-coded path: the multi-config generator puts artifacts
-          # under a per-config subdirectory and that layout is not worth pinning here.
+          # naudio is a SHARED target, so no exe runs without naudio.dll beside it. Collect by
+          # search rather than by a hard-coded path: the multi-config generator puts artifacts
+          # under a per-config subdirectory and that layout is not worth pinning here. Each exe is
+          # asserted PRESENT by name — a target that silently is not created leaves the build
+          # green (learning L9), and an artifact missing the station host's server would be found
+          # by the operator on the far machine.
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $exe = Get-ChildItem -Path build -Recurse -Filter na_wav_tap.exe | Select-Object -First 1
-          if (-not $exe) { Write-Output "::error::na_wav_tap.exe was not produced"; exit 1 }
-          Copy-Item $exe.FullName dist/
+          $tools = "na_wav_tap.exe","na_audio_source.exe","na_c_play_to_speakers.exe","na_c_inject_tone.exe"
+          foreach ($name in $tools) {
+            $exe = Get-ChildItem -Path build -Recurse -Filter $name -File | Select-Object -First 1
+            if (-not $exe) { Write-Output "::error::$name was not produced anywhere under build/"; exit 1 }
+            Copy-Item $exe.FullName dist/
+          }
           Get-ChildItem -Path build -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName dist/ -Force }
           Get-ChildItem dist | Format-Table Name, Length
 
-          # Prove it is a runnable image and not merely a file that got linked: --help exits 0 and
-          # touches no socket. A binary that cannot start is the failure this job exists to catch,
-          # and it would otherwise be discovered by the operator on the far machine.
-          & "dist/na_wav_tap.exe" --help
-          if ($LASTEXITCODE -ne 0) { Write-Output "::error::na_wav_tap.exe --help exited $LASTEXITCODE"; exit 1 }
-          Write-Output "na_wav_tap.exe runs on windows-latest"
+          # Prove each is a runnable image and not merely a file that got linked: --help exits 0
+          # and touches no socket, FROM dist/, so the DLL resolution the operator will rely on is
+          # the one exercised. A load-time failure is a negative NTSTATUS, which is exactly what
+          # this separates from a clean 0.
+          foreach ($name in $tools) {
+            & "dist/$name" --help *> $null
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::$name --help exited $LASTEXITCODE from dist/"; exit 1 }
+          }
+          Write-Output "the four Windows tools run on windows-latest from dist/"
 
-      - name: Upload the Windows client
+      - name: Upload the Windows tools
         uses: actions/upload-artifact@v4
         with:
-          name: na_wav_tap-windows-x64
+          # Renamed from na_wav_tap-windows-x64 when the artifact grew past the tap: a name that
+          # says one exe over a directory of four is the misleading kind.
+          name: naudio-tools-windows-x64
           path: dist/
