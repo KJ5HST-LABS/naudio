@@ -5,6 +5,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **The macOS `.pkg` is signed, notarized and stapled by the release pipeline itself.** Every
+  payload binary carries a Developer ID Application signature with the hardened runtime and a
+  secure timestamp; the two tools that open an input device (`na_audio_daemon`,
+  `na_audio_source`) carry the audio-input entitlement the hardened runtime requires for the
+  microphone — without it a daemon started by launchd captures two seconds of silence and
+  reports success; the installer wrapper is signed with the Developer ID Installer certificate;
+  and the notary ticket is stapled, so the installer opens with no Gatekeeper warning, online or
+  off. rc4 through rc6 published an unsigned `.pkg` with signing as a manual step afterwards, and
+  rc3 was signed by hand. The release note still reports what was measured on the artifact, not
+  what was intended.
+
 ### Fixed
 - **A DUAL server bound to port 0 no longer gives up inside a reserved UDP block wider than
   its retry budget** (issue #101). The retry #73 added asked the OS for a fresh port each

@@ -6,12 +6,14 @@
 # Copyright (C) 2025-2026 Terrell Deppe
 #
 # Issue #99. The release notes used to ASSERT that the macOS .pkg "is signed and
-# notarized and opens with no warning" — a property the workflow neither performs nor
-# checks, because signing is a manual post-build step. The note was therefore false at
-# the moment it published and became true only if a human followed up. An earlier
-# wording had the same defect pointed the other way ("both installers are unsigned"),
-# which sent macOS users through a Gatekeeper bypass they did not need. One root cause:
-# the note stated a signing outcome that nothing established.
+# notarized and opens with no warning" — a property the workflow of the time neither
+# performed nor checked, because signing was a manual post-build step. The note was
+# therefore false at the moment it published and became true only if a human followed up.
+# An earlier wording had the same defect pointed the other way ("both installers are
+# unsigned"), which sent macOS users through a Gatekeeper bypass they did not need. One
+# root cause: the note stated a signing outcome that nothing established. Since 2026-09-02
+# release.yml signs, notarizes and staples the .pkg itself when the org's secrets are
+# present — and this script is still the only thing that decides what the note says.
 #
 # So this is the one place that decides, and it decides by ASKING THE ARTIFACT — the
 # same house rule release.yml already applies to self-containment (assert with
@@ -35,9 +37,11 @@
 # measurement only once something has produced a presence):
 #   v1.0.0rc3's published .pkg  -> signed    (Developer ID Installer: Terrell Deppe 7SH6PYQ738)
 #   a pkgbuild'd payload        -> unsigned  ("Status: no signature", spctl rejected)
-# The negative direction is re-proven on every CI run (see release.yml); the positive
-# direction can only be exercised where a signing identity exists, which is the
-# operator's machine — exactly where publish-signed-pkg.sh runs it.
+# Both directions are re-proven on every CI run that holds the identity (release.yml): a
+# pkgbuild'd control must measure `unsigned` before the real .pkg is measured, and the
+# .pkg the workflow has just signed, notarized and stapled must measure `signed`, or the
+# job fails rather than publish. A run without the identity keeps only the negative
+# control and publishes whatever this script measures.
 
 set -u
 

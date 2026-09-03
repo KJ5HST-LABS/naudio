@@ -40,20 +40,22 @@ name: Release
 # the absence checks can fire. DEB/RPM already are Linux's double-clickable
 # installers and are unchanged.
 #
-# SIGNING IS MEASURED, NEVER ASSERTED (issue #99). Signing and notarizing the macOS .pkg
-# still has a MANUAL half. Since 2026-09-02 this workflow DOES sign the payload binaries
-# (package-macos imports DEVELOPER_ID_CERTIFICATE_P12 into a throwaway keychain and
-# CPACK_PRE_BUILD_SCRIPTS signs them), but it does not yet productsign the wrapper or
-# notarize — so the .pkg it uploads is still unsigned as a package. The note therefore does not claim
-# otherwise: package-macos runs packaging/macos/signing-status.sh against the artifact and
-# the release job writes the macOS sentence from that measurement. The note used to assert
-# "signed and notarized and opens with no warning" unconditionally, which was false at the
-# moment it published and true only if a human followed up; an earlier wording asserted the
-# opposite and sent users through a Gatekeeper bypass they did not need. Both were the same
-# defect — a signing outcome nothing established. packaging/macos/publish-signed-pkg.sh is
-# the manual step, and it rewrites this sentence from the same measurement once the signed
-# .pkg is actually published, so the note tracks the artifact instead of the intent.
-# The Windows installer is unsigned and SmartScreen warns about it.
+# SIGNING IS MEASURED, NEVER ASSERTED (issue #99). Since 2026-09-02 this workflow signs and
+# notarizes the macOS .pkg itself: package-macos imports both Developer ID certificates into
+# a throwaway keychain, CPACK_PRE_BUILD_SCRIPTS signs every payload binary (hardened runtime,
+# secure timestamp, the audio-input entitlement on the two capture tools), and once the
+# installer gate has passed, the wrapper is productsign'd, submitted to Apple's notary, and
+# the ticket stapled. None of that is TRUSTED: package-macos then runs
+# packaging/macos/signing-status.sh against the artifact and the release job writes the macOS
+# sentence from that measurement, so a run whose secrets were missing publishes an honest
+# "unsigned" note rather than a false "signed" one. The note used to assert "signed and
+# notarized and opens with no warning" unconditionally, which was false at the moment it
+# published and true only if a human followed up; an earlier wording asserted the opposite and
+# sent users through a Gatekeeper bypass they did not need. Both were the same defect — a
+# signing outcome nothing established. packaging/macos/publish-signed-pkg.sh remains as the
+# fallback for a release that was published without the secrets; it rewrites the same
+# sentence from the same measurement. The Windows installer is unsigned and SmartScreen
+# warns about it.
 
 on:
   push:
@@ -105,16 +107,18 @@ jobs:
       - name: Derive the pre-release suffix from the tag (empty on final tags and dry runs)
         run: echo "NAUDIO_PKG_SUFFIX=$(echo "${GITHUB_REF_NAME}" | sed -n 's/^v[0-9.]*\(rc[0-9][0-9]*\)$/\1/p')" >> "$GITHUB_ENV"
 
-      - name: Import the Developer ID Application certificate (throwaway keychain)
+      - name: Import the Developer ID certificates (throwaway keychain)
         env:
-          P12: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
-          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APP_P12: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
+          APP_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          INSTALLER_P12: ${{ secrets.DEVELOPER_ID_INSTALLER_P12 }}
+          INSTALLER_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_INSTALLER_PASSWORD }}
         run: |
           set -euo pipefail
           # No secret -> build unsigned, loudly. Degrading silently is the one thing this
           # must not do: the signing-status step measures the artifact either way, so the
           # release note stays honest, but a human reading the log must see which happened.
-          if [ -z "${P12:-}" ]; then
+          if [ -z "${APP_P12:-}" ]; then
             echo "::warning::DEVELOPER_ID_CERTIFICATE_P12 is empty — the payload will NOT be signed"
             exit 0
           fi
@@ -123,11 +127,21 @@ jobs:
           security create-keychain -p "$pw" "$kc"
           security set-keychain-settings -lut 21600 "$kc"
           security unlock-keychain -p "$pw" "$kc"
-          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          printf '%s' "$APP_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$APP_P12_PASSWORD" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/cert.p12"
+          # The Installer identity signs the .pkg WRAPPER (productsign); the Application one
+          # above signs the Mach-Os inside it. The notary wants both.
+          if [ -n "${INSTALLER_P12:-}" ]; then
+            printf '%s' "$INSTALLER_P12" | base64 --decode > "$RUNNER_TEMP/installer.p12"
+            security import "$RUNNER_TEMP/installer.p12" -k "$kc" -P "$INSTALLER_P12_PASSWORD" -T /usr/bin/productsign
+            rm -f "$RUNNER_TEMP/installer.p12"
+          else
+            echo "::warning::DEVELOPER_ID_INSTALLER_P12 is empty — the .pkg wrapper will NOT be signed"
+          fi
           # Without this, codesign blocks on a keychain-access prompt a runner has no UI to
           # answer — the job burns its timeout instead of failing, which is strictly worse.
+          # Once, after BOTH imports: it applies to the keys present at that moment.
           security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc" > /dev/null
           security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
           # PROVE an identity landed rather than trusting `security import`'s exit code: a
@@ -138,6 +152,15 @@ jobs:
           echo "NAUDIO_KEYCHAIN=$kc" >> "$GITHUB_ENV"
           echo "NAUDIO_CODESIGN_IDENTITY=$id" >> "$GITHUB_ENV"
           echo "imported: $id"
+          if [ -n "${INSTALLER_P12:-}" ]; then
+            # No `-p codesigning` here: an Installer certificate is not a code-signing
+            # identity and that policy filter hides it (measured: 0 with it, 1 without).
+            inst=$(security find-identity -v "$kc" \
+                   | sed -n 's/.*"\(Developer ID Installer: [^"]*\)".*/\1/p' | head -1)
+            [ -n "$inst" ] || { echo "::error::no Developer ID Installer identity after import"; exit 1; }
+            echo "NAUDIO_PRODUCTSIGN_IDENTITY=$inst" >> "$GITHUB_ENV"
+            echo "imported: $inst"
+          fi
 
       - name: Configure (release shape — no bridge, no hamlib; PortAudio bundled)
         run: |
@@ -393,6 +416,7 @@ jobs:
           # failure on this runner was invisible because its diagnostics go to STDOUT and an
           # earlier draft redirected that to /dev/null. Nothing here swallows output.
           n=0
+          entitled=0
           for f in /usr/local/bin/na_wav_tap /usr/local/bin/na_audio_daemon \
                    /usr/local/bin/na_audio_source /usr/local/bin/na_c_play_to_speakers \
                    /usr/local/lib/libnaudio.*.*.*.dylib; do
@@ -408,31 +432,116 @@ jobs:
               *runtime*) ;;
               *) echo "::error::$(basename "$f") lacks the hardened runtime"; echo "$desc"; exit 1 ;;
             esac
+            # The hardened runtime denies the microphone to a process whose signature does not
+            # claim it. Measured 2026-09-02 on a hardened daemon WITHOUT the entitlement: run
+            # from a terminal it captured (TCC charges the terminal), run by launchd — the
+            # path the .pkg registers — it read two seconds of -120 dBFS silence, exit 0, no
+            # error. So the two capture tools must carry it and the other three must not.
+            ents=$(codesign -d --entitlements - "$f" 2>/dev/null || true)
+            case "$(basename "$f")" in
+              na_audio_daemon|na_audio_source)
+                case "$ents" in
+                  *com.apple.security.device.audio-input*) entitled=$((entitled+1)) ;;
+                  *) echo "::error::$(basename "$f") lacks the audio-input entitlement — as a launchd agent it would capture silence"
+                     echo "$ents"; exit 1 ;;
+                esac ;;
+              *)
+                case "$ents" in
+                  *audio-input*) echo "::error::$(basename "$f") carries the audio-input entitlement and opens no input device"; exit 1 ;;
+                esac ;;
+            esac
             echo "  ok: $(basename "$f")"
           done
           # Cardinality (L230), the same 5 the installer gate scans: four executables plus
-          # libnaudio. A loop that matched nothing would otherwise report success.
+          # libnaudio. A loop that matched nothing would otherwise report success. And exactly
+          # the two capture tools entitled — a renamed tool would otherwise ship unable to hear.
           [ "$n" -eq 5 ] || { echo "::error::expected 5 signed binaries, saw $n"; exit 1; }
-          echo "== payload: $n installed binaries Developer ID signed with the hardened runtime =="
+          [ "$entitled" -eq 2 ] || { echo "::error::expected 2 entitled capture tools, saw $entitled"; exit 1; }
+          echo "== payload: $n installed binaries Developer ID signed with the hardened runtime; $entitled carry audio-input =="
+
+      - name: "Sign the .pkg, notarize it, staple the ticket"
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NAUDIO_PRODUCTSIGN_IDENTITY:-}" ]; then
+            echo "::warning::no Developer ID Installer identity — the .pkg ships unsigned and the note will say so"
+            exit 0
+          fi
+          # An Installer identity with no notary credential is a misconfiguration, not a
+          # degraded mode: a signed-but-unnotarized .pkg still trips Gatekeeper, and the note
+          # would (correctly) call it unsigned. Name the missing secret and stop.
+          # APPLE_APP_SPECIFIC_PASSWORD is the one notarytool takes — `--password` wants an
+          # app-specific password, not the Apple ID's own (that is APPLE_ID_PASSWORD). Its
+          # org visibility is PRIVATE, so the day this repository goes public it stops
+          # resolving here, and this is the line that will say so.
+          [ -n "${APPLE_ID:-}" ] || { echo "::error::APPLE_ID is empty — cannot notarize"; exit 1; }
+          [ -n "${APPLE_TEAM_ID:-}" ] || { echo "::error::APPLE_TEAM_ID is empty — cannot notarize"; exit 1; }
+          [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] \
+            || { echo "::error::APPLE_APP_SPECIFIC_PASSWORD is empty (org secret missing, or not visible to this repository) — cannot notarize"; exit 1; }
+
+          pkg=$(ls build/naudio-*.pkg)
+          signed="$RUNNER_TEMP/$(basename "$pkg")"
+          echo "productsign: $(basename "$pkg")"
+          productsign --sign "$NAUDIO_PRODUCTSIGN_IDENTITY" --keychain "$NAUDIO_KEYCHAIN" \
+                      --timestamp "$pkg" "$signed"
+          # Assert on the artifact, not the exit code: the wrapper must now name the
+          # Installer certificate.
+          pkgutil --check-signature "$signed" | tee "$RUNNER_TEMP/check-signature.txt"
+          grep -q 'Developer ID Installer' "$RUNNER_TEMP/check-signature.txt" \
+            || { echo "::error::productsign exited 0 but the .pkg carries no Developer ID Installer signature"; exit 1; }
+
+          # Apple validates every Mach-O inside the package as well as the wrapper. The
+          # verdict is the status field, never the exit code (L111's shape), so it is read
+          # back explicitly; JSON goes to a file and stderr stays visible (L335).
+          echo "notarytool submit --wait (Apple's queue; usually a few minutes)"
+          set +e
+          xcrun notarytool submit "$signed" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+                --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait --timeout 30m \
+                --output-format json > "$RUNNER_TEMP/notary.json"
+          submit_rc=$?
+          set -e
+          cat "$RUNNER_TEMP/notary.json"; echo
+          nid=$(jq -r '.id // empty' "$RUNNER_TEMP/notary.json")
+          nstatus=$(jq -r '.status // empty' "$RUNNER_TEMP/notary.json")
+          echo "notary: rc=$submit_rc id=${nid:-none} status=${nstatus:-none}"
+          if [ "$nstatus" != Accepted ]; then
+            # The reason lives only in the log, one more call away (2ae8cbb).
+            if [ -n "$nid" ]; then
+              xcrun notarytool log "$nid" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+                    --password "$APPLE_APP_SPECIFIC_PASSWORD" || true
+            fi
+            echo "::error::notarization did not end in Accepted (status: ${nstatus:-none}, rc=$submit_rc)"
+            exit 1
+          fi
+
+          xcrun stapler staple "$signed"
+          xcrun stapler validate "$signed"
+          spctl -a -vv -t install "$signed"
+          # The artifact the upload step and the signing-status step see is now the signed,
+          # notarized, stapled one — same name, same place. The installer gate above ran the
+          # unsigned wrapper around this identical payload; productsign and the ticket change
+          # no payload byte.
+          mv "$signed" "$pkg"
+          echo "== .pkg signed by '$NAUDIO_PRODUCTSIGN_IDENTITY', notarized ($nid), stapled =="
 
       - name: Remove the signing keychain
         if: always()
         run: |
           if [ -n "${NAUDIO_KEYCHAIN:-}" ]; then security delete-keychain "$NAUDIO_KEYCHAIN" || true; fi
 
-      - name: "Signing status: measured on the .pkg, never assumed (#99)"
+      - name: "Signing status: measured on the .pkg in both directions, never assumed (#99)"
         run: |
           set -euo pipefail
           pkg=$(ls build/naudio-*.pkg)
 
           # THE NEGATIVE CONTROL RUNS FIRST. A detector stuck at one answer would be
-          # indistinguishable from a correct one here, because the artifact this job
-          # produces is always unsigned — so require the measurement to convict a
-          # package that is unsigned by construction before believing what it says
-          # about ours (L222: an absence is a measurement only once something has
-          # produced a presence). The other direction cannot be exercised on a runner
-          # with no signing identity; it is exercised by publish-signed-pkg.sh, on the
-          # machine that has one.
+          # indistinguishable from a correct one, so require the measurement to convict a
+          # package that is unsigned by construction before believing what it says about
+          # ours (L222: an absence is a measurement only once something has produced a
+          # presence).
           mkdir -p /tmp/signing-control/payload
           echo control > /tmp/signing-control/payload/control.txt
           pkgbuild --root /tmp/signing-control/payload \
@@ -447,6 +556,15 @@ jobs:
 
           status=$(packaging/macos/signing-status.sh "$pkg")
           echo "$status" > build/macos-signing-status.txt
+          # THE POSITIVE DIRECTION. When the step above signed, notarized and stapled this
+          # .pkg, the detector must say so: a detector that can only convict is half a
+          # detector, and until 2026-09-02 this was the half no runner could exercise. A run
+          # with no Installer identity stays a measurement only — the note says "unsigned",
+          # and that is the truth about that artifact.
+          if [ -n "${NAUDIO_PRODUCTSIGN_IDENTITY:-}" ] && [ "$status" != signed ]; then
+            echo "::error::the .pkg was signed, notarized and stapled, yet measures '$status' — the signing step or the detector is broken; publishing nothing"
+            exit 1
+          fi
           echo "== macOS .pkg signing status: $status =="
 
       - uses: actions/upload-artifact@v4

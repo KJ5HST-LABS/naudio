@@ -5,11 +5,12 @@
 #
 # Copyright (C) 2025-2026 Terrell Deppe
 #
-# Issue #99. The release workflow cannot sign: no signing identity is available to it, so
-# the .pkg it publishes is unsigned and the release note says exactly that (measured, not
-# assumed — see signing-status.sh). This is the manual step that changes the fact, and it
-# is one command rather than four so the parts cannot be done separately. THAT is the bug
-# it fixes: signing, re-checksumming and correcting the note were three manual steps, and
+# Issue #99. Since 2026-09-02 the release workflow signs, notarizes and staples the .pkg
+# itself whenever the org's Developer ID and notary secrets are present, and the release
+# note says what it measured (see signing-status.sh). This is the FALLBACK for a release
+# that was published without them — the note then says "unsigned", truthfully — and it is
+# one command rather than four so the parts cannot be done separately. THAT is the bug it
+# fixes: signing, re-checksumming and correcting the note were three manual steps, and
 # for 36 minutes of v1.0.0rc3 the published sums described a file that had been replaced
 # while the note described a signature that did not exist yet.
 #
@@ -20,10 +21,12 @@
 #
 # Requires: a .pkg whose PAYLOAD BINARIES are already Developer ID Application signed with
 # --timestamp and --options runtime. This script signs the installer WRAPPER; the notary
-# validates what is inside it, and CI produces ad-hoc linker signatures, so a .pkg built
-# by CI cannot be notarized as-is. The script refuses up front rather than discovering it
-# three minutes later in a notary rejection. Also requires: a Developer ID Installer
-# identity in the keychain, and a notarytool keychain
+# validates what is inside it. CI signs the payload (cmake/CodesignPayload.cmake) whenever
+# DEVELOPER_ID_CERTIFICATE_P12 was present for the run; a .pkg from a run without it
+# carries ad-hoc linker signatures and cannot be notarized as-is — and cannot be repaired
+# here either, because pkgutil --expand-full does not round-trip. The script refuses up
+# front rather than discovering that three minutes later in a notary rejection. Also
+# requires: a Developer ID Installer identity in the keychain, and a notarytool keychain
 # profile (create one once with:
 #     xcrun notarytool store-credentials <profile> --apple-id <id> \
 #           --team-id <team> --password <app-specific-password>
@@ -90,15 +93,16 @@ else
     # PRE-FLIGHT: the notary service validates the Mach-O binaries INSIDE the package,
     # not just the installer signature productsign applies to the wrapper. Every payload
     # executable must carry a Developer ID Application signature, a secure timestamp and
-    # the hardened runtime. CI builds them with none of those — a linker ad-hoc signature
-    # is what you get — and nothing in this repository signs them, so submitting anyway
+    # the hardened runtime. A release run without DEVELOPER_ID_CERTIFICATE_P12 builds them
+    # with none of those — a linker ad-hoc signature is what you get — and submitting anyway
     # buys a ~3 minute wait and then `status: Invalid` whose reason is only visible via a
     # separate `notarytool log <id>` call.
     #
     # Found on v1.0.0rc5, the first time this script's write half ever ran. v1.0.0rc3 --
-    # the only signed release -- notarized because its payload binaries had been signed by
-    # hand beforehand, a step that exists in no script and was recorded nowhere. This check
-    # is why that is now visible in one line instead of one round trip to Apple.
+    # the only signed release before CI signed -- notarized because its payload binaries
+    # had been signed by hand beforehand, a step that then existed in no script and was
+    # recorded nowhere; cmake/CodesignPayload.cmake is that step now. This check is why the
+    # gap is visible in one line instead of one round trip to Apple.
     say "checking the payload binaries the notary will validate"
     unsigned_payload=""
     probe="$work/probe"
@@ -126,9 +130,10 @@ EOF_BINS
           "" \
           "Each needs: codesign --sign 'Developer ID Application: ...' --timestamp" \
           "            --options runtime <binary>" \
-          "before the .pkg is built. That does not happen in CI (no identity there) and no" \
-          "script in this repository does it, so a .pkg downloaded from a release cannot be" \
-          "notarized as-is. Signing has to move into the build that produces the package." \
+          "before the .pkg is built. CI does that (cmake/CodesignPayload.cmake) when" \
+          "DEVELOPER_ID_CERTIFICATE_P12 is present for the run; this .pkg came from a run" \
+          "without it. A published .pkg cannot be retrofitted (pkgutil --expand-full does not" \
+          "round-trip), so re-run the release with the secrets in place instead of signing this one." \
           "" >&2
         die "payload binaries unsigned — see above"
     fi

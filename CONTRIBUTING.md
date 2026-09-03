@@ -81,21 +81,32 @@ commands a build-tree install does), and attaches the artifacts to a GitHub Rele
 automatically for a `v*rc*` tag. `workflow_dispatch` runs the byte-identical dry run without
 touching a release, which is how the pipeline is proven before a tag exists.
 
-**Signing the macOS `.pkg` is a manual step, and it is one command:**
+**The macOS `.pkg` is signed, notarized and stapled by the release workflow itself.** The macOS
+job imports the org's `DEVELOPER_ID_CERTIFICATE_P12` and `DEVELOPER_ID_INSTALLER_P12` into a
+throwaway keychain; `cmake/CodesignPayload.cmake` signs every payload binary at
+`CPACK_PRE_BUILD_SCRIPTS` (hardened runtime, secure timestamp, and the audio-input entitlement on
+`na_audio_daemon` and `na_audio_source` — the two tools that open an input device, which the
+hardened runtime otherwise silences when launchd starts them); and once the installer gate has
+passed, the wrapper is `productsign`ed, submitted with `notarytool` (`APPLE_ID`, `APPLE_TEAM_ID`,
+`APPLE_APP_SPECIFIC_PASSWORD`) and stapled. None of that is trusted: `packaging/macos/signing-status.sh`
+measures the artifact afterwards and the release note is written from that measurement, never
+assumed (issue #99: the note used to assert "signed and notarized" unconditionally, which was false
+at the moment it published and true only if a human followed up). A run with the secrets present
+must measure `signed` or it fails; a run without them publishes an honest "unsigned" sentence.
+
+**If a release was published without the secrets**, the fallback is still one command:
 
 ```
 packaging/macos/publish-signed-pkg.sh v1.0.0rc4          # add --dry-run to verify and publish nothing
 ```
 
-The workflow has no signing identity, so the `.pkg` it publishes is unsigned and the release note
-says so — measured on the artifact by `packaging/macos/signing-status.sh`, never assumed (issue
-#99: the note used to assert "signed and notarized" unconditionally, which was false at the moment
-it published and true only if a human followed up). The script above signs, notarizes, staples,
-re-uploads, regenerates `sha256sums.txt` from the published assets, and rewrites that sentence —
-together, because doing them separately is what left one release describing a file it had already
-replaced. It refuses to upload anything that does not measure as signed first, and re-downloads
-the published assets to check the result. It needs a Developer ID Installer identity and a
-`notarytool` keychain profile; run it with `--help` for the one-time setup.
+It signs, notarizes, staples, re-uploads, regenerates `sha256sums.txt` from the published assets,
+and rewrites that sentence — together, because doing them separately is what left one release
+describing a file it had already replaced. It refuses to upload anything that does not measure as
+signed first, and re-downloads the published assets to check the result. It needs a Developer ID
+Installer identity and a `notarytool` keychain profile (run it with `--help` for the one-time
+setup), and a `.pkg` whose payload CI signed — an unsigned payload cannot be retrofitted, so re-run
+the release instead.
 
 The Windows installer is unsigned (no certificate) and SmartScreen warns about it.
 
