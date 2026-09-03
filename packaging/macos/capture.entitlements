@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  naudio - entitlements for the tools that open an audio INPUT device.
+  SPDX-License-Identifier: LGPL-2.1-or-later
+
+  Applied by cmake/CodesignPayload.cmake to na_audio_daemon and na_audio_source only. The
+  hardened runtime the notary requires (codesign - -options runtime) denies the microphone to a
+  process whose signature does not claim it. Measured 2026-09-02 on a hardened daemon signed
+  WITHOUT this file: launched from a terminal it captured real audio (TCC charges the terminal),
+  launched by launchd - the path the .pkg registers - the device opened, two seconds of -120 dBFS
+  silence came back, exit 0, no error, no prompt. The playback client, na_wav_tap and libnaudio
+  open no input device and carry no entitlement, and the signing script asserts both halves of
+  that on the signed bytes. v1.0.0rc3, the release that was signed by hand, shipped exactly this
+  on exactly these two.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

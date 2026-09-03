@@ -16,6 +16,14 @@
 # reason needs a separate `notarytool log <id>` call. See commit 2ae8cbb.
 #
 # This script therefore runs LAST, on the exact bytes that go into the package.
+#
+# ENTITLEMENTS. The hardened runtime restricts a process to the resources its signature claims,
+# and microphone access is one of them (com.apple.security.device.audio-input). The two tools
+# that open an INPUT device — na_audio_daemon and na_audio_source — are signed with
+# packaging/macos/capture.entitlements; the playback client, na_wav_tap and libnaudio open no
+# input and get none. Both halves are asserted on the signed bytes below. v1.0.0rc3, the release
+# signed by hand, shipped exactly this on exactly these two (read back from its .pkg on
+# 2026-09-02); the first CI-signed payload had dropped it.
 
 if(NOT CPACK_NAUDIO_CODESIGN_IDENTITY)
     message(FATAL_ERROR "CodesignPayload.cmake ran with no identity — it should not have been "
@@ -71,10 +79,23 @@ if(_n LESS 5)
 endif()
 message(STATUS "codesign: ${_n} Mach-O binaries with '${CPACK_NAUDIO_CODESIGN_IDENTITY}'")
 
+set(_entitlements "${CMAKE_CURRENT_LIST_DIR}/../packaging/macos/capture.entitlements")
+if(NOT EXISTS "${_entitlements}")
+    message(FATAL_ERROR "codesign: entitlements file missing: ${_entitlements}")
+endif()
+set(_capture_tools na_audio_daemon na_audio_source)
+set(_entitled 0)
+
 foreach(_bin ${_machos})
+    get_filename_component(_name "${_bin}" NAME)
+    set(_ent_args "")
+    if(_name IN_LIST _capture_tools)
+        set(_ent_args --entitlements "${_entitlements}")
+        math(EXPR _entitled "${_entitled} + 1")
+    endif()
     execute_process(
         COMMAND codesign --force --sign "${CPACK_NAUDIO_CODESIGN_IDENTITY}"
-                         --timestamp --options runtime "${_bin}"
+                         --timestamp --options runtime ${_ent_args} "${_bin}"
         RESULT_VARIABLE _rc ERROR_VARIABLE _err)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR "codesign failed on ${_bin}: ${_err}")
@@ -94,6 +115,33 @@ foreach(_bin ${_machos})
         message(FATAL_ERROR
             "codesign: ${_bin} lacks the hardened runtime after signing. Got:\n${_desc}")
     endif()
+
+    # Entitlements, both directions: the two capture tools must carry audio-input and the other
+    # three must not. codesign prints the dictionary on stdout and nothing at all for a binary
+    # that has none, so an empty result is the negative case, not a broken read.
+    execute_process(COMMAND codesign -d --entitlements - "${_bin}"
+                    OUTPUT_VARIABLE _ents ERROR_QUIET)
+    if(_name IN_LIST _capture_tools)
+        if(NOT _ents MATCHES "com\\.apple\\.security\\.device\\.audio-input")
+            message(FATAL_ERROR
+                "codesign: ${_name} does not carry the audio-input entitlement after signing "
+                "with ${_entitlements}. A hardened-runtime capture tool without it captures "
+                "silence when launched by launchd (measured 2026-09-02). Got:\n${_ents}")
+        endif()
+    elseif(_ents MATCHES "audio-input")
+        message(FATAL_ERROR
+            "codesign: ${_name} carries the audio-input entitlement and must not — only "
+            "na_audio_daemon and na_audio_source open an input device. Got:\n${_ents}")
+    endif()
 endforeach()
 
-message(STATUS "codesign: all ${_n} payload binaries carry Developer ID + hardened runtime")
+# CARDINALITY again: exactly the two capture tools were entitled. A renamed tool would otherwise
+# ship signed, hardened and silently unable to capture.
+if(NOT _entitled EQUAL 2)
+    message(FATAL_ERROR
+        "codesign: expected to entitle exactly 2 capture tools (na_audio_daemon, "
+        "na_audio_source), entitled ${_entitled}")
+endif()
+
+message(STATUS "codesign: all ${_n} payload binaries carry Developer ID + hardened runtime; "
+               "${_entitled} capture tools carry audio-input")
