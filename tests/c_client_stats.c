@@ -826,21 +826,60 @@ int main(void) {
      *
      * This is why sequence_gaps's header contract does not claim to close that gap — issue #29's
      * premise was that a post-reorder gap counter would report local loss, and this arm is the
-     * executable refutation. If it ever DOES move here, the tail-drop assumption has changed and
-     * that contract needs revisiting.
+     * executable refutation.
      *
      * socket_rx_drops (@since 0.3.0) is what DOES report it, and it is asserted below. The two
-     * assertions together are the point: the same induced fault must leave the gap counter at 0
-     * and move the kernel counter, because that is precisely the complementarity the header
-     * claims. Asserting either alone would let a future change collapse them into one counter
-     * that answers neither question. */
-    if (stalled.sequence_gaps != 0) {
-        fprintf(stderr, "  (sequence_gaps %lld on a stalled consumer — the socket buffer is no "
-                        "longer tail-dropping; revisit the contract in include/naudio.h)\n",
-                stalled.sequence_gaps);
-        return fail("sequence_gaps moved on a stalled consumer, which tail-drop makes invisible",
+     * assertions together are the point: the same induced fault must leave the gap counter
+     * NEGLIGIBLE and move the kernel counter, because that is precisely the complementarity the
+     * header claims. Asserting either alone would let a future change collapse them into one
+     * counter that answers neither question.
+     *
+     * WHY THIS IS A BOUND AND NOT `!= 0`. It was `!= 0` until 2026-09-05, when windows-latest read
+     * sequence_gaps 1 with packets_reordered 8 — on a commit whose OTHER CI run, over the identical
+     * tree, was green. Tail-drop had not stopped: 198 of the 221 datagrams on the wire were still
+     * lost with the counter reading 1. What Windows added was REORDERING, which this loopback does
+     * not do on macOS (12/12 local runs: reordered 0, gaps 0), and a datagram arriving after its
+     * slot has left the reorder window is emitted as a gap by a mechanism that has nothing to do
+     * with the buffer's drop discipline. `!= 0` was therefore asserting two things at once: the
+     * claim this arm exists for (tail-drop is invisible to a gap counter) and an accident of the
+     * host (nothing reorders on loopback). Only the first is a contract, so only the first is
+     * asserted now — L250's repair, the same one arm (7) below already carries.
+     *
+     * The 10% is not tuned against a host. The two hypotheses are "gaps are incidental" (a handful)
+     * and "gaps track the loss" (~100% of it); they sit two to three orders of magnitude apart, so
+     * any threshold between them separates them and the exact figure is not load-bearing. A counter
+     * that regressed into a loss meter reads ~198 on the run above and fails this by a factor of 10.
+     *
+     * The two guards below it are new with the bound and are the reason it is not weaker than the
+     * equality it replaced: a bound alone would be satisfied by an arm that induced no loss at all,
+     * and by a counter that had gone back to reading -1. */
+    const long long stalled_on_wire = g_relay_audio_seen + stalled_parity;
+    const long long stalled_lost = stalled_on_wire - stalled.packets_received;
+    if (stalled_lost <= 0) {
+        fprintf(stderr, "  (%lld datagrams on the wire, %lld read — the stalled consumer lost "
+                        "nothing, so there was no invisible loss for this arm to be about)\n",
+                stalled_on_wire, stalled.packets_received);
+        return fail("the stalled-consumer arm induced no loss for the gap counter to miss", NULL,
+                    srv, NULL);
+    }
+    if (stalled.sequence_gaps < 0) {
+        fprintf(stderr, "  (sequence_gaps %lld — unmeasured on a UDP_WAN profile, which always "
+                        "engages a reorder buffer; a -1 here would pass the bound below while "
+                        "measuring nothing)\n", stalled.sequence_gaps);
+        return fail("sequence_gaps reads unmeasured on the stalled-consumer arm", NULL, srv, NULL);
+    }
+    if (stalled.sequence_gaps * 10 > stalled_lost) {
+        fprintf(stderr, "  (sequence_gaps %lld against %lld datagrams lost — the gap counter is "
+                        "tracking slow-consumer loss it cannot see; either the socket buffer is no "
+                        "longer tail-dropping or the counter has become a loss meter, and the "
+                        "contract in include/naudio.h needs revisiting either way)\n",
+                stalled.sequence_gaps, stalled_lost);
+        return fail("sequence_gaps accounts for the tail-dropped loss, which it cannot witness",
                     NULL, srv, NULL);
     }
+    printf("c_client_stats: stalled consumer — sequence_gaps %lld against %lld lost of %lld on the "
+           "wire (%lld reordered); the gap counter does not see tail-drop\n",
+           stalled.sequence_gaps, stalled_lost, stalled_on_wire, stalled.packets_reordered);
     /* socket_rx_drops: the POSITIVE this arm previously had no way to assert.
      *
      * Same fault, same run, opposite reading — the loss that leaves queue_drops and sequence_gaps

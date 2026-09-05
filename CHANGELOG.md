@@ -5,6 +5,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **`na_client_stats.sequence_gaps` is documented as *negligible* under slow-consumer loss, not as exactly zero.** The header claimed a full receive buffer tail-drops and therefore "there is no hole in what it read, so there is nothing for a gap counter to count" — an absolute that CI falsified: windows-latest read `sequence_gaps 1` while 198 of 221 datagrams were lost, against `0` for the same code on macOS. Tail-drop had not stopped; reordering, a separate mechanism the claim did not account for, opened one gap when a datagram arrived after its slot had left the reorder window, and some platforms reorder a loopback stream where others never do. The useful half of the contract is unchanged and now stated precisely: this field does not track slow-consumer loss and can never be used to size it — `socket_rx_drops` reports that loss and nothing else here does. Consumers testing `sequence_gaps == 0` as a proxy for "no local loss" were relying on the overstatement and should compare against the loss instead.
+
 ## [1.0.0rc8] — 2026-09-05
 
 ### Added

@@ -999,11 +999,19 @@ typedef struct na_client_stats {
      *     the kernel discarded from one lost on the wire, and this field does not try. More
      *     importantly it does not SEE the slow-consumer case at all: an overflowing socket
      *     buffer tail-drops, so a consumer that cannot keep up reads a contiguous prefix of the
-     *     stream and simply stops early. There is no hole in what it read, so there is nothing
-     *     for a gap counter to count. Measured: a client stalled to a quarter of the offered
-     *     rate read 127 of 400 packets with sequence_gaps == 0. Local loss is reported by
-     *     socket_rx_drops instead (@since 0.3.0), and by nothing else here — see queue_drops,
-     *     which cannot move on a client either.
+     *     stream and simply stops early. The loss is at the tail, and a gap counter reads the
+     *     middle, so this field does not move with it. Measured: a client stalled to a quarter
+     *     of the offered rate read 127 of 400 packets with sequence_gaps == 0.
+     *
+     *     Do not read that 0 as a guarantee of exactly zero. Reordering is a separate mechanism
+     *     that CAN open a gap on a stalled connection — a datagram arriving after its slot has
+     *     left the reorder window is counted here — and some platforms reorder a loopback stream
+     *     where others never do. Measured on windows-latest: 198 of 221 datagrams lost with
+     *     sequence_gaps 1 and packets_reordered 8, against 0 and 0 for the same code on macOS.
+     *     What holds is the useful claim, not the absolute one: this field stays NEGLIGIBLE
+     *     against slow-consumer loss instead of tracking it, so it can never be used to size
+     *     that loss. Local loss is reported by socket_rx_drops instead (@since 0.3.0), and by
+     *     nothing else here — see queue_drops, which cannot move on a client either.
      *
      * It counts every packet type sharing the sequence space (audio, parity, control), not
      * audio packets alone, so it moves a little on a busy roster even with no loss. */
@@ -1019,11 +1027,13 @@ typedef struct na_client_stats {
      *
      * WHY NO OTHER FIELD HERE CAN SEE IT. A full receive buffer TAIL-DROPS: it discards
      * the NEWEST arrivals, so a consumer that cannot keep up reads an unbroken PREFIX of
-     * the stream and simply stops early. Nothing it read has a hole in it, so sequence_gaps
-     * has nothing to count (measured: a client stalled to a quarter of the offered rate read
-     * 127 of 400 packets with sequence_gaps == 0), and queue_drops cannot move on a client
-     * for the separate reason given above. The kernel is the only party that witnesses the
-     * discard, and this field is the kernel saying so.
+     * the stream and simply stops early. The discarded datagrams are past the end of what
+     * the client read, not holes inside it, so sequence_gaps does not move with this loss
+     * (measured: a client stalled to a quarter of the offered rate read 127 of 400 packets
+     * with sequence_gaps == 0; and where a platform reorders the loopback stream, 198 of 221
+     * lost still read sequence_gaps 1 — negligible, never the loss itself). queue_drops
+     * cannot move on a client for the separate reason given above. The kernel is the only
+     * party that witnesses the discard, and this field is the kernel saying so.
      *
      * -1 MEANS NOT MEASURED, and here that is a statement about the PLATFORM, not the
      * profile — which is what makes it different from every other -1 in this struct. The
