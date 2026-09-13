@@ -92,7 +92,11 @@ if(NAUDIO_BUILD_APPS)
     # which has no audio endpoints, so one would install cleanly and then capture nothing. A
     # logon task runs in the interactive session, where the devices are, and it takes the same
     # three properties: an absolute program path, generated rather than hand-written; created
-    # DISABLED so installing starts nothing; removed on uninstall.
+    # DISABLED so installing starts nothing (the systemd unit is likewise not enabled); removed
+    # on uninstall. The launchd agent is the odd one out since issue #102: macOS has a system
+    # switch for background items (Login Items) and it disagrees with a Disabled key, so the
+    # agent ships without one and is on by default — inert because it runs control mode with
+    # autostart off, which the servicecheck arm proves by running the unit's own arguments.
     #
     # One asymmetry Windows forces and the other two do not: its install prefix is chosen by the
     # operator on the installer's directory page, so the task XML is rendered TWICE — once here

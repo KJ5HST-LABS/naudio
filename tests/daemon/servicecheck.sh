@@ -11,7 +11,7 @@
 # closes that gap by RUNNING the unit's own argument list against the built binary — not by
 # reading the file and agreeing with itself.
 #
-# Three things are checked, in increasing order of what they can catch:
+# Four things are checked, in increasing order of what they can catch:
 #
 #   1. Structure — the generated file parses (plutil on macOS) and carries the keys the service
 #      story depends on.
@@ -20,22 +20,35 @@
 #      likely way this feature breaks, and it cannot be caught by running the built tree.
 #   3. Behaviour — the unit's OWN option list, extracted from the file and handed to the built
 #      binary, parses. This is the check that would catch `--duration-mss`.
+#   4. Inertness — the same option list, RUN: the daemon serves its control page and the
+#      pipeline it reports is idle. Installing a package must not start capturing at the next
+#      login, and since issue #102 that is a property of the unit's arguments rather than of a
+#      key that keeps the job from running (the launchd agent used to ship Disabled:true, which
+#      made the Login Items switch read ON while nothing ran). A unit that gained `--autostart
+#      true`, or lost `--mode control`, fails here.
 #
-# The arm ends with a can-fail control (L222): the same extraction and execution are run against
-# a deliberately corrupted copy of the unit, and the run FAILS the assertion. An arm that cannot
-# produce a failure has not shown that its passes mean anything.
+# Cases 3 and 4 each end with a can-fail control (L222): the same extraction and execution are
+# run against a deliberately corrupted variant, and the run FAILS the assertion. An arm that
+# cannot produce a failure has not shown that its passes mean anything.
 #
-# Hardware-free, like argcheck.sh and configcheck.sh and for the same reason: every case appends
-# `--mode zzz`, rejected at the mode dispatch, which is the last check before any device work.
+# Hardware-free, like argcheck.sh and configcheck.sh: cases 1–3 append `--mode zzz`, rejected at
+# the mode dispatch, which is the last check before any device work; case 4 runs control mode,
+# which opens no device until something asks, and nothing here asks — its control asks with a
+# capture pattern no device can match, so the request is refused at device resolution.
 set -u
 
-DAEMON="${1:?usage: servicecheck.sh <path-to-na_audio_daemon> <unit-file> <expected-exec-path> [app-info-plist]}"
+DAEMON="${1:?usage: servicecheck.sh <path-to-na_audio_daemon> <unit-file> <expected-exec-path> [app-info-plist] [curl]}"
 UNIT="${2:?missing unit file}"
 WANT_EXEC="${3:?missing expected exec path}"
 # The generated naudio Control Info.plist — launchd units only, where the agent names the app
 # (issue #102). Optional at the usage line because the other two unit kinds have no such file;
 # the launchd branch treats its absence as a harness fault, not a skip.
 APP_PLIST="${4:-}"
+# The HTTP client case 4 reads the pipeline state with. LOCATED BY CMAKE and passed in, as
+# controlcheck.sh's is, rather than looked up here; the fallback is for running this by hand.
+# Its absence is a harness fault, not a skip: a run of the unit's arguments whose state nobody
+# read would pass on a unit that captures at login (L321).
+CURL="${5:-curl}"
 
 [ -x "$DAEMON" ] || { echo "FAIL: not executable: $DAEMON"; exit 1; }
 [ -f "$UNIT" ]   || { echo "FAIL: no generated unit file at: $UNIT"; exit 1; }
@@ -83,11 +96,17 @@ if [ "$KIND" = launchd ]; then
         && ok "plist is well-formed XML" \
         || bad "plist is not well-formed XML: $(xmllint --noout "$UNIT" 2>&1 | head -1)"
 
-    # Installing a package must never start capturing a microphone at the next login. Measured
-    # during design: a Disabled:true agent refuses to bootstrap at all, so this key IS the
-    # inertness, and `launchctl enable` is what overrides it.
-    [ "$(plutil -extract Disabled raw -o - "$UNIT" 2>/dev/null)" = "true" ] \
-        && ok "agent ships disabled" || bad "agent is not Disabled:true — install would auto-start"
+    # The agent must NOT carry a Disabled key (issue #102). Until rc8 it shipped Disabled:true as
+    # the inertness, and that is the bug the issue reports: launchd never bootstrapped the job
+    # while Login Items showed its switch ON, and the switch and `launchctl enable`/`disable`
+    # turned out to be independent stores in both directions (measured 2026-09-13). The one
+    # switch is the platform's, so the plist must not fight it; inertness is now case 4, a
+    # property of the arguments. plutil exits non-zero for an absent key, which is the pass.
+    if plutil -extract Disabled raw -o - "$UNIT" > /dev/null 2>&1; then
+        bad "agent carries a Disabled key ($(plutil -extract Disabled raw -o - "$UNIT")) — Login Items would show a switch that does nothing"
+    else
+        ok "agent carries no Disabled key (Login Items is the switch)"
+    fi
 
     [ "$(plutil -extract Label raw -o - "$UNIT" 2>/dev/null)" = "org.kj5hst.naudio.daemon" ] \
         && ok "label is org.kj5hst.naudio.daemon" || bad "wrong Label"
@@ -254,6 +273,97 @@ if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q "unknown option: --duration-mss
 else
     bad "control did NOT fire — case 3 cannot be believed (exit $rc): $out"
 fi
+
+# ---- 4/4 inertness: the unit's own options, RUN, serve a page and capture nothing -------------
+# The same argument list, this time without the mode guard, so the daemon actually starts in
+# the mode the unit names and the pipeline state the browser would poll is read back. Two
+# additions, neither of which is in the unit: `--control-port 0` asks the OS for a free port (a
+# fixed one would make two arms running at once clash and read like a defect), and
+# `--no-config` keeps a developer's own daemon.conf — which may well say `autostart = true` —
+# from merging into the run. A `--duration-ms` backstop is appended too: the LAST occurrence
+# wins in the daemon's parser (case 3's guard relies on the same rule for --mode), the unit's
+# own `0` was asserted above, and without a backstop a harness that died between the start and
+# the kill would leave a daemon serving forever.
+command -v "$CURL" > /dev/null 2>&1 \
+    || { echo "FAIL: harness fault — no HTTP client at '$CURL'; case 4 cannot read the pipeline state"; exit 1; }
+
+RUN_PID=""
+stop_run() {
+    [ -n "$RUN_PID" ] && kill "$RUN_PID" 2> /dev/null
+    [ -n "$RUN_PID" ] && wait "$RUN_PID" 2> /dev/null
+    RUN_PID=""
+}
+trap 'stop_run; rm -rf "$TMP"' EXIT
+
+# start_unit <log> [extra args...] — runs the unit's own options plus the additions above, waits
+# for the page, and leaves its URL in RUN_URL (empty if the daemon never announced one) and the
+# pid in RUN_PID. Globals, deliberately: a helper that echoed the URL would be called inside
+# $(...), a subshell, and RUN_PID would never reach the trap — the first draft did exactly that
+# and every daemon it started outlived the arm until the backstop ended it (caught by pgrep).
+start_unit() {
+    local log="$1"; shift
+    "$DAEMON" "${unit_args[@]:1}" "$@" --control-port 0 --no-config --duration-ms 60000 \
+        > "$log" 2>&1 &
+    RUN_PID=$!
+    RUN_URL=""
+    local i
+    for i in $(seq 1 100); do
+        RUN_URL="$(sed -n 's/^control page : //p' "$log" 2> /dev/null | tr -d '\r')"
+        [ -n "$RUN_URL" ] && break
+        kill -0 "$RUN_PID" 2> /dev/null || break
+        sleep 0.1
+    done
+}
+# pipeline_state <url> — the stream state the page polls, settled: a run that was asked to
+# start passes through "starting" before it lands, so a reading of "starting" is re-read
+# (bounded). Anchored on `"stream":{"state":` — the pipeline's own object, not any other key
+# in the document that happens to be called state.
+pipeline_state() {
+    local url="${1%/}" s="" i
+    for i in $(seq 1 50); do
+        s="$("$CURL" -fsS --max-time 3 "$url/api/state" 2> /dev/null | tr -d '\r' \
+             | sed -n 's/.*"stream":{"state":"\([a-z]*\)".*/\1/p')"
+        [ "$s" = "starting" ] || break
+        sleep 0.1
+    done
+    printf '%s' "$s"
+}
+
+start_unit "$TMP/run.log"
+if [ -z "$RUN_URL" ]; then
+    bad "the unit's own options did not bring up a control page"
+    sed 's/^/  /' "$TMP/run.log"
+else
+    state="$(pipeline_state "$RUN_URL")"
+    if [ "$state" = "idle" ]; then
+        ok "the unit's own options serve the page ($RUN_URL) and capture nothing (state idle)"
+    else
+        bad "the unit's own options do NOT leave the pipeline idle: state '$state' — installing would capture at the next login"
+        sed 's/^/  /' "$TMP/run.log"
+    fi
+fi
+stop_run
+
+# ---- can-fail control for case 4 (L222) --------------------------------------------------------
+# The same start with `--autostart true` appended: the assertion above must now FAIL, or it was
+# reading a state that nothing could change. The capture pattern names a device that cannot
+# exist, so the start is refused at device resolution — the state lands on "error" (or is
+# unreadable, if the host cannot even enumerate) and no device is ever opened. A control that
+# opened the developer's microphone would be a worse defect than the one it guards against.
+start_unit "$TMP/control.log" --autostart true --capture no-such-device-servicecheck-control
+if [ -z "$RUN_URL" ]; then
+    bad "control did NOT run — the daemon announced no page with --autostart true"
+    sed 's/^/  /' "$TMP/control.log"
+else
+    state="$(pipeline_state "$RUN_URL")"
+    if [ "$state" = "idle" ]; then
+        bad "control did NOT fire — the pipeline reads idle with --autostart true; case 4 cannot be believed"
+        sed 's/^/  /' "$TMP/control.log"
+    else
+        ok "control fires: with --autostart true the pipeline is not idle (state '${state:-unreadable}')"
+    fi
+fi
+stop_run
 
 if [ "$fails" -ne 0 ]; then
     echo "servicecheck: $fails case(s) FAILED"

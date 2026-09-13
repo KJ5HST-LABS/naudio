@@ -1009,7 +1009,12 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
     # the launchd one. The fourth argument is the generated naudio Control Info.plist, set on
     # macOS only: the launchd arm asserts the agent's AssociatedBundleIdentifiers is that
     # bundle's CFBundleIdentifier (issue #102), and treats the argument's absence as a harness
-    # fault rather than a skip.
+    # fault rather than a skip. The fifth is the HTTP client the arm reads the pipeline state
+    # with when it RUNS the unit's arguments (issue #102: inertness is a behaviour of those
+    # arguments now, not a Disabled key) — located here, shared with the control-page gate
+    # below, and absent-as-harness-fault for the same reason as the fourth. It binds a socket
+    # and polls for the daemon's first line, so it gets the control-page gate's timeout.
+    find_program(NAUDIO_GATE_CURL NAMES curl)
     if(NAUDIO_SERVICE_UNIT_FILE)
         add_test(NAME naudio_daemon_servicecheck
                  COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
@@ -1017,7 +1022,9 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
                               "$<TARGET_FILE:na_audio_daemon>"
                               "${NAUDIO_SERVICE_UNIT_FILE}"
                               "${NAUDIO_SERVICE_EXEC_PATH}"
-                              "${NAUDIO_APP_INFO_PLIST}")
+                              "${NAUDIO_APP_INFO_PLIST}"
+                              "${NAUDIO_GATE_CURL}")
+        set_tests_properties(naudio_daemon_servicecheck PROPERTIES TIMEOUT 180)
     endif()
     # Control-page gate (issue #96 item 4). The page is the surface an operator reaches INSTEAD of
     # a terminal, so its failures are the ones with no exit code anywhere — a browser shows a
@@ -1031,12 +1038,12 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
     # asks it to, the arm passes --autostart false and asserts the pipeline is idle, and it never
     # posts a start.
     #
-    # Two external tools, both LOCATED HERE and passed in rather than assumed by the script: an
-    # HTTP client, and a Python to read JSON out of the responses (a regex over a message that
-    # can contain a quote or a comma is how a harness starts lying). Same discipline as the bash
-    # probe above — where either is missing the arm is not registered at all, because a test that
-    # fails as "unable to find executable" reads like a defect in the daemon.
-    find_program(NAUDIO_GATE_CURL NAMES curl)
+    # Two external tools, both LOCATED BY CMAKE and passed in rather than assumed by the script:
+    # an HTTP client (found above, for the service-unit gate), and a Python to read JSON out of
+    # the responses (a regex over a message that can contain a quote or a comma is how a harness
+    # starts lying). Same discipline as the bash probe above — where either is missing the arm is
+    # not registered at all, because a test that fails as "unable to find executable" reads like
+    # a defect in the daemon.
     find_program(NAUDIO_GATE_PYTHON NAMES python3 python)
     if(NAUDIO_GATE_CURL AND NAUDIO_GATE_PYTHON)
         add_test(NAME naudio_daemon_controlcheck

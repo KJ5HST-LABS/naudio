@@ -15,14 +15,20 @@
   at ~/Library/Application Support/naudio/daemon.conf (issue #96 item 1) the right file
   for this service to read.
 
-  Disabled: true ships the job INERT. Installing a package must not start capturing a
-  microphone at the next login. Measured, not assumed: bootstrapping a Disabled:true
-  plist fails outright ("Bootstrap failed: 5") and the job never runs, while the same
-  plist with Disabled:false runs — and `launchctl enable gui/<uid>/<label>` writes an
-  override that beats this key and SURVIVES a bootout/re-bootstrap, so a reinstall or
-  upgrade preserves an operator's enabled state instead of silently switching the
-  service off. See the man page's SERVICE REGISTRATION section for the enable command;
-  issue #96 item 4 turns it into a click.
+  There is deliberately NO Disabled key (issue #102). Installing a package must not start
+  capturing a microphone at the next login, and that is a property of the ARGUMENTS below
+  (control mode, autostart off: the page is served, no device is opened), not of a key
+  that stops the job from running at all. Until rc8 the key was there, and it produced the
+  bug the issue reports: Login Items showed the agent switched ON while launchd had never
+  bootstrapped it, so the operator saw two switches that disagreed. Measured 2026-09-13:
+  the Login Items switch and `launchctl enable`/`disable` are independent stores in both
+  directions — the switch boots the job out or in and writes no launchd override, and an
+  override moves nothing in the pane — so the only way to have ONE switch is for Login
+  Items to be it and for this file not to fight it. An rc7-era `launchctl disable`
+  override would still block bootstrap while the switch said on; the postinstall clears
+  it for the console user. The servicecheck arm asserts the key is absent AND runs these
+  arguments to prove they capture nothing; the release gate does the same on the
+  installed files.
 -->
 <plist version="1.0">
 <dict>
@@ -53,9 +59,6 @@
         <string>--duration-ms</string>
         <string>0</string>
     </array>
-
-    <key>Disabled</key>
-    <true/>
 
     <key>RunAtLoad</key>
     <true/>
