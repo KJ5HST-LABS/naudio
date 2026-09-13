@@ -168,6 +168,11 @@ if(NAUDIO_BUILD_APPS)
                        "${CMAKE_CURRENT_BINARY_DIR}/naudio-control" @ONLY)
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.Info.plist"
                 DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
+        # Read by the naudio_daemon_servicecheck arm: the agent's AssociatedBundleIdentifiers
+        # must be this file's CFBundleIdentifier (issue #102), asserted as a relation between
+        # the two generated files rather than as a literal either could drift from.
+        set(NAUDIO_APP_INFO_PLIST
+            "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.Info.plist" PARENT_SCOPE)
         # PROGRAMS, not FILES: configure_file writes 0644, and LaunchServices does not report a
         # bundle whose executable is not executable — it declines to open it, with no error the
         # operator can act on.

@@ -1006,14 +1006,18 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
     # build-tree test structurally cannot see. Registered only where the unit was generated, so
     # a configuration with no daemon has no such test rather than a skip that reads like
     # coverage; the platform decides WHICH unit, so ubuntu CI covers the systemd arm and macOS
-    # the launchd one.
+    # the launchd one. The fourth argument is the generated naudio Control Info.plist, set on
+    # macOS only: the launchd arm asserts the agent's AssociatedBundleIdentifiers is that
+    # bundle's CFBundleIdentifier (issue #102), and treats the argument's absence as a harness
+    # fault rather than a skip.
     if(NAUDIO_SERVICE_UNIT_FILE)
         add_test(NAME naudio_daemon_servicecheck
                  COMMAND "${NAUDIO_DAEMON_GATE_SHELL}"
                               "${CMAKE_CURRENT_SOURCE_DIR}/tests/daemon/servicecheck.sh"
                               "$<TARGET_FILE:na_audio_daemon>"
                               "${NAUDIO_SERVICE_UNIT_FILE}"
-                              "${NAUDIO_SERVICE_EXEC_PATH}")
+                              "${NAUDIO_SERVICE_EXEC_PATH}"
+                              "${NAUDIO_APP_INFO_PLIST}")
     endif()
     # Control-page gate (issue #96 item 4). The page is the surface an operator reaches INSTEAD of
     # a terminal, so its failures are the ones with no exit code anywhere — a browser shows a

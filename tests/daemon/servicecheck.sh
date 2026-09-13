@@ -29,9 +29,13 @@
 # `--mode zzz`, rejected at the mode dispatch, which is the last check before any device work.
 set -u
 
-DAEMON="${1:?usage: servicecheck.sh <path-to-na_audio_daemon> <unit-file> <expected-exec-path>}"
+DAEMON="${1:?usage: servicecheck.sh <path-to-na_audio_daemon> <unit-file> <expected-exec-path> [app-info-plist]}"
 UNIT="${2:?missing unit file}"
 WANT_EXEC="${3:?missing expected exec path}"
+# The generated naudio Control Info.plist — launchd units only, where the agent names the app
+# (issue #102). Optional at the usage line because the other two unit kinds have no such file;
+# the launchd branch treats its absence as a harness fault, not a skip.
+APP_PLIST="${4:-}"
 
 [ -x "$DAEMON" ] || { echo "FAIL: not executable: $DAEMON"; exit 1; }
 [ -f "$UNIT" ]   || { echo "FAIL: no generated unit file at: $UNIT"; exit 1; }
@@ -87,6 +91,32 @@ if [ "$KIND" = launchd ]; then
 
     [ "$(plutil -extract Label raw -o - "$UNIT" 2>/dev/null)" = "org.kj5hst.naudio.daemon" ] \
         && ok "label is org.kj5hst.naudio.daemon" || bad "wrong Label"
+
+    # Login Items names the agent after the app it is associated with (issue #102), and the
+    # association is a relation between two generated files: the agent's
+    # AssociatedBundleIdentifiers entry must be the CFBundleIdentifier of the naudio Control
+    # bundle the postinstall assembles. Asserted as a relation, not a literal, so a renamed
+    # bundle cannot silently orphan the association — Background Task Management drops an
+    # association it cannot resolve with no diagnostic anywhere (measured 2026-09-13).
+    if [ -z "$APP_PLIST" ]; then
+        bad "harness fault — no naudio Control Info.plist was handed to the launchd branch"
+    elif [ ! -f "$APP_PLIST" ]; then
+        bad "harness fault — no generated Info.plist at: $APP_PLIST"
+    else
+        app_id="$(plutil -extract CFBundleIdentifier raw -o - "$APP_PLIST" 2>/dev/null)"
+        assoc="$(plutil -extract AssociatedBundleIdentifiers.0 raw -o - "$UNIT" 2>/dev/null)"
+        if [ -z "$app_id" ]; then
+            bad "the control app's Info.plist carries no CFBundleIdentifier"
+        elif [ -z "$assoc" ]; then
+            bad "agent has no AssociatedBundleIdentifiers — Login Items would name the developer, not naudio Control"
+        elif [ "$assoc" != "$app_id" ]; then
+            bad "agent associates '$assoc' but the control app is '$app_id' — Login Items would drop the association"
+        elif plutil -extract AssociatedBundleIdentifiers.1 raw -o - "$UNIT" > /dev/null 2>&1; then
+            bad "agent associates more than one bundle; it ships exactly one app"
+        else
+            ok "agent is associated with the control app ($app_id)"
+        fi
+    fi
 
     # KeepAlive without a throttle turns a permanent config error into a hot loop.
     [ "$(plutil -extract ThrottleInterval raw -o - "$UNIT" 2>/dev/null)" -ge 10 ] 2>/dev/null \
