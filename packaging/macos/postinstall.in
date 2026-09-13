@@ -7,9 +7,11 @@
 # /Library/LaunchAgents is not under it. So the plist ships in the payload's share/
 # tree and this script copies it into place — the ".pkg postinstall" the issue names.
 #
-# It registers the agent; it does NOT enable or start it. The plist ships Disabled:true
-# and an operator's `launchctl enable` override outlives this copy, so a reinstall or
-# upgrade preserves whichever state they chose.
+# It registers the agent; it does not start it. Nothing runs until the next login, and
+# what runs then is the control page with no device open (the agent's own arguments). The
+# on/off switch is the platform's — Login Items (issue #102) — which keeps its own state
+# across upgrades; the one thing this script does to launchd's state is clear a stale
+# `launchctl disable` from the days when the docs named that as the switch (below).
 set -eu
 
 # productbuild passes the target VOLUME as $3 ("/" for the boot volume). Honour it, so
@@ -27,6 +29,19 @@ install -m 0644 -o root -g wheel "$SRC" "$DST"
 # The agent runs as the logged-in user, so the directory it logs into must be writable
 # by that user: group staff, which every local macOS account belongs to.
 install -d -m 0775 -o root -g staff "$LOGDIR"
+
+# Clear a stale `launchctl disable` (issue #102). Through rc8 the plist shipped Disabled:true
+# and the docs named `launchctl enable`/`disable` as the service's switch; an operator who ran
+# `disable` holds a launchd override that blocks bootstrap while the Login Items switch — the
+# switch now — reads on, because the two are independent stores in both directions (measured
+# 2026-09-13). Cleared for the console user, whose gui domain is the one this agent is
+# bootstrapped into at login. Idempotent, harmless when no override exists, and `|| true`
+# because nothing here may fail the install: an install with no console user (uid 0, or a
+# remote session) simply has no domain to clear.
+console_uid="$(stat -f %u /dev/console 2>/dev/null || echo 0)"
+if [ "$console_uid" -ge 500 ] 2>/dev/null; then
+    launchctl enable "gui/$console_uid/org.kj5hst.naudio.daemon" || true
+fi
 
 # "naudio Control.app" into /Applications (issue #96 item 4) — the shortcut that opens the
 # control page. Same reason as the plist: /Applications is not under the .pkg's /usr/local
