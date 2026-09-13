@@ -39,7 +39,9 @@
 
   Enabled is FALSE: installing a package must not start capturing at the next logon. The NSIS
   section registers the task disabled and the operator enables it, which is the same property
-  the launchd agent's Disabled key and systemd's not-enabled state give the other two platforms.
+  systemd's not-enabled state gives Linux. macOS is the odd one out (issue #102): it has a system
+  switch for background items, Login Items, which disagrees with a Disabled key, so the launchd
+  agent ships without one and is inert by its arguments instead. Windows has no such switch.
 -->
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>

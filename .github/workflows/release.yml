@@ -308,12 +308,18 @@ jobs:
           test -x "$exec_path" \
             || { echo "::error::agent names '$exec_path', which the install did not create"; exit 1; }
 
-          # Installing must not start capturing a microphone at the next login.
-          # Asserted AS POLICY, like the dev-file absence above.
-          [ "$(plutil -extract Disabled raw -o - "$AGENT")" = "true" ] \
-            || { echo "::error::the registered agent is not Disabled — install would auto-start"; exit 1; }
+          # The agent must NOT carry a Disabled key (#102). Until rc8 it did,
+          # and Login Items then showed a switch that was ON while launchd had
+          # never bootstrapped the job — the switch and launchctl's override
+          # are independent stores (measured 2026-09-13), so the one switch is
+          # the platform's and the plist must not fight it. Asserted AS POLICY,
+          # like the dev-file absence above; the "must not capture at the next
+          # login" half is now a BEHAVIOUR of the registered arguments, asserted
+          # on the installed binary below.
+          if plutil -extract Disabled raw -o - "$AGENT" > /dev/null 2>&1; then
+            echo "::error::the registered agent carries a Disabled key — Login Items would show a switch that does nothing"; exit 1; fi
 
-          # ...and it did not start one NOW either. An assertion of absence is
+          # It did not start one NOW either. An assertion of absence is
           # worth nothing from an instrument that finds nothing, so pgrep gets a
           # control built from the EXACT name searched for: a symlink to sleep,
           # run, observed, killed, and observed gone. Borrowing a system process
@@ -352,7 +358,7 @@ jobs:
           log_dir=$(dirname "$(plutil -extract StandardErrorPath raw -o - "$AGENT")")
           test -d "$log_dir" \
             || { echo "::error::agent logs to $log_dir, which the postinstall did not create"; exit 1; }
-          echo "launchd agent registered, inert, and pointing at $exec_path"
+          echo "launchd agent registered, switched by Login Items, and pointing at $exec_path"
 
           # --- The control page (#96 item 4) ---------------------------------
           # The agent runs the daemon in CONTROL mode now, which is what makes
@@ -394,11 +400,28 @@ jobs:
               || { echo "::error::the payload was signed but $APP has no _CodeSignature/CodeResources — the postinstall did not place the bundle's signature"; exit 1; }
           fi
 
-          # BEHAVIOUR on the installed binary: serve the page, fetch it, and
+          # BEHAVIOUR on the installed binary, with the REGISTERED AGENT'S OWN
+          # ARGUMENTS (#102): since the plist no longer carries Disabled, "a
+          # bare install captures nothing at the next login" is a property of
+          # what launchd will run, so that is what runs here — the argument
+          # list read back off the installed plist, not a hand-written one
+          # that could agree with itself. Two additions the agent does not
+          # carry: --control-port 0 (a free port) and --no-config (the runner's
+          # own files stay out of it); the --duration-ms backstop is appended
+          # LAST because the last occurrence wins and the agent's own 0 would
+          # otherwise run until killed by nothing. Serve the page, fetch it,
           # fetch the state the browser polls. Hardware-free — control mode
           # opens no device until asked, and nothing here asks.
-          "$exec_path" --mode control --control-port 0 --autostart false \
-                       --no-config --duration-ms 20000 > /tmp/ctl.log 2>&1 &
+          agent_args=()
+          n=1
+          while v=$(plutil -extract "ProgramArguments.$n" raw -o - "$AGENT" 2>/dev/null); do
+            agent_args+=("$v"); n=$((n+1))
+          done
+          [ "${#agent_args[@]}" -ge 2 ] \
+            || { echo "::error::read ${#agent_args[@]} arguments off the registered agent; expected --mode control at least"; exit 1; }
+          echo "registered agent runs: $exec_path ${agent_args[*]}"
+          "$exec_path" "${agent_args[@]}" --control-port 0 --no-config \
+                       --duration-ms 20000 > /tmp/ctl.log 2>&1 &
           ctl_daemon=$!
           url=""
           for _ in $(seq 1 50); do
@@ -1014,8 +1037,10 @@ jobs:
             exit 1 }
 
           # Installing must not start capturing at the next logon. This is the
-          # Windows spelling of the launchd Disabled key and systemd's
-          # not-enabled state, and it is asserted AS POLICY.
+          # Windows spelling of systemd's not-enabled state, and it is asserted
+          # AS POLICY. (The launchd agent no longer has a key for this — macOS
+          # has a system switch, Login Items, and the agent is inert by its
+          # arguments instead; see the macOS gate. Windows has no such switch.)
           if ($task.State -ne 'Disabled') {
             Write-Output "::error::the registered task is '$($task.State)', not Disabled — logging in would start capturing"; exit 1 }
 

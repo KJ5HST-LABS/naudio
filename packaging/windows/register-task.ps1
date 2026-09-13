@@ -18,8 +18,9 @@
 #     as "The task XML contains a value which is incorrectly formatted or out of range", naming
 #     neither the encoding nor the line.
 #   * The task is created from XML that says <Enabled>false</Enabled>, so it ships INERT. That
-#     is the same property the launchd agent's Disabled key and the systemd unit's not-enabled
-#     state give the other two platforms: installing must not start capturing at the next logon.
+#     is the same property the systemd unit's not-enabled state gives Linux: installing must not
+#     start capturing at the next logon. (The launchd agent has no such key since issue #102 —
+#     macOS has a system switch, Login Items, and the agent is inert by its arguments instead.)
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$InstallDir,
