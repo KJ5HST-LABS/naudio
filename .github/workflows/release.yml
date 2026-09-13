@@ -378,6 +378,22 @@ jobs:
           test -x "$app_exec" \
             || { echo "::error::$APP execs '$app_exec', which the install did not create"; exit 1; }
 
+          # The agent names this bundle (#102): Login Items shows the service
+          # under the app's name only when AssociatedBundleIdentifiers resolves
+          # to the bundle the postinstall placed. The relation the servicecheck
+          # arm asserts on the generated files, here on the INSTALLED ones.
+          app_id=$(plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist" 2>/dev/null || true)
+          assoc=$(plutil -extract AssociatedBundleIdentifiers.0 raw -o - "$AGENT" 2>/dev/null || true)
+          [ -n "$app_id" ] && [ "$assoc" = "$app_id" ] \
+            || { echo "::error::the registered agent associates '$assoc' but $APP is '$app_id' — Login Items would name the developer"; exit 1; }
+          # A signed payload must have placed the bundle's signature too: the
+          # association is silently dropped for an unsigned app (measured
+          # 2026-09-13). The signature itself is verified in the next step.
+          if [ -n "${NAUDIO_CODESIGN_IDENTITY:-}" ]; then
+            test -f "$APP/Contents/_CodeSignature/CodeResources" \
+              || { echo "::error::the payload was signed but $APP has no _CodeSignature/CodeResources — the postinstall did not place the bundle's signature"; exit 1; }
+          fi
+
           # BEHAVIOUR on the installed binary: serve the page, fetch it, and
           # fetch the state the browser polls. Hardware-free — control mode
           # opens no device until asked, and nothing here asks.
@@ -457,7 +473,27 @@ jobs:
           # the two capture tools entitled — a renamed tool would otherwise ship unable to hear.
           [ "$n" -eq 5 ] || { echo "::error::expected 5 signed binaries, saw $n"; exit 1; }
           [ "$entitled" -eq 2 ] || { echo "::error::expected 2 entitled capture tools, saw $entitled"; exit 1; }
-          echo "== payload: $n installed binaries Developer ID signed with the hardened runtime; $entitled carry audio-input =="
+
+          # naudio Control.app (#102): sealed in CPack staging, carried as loose signature
+          # files, reassembled by the postinstall — so the only bundle worth verifying is
+          # the INSTALLED one. Its Team ID must be the installed daemon's: Background Task
+          # Management names the agent after the app only when they match, and drops the
+          # association silently otherwise. A relation between two installed files, not
+          # a literal team id.
+          APP="/Applications/naudio Control.app"
+          codesign --verify --deep --strict "$APP" \
+            || { echo "::error::$APP does not verify after the postinstall assembled it"; exit 1; }
+          app_desc=$(codesign -dvv "$APP" 2>&1)
+          case "$app_desc" in
+            *"Authority=Developer ID Application"*) ;;
+            *) echo "::error::naudio Control.app is not Developer ID signed"; echo "$app_desc"; exit 1 ;;
+          esac
+          app_team=$(printf '%s\n' "$app_desc" | sed -n 's/^TeamIdentifier=//p')
+          daemon_team=$(codesign -dvv /usr/local/bin/na_audio_daemon 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          [ -n "$app_team" ] && [ "$app_team" = "$daemon_team" ] \
+            || { echo "::error::naudio Control.app's TeamIdentifier ('$app_team') is not the daemon's ('$daemon_team') — Login Items would drop the association"; exit 1; }
+          echo "  ok: naudio Control.app (TeamIdentifier $app_team)"
+          echo "== payload: $n installed binaries Developer ID signed with the hardened runtime; $entitled carry audio-input; naudio Control.app sealed with the daemon's team id =="
 
       - name: "Sign the .pkg, notarize it, staple the ticket"
         env:
