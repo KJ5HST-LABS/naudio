@@ -145,3 +145,187 @@ endif()
 
 message(STATUS "codesign: all ${_n} payload binaries carry Developer ID + hardened runtime; "
                "${_entitled} capture tools carry audio-input")
+
+# ---- naudio Control.app (issue #102) ----------------------------------------------------------
+# Login Items names a launchd agent after the app its plist associates it with
+# (AssociatedBundleIdentifiers) — but only when that app is Developer ID signed with the agent's
+# Team ID. Measured 2026-09-13: Background Task Management silently dropped the association for
+# an unsigned probe app and honoured it for a signed one, with the plist identical and valid in
+# both cases. So the key in the plist is worth nothing unless the bundle it names is signed here.
+#
+# The bundle is not in the payload. tools/CMakeLists.txt keeps it out — pkgbuild auto-detects a
+# .app in a payload and hands its placement to macOS Installer, which on a CI runner placed
+# nothing — so the payload carries two flat files under share/naudio/ and the postinstall
+# assembles them. What the payload CAN carry is the signature: for a bundle whose executable is a
+# script, codesign writes it as ordinary files under Contents/_CodeSignature/ with no extended
+# attributes, and a bundle reassembled from loose files with install(1) verifies --deep --strict
+# (both measured, the second with a one-byte control that fails). This step assembles a temporary
+# bundle from the staged pieces, signs it, verifies it, and copies the signature files back into
+# the staging tree as share/naudio/naudio-control.codesig/*, which the postinstall installs into
+# place beside the other two. A directory of data files is not a bundle and cannot trip the
+# auto-detection.
+#
+# No entitlements: the bundle executable execs the daemon, and the exec'd image carries its own
+# signature and audio-input entitlement (above). The seal covers Info.plist, which carries the
+# project version — the roll happens before cpack, so the seal is always of the rolled file.
+
+set(_app_script "")
+set(_app_plist "")
+set(_app_script_n 0)
+set(_app_plist_n 0)
+foreach(_f ${_candidates})
+    get_filename_component(_name "${_f}" NAME)
+    if(_name STREQUAL "naudio-control")
+        set(_app_script "${_f}")
+        math(EXPR _app_script_n "${_app_script_n} + 1")
+    elseif(_name STREQUAL "naudio-control.Info.plist")
+        set(_app_plist "${_f}")
+        math(EXPR _app_plist_n "${_app_plist_n} + 1")
+    endif()
+endforeach()
+# CARDINALITY (L230): exactly one of each, side by side. Zero means the app was not staged and
+# Login Items would keep showing the developer's name; two means a tree this script does not
+# understand. Neither is a payload to hand to CPack as signed.
+if(NOT _app_script_n EQUAL 1 OR NOT _app_plist_n EQUAL 1)
+    message(FATAL_ERROR
+        "codesign: expected exactly one staged naudio-control and one naudio-control.Info.plist "
+        "under ${_stage}; found ${_app_script_n} and ${_app_plist_n}. The control app cannot be "
+        "signed, so Login Items would name the developer instead of naudio Control.")
+endif()
+get_filename_component(_app_payload_dir "${_app_script}" DIRECTORY)
+get_filename_component(_app_plist_dir "${_app_plist}" DIRECTORY)
+if(NOT _app_payload_dir STREQUAL _app_plist_dir)
+    message(FATAL_ERROR
+        "codesign: the control app's pieces are staged in different directories "
+        "(${_app_payload_dir} vs ${_app_plist_dir}); the postinstall reads both from one.")
+endif()
+
+# The daemon's Team ID, read off its signature — the relation Login Items depends on is asserted
+# below against this, not against a literal.
+set(_daemon "")
+foreach(_bin ${_machos})
+    get_filename_component(_name "${_bin}" NAME)
+    if(_name STREQUAL "na_audio_daemon")
+        set(_daemon "${_bin}")
+    endif()
+endforeach()
+if(NOT _daemon)
+    message(FATAL_ERROR "codesign: na_audio_daemon is not among the ${_n} signed Mach-O files")
+endif()
+execute_process(COMMAND codesign -dvv "${_daemon}" ERROR_VARIABLE _desc OUTPUT_QUIET)
+string(REGEX MATCH "TeamIdentifier=([^\n]+)" _m "${_desc}")
+set(_daemon_team "${CMAKE_MATCH_1}")
+if(NOT _daemon_team)
+    message(FATAL_ERROR "codesign: could not read a TeamIdentifier off ${_daemon}. Got:\n${_desc}")
+endif()
+
+# Assembled OUTSIDE the staging tree, deliberately: a .app inside it would be exactly the payload
+# bundle tools/CMakeLists.txt keeps out. A sibling of the staging directory is never packaged.
+# From the STAGED copies, so the seal is of the bytes that ship (install(PROGRAMS) has already
+# made the script 0755 here; the mode is not sealed, the hash is).
+set(_app_work "${_stage}.naudio-control-sign")
+set(_app "${_app_work}/naudio Control.app")
+file(REMOVE_RECURSE "${_app_work}")
+file(MAKE_DIRECTORY "${_app}/Contents/MacOS")
+file(COPY "${_app_script}" DESTINATION "${_app}/Contents/MacOS")
+file(COPY "${_app_plist}" DESTINATION "${_app}/Contents")
+file(RENAME "${_app}/Contents/naudio-control.Info.plist" "${_app}/Contents/Info.plist")
+
+execute_process(
+    COMMAND codesign --force --sign "${CPACK_NAUDIO_CODESIGN_IDENTITY}"
+                     --timestamp --options runtime "${_app}"
+    RESULT_VARIABLE _rc ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR "codesign failed on ${_app}: ${_err}")
+endif()
+
+# On the artifact, as above. The identifier is read from the staged Info.plist and the Team ID
+# from the signed daemon, so both are relations between shipped files rather than literals a
+# rename could orphan.
+execute_process(COMMAND plutil -extract CFBundleIdentifier raw -o - "${_app_plist}"
+                OUTPUT_VARIABLE _bundle_id ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT _bundle_id)
+    message(FATAL_ERROR "codesign: no CFBundleIdentifier in ${_app_plist}")
+endif()
+execute_process(COMMAND codesign -dvv "${_app}" ERROR_VARIABLE _desc OUTPUT_QUIET)
+if(NOT _desc MATCHES "Authority=Developer ID Application")
+    message(FATAL_ERROR
+        "codesign: naudio Control.app is not Developer ID Application signed after signing it. "
+        "Got:\n${_desc}")
+endif()
+string(REGEX MATCH "\nIdentifier=([^\n]+)\n" _m "${_desc}")
+if(NOT CMAKE_MATCH_1 STREQUAL _bundle_id)
+    message(FATAL_ERROR
+        "codesign: naudio Control.app was sealed as '${CMAKE_MATCH_1}', not as the bundle's "
+        "CFBundleIdentifier (${_bundle_id}). Got:\n${_desc}")
+endif()
+string(REGEX MATCH "TeamIdentifier=([^\n]+)" _m "${_desc}")
+if(NOT CMAKE_MATCH_1 STREQUAL _daemon_team)
+    message(FATAL_ERROR
+        "codesign: naudio Control.app's TeamIdentifier ('${CMAKE_MATCH_1}') is not the daemon's "
+        "('${_daemon_team}'); Background Task Management drops the association unless they "
+        "match. Got:\n${_desc}")
+endif()
+execute_process(COMMAND codesign --verify --deep --strict "${_app}"
+                RESULT_VARIABLE _rc ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR "codesign: naudio Control.app does not verify after signing: ${_err}")
+endif()
+
+# Copy the signature back as loose payload files. Every file codesign wrote, not a fixed list:
+# the set has varied across macOS releases (CodeRequirements-1 came and went), and a member
+# left behind would ship a bundle that fails to verify with no local check firing.
+set(_codesig_dst "${_app_payload_dir}/naudio-control.codesig")
+file(GLOB _sigfiles "${_app}/Contents/_CodeSignature/*")
+list(LENGTH _sigfiles _nsig)
+if(_nsig LESS 3)
+    message(FATAL_ERROR
+        "codesign: naudio Control.app carries ${_nsig} file(s) under _CodeSignature; a sealed "
+        "bundle carries at least CodeDirectory, CodeResources and CodeSignature")
+endif()
+file(REMOVE_RECURSE "${_codesig_dst}")
+file(MAKE_DIRECTORY "${_codesig_dst}")
+file(COPY ${_sigfiles} DESTINATION "${_codesig_dst}")
+
+# PROVE THE COPY-BACK IS COMPLETE ON THE BYTES THAT SHIP: reassemble a second bundle the way the
+# postinstall does — from the staged pieces plus the staged signature directory, nothing from the
+# temporary bundle — and verify it. This is the postinstall's method run at packaging time.
+set(_app2 "${_app_work}/reassembled/naudio Control.app")
+file(MAKE_DIRECTORY "${_app2}/Contents/MacOS" "${_app2}/Contents/_CodeSignature")
+file(COPY "${_app_script}" DESTINATION "${_app2}/Contents/MacOS")
+file(COPY "${_app_plist}" DESTINATION "${_app2}/Contents")
+file(RENAME "${_app2}/Contents/naudio-control.Info.plist" "${_app2}/Contents/Info.plist")
+file(GLOB _staged_sigs "${_codesig_dst}/*")
+file(COPY ${_staged_sigs} DESTINATION "${_app2}/Contents/_CodeSignature")
+execute_process(COMMAND codesign --verify --deep --strict "${_app2}"
+                RESULT_VARIABLE _rc ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR
+        "codesign: a bundle reassembled from the staged pieces and ${_codesig_dst} does not "
+        "verify — the postinstall would place an unverifiable app: ${_err}")
+endif()
+file(REMOVE_RECURSE "${_app_work}")
+
+# CARDINALITY, once more: this step must have added no Mach-O to the payload. The notary would
+# see a sixth binary this script never signed; the release gate counts five.
+set(_n_after 0)
+file(GLOB_RECURSE _after "${_stage}/*")
+foreach(_f ${_after})
+    if(IS_SYMLINK "${_f}" OR IS_DIRECTORY "${_f}")
+        continue()
+    endif()
+    execute_process(COMMAND file -b "${_f}" OUTPUT_VARIABLE _kind ERROR_QUIET
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_kind MATCHES "Mach-O")
+        math(EXPR _n_after "${_n_after} + 1")
+    endif()
+endforeach()
+if(NOT _n_after EQUAL _n)
+    message(FATAL_ERROR
+        "codesign: the payload carried ${_n} Mach-O files before the control app was signed and "
+        "${_n_after} after; the signature files must not be binaries")
+endif()
+
+message(STATUS "codesign: naudio Control.app sealed as ${_bundle_id} (TeamIdentifier "
+               "${_daemon_team}); ${_nsig} signature files staged under "
+               "${_codesig_dst}")

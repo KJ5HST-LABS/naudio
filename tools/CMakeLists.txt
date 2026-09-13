@@ -118,9 +118,11 @@ if(NAUDIO_BUILD_APPS)
         # /usr/local install prefix and the payload therefore cannot reach it.
         set(NAUDIO_PLIST_PAYLOAD_PATH
             "${CMAKE_INSTALL_FULL_DATADIR}/naudio/org.kj5hst.naudio.daemon.plist")
-        # Where the postinstall will find the control app's TWO PIECES inside the payload. Set
-        # HERE rather than beside their configure_file below, because postinstall.in is
-        # configured a few lines down and a variable set after it would expand to nothing.
+        # Where the postinstall will find the control app's TWO PIECES inside the payload — and,
+        # when the payload is signed, its signature directory naudio-control.codesig/, which
+        # cmake/CodesignPayload.cmake writes beside them at cpack time (issue #102). Set HERE
+        # rather than beside their configure_file below, because postinstall.in is configured a
+        # few lines down and a variable set after it would expand to nothing.
         set(NAUDIO_APP_PAYLOAD_DIR "${CMAKE_INSTALL_FULL_DATADIR}/naudio")
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/org.kj5hst.naudio.daemon.plist.in"
@@ -154,6 +156,12 @@ if(NAUDIO_BUILD_APPS)
         # it on a CI runner, silently, while the payload listing showed the files present. Two
         # ordinary files cannot be auto-detected as a bundle, so the postinstall's `install`
         # calls are the only thing that decides where this lands.
+        #
+        # The same reasoning is why a SIGNED release carries the bundle's signature as loose
+        # files too (share/naudio/naudio-control.codesig/, written at cpack time by
+        # cmake/CodesignPayload.cmake, which explains why the bundle must be signed at all):
+        # a directory of data files is not a bundle either, and the postinstall installs them
+        # into Contents/_CodeSignature/ beside the other two.
         configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/app/Info.plist.in"
                        "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.Info.plist" @ONLY)
         configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/app/naudio-control.in"
