@@ -47,11 +47,12 @@ those are in every other format on this page.
 
 - **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`), puts **naudio Control**
   in `/Applications`, and registers the daemon as a background service — listed as **naudio
-  Control** under *System Settings › General › Login Items & Extensions* on a fresh install —
-  switched off until you turn it on (see *Running the daemon in the background* below). A Mac
-  that already had the service from an earlier release keeps listing it under the developer's
-  name: macOS names that entry once, when it first sees the service, and neither reinstalling
-  nor restarting renames it. **Each release's notes say
+  Control** under *System Settings › General › Login Items & Extensions* on a fresh install. Its
+  switch there is the service's switch: it is on, so from your next login the daemon serves the
+  control page and captures nothing until you press Start; turn it off there to stop it (see
+  *Running the daemon in the background* below). A Mac that already had the service from an
+  earlier release keeps listing it under the developer's name: macOS names that entry once, when
+  it first sees the service, and neither reinstalling nor restarting renames it. **Each release's notes say
   whether that release's `.pkg` is signed and notarized**, and they say it from a check of the
   file itself rather than from what was intended (issue #99) — a signed one opens like any other
   installer, and an unsigned one needs a right-click → *Open* the first time. macOS installers have no
@@ -219,15 +220,21 @@ packages also install it as a background service, so it starts with your compute
 keeps serving audio on its own — including its control page, so once the service is on, the
 shortcut above just opens the page.
 
-The service arrives **switched off**. Installing software should not start listening to
-your microphone, so turning it on is a deliberate, one-time step:
+Installing software should not start listening to your microphone, and none of the three
+does: the service runs the control page and opens no device until you press Start (or tick
+*Start streaming automatically*). Where the platforms differ is the switch.
+
+On **macOS** the switch is the system's: the service appears in *System Settings › General ›
+Login Items & Extensions › Allow in the Background* as **naudio Control**, on. From your next
+login the daemon is running and its page is a click away; turning the switch off there stops
+it and keeps it off, turning it on starts it again. There is no command to run — a
+`launchctl enable`/`disable` from the rc7 and rc8 instructions does not move that switch (the
+two are independent), so the installer clears one if you had run it.
+
+On **Linux** the service arrives **switched off**, and turning it on is a deliberate,
+one-time step:
 
 ```bash
-# macOS
-launchctl enable gui/$(id -u)/org.kj5hst.naudio.daemon
-launchctl kickstart -k gui/$(id -u)/org.kj5hst.naudio.daemon
-
-# Linux
 systemctl --user enable --now naudio-daemon
 ```
 
@@ -243,14 +250,13 @@ systemctl --user restart naudio-daemon                          # Linux
 
 If the service will not start, the usual cause is a mistake in the configuration file, and
 the message names the line: `systemctl --user status naudio-daemon` on Linux, or
-`/usr/local/var/log/naudio/daemon.log` on a Mac. To switch the service off again, use
-`launchctl disable gui/$(id -u)/org.kj5hst.naudio.daemon` or
-`systemctl --user disable --now naudio-daemon`.
+`/usr/local/var/log/naudio/daemon.log` on a Mac. To switch the service off again, turn it off
+in Login Items on a Mac, or use `systemctl --user disable --now naudio-daemon` on Linux.
 
 On **Windows** the installer registers a Task Scheduler **logon task** rather than a Windows
 service, and for the same reason the other two are session-scoped: a Windows service runs in
 session 0, which has no audio devices, so it would install perfectly and then capture nothing.
-It arrives switched off like the others:
+It arrives switched off, like Linux:
 
 ```powershell
 schtasks /Change /TN "\naudio\naudio-daemon" /ENABLE
@@ -261,8 +267,8 @@ Turn it off again with `/DISABLE`, or from *Task Scheduler* under the **naudio**
 does not capture a task's output anywhere, so there is no equivalent of the log file above: a
 configuration mistake shows up as `LastTaskResult` 2 on the task, and on the control page.
 
-All three services run the daemon in **control mode**, so turning one on gives you the control
-page at every login and captures nothing until you ask it to. If you want capture to start
+All three services run the daemon in **control mode**, so a service that is on gives you the
+control page at every login and captures nothing until you ask it to. If you want capture to start
 automatically, tick *Start streaming automatically* on the page (it writes `autostart = true`
 into the configuration file).
 

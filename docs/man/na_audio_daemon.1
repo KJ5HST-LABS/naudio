@@ -266,25 +266,37 @@ silently overridden by a value you never chose.
 .SH SERVICE REGISTRATION
 The packages install a service definition so the daemon can run without a
 terminal.
-It is installed
-.I inert:
-installing a package must not start capturing a microphone at your next login,
-so you enable the service once, deliberately.
+Installing a package must not start capturing a microphone at your next
+login, and on no platform does it: the service runs
+.B \-\-mode control
+and opens no device until you press Start on the page.
+Where the platforms differ is the switch.
 .PP
 On macOS the installer registers a launchd
 .I agent
 at
-.IR /Library/LaunchAgents/org.kj5hst.naudio.daemon.plist .
-Enable and start it with:
+.IR /Library/LaunchAgents/org.kj5hst.naudio.daemon.plist ,
+and the switch is the system's: the service is listed in
+.I "System Settings > General > Login Items & Extensions > Allow in the Background"
+as
+.BR "naudio Control" ,
+on.
+From your next login the daemon is running and its page is a click away;
+turning the switch off there stops it and keeps it off, turning it on starts
+it again.
+There is no command to run.
+Earlier releases named
+.B launchctl enable
+and
+.B disable
+as the switch; they do not move the Login Items switch (the two are
+independent stores), so the installer clears a
+.B disable
+you may have run.
 .PP
-.nf
-.RS
-launchctl enable gui/$(id \-u)/org.kj5hst.naudio.daemon
-launchctl kickstart \-k gui/$(id \-u)/org.kj5hst.naudio.daemon
-.RE
-.fi
-.PP
-On Linux the packages install a systemd
+On Linux the service arrives
+.I inert
+and you enable it once, deliberately: the packages install a systemd
 .I user
 unit at
 .IR /usr/lib/systemd/user/naudio\-daemon.service :
@@ -328,7 +340,7 @@ shows as
 .PP
 All three units run
 .BR "\-\-mode control" ,
-so enabling the service gives you the control page at every login and captures
+so a service that is on gives you the control page at every login and captures
 nothing until you ask it to.
 Set
 .B autostart
