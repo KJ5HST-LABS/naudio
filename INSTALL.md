@@ -47,8 +47,11 @@ those are in every other format on this page.
 
 - **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`), puts **naudio Control**
   in `/Applications`, and registers the daemon as a background service — listed as **naudio
-  Control** under *System Settings › General › Login Items & Extensions* — switched off until you
-  turn it on (see *Running the daemon in the background* below). **Each release's notes say
+  Control** under *System Settings › General › Login Items & Extensions* on a fresh install —
+  switched off until you turn it on (see *Running the daemon in the background* below). A Mac
+  that already had the service from an earlier release keeps listing it under the developer's
+  name: macOS names that entry once, when it first sees the service, and neither reinstalling
+  nor restarting renames it. **Each release's notes say
   whether that release's `.pkg` is signed and notarized**, and they say it from a check of the
   file itself rather than from what was intended (issue #99) — a signed one opens like any other
   installer, and an unsigned one needs a right-click → *Open* the first time. macOS installers have no
