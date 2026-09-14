@@ -43,7 +43,33 @@
   header h1 { margin: 0; font-size: 19px; letter-spacing: -0.01em; }
   header .ver { color: var(--muted); font: 12px/1 var(--mono); }
   header .path { margin-left: auto; color: var(--muted); font: 12px/1.4 var(--mono); word-break: break-all; }
+
+  /* --- tabs (issue #106) ---
+     Setup and Stream are two tabs, not two stacked panels, so that "configure first" is the
+     page's shape rather than something the operator infers from a Save button two panels
+     down. Each tab carries a marker: Setup a dot while the form has unsaved changes, Stream
+     the pipeline's state colour, so whichever tab is open says what the other one needs. */
+  .tabs {
+    display: flex; gap: 4px; padding: 0 24px; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .tab {
+    font: inherit; font-weight: 600; font-size: 14px; padding: 12px 16px; cursor: pointer;
+    border: 0; border-bottom: 2px solid transparent; border-radius: 0; margin-bottom: -1px;
+    background: none; color: var(--muted); display: inline-flex; align-items: center; gap: 8px;
+  }
+  .tab:hover { color: var(--ink); border-bottom-color: var(--line); }
+  .tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+  .tab .mark {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--idle); display: none;
+  }
+  .tab .mark.on { display: inline-block; }
+  .tab .mark.dirty { background: var(--warn); }
+  .tab .mark.running { background: var(--ok); }
+  .tab .mark.starting, .tab .mark.stopping { background: var(--warn); }
+  .tab .mark.error { background: var(--bad); }
   main { max-width: 1080px; margin: 0 auto; padding: 24px; display: grid; gap: 20px; }
+  main [role="tabpanel"][hidden] { display: none; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; }
   .panel > h2 {
     margin: 0 0 14px; font-size: 12px; font-weight: 650; letter-spacing: .09em;
@@ -71,7 +97,13 @@
   .meter > i { display: block; height: 100%; background: var(--ok); width: 0; transition: width .35s; }
 
   /* --- controls --- */
-  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
+  /* Why Start is off, said beside it (issue #106): one line, with the way to Setup. */
+  .reason { font-size: 13px; color: var(--muted); flex-basis: 100%; }
+  .reason button.link {
+    border: 0; background: none; padding: 0; color: var(--accent); font-weight: 600;
+    text-decoration: underline; cursor: pointer;
+  }
   button {
     font: inherit; font-weight: 550; padding: 9px 18px; border-radius: 7px; cursor: pointer;
     border: 1px solid var(--line); background: var(--panel); color: var(--ink);
@@ -116,38 +148,21 @@
   <span class="path" id="configPath"></span>
 </header>
 
-<main>
-  <section class="panel">
-    <h2>Stream</h2>
-    <div id="streamNotice" hidden></div>
-    <div class="statusline">
-      <span class="badge" id="stateBadge">idle</span>
-      <span class="detail" id="stateDetail"></span>
-    </div>
-    <div class="grid">
-      <div class="stat"><div class="k">Delivered</div><div class="v" id="sDelivery">—</div>
-        <div class="meter"><i id="mDelivery"></i></div></div>
-      <div class="stat"><div class="k">Clients</div><div class="v" id="sClients">—</div></div>
-      <div class="stat"><div class="k">Received</div><div class="v" id="sRx">—</div></div>
-      <div class="stat"><div class="k">Uptime</div><div class="v" id="sUptime">—</div></div>
-      <div class="stat"><div class="k">Left</div><div class="v" id="sRmsL">—</div>
-        <div class="meter"><i id="mRmsL"></i></div></div>
-      <div class="stat"><div class="k">Right</div><div class="v" id="sRmsR">—</div>
-        <div class="meter"><i id="mRmsR"></i></div></div>
-      <div class="stat"><div class="k">Gaps</div><div class="v" id="sGaps">—</div></div>
-      <div class="stat"><div class="k">Recovered by FEC</div><div class="v" id="sFec">—</div></div>
-      <div class="stat"><div class="k">Errors</div><div class="v" id="sErrors">—</div></div>
-    </div>
-    <div class="actions">
-      <button class="primary" id="btnStart">Start streaming</button>
-      <button id="btnStop" disabled>Stop</button>
-      <button id="btnRestart" disabled>Restart</button>
-      <button id="btnQuit">Quit daemon</button>
-    </div>
-  </section>
+<!-- Setup before Stream, in this order on purpose (issue #106): the settings decide what Start
+     does, so they come first, and the page opens on Setup until a capture device is chosen. -->
+<nav class="tabs" role="tablist" aria-label="naudio control">
+  <button class="tab" role="tab" id="tabSetup" aria-controls="panelSetup" aria-selected="true">
+    Setup <span class="mark" id="markSetup" title="Unsaved changes"></span></button>
+  <button class="tab" role="tab" id="tabStream" aria-controls="panelStream" aria-selected="false">
+    Stream <span class="mark" id="markStream"></span></button>
+</nav>
 
-  <section class="panel">
-    <h2>Settings</h2>
+<main>
+  <section class="panel" role="tabpanel" id="panelSetup" aria-labelledby="tabSetup">
+    <h2>Setup</h2>
+    <!-- Shown until a capture device is chosen: the one sentence a first run needs. -->
+    <div id="setupIntro" class="notice info" hidden>Start here: choose the radio’s capture
+      device, then save. Streaming waits on the Stream tab until Setup is saved.</div>
     <div id="configNotice" hidden></div>
     <div class="fields">
       <div class="field">
@@ -193,7 +208,8 @@
         <label for="autostartChk">Start streaming automatically when the daemon starts</label>
       </div>
       <!-- Runs at login: the platform's switch, mirrored (issue #102). Hidden until the daemon
-           reports it; the button appears only where a pane owns the switch (macOS). -->
+           reports it; the button appears only where a pane owns the switch (macOS). It lives
+           on Setup because the login service is configuration, not operation (issue #106). -->
       <div class="field service full" id="serviceRow" hidden>
         <span class="k">Runs at login: <span class="badge" id="serviceBadge">—</span></span>
         <button class="small" id="btnLoginItems" hidden>Open Login Items…</button>
@@ -204,6 +220,40 @@
       <button class="primary" id="btnSave">Save settings</button>
       <button id="btnRescan">Rescan devices</button>
       <button id="btnRevert">Discard changes</button>
+    </div>
+  </section>
+
+  <section class="panel" role="tabpanel" id="panelStream" aria-labelledby="tabStream" hidden>
+    <h2>Stream</h2>
+    <div id="streamNotice" hidden></div>
+    <!-- Settings saved while the stream runs are not the stream's settings until it restarts;
+         that is said HERE, where Restart is, not on the Setup tab (issue #106). -->
+    <div id="applyNotice" class="notice info" hidden>Settings were saved after this stream
+      started — press Restart to apply them.</div>
+    <div class="statusline">
+      <span class="badge" id="stateBadge">idle</span>
+      <span class="detail" id="stateDetail"></span>
+    </div>
+    <div class="grid">
+      <div class="stat"><div class="k">Delivered</div><div class="v" id="sDelivery">—</div>
+        <div class="meter"><i id="mDelivery"></i></div></div>
+      <div class="stat"><div class="k">Clients</div><div class="v" id="sClients">—</div></div>
+      <div class="stat"><div class="k">Received</div><div class="v" id="sRx">—</div></div>
+      <div class="stat"><div class="k">Uptime</div><div class="v" id="sUptime">—</div></div>
+      <div class="stat"><div class="k">Left</div><div class="v" id="sRmsL">—</div>
+        <div class="meter"><i id="mRmsL"></i></div></div>
+      <div class="stat"><div class="k">Right</div><div class="v" id="sRmsR">—</div>
+        <div class="meter"><i id="mRmsR"></i></div></div>
+      <div class="stat"><div class="k">Gaps</div><div class="v" id="sGaps">—</div></div>
+      <div class="stat"><div class="k">Recovered by FEC</div><div class="v" id="sFec">—</div></div>
+      <div class="stat"><div class="k">Errors</div><div class="v" id="sErrors">—</div></div>
+    </div>
+    <div class="actions">
+      <button class="primary" id="btnStart">Start streaming</button>
+      <button id="btnStop" disabled>Stop</button>
+      <button id="btnRestart" disabled>Restart</button>
+      <button id="btnQuit">Quit daemon</button>
+      <span class="reason" id="startReason" hidden></span>
     </div>
   </section>
 </main>

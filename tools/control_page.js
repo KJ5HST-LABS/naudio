@@ -62,8 +62,41 @@ let devices = null;      // {capture: [...], playback: [...]} or null before the
 let devicesStale = true;
 let dirty = false;       // the form differs from `settings`
 let busy = false;
+let applyPending = false; // settings were saved while the stream ran; a restart applies them
 
 function markDirty() { dirty = true; refreshButtons(); }
+
+// --- tabs (issue #106) --------------------------------------------------------------------
+// Setup and Stream. The page opens on Setup until the radio's capture device is chosen, so the
+// first thing a new operator sees is the choice they have to make; once it is chosen — or when
+// a stream is already running, which is worth seeing whatever the setup says — it opens on
+// Stream. After that the operator's clicks decide. Nothing here is remembered across loads.
+const TABS = { setup: ['tabSetup', 'panelSetup'], stream: ['tabStream', 'panelStream'] };
+let initialTabChosen = false;
+
+function showTab(name) {
+  for (const [tab, [btn, panel]] of Object.entries(TABS)) {
+    const on = tab === name;
+    $(btn).setAttribute('aria-selected', on ? 'true' : 'false');
+    $(panel).hidden = !on;
+  }
+}
+
+// "Set up" means the capture device is chosen — by id from the picker or by a name pattern in
+// the file. The automatic pick (first USB audio device) still works for the daemon's own
+// autostart, but the page does not let Start rest on it: a device the operator never chose is
+// the one the operator cannot see is wrong.
+function setupComplete() {
+  const v = (k) => (settings[k] ? settings[k].value : '');
+  return !!(v('capture-id') || v('capture'));
+}
+
+function chooseInitialTab() {
+  if (initialTabChosen) return;
+  initialTabChosen = true;
+  const running = lastState === 'running' || lastState === 'starting';
+  showTab(running || setupComplete() ? 'stream' : 'setup');
+}
 
 // --- devices ----------------------------------------------------------------------------
 // The picker offers BOTH ways the daemon can name a device, because both exist in the config
@@ -174,8 +207,13 @@ async function save() {
   busy = true; refreshButtons();
   try {
     const r = await api('/api/config', formToSettings());
+    // A save while the stream runs is not the stream's settings until it restarts. That is
+    // said on the Stream tab, beside Restart (issue #106); here the notice points there.
+    if (r.restartNeeded) applyPending = true;
     notice($('configNotice'), 'good',
-      'Saved to ' + r.configPath + (r.restartNeeded ? ' — press Restart to apply it to the running stream.' : '.'));
+      'Saved to ' + r.configPath + (r.restartNeeded
+        ? ' — the running stream still has the old settings; Restart it from the Stream tab.'
+        : '. Streaming is on the Stream tab.'));
     await load();
   } catch (e) {
     notice($('configNotice'), 'err', e.message);
@@ -257,20 +295,66 @@ async function quitDaemon() {
   }
 }
 
+// Why Start is off, in one line, or null when it is not. Unsaved changes block it too: a stream
+// started on a form that differs from the file is the exact failure #106 reports.
+function startBlockedReason() {
+  if (!setupComplete()) return 'Choose the radio’s capture device in Setup and save it.';
+  if (dirty) return 'Setup has unsaved changes — save or discard them first.';
+  return null;
+}
+
 function refreshButtons() {
   const running = lastState === 'running' || lastState === 'starting';
-  $('btnStart').disabled = busy || running;
+  const blocked = startBlockedReason();
+  $('btnStart').disabled = busy || running || !!blocked;
   $('btnStop').disabled = busy || !running;
   $('btnRestart').disabled = busy || !running;
   $('btnSave').disabled = busy || !dirty;
   $('btnRevert').disabled = busy || !dirty;
+
+  // The reason sits beside the buttons, with the way to Setup, and only while it applies.
+  // Rebuilt only when the text changes — this runs on every poll.
+  const reason = $('startReason');
+  if (blocked && !running) {
+    if (reason.dataset.text !== blocked) {
+      reason.dataset.text = blocked;
+      reason.replaceChildren();
+      reason.append(blocked + ' ');
+      const go = document.createElement('button');
+      go.className = 'link';
+      go.textContent = 'Open Setup';
+      go.addEventListener('click', () => showTab('setup'));
+      reason.appendChild(go);
+    }
+    reason.hidden = false;
+  } else {
+    reason.hidden = true;
+  }
+
+  $('setupIntro').hidden = setupComplete();
+
+  // Restart is the primary action while saved settings wait to be applied (issue #106).
+  const pending = applyPending && running;
+  $('applyNotice').hidden = !pending;
+  $('btnRestart').className = pending ? 'primary' : '';
+  $('btnStart').className = pending ? '' : 'primary';
+
+  // The tab markers: Setup carries a dot while the form has unsaved changes, Stream the
+  // pipeline's state colour, so each tab says what the other one needs.
+  $('markSetup').className = 'mark' + (dirty ? ' on dirty' : '');
+  $('markStream').className = 'mark' + (lastState === 'idle' ? '' : ' on ' + lastState);
 }
 
 // --- live status ------------------------------------------------------------------------
 let lastState = 'idle';
+let lastUptimeMs = 0;
 
 function renderStream(s) {
   lastState = s.state;
+  // Saved-but-unapplied settings are applied by whatever starts the pipeline next: a stop, or
+  // a restart, which shows as the uptime going backwards between two polls.
+  if (s.state !== 'running' || s.uptimeMs < lastUptimeMs) applyPending = false;
+  lastUptimeMs = s.state === 'running' ? s.uptimeMs : 0;
   const badge = $('stateBadge');
   badge.className = 'badge ' + s.state;
   badge.textContent = s.state;
@@ -316,6 +400,7 @@ async function load() {
   applySettingsToForm();
   renderStream(st.stream);
   renderService(st.service);
+  chooseInitialTab();
 }
 
 async function poll() {
@@ -337,6 +422,8 @@ async function poll() {
 }
 
 function init() {
+  $('tabSetup').addEventListener('click', () => showTab('setup'));
+  $('tabStream').addEventListener('click', () => showTab('stream'));
   $('btnStart').addEventListener('click', () => stream('start'));
   $('btnStop').addEventListener('click', () => stream('stop'));
   $('btnRestart').addEventListener('click', () => stream('restart'));

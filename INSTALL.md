@@ -69,8 +69,10 @@ those are in every other format on this page.
   *More info* → *Run anyway*.
 
 Once it is installed, open **naudio Control** — the Start-menu entry, the desktop entry on Linux,
-or **Network Audio Service** in Applications on a Mac. It opens a page in your browser where you pick the radio's audio
-device, choose a transport and port, and press Start. Nothing captures audio until you do.
+or **Network Audio Service** in Applications on a Mac. It opens a page in your browser with two tabs:
+**Setup**, where you pick the radio's audio device, choose a transport and port, and save; then
+**Stream**, where you press Start. The page opens on Setup until a device is chosen, and Start waits
+until Setup is saved. Nothing captures audio until you press it.
 
 ### Debian / Ubuntu (.deb)
 
@@ -201,20 +203,29 @@ Windows and the applications menu on Linux, `/Applications/Network Audio Service
 Opening it starts the daemon in *control mode* and opens a page in your browser at
 `http://127.0.0.1:8737/`.
 
-From that page you can:
+The page has two tabs, **Setup** and **Stream**, in that order because the settings decide what
+Start does. On **Setup** you:
 
 - **pick the capture device** — the radio's USB audio interface, chosen from a list rather than
   typed as a name or an index;
 - **set the transport, port, sample rate and channel count**, and save them, which writes the
   same configuration file `man na_audio_daemon` describes (so the background service below picks
   up exactly what you chose);
-- **start, stop and restart the stream**, and watch it: delivered percentage, connected clients,
-  per-channel levels, gaps and error counters;
 - **see whether the service runs at login** — *Runs at login: On / Off / Not installed*, read
   from the platform's own switch every second. On a Mac the row's **Open Login Items…** button
   takes you to the pane that owns that switch (the page shows it; only System Settings can move
-  it); on Linux the row names the `systemctl --user` command;
+  it); on Linux the row names the `systemctl --user` command.
+
+On **Stream** you:
+
+- **start, stop and restart the stream**, and watch it: delivered percentage, connected clients,
+  per-channel levels, gaps and error counters;
 - **quit the daemon**, since a program started from a shortcut has no window to close.
+
+The page opens on Setup until a capture device has been chosen, and **Start** stays off — with
+the reason beside it — until Setup is saved; while Setup holds unsaved changes its tab carries a
+dot and Start waits. Settings saved while a stream is running are not that stream's settings until
+it restarts: the Stream tab says so and offers **Restart**.
 
 Nothing is captured until you press **Start**, or tick *Start streaming automatically when the
 daemon starts*. Opening the shortcut twice is safe: if a control page is already running, the

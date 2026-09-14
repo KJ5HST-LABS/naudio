@@ -151,23 +151,38 @@ and nothing else: no device is opened until you press
 .B Start
 on the page (or set
 .BR autostart ).
-The page is where the whole configuration surface lives \(em a device picker
+The page has two tabs, and the order is the point:
+.B Setup
+first, then
+.BR Stream .
+Setup is where the whole configuration surface lives \(em a device picker
 built from the same enumeration
 .B \-\-list\-devices
-reports, every setting in this manual as a form field, and Start / Stop /
-Restart / Quit for the stream, with the delivered percentage, connected
-clients, per-channel levels and error counters updating as it runs.
-Saving writes the configuration file described below, so what you set on the
+reports, every setting in this manual as a form field, and
+.BR "Save settings" ,
+which writes the configuration file described below, so what you set on the
 page is what the service reads at your next login.
 A
 .I "Runs at login"
-row shows the background service's switch as the platform reports it
+row there shows the background service's switch as the platform reports it
 (On, Off, or Not installed), re-read every second; on macOS its
 .I "Open Login Items"
 button opens the pane that owns the switch, since only System Settings
 can move it, and on Linux the row names the
 .B systemctl \-\-user
 command.
+Stream is Start / Stop / Restart / Quit for the stream, with the delivered
+percentage, connected clients, per-channel levels and error counters
+updating as it runs.
+The page opens on Setup until a capture device has been chosen and saved,
+and
+.B Start
+stays off, with the reason beside it, until it has \(em and while Setup
+holds unsaved changes, which the Setup tab marks with a dot.
+Settings saved while a stream is running are not that stream's settings:
+the Stream tab says so and offers
+.BR Restart ,
+which applies them.
 .PP
 The installed packages create a shortcut that opens it: a
 .B naudio Control
