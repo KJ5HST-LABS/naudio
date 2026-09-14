@@ -288,6 +288,65 @@ else
         || { bad "the daemon rejected its own control page's config file"; cat "$TMP/reread.log"; }
 fi
 
+# ---- the login service's switch (issue #102) --------------------------------------------------
+# /api/state carries `service`: which service manager this build asks, whether the unit is
+# installed, and whether its switch is on. The VALUES depend on the host (a developer's Mac with
+# the agent registered reads true/true; a runner reads false/false), so what is asserted is the
+# shape and the one relation that holds everywhere — a switch cannot be on for a unit that is
+# not installed. The installer gate asserts the values on a host where it knows them.
+expect "GET /api/state carries the service switch" 200 "/api/state"
+if ! jget service > /dev/null; then
+    bad "/api/state has no 'service' key"
+else
+    case "$(jget service.manager)" in
+        launchd|systemd|task-scheduler) ok "service.manager names a service manager ($(jget service.manager))" ;;
+        *) bad "service.manager is '$(jget service.manager)', not launchd, systemd or task-scheduler" ;;
+    esac
+    case "$(jget service.installed)" in
+        true|false) ok "service.installed is a boolean ($(jget service.installed))" ;;
+        *) bad "service.installed is '$(jget service.installed)', not a boolean" ;;
+    esac
+    case "$(jget service.enabled)" in
+        true|false) ok "service.enabled is a boolean ($(jget service.enabled))" ;;
+        *) bad "service.enabled is '$(jget service.enabled)', not a boolean" ;;
+    esac
+    if [ "$(jget service.enabled)" = "true" ] && [ "$(jget service.installed)" = "false" ]; then
+        bad "service reads enabled without being installed — a switch on nothing"
+    else
+        ok "service.enabled implies service.installed"
+    fi
+fi
+
+# The route that opens the pane owning the switch is a POST behind the same three defences as
+# every other action — a page on the internet must not be able to pop System Settings open.
+# The defences fire BEFORE routing, so a 403 alone would not prove the route exists; the
+# well-formed request is what proves it, and it is platform-shaped: a 404 whose message names
+# macOS where there is no pane, and a 200 on macOS — exercised there only under CI, because on
+# a developer's Mac it opens System Settings on every run of the suite (said here rather than
+# silently skipped; the release gate's installer run makes the same POST on a runner).
+expect "POST /api/open-login-items from a foreign Origin" 403 "/api/open-login-items" \
+    -X POST -H "$CT" -H "Origin: http://evil.example" -d '{}'
+expect "POST /api/open-login-items as text/plain" 415 "/api/open-login-items" \
+    -X POST -H 'Content-Type: text/plain' -d '{}'
+expect "GET /api/open-login-items (not a GET route)" 404 "/api/open-login-items"
+case "$(uname -s)" in
+    Darwin)
+        if [ "${CI:-}" = "true" ]; then
+            expect "POST /api/open-login-items opens the pane (CI runner)" 200 \
+                "/api/open-login-items" -X POST -H "$CT" -d '{}'
+        else
+            echo "note: not POSTing /api/open-login-items on a developer's Mac — it would open"
+            echo "      System Settings on every run; CI runners and the release gate make that request"
+        fi ;;
+    *)
+        expect "POST /api/open-login-items where there is no pane" 404 "/api/open-login-items" \
+            -X POST -H "$CT" -d '{}'
+        case "$(jget error)" in
+            *macOS*) ok "  ... and says the pane is macOS's" ;;
+            *) bad "  ... with the generic 404 message: '$(jget error)' — the route is not wired" ;;
+        esac ;;
+esac
+
 # ---- devices ----------------------------------------------------------------------------------
 # Whether PortAudio can enumerate is a property of the HOST, not of this code, so ask the host
 # rather than tolerating either answer: --list-devices runs the same enumeration through a

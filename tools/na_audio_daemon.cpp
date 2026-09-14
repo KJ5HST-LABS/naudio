@@ -71,11 +71,14 @@
 #include <utility>
 #include <vector>
 
-// mkdir, for the control page creating the config file's parent directory.
+// mkdir, for the control page creating the config file's parent directory; on POSIX also the
+// exit-status macros and getuid(), for reading the login service's switch (issue #102).
 #if defined(_WIN32)
 #include <direct.h>
 #else
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 // Set by the build (tools/CMakeLists.txt) so the control page can name the version it is part
@@ -1368,7 +1371,96 @@ void sendError(naudio::net::Socket& sock, int status, const std::string& reason,
     sendJson(sock, status, reason, "{\"error\":" + jstr(message) + "}");
 }
 
+// --- the login service's switch, read for the page (issue #102) ------------------------------
+// The page shows whether this daemon is registered to run at login and whether that switch is
+// on. READ-ONLY, deliberately, on every platform: on macOS the switch is Login Items, whose
+// state has no public interface a process can drive (launchctl enable/disable neither reads
+// nor writes it — measured 2026-09-13), so the page mirrors it and links to it rather than
+// offering a toggle it could not make true. Linux and Windows get the same read and the
+// command their INSTALL.md section names; a toggle for them is not this issue's.
+//
+// Each read is one short-lived child per /api/state poll — the page polls once a second, and
+// the daemon takes no dependency on a service-manager library to save a fork.
 
+// Run a shell command with its output discarded; the child's exit status, or -1 if it could not
+// be run. std::system's raw value is wait(2)-encoded on POSIX and the exit status on Windows.
+int runQuiet(const std::string& cmd) {
+    const int rc = std::system(cmd.c_str());
+#if defined(_WIN32)
+    return rc;
+#else
+    if (rc == -1 || !WIFEXITED(rc)) return -1;
+    return WEXITSTATUS(rc);
+#endif
+}
+
+bool fileExists(const std::string& path) { return std::ifstream(path).good(); }
+
+// {"manager":..., "installed":bool, "enabled":bool} — or null where this build has no service
+// manager to ask. `manager` names the platform's mechanism so the page can word the row and
+// decide whether "Open Login Items" applies; `installed` is the unit file's presence where the
+// platform installs it; `enabled` is the switch as the platform reports it.
+std::string serviceJson() {
+#if defined(__APPLE__)
+    // The postinstall's destination (packaging/macos/postinstall.in). E4a: the Login Items
+    // switch boots the job out of the user's domain when off and bootstraps it when on, so
+    // presence in that domain IS the switch — `launchctl print` exits 0 only for a loaded job.
+    const bool installed = fileExists("/Library/LaunchAgents/org.kj5hst.naudio.daemon.plist");
+    const bool enabled =
+        installed && runQuiet("launchctl print gui/" + std::to_string(getuid()) +
+                              "/org.kj5hst.naudio.daemon >/dev/null 2>&1") == 0;
+    return std::string("{\"manager\":\"launchd\",\"installed\":") + (installed ? "true" : "false") +
+           ",\"enabled\":" + (enabled ? "true" : "false") + "}";
+#elif defined(_WIN32)
+    // The task the installer registers (packaging/windows/register-task.ps1). A query of a
+    // task that exists exits 0; its enabled state is the Status column of the CSV listing,
+    // "Disabled" when off and "Ready" or "Running" when on — the one read that needs output.
+    const bool installed =
+        runQuiet("schtasks /Query /TN \\naudio\\naudio-daemon >NUL 2>&1") == 0;
+    bool enabled = false;
+    if (installed) {
+        if (FILE* p = _popen("schtasks /Query /TN \\naudio\\naudio-daemon /FO CSV /NH 2>NUL",
+                             "r")) {
+            char line[512];
+            std::string out;
+            while (std::fgets(line, sizeof line, p)) out += line;
+            _pclose(p);
+            enabled = !out.empty() && out.find("\"Disabled\"") == std::string::npos;
+        }
+    }
+    return std::string("{\"manager\":\"task-scheduler\",\"installed\":") +
+           (installed ? "true" : "false") + ",\"enabled\":" + (enabled ? "true" : "false") + "}";
+#else
+    // The user unit, wherever systemd would find it (systemd.unit(5)'s user search path; the
+    // packages install under /usr, a local build under /usr/local). The file rather than
+    // `systemctl --user cat`, which cannot tell "no such unit" from "no user bus" — both exit
+    // 1 — and a headless session has no user bus.
+    const char* home = std::getenv("HOME");
+    const std::string unit = "naudio-daemon.service";
+    const bool installed =
+        fileExists("/usr/lib/systemd/user/" + unit) ||
+        fileExists("/usr/local/lib/systemd/user/" + unit) ||
+        fileExists("/etc/systemd/user/" + unit) ||
+        (home && *home && fileExists(std::string(home) + "/.config/systemd/user/" + unit));
+    const bool enabled =
+        installed && runQuiet("systemctl --user is-enabled " + unit + " >/dev/null 2>&1") == 0;
+    return std::string("{\"manager\":\"systemd\",\"installed\":") + (installed ? "true" : "false") +
+           ",\"enabled\":" + (enabled ? "true" : "false") + "}";
+#endif
+}
+
+// The reverse link: the page cannot move the macOS switch, so it opens the pane that can. The
+// URL scheme lands on System Settings > General > Login Items & Extensions (measured 2026-09-14:
+// opening it is also what makes Background Task Management rescan). Best-effort, like
+// openInBrowser below: a session with no GUI prints nothing and the page reports the failure.
+bool openLoginItemsPane() {
+#if defined(__APPLE__)
+    return runQuiet("open 'x-apple.systempreferences:com.apple.LoginItems-Settings.extension' "
+                    ">/dev/null 2>&1") == 0;
+#else
+    return false;
+#endif
+}
 
 // --- the server -------------------------------------------------------------------------------
 class ControlServer {
@@ -1510,6 +1602,7 @@ private:
         if (req.method == "POST" && path == "/api/config") { postConfig(sock, req); return; }
         if (req.method == "POST" && path == "/api/stream") { postStream(sock, req); return; }
         if (req.method == "POST" && path == "/api/quit")   { postQuit(sock);        return; }
+        if (req.method == "POST" && path == "/api/open-login-items") { postOpenLoginItems(sock); return; }
         sendError(sock, 404, "Not Found", "no such endpoint: " + path);
     }
 
@@ -1573,8 +1666,31 @@ private:
             out += ",\"devices\":" + (devicesJson_.empty() ? std::string("null") : devicesJson_);
             out += ",\"devicesStale\":" + std::string(devicesStale_ ? "true" : "false");
         }
+        // The login service's switch (issue #102), read fresh on every poll so the page shows a
+        // change made in System Settings within one poll rather than at the next page load.
+        out += ",\"service\":" + serviceJson();
         out += "}";
         sendJson(sock, 200, "OK", out);
+    }
+
+    // macOS only: the page's way into the pane that owns the switch (issue #102). A POST, not a
+    // GET, so it sits behind the same three browser defences as every other action here — a
+    // page on the internet must not be able to pop System Settings open. 404 where there is no
+    // such pane, so the page can hide the button on the platforms that have none.
+    void postOpenLoginItems(naudio::net::Socket& sock) {
+#if defined(__APPLE__)
+        if (!openLoginItemsPane()) {
+            sendError(sock, 500, "Internal Server Error",
+                      "could not open System Settings; open General > Login Items & Extensions "
+                      "yourself");
+            return;
+        }
+        std::printf("[control] opened Login Items\n");
+        std::fflush(stdout);
+        sendJson(sock, 200, "OK", "{\"ok\":true}");
+#else
+        sendError(sock, 404, "Not Found", "Login Items is a macOS pane; this platform has none");
+#endif
     }
 
     static std::string deviceArrayJson(const std::vector<naudio::DeviceInfo>& devs,
