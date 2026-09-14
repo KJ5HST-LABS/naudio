@@ -210,6 +210,10 @@ From that page you can:
   up exactly what you chose);
 - **start, stop and restart the stream**, and watch it: delivered percentage, connected clients,
   per-channel levels, gaps and error counters;
+- **see whether the service runs at login** — *Runs at login: On / Off / Not installed*, read
+  from the platform's own switch every second. On a Mac the row's **Open Login Items…** button
+  takes you to the pane that owns that switch (the page shows it; only System Settings can move
+  it); on Linux the row names the `systemctl --user` command;
 - **quit the daemon**, since a program started from a shortcut has no window to close.
 
 Nothing is captured until you press **Start**, or tick *Start streaming automatically when the

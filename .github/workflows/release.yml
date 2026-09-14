@@ -452,12 +452,31 @@ jobs:
             || { echo "::error::the installed daemon's control page is not the control page"; exit 1; }
           curl -fsS "${url}api/state" | grep -q '"state":"idle"' \
             || { echo "::error::the installed daemon's /api/state did not report an idle pipeline"; exit 1; }
+          # The page's "Runs at login" row (#102): the installed daemon must see
+          # the agent the postinstall registered — the one host where the value
+          # is known, so it is asserted here and only its shape in the arm. The
+          # switch itself reads off ("enabled":false): nothing bootstrapped the
+          # job into the runner's gui domain, and that is what login does.
+          svc=$(curl -fsS "${url}api/state" | sed -n 's/.*"service":{\([^}]*\)}.*/\1/p')
+          case "$svc" in
+            *'"manager":"launchd"'*'"installed":true'*) echo "  service: $svc" ;;
+            *) echo "::error::the installed daemon does not see its own launchd agent: service={$svc}"; exit 1 ;;
+          esac
+          # The route the row's button calls, behind the same defences as the
+          # rest: a foreign Origin is refused, and the well-formed POST opens the
+          # pane (a runner has a GUI session; `open` exits 0 there).
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+                -H 'Origin: http://evil.example' -d '{}' "${url}api/open-login-items")" = "403" ] \
+            || { echo "::error::/api/open-login-items accepted a foreign Origin"; exit 1; }
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+                -d '{}' "${url}api/open-login-items")" = "200" ] \
+            || { echo "::error::/api/open-login-items did not open the pane on the installed daemon"; exit 1; }
           # Control: the same fetch against a port with nothing on it must fail,
           # or the two assertions above would pass on any reachable machine.
           if curl -fsS --max-time 3 "http://127.0.0.1:1/" > /dev/null 2>&1; then
             echo "::error::control broken: a dead port answered"; exit 1; fi
           kill "$ctl_daemon" 2>/dev/null || true
-          echo "installed daemon serves its control page and reports an idle pipeline"
+          echo "installed daemon serves its control page, reports an idle pipeline, and sees its login agent"
           echo "== macOS installer gate: PASS =="
 
       - name: "Payload signatures: measured on the INSTALLED binaries a user gets"
@@ -845,12 +864,24 @@ jobs:
             || { echo "::error::the installed daemon's control page is not the control page"; exit 1; }
           curl -fsS "${url}api/state" | grep -q '"state":"idle"' \
             || { echo "::error::the installed daemon's /api/state did not report an idle pipeline"; exit 1; }
+          # The page's "Runs at login" row (#102): the installed daemon must see
+          # the user unit the package placed at $UNIT. "enabled" reads false — the
+          # unit ships inert and nothing here enabled it — and the route that
+          # opens macOS's pane is a 404 that says so on this platform.
+          svc=$(curl -fsS "${url}api/state" | sed -n 's/.*"service":{\([^}]*\)}.*/\1/p')
+          case "$svc" in
+            *'"manager":"systemd"'*'"installed":true'*'"enabled":false'*) echo "  service: $svc" ;;
+            *) echo "::error::the installed daemon does not see its own inert systemd unit: service={$svc}"; exit 1 ;;
+          esac
+          curl -s -X POST -H 'Content-Type: application/json' -d '{}' "${url}api/open-login-items" \
+            | grep -q 'macOS' \
+            || { echo "::error::/api/open-login-items is not the platform-shaped 404 on Linux"; exit 1; }
           # Control: a port with nothing on it must NOT answer, or the two
           # assertions above would pass anywhere.
           if curl -fsS --max-time 3 "http://127.0.0.1:1/" > /dev/null 2>&1; then
             echo "::error::control broken: a dead port answered"; exit 1; fi
           kill "$ctl_daemon" 2>/dev/null || true
-          echo "installed daemon serves its control page and reports an idle pipeline"
+          echo "installed daemon serves its control page, reports an idle pipeline, and sees its inert unit"
           echo "== DEB gate: PASS =="
 
       - name: "Package gate 3/3: RPM — content assertions (no rpm host here to install on)"
@@ -1142,6 +1173,12 @@ jobs:
           $state = (Invoke-WebRequest -UseBasicParsing -Uri "${url}api/state").Content
           if ($state -notmatch '"state":"idle"') {
             Write-Output "::error::/api/state did not report an idle pipeline: $state"; exit 1 }
+          # The page's "Runs at login" row (#102): the installed daemon must see
+          # the task the installer registered, and read its Disabled state as
+          # the switch being off — the same fact asserted from the scheduler
+          # above, now read the way the page reads it (schtasks' CSV listing).
+          if ($state -notmatch '"service":\{"manager":"task-scheduler","installed":true,"enabled":false\}') {
+            Write-Output "::error::the installed daemon does not see its own disabled logon task: $state"; exit 1 }
           # Control: a port with nothing on it must NOT answer, or the two
           # assertions above would pass on any machine that has a web server.
           $dead = $false

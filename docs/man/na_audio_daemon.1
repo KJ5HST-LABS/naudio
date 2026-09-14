@@ -159,6 +159,15 @@ Restart / Quit for the stream, with the delivered percentage, connected
 clients, per-channel levels and error counters updating as it runs.
 Saving writes the configuration file described below, so what you set on the
 page is what the service reads at your next login.
+A
+.I "Runs at login"
+row shows the background service's switch as the platform reports it
+(On, Off, or Not installed), re-read every second; on macOS its
+.I "Open Login Items"
+button opens the pane that owns the switch, since only System Settings
+can move it, and on Linux the row names the
+.B systemctl \-\-user
+command.
 .PP
 The installed packages create a shortcut that opens it: a
 .B naudio Control
