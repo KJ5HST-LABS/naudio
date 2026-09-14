@@ -171,8 +171,10 @@ message(STATUS "codesign: all ${_n} payload binaries carry Developer ID + harden
 
 set(_app_script "")
 set(_app_plist "")
+set(_app_icon "")
 set(_app_script_n 0)
 set(_app_plist_n 0)
+set(_app_icon_n 0)
 foreach(_f ${_candidates})
     get_filename_component(_name "${_f}" NAME)
     if(_name STREQUAL "naudio-control")
@@ -181,23 +183,43 @@ foreach(_f ${_candidates})
     elseif(_name STREQUAL "naudio-control.Info.plist")
         set(_app_plist "${_f}")
         math(EXPR _app_plist_n "${_app_plist_n} + 1")
+    elseif(_name STREQUAL "naudio.icns")
+        set(_app_icon "${_f}")
+        math(EXPR _app_icon_n "${_app_icon_n} + 1")
     endif()
 endforeach()
 # CARDINALITY (L230): exactly one of each, side by side. Zero means the app was not staged and
 # Login Items would keep showing the developer's name; two means a tree this script does not
-# understand. Neither is a payload to hand to CPack as signed.
-if(NOT _app_script_n EQUAL 1 OR NOT _app_plist_n EQUAL 1)
+# understand. Neither is a payload to hand to CPack as signed. The icon (issue #103) is the
+# third piece: the seal covers Contents/Resources, so a bundle sealed with it and assembled
+# without it does not verify, and one sealed without it has no icon anywhere — either way the
+# staged set has to be the complete one.
+if(NOT _app_script_n EQUAL 1 OR NOT _app_plist_n EQUAL 1 OR NOT _app_icon_n EQUAL 1)
     message(FATAL_ERROR
-        "codesign: expected exactly one staged naudio-control and one naudio-control.Info.plist "
-        "under ${_stage}; found ${_app_script_n} and ${_app_plist_n}. The control app cannot be "
-        "signed, so Login Items would name the developer instead of the service.")
+        "codesign: expected exactly one staged naudio-control, one naudio-control.Info.plist and "
+        "one naudio.icns under ${_stage}; found ${_app_script_n}, ${_app_plist_n} and "
+        "${_app_icon_n}. The control app cannot be signed, so Login Items would name the "
+        "developer instead of the service.")
 endif()
 get_filename_component(_app_payload_dir "${_app_script}" DIRECTORY)
 get_filename_component(_app_plist_dir "${_app_plist}" DIRECTORY)
-if(NOT _app_payload_dir STREQUAL _app_plist_dir)
+get_filename_component(_app_icon_dir "${_app_icon}" DIRECTORY)
+if(NOT _app_payload_dir STREQUAL _app_plist_dir OR NOT _app_payload_dir STREQUAL _app_icon_dir)
     message(FATAL_ERROR
         "codesign: the control app's pieces are staged in different directories "
-        "(${_app_payload_dir} vs ${_app_plist_dir}); the postinstall reads both from one.")
+        "(${_app_payload_dir}, ${_app_plist_dir}, ${_app_icon_dir}); the postinstall reads all "
+        "three from one.")
+endif()
+# The icon goes into the bundle under the name Info.plist gives it, and the postinstall
+# installs the staged file under its own name — so the two names must be one, asserted as a
+# relation between the staged plist and the staged file rather than as a literal.
+execute_process(COMMAND plutil -extract CFBundleIconFile raw -o - "${_app_plist}"
+                OUTPUT_VARIABLE _icon_name ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+get_filename_component(_app_icon_file "${_app_icon}" NAME)
+if(NOT _icon_name STREQUAL _app_icon_file)
+    message(FATAL_ERROR
+        "codesign: ${_app_plist} names its icon '${_icon_name}' but the staged icon is "
+        "'${_app_icon_file}'; the postinstall would place a file the bundle does not look for")
 endif()
 
 # The daemon's Team ID, read off its signature — the relation Login Items depends on is asserted
@@ -244,10 +266,11 @@ endif()
 set(_app_work "${_stage}.naudio-control-sign")
 set(_app "${_app_work}/${_bundle_name}.app")
 file(REMOVE_RECURSE "${_app_work}")
-file(MAKE_DIRECTORY "${_app}/Contents/MacOS")
+file(MAKE_DIRECTORY "${_app}/Contents/MacOS" "${_app}/Contents/Resources")
 file(COPY "${_app_script}" DESTINATION "${_app}/Contents/MacOS")
 file(COPY "${_app_plist}" DESTINATION "${_app}/Contents")
 file(RENAME "${_app}/Contents/naudio-control.Info.plist" "${_app}/Contents/Info.plist")
+file(COPY "${_app_icon}" DESTINATION "${_app}/Contents/Resources")
 
 execute_process(
     COMMAND codesign --force --sign "${CPACK_NAUDIO_CODESIGN_IDENTITY}"
@@ -309,10 +332,12 @@ file(COPY ${_sigfiles} DESTINATION "${_codesig_dst}")
 # postinstall does — from the staged pieces plus the staged signature directory, nothing from the
 # temporary bundle — and verify it. This is the postinstall's method run at packaging time.
 set(_app2 "${_app_work}/reassembled/${_bundle_name}.app")
-file(MAKE_DIRECTORY "${_app2}/Contents/MacOS" "${_app2}/Contents/_CodeSignature")
+file(MAKE_DIRECTORY "${_app2}/Contents/MacOS" "${_app2}/Contents/Resources"
+                    "${_app2}/Contents/_CodeSignature")
 file(COPY "${_app_script}" DESTINATION "${_app2}/Contents/MacOS")
 file(COPY "${_app_plist}" DESTINATION "${_app2}/Contents")
 file(RENAME "${_app2}/Contents/naudio-control.Info.plist" "${_app2}/Contents/Info.plist")
+file(COPY "${_app_icon}" DESTINATION "${_app2}/Contents/Resources")
 file(GLOB _staged_sigs "${_codesig_dst}/*")
 file(COPY ${_staged_sigs} DESTINATION "${_app2}/Contents/_CodeSignature")
 execute_process(COMMAND codesign --verify --deep --strict "${_app2}"
@@ -321,6 +346,19 @@ if(NOT _rc EQUAL 0)
     message(FATAL_ERROR
         "codesign: a bundle reassembled from the staged pieces and ${_codesig_dst} does not "
         "verify — the postinstall would place an unverifiable app: ${_err}")
+endif()
+# CAN-FAIL CONTROL (L222): the same reassembly MINUS the icon must NOT verify. This is what
+# proves the seal covers Contents/Resources — i.e. that the verification above would have
+# caught a postinstall that forgot the icon, and that the postinstall's copy of it must be the
+# sealed bytes. A verify that passed both ways would be proving nothing about the icon.
+file(REMOVE "${_app2}/Contents/Resources/${_app_icon_file}")
+execute_process(COMMAND codesign --verify --deep --strict "${_app2}"
+                RESULT_VARIABLE _rc ERROR_QUIET OUTPUT_QUIET)
+if(_rc EQUAL 0)
+    message(FATAL_ERROR
+        "codesign: control broken — ${_bundle_name}.app verified with its icon removed, so the "
+        "seal does not cover Contents/Resources and the reassembly proof above says nothing "
+        "about the icon")
 endif()
 file(REMOVE_RECURSE "${_app_work}")
 

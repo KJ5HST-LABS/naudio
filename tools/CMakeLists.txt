@@ -54,8 +54,30 @@ if(NAUDIO_BUILD_APPS)
     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/control_page.cpp.in"
                    "${CMAKE_CURRENT_BINARY_DIR}/control_page.cpp" @ONLY)
 
+    # The icon (issue #103) is one file per platform container, all generated from
+    # packaging/icons/naudio.png by packaging/icons/regenerate.py and checked in — see that
+    # script for why the build does not make them. On Windows it is compiled INTO the daemon as
+    # its icon resource: Explorer, the taskbar, the Start-menu shortcut (which shows its
+    # target's icon) and Add/Remove Programs (CPACK_NSIS_INSTALLED_ICON_NAME names this
+    # executable) all read it from there. The .rc is generated so it names this checkout's
+    # .ico by absolute path, which is the one path both rc.exe and windres resolve from any
+    # working directory. Only the daemon carries it — the other tools are console programs
+    # with no launcher — and the release gate uses one of those as the zero-icon control.
+    set(NAUDIO_ICON_DIR "${naudio_SOURCE_DIR}/packaging/icons")
+    set(_daemon_icon_sources "")
+    if(WIN32)
+        set(NAUDIO_ICO_PATH "${NAUDIO_ICON_DIR}/naudio.ico")
+        if(NOT EXISTS "${NAUDIO_ICO_PATH}")
+            message(FATAL_ERROR "naudio: missing icon ${NAUDIO_ICO_PATH}")
+        endif()
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/windows/na_audio_daemon.rc.in"
+                       "${CMAKE_CURRENT_BINARY_DIR}/na_audio_daemon.rc" @ONLY)
+        set(_daemon_icon_sources "${CMAKE_CURRENT_BINARY_DIR}/na_audio_daemon.rc")
+    endif()
+
     add_executable(na_audio_daemon na_audio_daemon.cpp
-                                   "${CMAKE_CURRENT_BINARY_DIR}/control_page.cpp")
+                                   "${CMAKE_CURRENT_BINARY_DIR}/control_page.cpp"
+                                   ${_daemon_icon_sources})
     target_link_libraries(na_audio_daemon PRIVATE naudio_net naudio_pa)
     # The control page names the version it is part of; there is no other way for a tool to know
     # it, since it links the internal static libraries rather than the versioned shared one.
@@ -185,6 +207,16 @@ if(NAUDIO_BUILD_APPS)
         # operator can act on.
         install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/naudio-control"
                 DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
+        # The THIRD piece (issue #103): the bundle's icon, under the name Info.plist.in's
+        # CFBundleIconFile gives it. The postinstall places it in Contents/Resources; the seal
+        # covers Resources, so cmake/CodesignPayload.cmake assembles it into the bundle it
+        # signs, and refuses a staging tree where it is missing (a sealed bundle without it
+        # would still verify — the notary never sees it — but it would have no icon).
+        if(NOT EXISTS "${NAUDIO_ICON_DIR}/naudio.icns")
+            message(FATAL_ERROR "naudio: missing icon ${NAUDIO_ICON_DIR}/naudio.icns")
+        endif()
+        install(FILES "${NAUDIO_ICON_DIR}/naudio.icns"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
     elseif(WIN32)
         # For the servicecheck arm: this build's install path, rendered here. The file the
         # installer actually registers is rendered from the same template against $INSTDIR.
@@ -216,6 +248,17 @@ if(NAUDIO_BUILD_APPS)
                        "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.desktop" @ONLY)
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.desktop"
                 DESTINATION "${CMAKE_INSTALL_DATADIR}/applications" COMPONENT tools)
+        # Its icon (issue #103): the desktop entry's Icon=naudio is resolved by the desktop's
+        # icon theme through share/icons/hicolor/<size>x<size>/apps/naudio.png — a name, not a
+        # path, so the theme picks the size the menu, the panel or the launcher wants. The
+        # whole checked-in hicolor tree ships; the release gate asserts the sizes on the
+        # installed system and that the entry's Icon= is the file's stem.
+        if(NOT EXISTS "${NAUDIO_ICON_DIR}/hicolor/256x256/apps/naudio.png")
+            message(FATAL_ERROR "naudio: missing icon tree ${NAUDIO_ICON_DIR}/hicolor")
+        endif()
+        install(DIRECTORY "${NAUDIO_ICON_DIR}/hicolor"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/icons" COMPONENT tools
+                FILES_MATCHING PATTERN "naudio.png")
     endif()
     # Both read by the naudio_daemon_servicecheck arm, which asserts the unit names exactly
     # this path — the failure no build-tree test can see.

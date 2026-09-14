@@ -1375,6 +1375,15 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         set(CPACK_NSIS_PACKAGE_NAME "naudio")
         set(CPACK_NSIS_URL_INFO_ABOUT "${CPACK_PACKAGE_HOMEPAGE_URL}")
         set(CPACK_NSIS_CONTACT "${CPACK_PACKAGE_CONTACT}")
+        # The icon (issue #103), in the three places Windows shows one for an installed program:
+        # the setup .exe and the uninstaller carry it as their own icon (MUI_ICON/MUI_UNIICON —
+        # makensis embeds the .ico), and Add/Remove Programs reads it off the installed daemon,
+        # which tools/CMakeLists.txt compiles it into. The path is this checkout's .ico with
+        # forward slashes, which makensis accepts in a compile-time path; the INSTALLED_ICON_NAME
+        # is relative to $INSTDIR and carries the four-backslash round trip explained below.
+        set(CPACK_NSIS_MUI_ICON "${CMAKE_CURRENT_SOURCE_DIR}/packaging/icons/naudio.ico")
+        set(CPACK_NSIS_MUI_UNIICON "${CMAKE_CURRENT_SOURCE_DIR}/packaging/icons/naudio.ico")
+        set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\na_audio_daemon.exe")
 
         # The Start-menu entry that opens the control page (issue #96 item 4) — the "shortcut"
         # the issue's acceptance names. It is the same command line the .desktop file and the

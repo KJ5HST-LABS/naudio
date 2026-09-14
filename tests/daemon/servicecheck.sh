@@ -150,6 +150,29 @@ if [ "$KIND" = launchd ]; then
         else
             ok "the control app has one name ($app_name)"
         fi
+
+        # The icon (issue #103): CFBundleIconFile must name a file the source tree carries under
+        # packaging/icons/ — the payload installs it by that name and the postinstall places it
+        # under Contents/Resources — and the file must be a complete .icns, which iconutil
+        # proves by unpacking it: a hand-edited or truncated icon unpacks to fewer members, and
+        # the Finder falls back to the generic icon with no diagnostic. Ten members is Apple's
+        # iconset (five sizes, each at 1x and 2x), the set regenerate.py writes.
+        icon_name="$(plutil -extract CFBundleIconFile raw -o - "$APP_PLIST" 2>/dev/null)"
+        icon_dir="$(cd "$(dirname "$0")/../../packaging/icons" 2>/dev/null && pwd)"
+        if [ -z "$icon_name" ]; then
+            bad "the control app's Info.plist carries no CFBundleIconFile — the Finder, the Dock and Login Items would show the generic icon"
+        elif [ -z "$icon_dir" ] || [ ! -f "$icon_dir/$icon_name" ]; then
+            bad "the control app names its icon '$icon_name' but packaging/icons/ carries no such file"
+        elif ! iconutil -c iconset "$icon_dir/$icon_name" -o "$TMP/icon.iconset" 2>/dev/null; then
+            bad "packaging/icons/$icon_name is not an .icns iconutil can unpack"
+        else
+            members="$(find "$TMP/icon.iconset" -name 'icon_*.png' | wc -l | tr -d ' ')"
+            if [ "$members" -eq 10 ]; then
+                ok "the control app's icon ($icon_name) unpacks to all 10 iconset members"
+            else
+                bad "packaging/icons/$icon_name unpacks to $members iconset members, not 10 — a size is missing"
+            fi
+        fi
     fi
 
     # KeepAlive without a throttle turns a permanent config error into a hot loop.

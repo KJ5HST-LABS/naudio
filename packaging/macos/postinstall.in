@@ -71,13 +71,20 @@ if [ -f "$APP_SRC/naudio-control" ] && [ -f "$APP_SRC/naudio-control.Info.plist"
             "$APP_DST/Contents/Info.plist"
     install -m 0755 -o root -g wheel "$APP_SRC/naudio-control" \
             "$APP_DST/Contents/MacOS/naudio-control"
+    # The icon (issue #103), under the name Info.plist's CFBundleIconFile gives it. The seal
+    # below covers Resources, so this file must be byte-identical to the one
+    # cmake/CodesignPayload.cmake sealed — it is: both read the same staged payload file.
+    if [ -f "$APP_SRC/naudio.icns" ]; then
+        install -d -m 0755 -o root -g wheel "$APP_DST/Contents/Resources"
+        install -m 0644 -o root -g wheel "$APP_SRC/naudio.icns" \
+                "$APP_DST/Contents/Resources/naudio.icns"
+    fi
     # The bundle's Developer ID signature (issue #102), present when the payload was signed:
     # codesign writes it as ordinary files under Contents/_CodeSignature/ — no extended
     # attributes — and a bundle reassembled this way verifies --deep --strict (measured;
     # cmake/CodesignPayload.cmake re-proves it on every signed package). Every file in the
     # directory, not a fixed list: the set codesign writes has varied across macOS releases.
     # An unsigned build ships no such directory and assembles the unsigned bundle as before.
-    # (#103's icon is one more `install` beside these, under Contents/Resources.)
     if [ -d "$APP_SRC/naudio-control.codesig" ]; then
         install -d -m 0755 -o root -g wheel "$APP_DST/Contents/_CodeSignature"
         for sig in "$APP_SRC/naudio-control.codesig"/*; do
