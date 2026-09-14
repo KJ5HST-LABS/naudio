@@ -9,13 +9,18 @@
 # opens THAT page and exits 0 instead of failing to bind. So this one entry both starts the
 # daemon (when nothing is running) and opens the page (when the logon service already started
 # it), with no launcher script to get the two cases wrong.
+#
+# Icon= is a THEME NAME, not a path (issue #103): the desktop resolves it through
+# share/icons/hicolor/<size>x<size>/apps/naudio.png, which the package installs at every
+# standard size, and picks the one the menu or panel wants. Until #103 this borrowed the
+# theme's audio-card icon.
 Type=Application
 Version=1.0
 Name=naudio Control
 GenericName=Audio streaming control
 Comment=Pick a capture device, save settings and start streaming, in a browser
 Exec=@NAUDIO_SERVICE_EXEC@ --mode control --duration-ms 0 --open-page
-Icon=audio-card
+Icon=naudio
 Terminal=false
 Categories=AudioVideo;Audio;Network;HamRadio;
 Keywords=naudio;audio;streaming;ham;radio;

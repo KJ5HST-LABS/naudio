@@ -18,6 +18,12 @@
   and a localized InfoPlist.strings). The identifier is unchanged: it is the key Background Task
   Management already holds for the association, and identifiers are not shown to anyone.
 
+  CFBundleIconFile names the icon the Finder, the Dock, Login Items and the "App Background
+  Activity" notification all show for this bundle (issue #103): packaging/icons/naudio.icns,
+  carried in the payload beside the other two pieces and placed under Contents/Resources by the
+  postinstall. The seal covers it, so cmake/CodesignPayload.cmake assembles it into the bundle it
+  signs, and the release gate asserts the installed file this key names exists.
+
   LSUIElement is true so this does not take over the Dock and the menu bar as a foreground app
   would; it is a background program whose interface is a web page. NSMicrophoneUsageDescription
   is the string macOS shows when the daemon this bundle launches first opens a capture device -
@@ -42,6 +48,8 @@
     <string>naudio-control</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <key>CFBundleIconFile</key>
+    <string>naudio.icns</string>
     <key>LSUIElement</key>
     <true/>
     <key>LSMinimumSystemVersion</key>
