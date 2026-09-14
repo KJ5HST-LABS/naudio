@@ -53,7 +53,10 @@ those are in every other format on this page.
   control page and captures nothing until you press Start; turn it off there to stop it (see
   *Running the daemon in the background* below). A Mac that already had the service from an
   earlier release keeps listing it under the developer's name: macOS names that entry once, when
-  it first sees the service, and neither reinstalling nor restarting renames it. **Each release's notes say
+  it first sees the service, and reinstalling over it does not rename it. To rename it, make
+  macOS drop the old entry first: `sudo rm /Library/LaunchAgents/org.kj5hst.naudio.daemon.plist`,
+  open *Login Items & Extensions* (the pane rescans and drops the orphaned entry), then run the
+  installer again — no logout needed. **Each release's notes say
   whether that release's `.pkg` is signed and notarized**, and they say it from a check of the
   file itself rather than from what was intended (issue #99) — a signed one opens like any other
   installer, and an unsigned one needs a right-click → *Open* the first time. macOS installers have no

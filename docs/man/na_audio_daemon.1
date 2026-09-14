@@ -171,7 +171,13 @@ background service described below under that same name in
 .IR "System Settings > General > Login Items & Extensions" ;
 a Mac that already had the service from an earlier release keeps listing it
 under the developer's name, because macOS names that entry once, when it first
-sees the service, and neither reinstalling nor restarting renames it.
+sees the service, and reinstalling over it does not rename it.
+To rename it, make macOS drop the old entry first: remove
+.IR /Library/LaunchAgents/org.kj5hst.naudio.daemon.plist ,
+open
+.I "Login Items & Extensions"
+(the pane rescans and drops the orphaned entry), then run the installer again;
+no logout is needed.
 All three run the same command, and using one twice is safe \(em if a control
 page is already answering on the configured port, the second launch opens that
 page and exits rather than failing to bind.
