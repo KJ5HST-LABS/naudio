@@ -1006,14 +1006,15 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
     # build-tree test structurally cannot see. Registered only where the unit was generated, so
     # a configuration with no daemon has no such test rather than a skip that reads like
     # coverage; the platform decides WHICH unit, so ubuntu CI covers the systemd arm and macOS
-    # the launchd one. The fourth argument is the generated naudio Control Info.plist, set on
+    # the launchd one. The fourth argument is the generated control app Info.plist, set on
     # macOS only: the launchd arm asserts the agent's AssociatedBundleIdentifiers is that
-    # bundle's CFBundleIdentifier (issue #102), and treats the argument's absence as a harness
-    # fault rather than a skip. The fifth is the HTTP client the arm reads the pipeline state
-    # with when it RUNS the unit's arguments (issue #102: inertness is a behaviour of those
-    # arguments now, not a Disabled key) — located here, shared with the control-page gate
-    # below, and absent-as-harness-fault for the same reason as the fourth. It binds a socket
-    # and polls for the daemon's first line, so it gets the control-page gate's timeout.
+    # bundle's CFBundleIdentifier and that the bundle carries one name (issue #102), and treats
+    # the argument's absence as a harness fault rather than a skip. The fifth is the HTTP
+    # client the arm reads the pipeline state with when it RUNS the unit's arguments (issue
+    # #102: inertness is a behaviour of those arguments now, not a Disabled key) — located
+    # here, shared with the control-page gate below, and absent-as-harness-fault for the same
+    # reason as the fourth. It binds a socket and polls for the daemon's first line, so it gets
+    # the control-page gate's timeout.
     find_program(NAUDIO_GATE_CURL NAMES curl)
     if(NAUDIO_SERVICE_UNIT_FILE)
         add_test(NAME naudio_daemon_servicecheck

@@ -146,7 +146,7 @@ endif()
 message(STATUS "codesign: all ${_n} payload binaries carry Developer ID + hardened runtime; "
                "${_entitled} capture tools carry audio-input")
 
-# ---- naudio Control.app (issue #102) ----------------------------------------------------------
+# ---- Network Audio Service.app (issue #102) --------------------------------------------------
 # Login Items names a launchd agent after the app its plist associates it with
 # (AssociatedBundleIdentifiers) — but only when that app is Developer ID signed with the agent's
 # Team ID. Measured 2026-09-13: Background Task Management silently dropped the association for
@@ -190,7 +190,7 @@ if(NOT _app_script_n EQUAL 1 OR NOT _app_plist_n EQUAL 1)
     message(FATAL_ERROR
         "codesign: expected exactly one staged naudio-control and one naudio-control.Info.plist "
         "under ${_stage}; found ${_app_script_n} and ${_app_plist_n}. The control app cannot be "
-        "signed, so Login Items would name the developer instead of naudio Control.")
+        "signed, so Login Items would name the developer instead of the service.")
 endif()
 get_filename_component(_app_payload_dir "${_app_script}" DIRECTORY)
 get_filename_component(_app_plist_dir "${_app_plist}" DIRECTORY)
@@ -219,12 +219,30 @@ if(NOT _daemon_team)
     message(FATAL_ERROR "codesign: could not read a TeamIdentifier off ${_daemon}. Got:\n${_desc}")
 endif()
 
+# The bundle's names, read off the staged Info.plist. The on-disk name the postinstall assembles
+# is what the Finder shows, and the Finder ignores a CFBundleDisplayName that differs from it
+# (measured 2026-09-14), so the two keys must agree and the temporary bundles below are named
+# after them — the same directory name the postinstall creates, not a literal of their own.
+execute_process(COMMAND plutil -extract CFBundleName raw -o - "${_app_plist}"
+                OUTPUT_VARIABLE _bundle_name ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND plutil -extract CFBundleDisplayName raw -o - "${_app_plist}"
+                OUTPUT_VARIABLE _bundle_display ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT _bundle_name)
+    message(FATAL_ERROR "codesign: no CFBundleName in ${_app_plist}")
+endif()
+if(NOT _bundle_display STREQUAL _bundle_name)
+    message(FATAL_ERROR
+        "codesign: CFBundleDisplayName ('${_bundle_display}') differs from CFBundleName "
+        "('${_bundle_name}') in ${_app_plist}; the Finder shows the on-disk name and Login Items "
+        "the display name, so the service would carry two names")
+endif()
+
 # Assembled OUTSIDE the staging tree, deliberately: a .app inside it would be exactly the payload
 # bundle tools/CMakeLists.txt keeps out. A sibling of the staging directory is never packaged.
 # From the STAGED copies, so the seal is of the bytes that ship (install(PROGRAMS) has already
 # made the script 0755 here; the mode is not sealed, the hash is).
 set(_app_work "${_stage}.naudio-control-sign")
-set(_app "${_app_work}/naudio Control.app")
+set(_app "${_app_work}/${_bundle_name}.app")
 file(REMOVE_RECURSE "${_app_work}")
 file(MAKE_DIRECTORY "${_app}/Contents/MacOS")
 file(COPY "${_app_script}" DESTINATION "${_app}/Contents/MacOS")
@@ -250,26 +268,26 @@ endif()
 execute_process(COMMAND codesign -dvv "${_app}" ERROR_VARIABLE _desc OUTPUT_QUIET)
 if(NOT _desc MATCHES "Authority=Developer ID Application")
     message(FATAL_ERROR
-        "codesign: naudio Control.app is not Developer ID Application signed after signing it. "
+        "codesign: ${_bundle_name}.app is not Developer ID Application signed after signing it. "
         "Got:\n${_desc}")
 endif()
 string(REGEX MATCH "\nIdentifier=([^\n]+)\n" _m "${_desc}")
 if(NOT CMAKE_MATCH_1 STREQUAL _bundle_id)
     message(FATAL_ERROR
-        "codesign: naudio Control.app was sealed as '${CMAKE_MATCH_1}', not as the bundle's "
+        "codesign: ${_bundle_name}.app was sealed as '${CMAKE_MATCH_1}', not as the bundle's "
         "CFBundleIdentifier (${_bundle_id}). Got:\n${_desc}")
 endif()
 string(REGEX MATCH "TeamIdentifier=([^\n]+)" _m "${_desc}")
 if(NOT CMAKE_MATCH_1 STREQUAL _daemon_team)
     message(FATAL_ERROR
-        "codesign: naudio Control.app's TeamIdentifier ('${CMAKE_MATCH_1}') is not the daemon's "
+        "codesign: ${_bundle_name}.app's TeamIdentifier ('${CMAKE_MATCH_1}') is not the daemon's "
         "('${_daemon_team}'); Background Task Management drops the association unless they "
         "match. Got:\n${_desc}")
 endif()
 execute_process(COMMAND codesign --verify --deep --strict "${_app}"
                 RESULT_VARIABLE _rc ERROR_VARIABLE _err)
 if(NOT _rc EQUAL 0)
-    message(FATAL_ERROR "codesign: naudio Control.app does not verify after signing: ${_err}")
+    message(FATAL_ERROR "codesign: ${_bundle_name}.app does not verify after signing: ${_err}")
 endif()
 
 # Copy the signature back as loose payload files. Every file codesign wrote, not a fixed list:
@@ -280,7 +298,7 @@ file(GLOB _sigfiles "${_app}/Contents/_CodeSignature/*")
 list(LENGTH _sigfiles _nsig)
 if(_nsig LESS 3)
     message(FATAL_ERROR
-        "codesign: naudio Control.app carries ${_nsig} file(s) under _CodeSignature; a sealed "
+        "codesign: ${_bundle_name}.app carries ${_nsig} file(s) under _CodeSignature; a sealed "
         "bundle carries at least CodeDirectory, CodeResources and CodeSignature")
 endif()
 file(REMOVE_RECURSE "${_codesig_dst}")
@@ -290,7 +308,7 @@ file(COPY ${_sigfiles} DESTINATION "${_codesig_dst}")
 # PROVE THE COPY-BACK IS COMPLETE ON THE BYTES THAT SHIP: reassemble a second bundle the way the
 # postinstall does — from the staged pieces plus the staged signature directory, nothing from the
 # temporary bundle — and verify it. This is the postinstall's method run at packaging time.
-set(_app2 "${_app_work}/reassembled/naudio Control.app")
+set(_app2 "${_app_work}/reassembled/${_bundle_name}.app")
 file(MAKE_DIRECTORY "${_app2}/Contents/MacOS" "${_app2}/Contents/_CodeSignature")
 file(COPY "${_app_script}" DESTINATION "${_app2}/Contents/MacOS")
 file(COPY "${_app_plist}" DESTINATION "${_app2}/Contents")
@@ -326,6 +344,6 @@ if(NOT _n_after EQUAL _n)
         "${_n_after} after; the signature files must not be binaries")
 endif()
 
-message(STATUS "codesign: naudio Control.app sealed as ${_bundle_id} (TeamIdentifier "
+message(STATUS "codesign: ${_bundle_name}.app sealed as ${_bundle_id} (TeamIdentifier "
                "${_daemon_team}); ${_nsig} signature files staged under "
                "${_codesig_dst}")

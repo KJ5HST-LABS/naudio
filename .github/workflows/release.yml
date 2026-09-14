@@ -258,9 +258,15 @@ jobs:
           test ! -e "$AGENT" \
             || { echo "::error::control broken: $AGENT existed before the install"; exit 1; }
           # Same control for the Applications shortcut (#96 item 4).
-          APP="/Applications/naudio Control.app"
+          APP="/Applications/Network Audio Service.app"
           test ! -e "$APP" \
             || { echo "::error::control broken: $APP existed before the install"; exit 1; }
+          # The bundle rc7 and rc8 placed under the page's name carries the same
+          # identifier; the postinstall must remove it on upgrade, or LaunchServices
+          # — and so Login Items — may resolve the identifier to either (#102).
+          # Planted here so its absence after the install is a measurement.
+          APP_LEGACY="/Applications/naudio Control.app"
+          sudo mkdir -p "$APP_LEGACY/Contents"
 
           # THE install the deliverable promises: Installer.app's command-line
           # twin placing real files under /usr/local, receipt and all.
@@ -372,8 +378,20 @@ jobs:
           # the shortcut #96's acceptance names, since macOS has no .desktop.
           test -d "$APP" \
             || { echo "::error::the .pkg postinstall did not place $APP"; exit 1; }
+          test ! -e "$APP_LEGACY" \
+            || { echo "::error::the .pkg postinstall left the pre-rename bundle at $APP_LEGACY — two bundles now carry one identifier"; exit 1; }
           plutil -lint "$APP/Contents/Info.plist" > /dev/null \
             || { echo "::error::$APP has an invalid Info.plist"; exit 1; }
+          # One name in Settings, the Finder and Spotlight (#102): the Finder shows
+          # the ON-DISK name and ignores a differing CFBundleDisplayName; Login Items
+          # shows the display name (measured 2026-09-14). All three are one string,
+          # asserted as relations between the installed bundle's own fields.
+          app_name=$(plutil -extract CFBundleName raw -o - "$APP/Contents/Info.plist" 2>/dev/null || true)
+          app_display=$(plutil -extract CFBundleDisplayName raw -o - "$APP/Contents/Info.plist" 2>/dev/null || true)
+          [ -n "$app_name" ] && [ "$(basename "$APP" .app)" = "$app_name" ] \
+            || { echo "::error::$APP is not named after its CFBundleName ('$app_name') — the Finder would show a different name from Login Items"; exit 1; }
+          [ "$app_display" = "$app_name" ] \
+            || { echo "::error::$APP's CFBundleDisplayName ('$app_display') differs from its CFBundleName ('$app_name')"; exit 1; }
           # A bundle whose executable is not executable is not opened by
           # LaunchServices, and it says nothing about why (configure_file writes
           # 0644, so this is the mode the CMake file(CHMOD) exists to fix).
@@ -497,26 +515,26 @@ jobs:
           [ "$n" -eq 5 ] || { echo "::error::expected 5 signed binaries, saw $n"; exit 1; }
           [ "$entitled" -eq 2 ] || { echo "::error::expected 2 entitled capture tools, saw $entitled"; exit 1; }
 
-          # naudio Control.app (#102): sealed in CPack staging, carried as loose signature
-          # files, reassembled by the postinstall — so the only bundle worth verifying is
-          # the INSTALLED one. Its Team ID must be the installed daemon's: Background Task
-          # Management names the agent after the app only when they match, and drops the
-          # association silently otherwise. A relation between two installed files, not
-          # a literal team id.
-          APP="/Applications/naudio Control.app"
+          # Network Audio Service.app (#102): sealed in CPack staging, carried as loose
+          # signature files, reassembled by the postinstall — so the only bundle worth
+          # verifying is the INSTALLED one. Its Team ID must be the installed daemon's:
+          # Background Task Management names the agent after the app only when they
+          # match, and drops the association silently otherwise. A relation between two
+          # installed files, not a literal team id.
+          APP="/Applications/Network Audio Service.app"
           codesign --verify --deep --strict "$APP" \
             || { echo "::error::$APP does not verify after the postinstall assembled it"; exit 1; }
           app_desc=$(codesign -dvv "$APP" 2>&1)
           case "$app_desc" in
             *"Authority=Developer ID Application"*) ;;
-            *) echo "::error::naudio Control.app is not Developer ID signed"; echo "$app_desc"; exit 1 ;;
+            *) echo "::error::$APP is not Developer ID signed"; echo "$app_desc"; exit 1 ;;
           esac
           app_team=$(printf '%s\n' "$app_desc" | sed -n 's/^TeamIdentifier=//p')
           daemon_team=$(codesign -dvv /usr/local/bin/na_audio_daemon 2>&1 | sed -n 's/^TeamIdentifier=//p')
           [ -n "$app_team" ] && [ "$app_team" = "$daemon_team" ] \
-            || { echo "::error::naudio Control.app's TeamIdentifier ('$app_team') is not the daemon's ('$daemon_team') — Login Items would drop the association"; exit 1; }
-          echo "  ok: naudio Control.app (TeamIdentifier $app_team)"
-          echo "== payload: $n installed binaries Developer ID signed with the hardened runtime; $entitled carry audio-input; naudio Control.app sealed with the daemon's team id =="
+            || { echo "::error::$APP's TeamIdentifier ('$app_team') is not the daemon's ('$daemon_team') — Login Items would drop the association"; exit 1; }
+          echo "  ok: $APP (TeamIdentifier $app_team)"
+          echo "== payload: $n installed binaries Developer ID signed with the hardened runtime; $entitled carry audio-input; $APP sealed with the daemon's team id =="
 
       - name: "Sign the .pkg, notarize it, staple the ticket"
         env:

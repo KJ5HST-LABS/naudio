@@ -113,12 +113,12 @@ if [ "$KIND" = launchd ]; then
 
     # Login Items names the agent after the app it is associated with (issue #102), and the
     # association is a relation between two generated files: the agent's
-    # AssociatedBundleIdentifiers entry must be the CFBundleIdentifier of the naudio Control
+    # AssociatedBundleIdentifiers entry must be the CFBundleIdentifier of the control app
     # bundle the postinstall assembles. Asserted as a relation, not a literal, so a renamed
     # bundle cannot silently orphan the association — Background Task Management drops an
     # association it cannot resolve with no diagnostic anywhere (measured 2026-09-13).
     if [ -z "$APP_PLIST" ]; then
-        bad "harness fault — no naudio Control Info.plist was handed to the launchd branch"
+        bad "harness fault — no control app Info.plist was handed to the launchd branch"
     elif [ ! -f "$APP_PLIST" ]; then
         bad "harness fault — no generated Info.plist at: $APP_PLIST"
     else
@@ -127,13 +127,28 @@ if [ "$KIND" = launchd ]; then
         if [ -z "$app_id" ]; then
             bad "the control app's Info.plist carries no CFBundleIdentifier"
         elif [ -z "$assoc" ]; then
-            bad "agent has no AssociatedBundleIdentifiers — Login Items would name the developer, not naudio Control"
+            bad "agent has no AssociatedBundleIdentifiers — Login Items would name the developer, not the service"
         elif [ "$assoc" != "$app_id" ]; then
             bad "agent associates '$assoc' but the control app is '$app_id' — Login Items would drop the association"
         elif plutil -extract AssociatedBundleIdentifiers.1 raw -o - "$UNIT" > /dev/null 2>&1; then
             bad "agent associates more than one bundle; it ships exactly one app"
         else
             ok "agent is associated with the control app ($app_id)"
+        fi
+
+        # The name Login Items shows is that app's. The Finder shows a bundle's ON-DISK name and
+        # ignores a CFBundleDisplayName that differs from it (measured 2026-09-14), while Login
+        # Items and Spotlight resolve the display name — so the two keys must agree, or the
+        # service carries one name in Settings and another in Applications. The on-disk name is
+        # the postinstall's; the release gate asserts it against these on the installed bundle.
+        app_name="$(plutil -extract CFBundleName raw -o - "$APP_PLIST" 2>/dev/null)"
+        app_display="$(plutil -extract CFBundleDisplayName raw -o - "$APP_PLIST" 2>/dev/null)"
+        if [ -z "$app_name" ]; then
+            bad "the control app's Info.plist carries no CFBundleName"
+        elif [ "$app_display" != "$app_name" ]; then
+            bad "the control app's CFBundleDisplayName ('$app_display') differs from its CFBundleName ('$app_name') — Settings and the Finder would show two names"
+        else
+            ok "the control app has one name ($app_name)"
         fi
     fi
 
