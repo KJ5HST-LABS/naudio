@@ -146,11 +146,14 @@ if(NAUDIO_BUILD_APPS)
         set(NAUDIO_SERVICE_UNIT_FILE
             "${CMAKE_CURRENT_BINARY_DIR}/org.kj5hst.naudio.daemon.plist" PARENT_SCOPE)
 
-        # "naudio Control.app" (issue #96 item 4) — the Applications entry, because macOS has no
-        # .desktop equivalent and the issue's acceptance is that the page opens from an INSTALLED
-        # shortcut. It is a launcher, not a program: a three-line script that execs the daemon in
-        # control mode. Like the plist it rides inside the payload and is placed by the
+        # "Network Audio Service.app" (issue #96 item 4) — the Applications entry, because macOS
+        # has no .desktop equivalent and the issue's acceptance is that the page opens from an
+        # INSTALLED shortcut. It is a launcher, not a program: a three-line script that execs the
+        # daemon in control mode. Like the plist it rides inside the payload and is placed by the
         # postinstall, because /Applications is not under the /usr/local install prefix either.
+        # Named after the service rather than the page because on macOS this bundle is also what
+        # Login Items shows the agent as (issue #102); the Linux and Windows shortcuts below keep
+        # the page's name, having no service row that borrows an app's.
         #
         # THE PAYLOAD CARRIES TWO FLAT FILES, NOT A BUNDLE, and that is the whole point. Shipping
         # the assembled `.app` inside the payload made `pkgbuild` auto-detect it and write

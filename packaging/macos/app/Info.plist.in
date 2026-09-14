@@ -1,12 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  naudio Control.app (issue #96 item 4) - the Applications entry that opens the control page.
-  SPDX-License-Identifier: LGPL-2.1-or-later
+  Network Audio Service.app (issue #96 item 4) - the Applications entry that opens the control
+  page. SPDX-License-Identifier: LGPL-2.1-or-later
 
   A launcher, not a program: Contents/MacOS/naudio-control execs the installed daemon in control
   mode. It exists because the issue's acceptance is that an operator opens the page from an
   INSTALLED shortcut, and macOS has no equivalent of a .desktop file.
+
+  The bundle is named after the SERVICE, not the page, because on macOS this bundle is also the
+  service's identity: Login Items lists the launchd agent under the name of the app the agent
+  names through AssociatedBundleIdentifiers (issue #102), and that row is the service's switch.
+  CFBundleName, CFBundleDisplayName and the on-disk name the postinstall assembles must all be
+  this same string - the Finder shows the on-disk name, and it ignores a CFBundleDisplayName
+  that differs from it (measured 2026-09-14: LaunchServices resolved the display name, the
+  Finder's own displayName(atPath:) kept the file name, with and without LSHasLocalizedDisplayName
+  and a localized InfoPlist.strings). The identifier is unchanged: it is the key Background Task
+  Management already holds for the association, and identifiers are not shown to anyone.
 
   LSUIElement is true so this does not take over the Dock and the menu bar as a foreground app
   would; it is a background program whose interface is a web page. NSMicrophoneUsageDescription
@@ -17,9 +27,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>naudio Control</string>
+    <string>Network Audio Service</string>
     <key>CFBundleDisplayName</key>
-    <string>naudio Control</string>
+    <string>Network Audio Service</string>
     <key>CFBundleIdentifier</key>
     <string>org.kj5hst.naudio.control</string>
     <key>CFBundleVersion</key>

@@ -43,9 +43,13 @@ if [ "$console_uid" -ge 500 ] 2>/dev/null; then
     launchctl enable "gui/$console_uid/org.kj5hst.naudio.daemon" || true
 fi
 
-# "naudio Control.app" into /Applications (issue #96 item 4) — the shortcut that opens the
-# control page. Same reason as the plist: /Applications is not under the .pkg's /usr/local
-# payload prefix, so the payload carries the parts in share/naudio/ and this assembles them.
+# "Network Audio Service.app" into /Applications (issue #96 item 4) — the shortcut that opens
+# the control page, named after the service because Login Items shows the agent under this
+# bundle's name (issue #102). Same reason as the plist: /Applications is not under the .pkg's
+# /usr/local payload prefix, so the payload carries the parts in share/naudio/ and this
+# assembles them. The on-disk name below is what the Finder shows — it ignores a
+# CFBundleDisplayName that differs from the file name — so it must equal the bundle's
+# CFBundleName; the release gate asserts that on the installed files.
 #
 # ASSEMBLED HERE rather than carried as a bundle. A .app inside the payload is auto-detected by
 # pkgbuild, which writes <relocate>/<strict-identifier>/<upgrade-bundle> into PackageInfo and
@@ -54,11 +58,14 @@ fi
 # listed in the payload. Two ordinary files and three install(1) calls have no such opinion.
 #
 # Onto a REMOVED destination, not over a live one: a bundle updated in place can end up holding
-# files from two versions at once, and LaunchServices caches what it finds there.
+# files from two versions at once, and LaunchServices caches what it finds there. The bundle
+# rc7 and rc8 installed as "naudio Control.app" goes too: it carries the same identifier, and
+# two bundles with one identifier leave LaunchServices — and so Login Items — to pick either.
 APP_SRC="${VOL}@NAUDIO_APP_PAYLOAD_DIR@"
-APP_DST="${VOL}/Applications/naudio Control.app"
+APP_DST="${VOL}/Applications/Network Audio Service.app"
+APP_LEGACY="${VOL}/Applications/naudio Control.app"
 if [ -f "$APP_SRC/naudio-control" ] && [ -f "$APP_SRC/naudio-control.Info.plist" ]; then
-    rm -rf "$APP_DST"
+    rm -rf "$APP_DST" "$APP_LEGACY"
     install -d -m 0755 -o root -g wheel "$APP_DST/Contents/MacOS"
     install -m 0644 -o root -g wheel "$APP_SRC/naudio-control.Info.plist" \
             "$APP_DST/Contents/Info.plist"

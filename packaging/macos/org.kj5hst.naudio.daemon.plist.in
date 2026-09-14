@@ -66,11 +66,11 @@
     <!-- What Login Items calls this agent (issue #102). Background Task Management groups a
          launchd job under the developer name on its executable's signature unless the job
          names an app here; then it is shown under that app's name, so the switch reads
-         "naudio Control" rather than the person who signed the daemon. Honoured ONLY when
-         the named bundle is Developer ID signed with the daemon's Team ID (measured
+         "Network Audio Service" rather than the person who signed the daemon. Honoured ONLY
+         when the named bundle is Developer ID signed with the daemon's Team ID (measured
          2026-09-13: the key was silently dropped for an unsigned app, with no diagnostic
-         anywhere), which is why cmake/CodesignPayload.cmake signs naudio Control.app and
-         the servicecheck arm asserts this value is the bundle's CFBundleIdentifier. -->
+         anywhere), which is why cmake/CodesignPayload.cmake signs Network Audio Service.app
+         and the servicecheck arm asserts this value is the bundle's CFBundleIdentifier. -->
     <key>AssociatedBundleIdentifiers</key>
     <array>
         <string>org.kj5hst.naudio.control</string>
