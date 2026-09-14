@@ -45,9 +45,10 @@ run naudio — the programs, the library they share, and (on a Mac) their manual
 What the installers leave out are the files for *building software* against naudio;
 those are in every other format on this page.
 
-- **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`), puts **naudio Control**
-  in `/Applications`, and registers the daemon as a background service — listed as **naudio
-  Control** under *System Settings › General › Login Items & Extensions* on a fresh install. Its
+- **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`), puts **Network Audio
+  Service** in `/Applications` (the entry that opens the control page), and registers the daemon
+  as a background service — listed as **Network Audio Service** under *System Settings › General
+  › Login Items & Extensions* on a fresh install. Its
   switch there is the service's switch: it is on, so from your next login the daemon serves the
   control page and captures nothing until you press Start; turn it off there to stop it (see
   *Running the daemon in the background* below). A Mac that already had the service from an
@@ -64,8 +65,8 @@ those are in every other format on this page.
   to add the programs to `PATH`. The installer is unsigned, so SmartScreen warns: choose
   *More info* → *Run anyway*.
 
-Once it is installed, open **naudio Control** — the Start-menu entry, the Applications entry, or
-the desktop entry on Linux. It opens a page in your browser where you pick the radio's audio
+Once it is installed, open **naudio Control** — the Start-menu entry, the desktop entry on Linux,
+or **Network Audio Service** in Applications on a Mac. It opens a page in your browser where you pick the radio's audio
 device, choose a transport and port, and press Start. Nothing captures audio until you do.
 
 ### Debian / Ubuntu (.deb)
@@ -191,9 +192,11 @@ package manager: `apt-get remove naudio`, `rpm -e naudio`, `brew uninstall naudi
 
 ## The control page — running naudio without a terminal
 
-Every package installs a shortcut called **naudio Control**: the Start menu on Windows, the
-applications menu on Linux, `/Applications/naudio Control.app` on macOS. Opening it starts the
-daemon in *control mode* and opens a page in your browser at `http://127.0.0.1:8737/`.
+Every package installs a shortcut that opens the page: **naudio Control** in the Start menu on
+Windows and the applications menu on Linux, `/Applications/Network Audio Service.app` on macOS
+(named after the service because that is also the name macOS lists it under in Login Items).
+Opening it starts the daemon in *control mode* and opens a page in your browser at
+`http://127.0.0.1:8737/`.
 
 From that page you can:
 
@@ -225,7 +228,7 @@ does: the service runs the control page and opens no device until you press Star
 *Start streaming automatically*). Where the platforms differ is the switch.
 
 On **macOS** the switch is the system's: the service appears in *System Settings › General ›
-Login Items & Extensions › Allow in the Background* as **naudio Control**, on. From your next
+Login Items & Extensions › Allow in the Background* as **Network Audio Service**, on. From your next
 login the daemon is running and its page is a click away; turning the switch off there stops
 it and keeps it off, turning it on starts it again. There is no command to run — a
 `launchctl enable`/`disable` from the rc7 and rc8 instructions does not move that switch (the

@@ -165,9 +165,9 @@ The installed packages create a shortcut that opens it: a
 entry in the Windows Start menu, a
 .B naudio Control
 desktop entry on Linux, and
-.I /Applications/naudio Control.app
-on macOS, where a fresh install lists the background service described below
-under the same name in
+.I "/Applications/Network Audio Service.app"
+on macOS \(em named after the service because a fresh install lists the
+background service described below under that same name in
 .IR "System Settings > General > Login Items & Extensions" ;
 a Mac that already had the service from an earlier release keeps listing it
 under the developer's name, because macOS names that entry once, when it first
@@ -279,7 +279,7 @@ at
 and the switch is the system's: the service is listed in
 .I "System Settings > General > Login Items & Extensions > Allow in the Background"
 as
-.BR "naudio Control" ,
+.BR "Network Audio Service" ,
 on.
 From your next login the daemon is running and its page is a click away;
 turning the switch off there stops it and keeps it off, turning it on starts
