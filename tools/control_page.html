@@ -94,6 +94,11 @@
   .field.check input { width: 16px; height: 16px; }
   .field.check label { font-size: 14px; color: var(--ink); }
   .full { grid-column: 1 / -1; }
+  /* The login-service row (issue #102): a read of the platform's switch, not a control. */
+  .field.service { flex-direction: row; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .field.service .k { font-size: 14px; color: var(--ink); }
+  .field.service .hint { flex-basis: 100%; }
+  button.small { padding: 5px 12px; font-size: 13px; }
 
   /* --- notices --- */
   .notice { padding: 10px 14px; border-radius: 8px; font-size: 13.5px; margin-bottom: 14px; }
@@ -186,6 +191,13 @@
       <div class="field check full">
         <input id="autostartChk" type="checkbox">
         <label for="autostartChk">Start streaming automatically when the daemon starts</label>
+      </div>
+      <!-- Runs at login: the platform's switch, mirrored (issue #102). Hidden until the daemon
+           reports it; the button appears only where a pane owns the switch (macOS). -->
+      <div class="field service full" id="serviceRow" hidden>
+        <span class="k">Runs at login: <span class="badge" id="serviceBadge">—</span></span>
+        <button class="small" id="btnLoginItems" hidden>Open Login Items…</button>
+        <span class="hint" id="serviceHint"></span>
       </div>
     </div>
     <div class="actions">

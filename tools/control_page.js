@@ -199,12 +199,56 @@ async function stream(action) {
   }
 }
 
+// --- the login service's switch (issue #102) ----------------------------------------------
+// The daemon reports whether it is registered to run at login and whether that switch is on.
+// This row MIRRORS the switch; it does not offer one. On macOS the switch is Login Items, whose
+// state nothing outside System Settings can move (measured), so the honest control is a link
+// to the pane; on Linux and Windows the row names the command INSTALL.md gives. `service` is
+// null on a build with no service manager to ask, and the row stays hidden.
+let serviceManager = null;
+
+function renderService(svc) {
+  const row = $('serviceRow');
+  if (!svc) { row.hidden = true; return; }
+  row.hidden = false;
+  serviceManager = svc.manager;
+  const badge = $('serviceBadge');
+  if (!svc.installed) { badge.className = 'badge'; badge.textContent = 'Not installed'; }
+  else if (svc.enabled) { badge.className = 'badge running'; badge.textContent = 'On'; }
+  else { badge.className = 'badge'; badge.textContent = 'Off'; }
+  $('btnLoginItems').hidden = svc.manager !== 'launchd';
+  const hints = {
+    'launchd': 'The switch is in System Settings › General › Login Items & Extensions › '
+             + 'Allow in the Background, as Network Audio Service. Turning it off there stops '
+             + 'the service; turning it on starts it.',
+    'systemd': svc.enabled
+             ? 'Turn it off with: systemctl --user disable --now naudio-daemon'
+             : 'Turn it on with: systemctl --user enable --now naudio-daemon',
+    'task-scheduler': 'The switch is the naudio-daemon task in Task Scheduler (Enable / Disable).',
+  };
+  $('serviceHint').textContent = svc.installed
+    ? (hints[svc.manager] || '')
+    : 'No login service is registered on this machine; the installers register one.';
+}
+
+async function openLoginItems() {
+  try {
+    await api('/api/open-login-items', {});
+  } catch (e) {
+    notice($('configNotice'), 'err', e.message);
+  }
+}
+
 // Stopping the daemon is not the same as stopping the stream, so it asks first — and it is the
 // only action here that cannot be undone from this page, since the page goes away with it.
 async function quitDaemon() {
+  const back = serviceManager === 'launchd'
+    ? 'Start it again from Network Audio Service in Applications, or at your next login if it '
+      + 'is on in Login Items.'
+    : 'Start it again from the naudio Control shortcut, or at your next login if the service '
+      + 'is enabled.';
   if (!window.confirm('Stop the naudio daemon? The stream ends and this page stops working. '
-                    + 'Start it again from the naudio shortcut, or by logging in if you enabled '
-                    + 'the service.')) return;
+                    + back)) return;
   try {
     await api('/api/quit', {});
     notice($('streamNotice'), 'info', 'The daemon is stopping. This page will stop responding.');
@@ -271,12 +315,15 @@ async function load() {
   if (st.devices) { devices = st.devices; devicesStale = st.devicesStale; }
   applySettingsToForm();
   renderStream(st.stream);
+  renderService(st.service);
 }
 
 async function poll() {
   try {
     const st = await api('/api/state');
     renderStream(st.stream);
+    // Re-rendered every poll, so a switch flipped in System Settings shows here within a second.
+    renderService(st.service);
     // The form is left alone while the operator is editing it: overwriting a half-typed port
     // number once a second is the classic way a live-updating page becomes unusable.
     if (!dirty) { settings = st.settings; }
@@ -294,6 +341,7 @@ function init() {
   $('btnStop').addEventListener('click', () => stream('stop'));
   $('btnRestart').addEventListener('click', () => stream('restart'));
   $('btnQuit').addEventListener('click', quitDaemon);
+  $('btnLoginItems').addEventListener('click', openLoginItems);
   $('btnSave').addEventListener('click', save);
   $('btnRescan').addEventListener('click', rescan);
   $('btnRevert').addEventListener('click', () => { applySettingsToForm(); notice($('configNotice'), null); });
