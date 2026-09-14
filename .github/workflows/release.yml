@@ -401,6 +401,21 @@ jobs:
           app_exec=$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$APP/Contents/MacOS/naudio-control")
           test -x "$app_exec" \
             || { echo "::error::$APP execs '$app_exec', which the install did not create"; exit 1; }
+          # Its icon (#103): the installed plist names a file, and the postinstall
+          # placed that file under Resources — a relation between two installed
+          # files, not a literal name — and it is a complete .icns (iconutil
+          # unpacks it to Apple's ten members; a truncated one unpacks to none).
+          app_icon=$(plutil -extract CFBundleIconFile raw -o - "$APP/Contents/Info.plist" 2>/dev/null || true)
+          [ -n "$app_icon" ] \
+            || { echo "::error::$APP's Info.plist has no CFBundleIconFile — the Finder, the Dock and Login Items would show the generic icon"; exit 1; }
+          test -f "$APP/Contents/Resources/$app_icon" \
+            || { echo "::error::$APP names its icon '$app_icon' but the postinstall did not place Contents/Resources/$app_icon"; exit 1; }
+          rm -rf "$RUNNER_TEMP/icon.iconset"
+          iconutil -c iconset "$APP/Contents/Resources/$app_icon" -o "$RUNNER_TEMP/icon.iconset" \
+            || { echo "::error::the installed $app_icon is not an .icns iconutil can unpack"; exit 1; }
+          [ "$(find "$RUNNER_TEMP/icon.iconset" -name 'icon_*.png' | wc -l | tr -d ' ')" -eq 10 ] \
+            || { echo "::error::the installed $app_icon unpacks to $(ls "$RUNNER_TEMP/icon.iconset" | wc -l | tr -d ' ') iconset members, not 10"; exit 1; }
+          echo "  icon: $APP/Contents/Resources/$app_icon (10 iconset members)"
 
           # The agent names this bundle (#102): Login Items shows the service
           # under the app's name only when AssociatedBundleIdentifiers resolves
@@ -847,6 +862,25 @@ jobs:
             || { echo "::error::$DESKTOP execs '$desktop_exec', which the DEB did not install"; exit 1; }
           grep -q '^Exec=.* --mode control ' "$DESKTOP" \
             || { echo "::error::$DESKTOP does not launch control mode"; exit 1; }
+          # Its icon (#103): Icon= is a theme NAME the desktop resolves through
+          # share/icons/hicolor/<size>/apps/<name>.png, so the assertion is the
+          # relation — the entry's name, and a PNG of that name at every size
+          # the checked-in tree carries. Nine sizes, like the tree; a size that
+          # went missing from the package would leave some launcher on the
+          # generic icon with nothing else red.
+          desktop_icon=$(sed -n 's/^Icon=\(.*\)$/\1/p' "$DESKTOP")
+          [ -n "$desktop_icon" ] && [ "$desktop_icon" = naudio ] \
+            || { echo "::error::$DESKTOP's Icon= is '$desktop_icon', not the theme name naudio"; exit 1; }
+          icon_sizes=0
+          for s in 16 22 24 32 48 64 128 256 512; do
+            f="/usr/share/icons/hicolor/${s}x${s}/apps/${desktop_icon}.png"
+            test -f "$f" || { echo "::error::the DEB did not install $f — the desktop's ${s}px launchers would fall back to the generic icon"; exit 1; }
+            file "$f" | grep -q "PNG image data, $s x $s" \
+              || { echo "::error::$f is not a ${s}×${s} PNG: $(file "$f")"; exit 1; }
+            icon_sizes=$((icon_sizes+1))
+          done
+          [ "$icon_sizes" -eq 9 ] || { echo "::error::expected 9 icon sizes, checked $icon_sizes"; exit 1; }
+          echo "  icon: Icon=$desktop_icon resolves at 9 hicolor sizes"
 
           # BEHAVIOUR on the installed binary: serve the page and answer the
           # poll the browser makes. Hardware-free — nothing here starts a stream.
@@ -893,7 +927,10 @@ jobs:
                       /usr/bin/na_audio_source /usr/bin/na_c_play_to_speakers \
                       /usr/include/naudio.h /usr/lib/pkgconfig/naudio.pc \
                       /usr/lib/systemd/user/naudio-daemon.service \
-                      /usr/share/applications/naudio-control.desktop; do
+                      /usr/share/applications/naudio-control.desktop \
+                      /usr/share/icons/hicolor/16x16/apps/naudio.png \
+                      /usr/share/icons/hicolor/256x256/apps/naudio.png \
+                      /usr/share/icons/hicolor/512x512/apps/naudio.png; do
             grep -qx "$want" rpm-contents.txt \
               || { echo "::error::RPM is missing $want"; cat rpm-contents.txt; exit 1; }
           done
@@ -1036,6 +1073,33 @@ jobs:
             if (-not (Test-Path "$I/$f")) { Write-Output "::error::installed tree is missing $f"; exit 1 } }
           & "$I/bin/na_wav_tap.exe" --help
           if ($LASTEXITCODE -ne 0) { Write-Output "::error::installed na_wav_tap.exe will not run"; exit 1 }
+
+          # The icon (#103). Explorer, the taskbar and the Start-menu shortcut show the
+          # daemon's own icon resource, so the assertion is on the INSTALLED binary:
+          # ExtractIconEx with index -1 returns how many icons a file carries — 0 for an
+          # executable with no resource. The control (L222) is na_wav_tap.exe, a console
+          # tool deliberately built without one: the same call must return 0 there, or a
+          # shell-supplied default would be counted as ours. The setup .exe's and the
+          # uninstaller's own icon come from MUI_ICON/MUI_UNIICON, asserted on the .nsi
+          # CPack generated, because an NSIS stub carries a default icon either way and a
+          # count cannot tell the two apart.
+          Add-Type -Namespace Naudio -Name Shell -MemberDefinition '[DllImport("shell32.dll", CharSet=CharSet.Unicode)] public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint n);'
+          $daemonIcons = [Naudio.Shell]::ExtractIconEx("$I\bin\na_audio_daemon.exe", -1, $null, $null, 0)
+          $tapIcons = [Naudio.Shell]::ExtractIconEx("$I\bin\na_wav_tap.exe", -1, $null, $null, 0)
+          if ($tapIcons -ne 0) {
+            Write-Output "::error::control broken: na_wav_tap.exe reports $tapIcons icon(s) and carries none — the count cannot be believed"; exit 1 }
+          if ($daemonIcons -lt 1) {
+            Write-Output "::error::na_audio_daemon.exe carries no icon resource — Explorer and the Start-menu shortcut would show the generic one"; exit 1 }
+          $nsi = Get-ChildItem build/_CPack_Packages -Recurse -Filter project.nsi | Select-Object -First 1
+          if (-not $nsi) { Write-Output "::error::CPack left no project.nsi to assert the installer icon on"; exit 1 }
+          $muiIcon = Select-String -Path $nsi.FullName -Pattern '^!define MUI_ICON "(.+)"' | Select-Object -First 1
+          if (-not $muiIcon) { Write-Output "::error::the generated .nsi defines no MUI_ICON — the setup .exe carries NSIS's default icon"; exit 1 }
+          $muiIconPath = $muiIcon.Matches[0].Groups[1].Value
+          if ($muiIconPath -notmatch 'packaging/icons/naudio\.ico$' -or -not (Test-Path -LiteralPath $muiIconPath)) {
+            Write-Output "::error::MUI_ICON is '$muiIconPath', not this checkout's packaging/icons/naudio.ico"; exit 1 }
+          if (-not (Select-String -Path $nsi.FullName -Pattern '^!define MUI_UNICON "(.+)naudio\.ico"' -Quiet)) {
+            Write-Output "::error::the generated .nsi defines no MUI_UNICON naming naudio.ico — the uninstaller carries NSIS's default icon"; exit 1 }
+          Write-Output "icon: na_audio_daemon.exe carries $daemonIcons icon group(s) (na_wav_tap.exe 0, as the control); setup and uninstaller use $muiIconPath"
 
           # The daemon, on the installed layout, doing the one thing it can do here without a
           # sound card: refuse a bad config file by name and line. --help alone would prove only

@@ -169,6 +169,26 @@ jobs:
           if ($bad) { exit 1 }
           Write-Output "== Windows tools present and startable =="
 
+      - name: Assert the daemon carries its icon resource (issue #103), with a zero-icon control
+        shell: pwsh
+        run: |
+          # The .rc is compiled into na_audio_daemon.exe alone; a build that silently dropped
+          # the resource (an RC language that failed to enable, a path the resource compiler
+          # could not open) would still produce a runnable daemon, so the binary is asked.
+          # ExtractIconEx with index -1 returns the number of icons a file carries. The control
+          # (L222) is na_wav_tap.exe, built without one: it must report 0, or a shell-supplied
+          # default is being counted. The release gate repeats this on the INSTALLED files.
+          Add-Type -Namespace Naudio -Name Shell -MemberDefinition '[DllImport("shell32.dll", CharSet=CharSet.Unicode)] public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint n);'
+          $daemon = (Get-ChildItem -Path build -Recurse -Filter na_audio_daemon.exe -File | Select-Object -First 1).FullName
+          $tap = (Get-ChildItem -Path build -Recurse -Filter na_wav_tap.exe -File | Select-Object -First 1).FullName
+          $daemonIcons = [Naudio.Shell]::ExtractIconEx($daemon, -1, $null, $null, 0)
+          $tapIcons = [Naudio.Shell]::ExtractIconEx($tap, -1, $null, $null, 0)
+          if ($tapIcons -ne 0) {
+            Write-Output "::error::control broken: na_wav_tap.exe reports $tapIcons icon(s) and carries none"; exit 1 }
+          if ($daemonIcons -lt 1) {
+            Write-Output "::error::na_audio_daemon.exe carries no icon resource — the .rc did not make it into the link"; exit 1 }
+          Write-Output "na_audio_daemon.exe carries $daemonIcons icon group(s); na_wav_tap.exe 0 (control)"
+
       - name: Test (conformance vectors + Winsock loopback smokes)
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
 
