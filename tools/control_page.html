@@ -170,10 +170,13 @@
         <select id="captureSel"></select>
         <span class="hint" id="captureHint"></span>
       </div>
+      <!-- Both pickers list devices by number, as the daemon enumerates them, but a choice is
+           saved by NAME (issue #107): numbers move when a device comes or goes, the name does
+           not. The hint under each says when the saved device has moved or is not connected. -->
       <div class="field">
         <label for="playbackSel">Send received audio to</label>
         <select id="playbackSel"></select>
-        <span class="hint">A virtual sink (BlackHole, VB-Cable, Loopback) is what a digital-mode app reads.</span>
+        <span class="hint" id="playbackHint">A virtual sink (BlackHole, VB-Cable, Loopback) is what a digital-mode app reads.</span>
       </div>
       <div class="field">
         <label for="transportSel">Transport</label>

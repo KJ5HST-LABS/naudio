@@ -60,6 +60,7 @@ function dbBar(db) { return Math.max(0, Math.min(100, ((db + 60) / 60) * 100)); 
 let settings = {};       // key -> {value, kind, lo, hi} as the daemon reported it
 let devices = null;      // {capture: [...], playback: [...]} or null before the first scan
 let devicesStale = true;
+let resolved = null;     // {capture: {id, name, how, moved, reason}, playback: {...}} or null
 let dirty = false;       // the form differs from `settings`
 let busy = false;
 let applyPending = false; // settings were saved while the stream ran; a restart applies them
@@ -99,29 +100,48 @@ function chooseInitialTab() {
 }
 
 // --- devices ----------------------------------------------------------------------------
-// The picker offers BOTH ways the daemon can name a device, because both exist in the config
-// file for a reason: an id is exact but moves when devices are re-enumerated, a name pattern
-// survives that but can match nothing. Selecting a device writes the id; "match by name"
-// keeps whatever pattern is already configured.
-function fillDeviceSelect(sel, list, dir, idKey, patKey) {
+// A device id is a position in the enumeration, and it moves when a device comes or goes; the
+// device's NAME survives that. So the picker lists devices by id, as the daemon enumerates
+// them, but a choice is SAVED as name + id (issue #107): the daemon lets the name decide and
+// uses the id only to tell two identically named devices apart. What the picker shows selected
+// is what the saved choice resolves to NOW — read off `resolved`, which the daemon computes
+// with the same rule the stream applies at start — and the hint beside it says when the device
+// has moved to a different id, or is not connected at all.
+//
+// The option's value is the device id, '' for the automatic/none choice, or 'saved' for a
+// choice that cannot be shown as a device right now (not connected, or no list yet); saving
+// with 'saved' selected leaves the file's choice exactly as it is.
+function fillDeviceSelect(sel, list, dir, idKey, patKey, res) {
   const currentId = settings[idKey] ? settings[idKey].value : '';
   const currentPat = settings[patKey] ? settings[patKey].value : '';
+  const savedLabel = currentPat ? `“${currentPat}”` : (currentId ? `device #${currentId}` : '');
   sel.replaceChildren();
 
   const auto = document.createElement('option');
   auto.value = '';
-  auto.textContent = currentPat
-    ? `Match by name: “${currentPat}”`
-    : (dir === 'capture' ? 'Automatic (first USB audio device)' : 'None — discard received audio');
+  auto.textContent = dir === 'capture' ? 'Automatic (first USB audio device)'
+                                       : 'None — discard received audio';
   sel.appendChild(auto);
 
+  const keep = (text) => {
+    const o = document.createElement('option');
+    o.value = 'saved';
+    o.textContent = text;
+    sel.appendChild(o);
+    sel.value = 'saved';
+  };
+
   if (!list) {
-    const none = document.createElement('option');
-    none.value = '';
-    none.disabled = true;
-    none.textContent = 'No device list yet — press “Rescan devices”';
-    sel.appendChild(none);
-    sel.value = '';
+    if (savedLabel) keep(`Saved: ${savedLabel} — press “Rescan devices” to see it`);
+    else {
+      const none = document.createElement('option');
+      none.value = '';
+      none.disabled = true;
+      none.textContent = 'No device list yet — press “Rescan devices”';
+      sel.appendChild(none);
+      sel.value = '';
+    }
+    sel.dataset.filled = sel.value;
     return;
   }
   for (const d of list) {
@@ -132,15 +152,50 @@ function fillDeviceSelect(sel, list, dir, idKey, patKey) {
                     (d.virtual ? ' (virtual)' : '');
     sel.appendChild(o);
   }
-  sel.value = list.some((d) => String(d.id) === currentId) ? currentId : '';
+  const r = res && res[dir];
+  if (r && r.id >= 0 && (r.how === 'name' || r.how === 'id') &&
+      list.some((d) => d.id === r.id)) {
+    sel.value = String(r.id);
+  } else if (savedLabel) {
+    // Saved, but resolving to nothing in this list — the device is not connected. Shown as
+    // such rather than as "Automatic", which would be a different choice and, on Save, would
+    // silently replace the one the operator made.
+    keep(`Saved: ${savedLabel} — not connected`);
+  } else {
+    sel.value = '';
+  }
+  sel.dataset.filled = sel.value;
+}
+
+// One line under each picker about the saved choice, when there is something to say.
+function deviceHint(dir, res) {
+  const r = res && res[dir];
+  const idKey = dir + '-id';
+  const currentId = settings[idKey] ? settings[idKey].value : '';
+  const currentPat = settings[dir] ? settings[dir].value : '';
+  if (!r || (!currentPat && !currentId)) return '';
+  if (r.how === 'none') {
+    return `Not connected: ${r.reason}. Plug it in and rescan, or choose another device.`;
+  }
+  if (r.how === 'name' && r.moved) {
+    return `“${r.name}” is now device ${r.id} (it was saved as ${currentId}); the name is what ` +
+           'is followed, so nothing needs changing.';
+  }
+  if (r.how === 'id') {
+    return `Saved by number only (device ${currentId}). Numbers change when a device is added or ` +
+           'removed; the next Save pins it by name as well.';
+  }
+  return '';
 }
 
 function renderDevices() {
-  fillDeviceSelect($('captureSel'), devices && devices.capture, 'capture', 'capture-id', 'capture');
-  fillDeviceSelect($('playbackSel'), devices && devices.playback, 'playback', 'playback-id', 'playback');
-  $('captureHint').textContent = devicesStale
+  fillDeviceSelect($('captureSel'), devices && devices.capture, 'capture', 'capture-id', 'capture', resolved);
+  fillDeviceSelect($('playbackSel'), devices && devices.playback, 'playback', 'playback-id', 'playback', resolved);
+  $('captureHint').textContent = deviceHint('capture', resolved) || (devicesStale
     ? 'This list was captured earlier — stop the stream and rescan to see a device plugged in since.'
-    : 'Pick the radio’s USB audio interface.';
+    : 'Pick the radio’s USB audio interface. It is saved by name, so it is still the radio if its number changes.');
+  $('playbackHint').textContent = deviceHint('playback', resolved) ||
+    'A virtual sink (BlackHole, VB-Cable, Loopback) is what a digital-mode app reads.';
 }
 
 async function rescan() {
@@ -148,6 +203,7 @@ async function rescan() {
     const r = await api('/api/devices');
     devices = r.devices;
     devicesStale = !!r.stale;
+    if (r.resolved !== undefined) resolved = r.resolved;
     renderDevices();
     notice($('configNotice'), 'info', devicesStale
       ? 'Device list unchanged: PortAudio cannot be re-scanned while the stream is running. Stop it first.'
@@ -194,12 +250,27 @@ function formToSettings() {
     'control-port': $('controlPortInp').value.trim(),
     autostart: $('autostartChk').checked ? 'true' : 'false',
   };
-  // A chosen device writes its id and clears the name pattern; leaving the selector on the
-  // first entry keeps whichever pattern is configured and clears the id.
-  const cap = $('captureSel').value;
-  const play = $('playbackSel').value;
-  if (cap) { out['capture-id'] = cap; out['capture'] = ''; } else { out['capture-id'] = ''; }
-  if (play) { out['playback-id'] = play; out['playback'] = ''; } else { out['playback-id'] = ''; }
+  // A chosen device is written as its NAME and its id (issue #107): the daemon follows the name
+  // and keeps the id only to tell identically named devices apart. The first entry clears both
+  // (automatic / none). 'saved' — a choice that could not be shown as a device — sends nothing,
+  // so the file keeps the choice the operator made. And a picker the operator did not touch,
+  // whose saved pattern already resolves by name, sends nothing either: a pattern typed into
+  // the file by hand ("USB Audio") is not rewritten to the full device name by a save that was
+  // about the port. A choice saved by id alone IS upgraded to name + id on any save — that is
+  // the file this issue was found in, and the name is what its author meant.
+  const device = (selId, dir, idKey, patKey) => {
+    const sel = $(selId);
+    const v = sel.value;
+    if (v === 'saved') return;
+    if (v === '') { out[idKey] = ''; out[patKey] = ''; return; }
+    const r = resolved && resolved[dir];
+    if (v === sel.dataset.filled && r && r.how === 'name') return;
+    const d = devices && devices[dir].find((x) => String(x.id) === v);
+    out[idKey] = v;
+    out[patKey] = d ? d.name : '';
+  };
+  device('captureSel', 'capture', 'capture-id', 'capture');
+  device('playbackSel', 'playback', 'playback-id', 'playback');
   return out;
 }
 
@@ -300,6 +371,11 @@ async function quitDaemon() {
 function startBlockedReason() {
   if (!setupComplete()) return 'Choose the radio’s capture device in Setup and save it.';
   if (dirty) return 'Setup has unsaved changes — save or discard them first.';
+  // The saved device is not in the current list (issue #107). Start would refuse anyway — the
+  // daemon never opens whatever now holds the saved number — but the reason belongs here, before
+  // the click, in the device's own name.
+  const r = resolved && resolved.capture;
+  if (r && r.how === 'none') return `The saved capture device is not connected: ${r.reason}.`;
   return null;
 }
 
@@ -397,6 +473,7 @@ async function load() {
   $('configPath').textContent = st.configPath || 'no writable configuration file on this machine';
   settings = st.settings;
   if (st.devices) { devices = st.devices; devicesStale = st.devicesStale; }
+  resolved = st.resolved || null;
   applySettingsToForm();
   renderStream(st.stream);
   renderService(st.service);
@@ -406,12 +483,13 @@ async function load() {
 async function poll() {
   try {
     const st = await api('/api/state');
+    // The form is left alone while the operator is editing it: overwriting a half-typed port
+    // number once a second is the classic way a live-updating page becomes unusable. Taken
+    // before the stream is rendered, since Start's reason reads `resolved`.
+    if (!dirty) { settings = st.settings; resolved = st.resolved || null; }
     renderStream(st.stream);
     // Re-rendered every poll, so a switch flipped in System Settings shows here within a second.
     renderService(st.service);
-    // The form is left alone while the operator is editing it: overwriting a half-typed port
-    // number once a second is the classic way a live-updating page becomes unusable.
-    if (!dirty) { settings = st.settings; }
   } catch (e) {
     lastState = 'error';
     $('stateBadge').className = 'badge error';
