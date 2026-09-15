@@ -80,6 +80,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+// _NSGetExecutablePath, for telling a launch from inside Network Audio Service.app apart from
+// a command line (issue #105).
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 // Set by the build (tools/CMakeLists.txt) so the control page can name the version it is part
 // of. Defaulted so the file still compiles if it is ever built outside this project's CMake.
@@ -214,13 +219,14 @@ struct SilenceWatch {
 // What the page, the log and the summaries say when the watch fires. The likely cause is named
 // per platform: on macOS the common one is a denied Microphone permission — the OS's answer to
 // "Don't Allow" is silence, not an error — so the pane that fixes it is named, along with the
-// name the service has there (TCC lists a launchd agent by its executable's file name). A muted
-// or mis-chosen input reads the same everywhere.
+// name the service has there: the agent runs from inside Network Audio Service.app, which is
+// what TCC calls it (launchedFromBundle below). A muted or mis-chosen input reads the same
+// everywhere.
 std::string silenceHint(std::int64_t silentMs) {
     const std::string secs = std::to_string(silentMs / 1000);
 #if defined(__APPLE__)
     return "macOS has delivered " + secs + " s of silence at full rate. Check System Settings › "
-           "Privacy & Security › Microphone: na_audio_daemon must be allowed (a denied "
+           "Privacy & Security › Microphone: Network Audio Service must be allowed (a denied "
            "permission is silence, not an error), then restart the stream. A muted input reads "
            "the same.";
 #else
@@ -859,10 +865,21 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
     std::string err;
     if (!server.start(&err)) {
         std::fprintf(stderr, "error: server.start failed: %s\n", err.c_str());
-        liveFail(live, "server.start failed: " + err +
-                           (a.formatDeclared ? " (the device may not support the declared rate or "
-                                               "channel count — naudio does not resample)"
-                                             : ""));
+        std::string why = "server.start failed: " + err +
+                          (a.formatDeclared ? " (the device may not support the declared rate or "
+                                              "channel count — naudio does not resample)"
+                                            : "");
+#if defined(__APPLE__)
+        // The first capture on a Mac raises the Microphone permission dialog, and CoreAudio does
+        // not always wait for the answer: the open can fail while the dialog is up (measured
+        // 2026-09-15 — err 28479 from AUHAL, with Allow clicked a few seconds later, and the
+        // next Start ran). The operator who just clicked Allow and sees this needs to know that
+        // pressing Start again is the whole fix.
+        if (err.find("Pa_OpenStream (capture)") != std::string::npos)
+            why += " — if macOS just asked whether to allow Network Audio Service to use the "
+                   "microphone, answer it and press Start again";
+#endif
+        liveFail(live, why);
         if (a.formatDeclared)
             std::fprintf(stderr, "hint: the capture device may not support %d Hz / %d ch — naudio "
                                  "does not resample. Pick a rate the device supports.\n",
@@ -2363,10 +2380,40 @@ int runControl(const Args& a, const std::string& configPath, bool openPage) {
     return 0;
 }
 
+#if defined(__APPLE__)
+// Is this process the executable of an application bundle (issue #105)? On macOS the daemon IS
+// Network Audio Service.app's executable: the launchd agent runs it from inside the bundle,
+// because TCC names a process after its bundle and after nothing else — an embedded Info.plist
+// in a bare executable was measured (2026-09-15, macOS 27) to change neither the Microphone
+// prompt nor the Privacy & Security row, which both read the file name. A double-click in the
+// Finder runs the same executable with no arguments at all, and that launch means "open the
+// control page": the arguments the bundle's launcher script used to pass.
+bool launchedFromBundle() {
+    char buf[4096];
+    std::uint32_t n = sizeof buf;
+    if (_NSGetExecutablePath(buf, &n) != 0) return false;
+    return std::strstr(buf, ".app/Contents/MacOS/") != nullptr;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
     Args args;
+
+#if defined(__APPLE__)
+    // A bare launch from inside a bundle takes the app's arguments (above). Only the bare launch:
+    // the agent passes its own, and a command line inside the bundle is still a command line.
+    static const char* const kAppLaunch[] = {"--mode", "control", "--duration-ms", "0",
+                                             "--open-page"};
+    std::vector<char*> appArgv;
+    if (argc == 1 && launchedFromBundle()) {
+        appArgv.push_back(argv[0]);
+        for (const char* s : kAppLaunch) appArgv.push_back(const_cast<char*>(s));
+        argv = appArgv.data();
+        argc = static_cast<int>(appArgv.size());
+    }
+#endif
 
     // --- Pass 1: locate and apply the config file BEFORE the flag pass — that ordering IS the
     // precedence rule (defaults < config file < flags). --help suppresses config loading

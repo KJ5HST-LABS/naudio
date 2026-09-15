@@ -137,6 +137,20 @@ if(NAUDIO_BUILD_APPS)
         set(NAUDIO_SERVICE_EXEC "${NAUDIO_SERVICE_EXEC}.exe")
     endif()
     if(APPLE)
+        # On macOS the agent runs the daemon FROM INSIDE Network Audio Service.app (issue #105),
+        # not from bin/: TCC names a process after its bundle, and after nothing else — the
+        # Microphone prompt and the Privacy & Security row for an agent run from
+        # /usr/local/bin read "na_audio_daemon" with a generic icon, and an Info.plist embedded
+        # in that executable changed neither (measured 2026-09-15, macOS 27). Run as the
+        # bundle's own executable, the same daemon is "Network Audio Service" with its icon in
+        # both places, and the usage sentence in the bundle's Info.plist is the one the prompt
+        # shows. The name and the path are owned HERE, and the plist, the postinstall and the
+        # bundle's Info.plist all take them from here, because the three must be one string:
+        # the Finder shows the on-disk name and ignores a CFBundleDisplayName that differs
+        # from it (measured 2026-09-14), and Login Items shows the display name.
+        set(NAUDIO_APP_NAME "Network Audio Service")
+        set(NAUDIO_APP_DIR "/Applications/${NAUDIO_APP_NAME}.app")
+        set(NAUDIO_SERVICE_EXEC "${NAUDIO_APP_DIR}/Contents/MacOS/na_audio_daemon")
         set(NAUDIO_SERVICE_LOGDIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/log/naudio")
         set(NAUDIO_SERVICE_LOG "${NAUDIO_SERVICE_LOGDIR}/daemon.log")
         # Where the postinstall will find the plist inside the installed payload —
@@ -170,43 +184,51 @@ if(NAUDIO_BUILD_APPS)
 
         # "Network Audio Service.app" (issue #96 item 4) — the Applications entry, because macOS
         # has no .desktop equivalent and the issue's acceptance is that the page opens from an
-        # INSTALLED shortcut. It is a launcher, not a program: a three-line script that execs the
-        # daemon in control mode. Like the plist it rides inside the payload and is placed by the
-        # postinstall, because /Applications is not under the /usr/local install prefix either.
-        # Named after the service rather than the page because on macOS this bundle is also what
-        # Login Items shows the agent as (issue #102); the Linux and Windows shortcuts below keep
-        # the page's name, having no service row that borrows an app's.
+        # INSTALLED shortcut. Since issue #105 its executable is THE DAEMON ITSELF, a second copy
+        # of na_audio_daemon: the launchd agent runs that copy (NAUDIO_SERVICE_EXEC above), so
+        # the process TCC sees is the bundle, and a double-click runs the same copy with no
+        # arguments, which the daemon takes as "open the control page" (launchedFromBundle in
+        # na_audio_daemon.cpp) — what the three-line launcher script it replaces used to pass.
+        # Like the plist it rides inside the payload and is placed by the postinstall, because
+        # /Applications is not under the /usr/local install prefix either. Named after the
+        # service rather than the page because on macOS this bundle IS the service: what Login
+        # Items shows the agent as (issue #102) and what the Microphone prompt names (#105);
+        # the Linux and Windows shortcuts below keep the page's name, having no such row.
         #
-        # THE PAYLOAD CARRIES TWO FLAT FILES, NOT A BUNDLE, and that is the whole point. Shipping
+        # THE PAYLOAD CARRIES FLAT FILES, NOT A BUNDLE, and that is the whole point. Shipping
         # the assembled `.app` inside the payload made `pkgbuild` auto-detect it and write
         # <relocate>, <strict-identifier>, <upgrade-bundle> and <bundle-version> entries into
         # PackageInfo — machinery that lets macOS Installer decide for itself where, or whether,
         # to place the bundle by consulting Spotlight for the bundle identifier. It did not place
-        # it on a CI runner, silently, while the payload listing showed the files present. Two
-        # ordinary files cannot be auto-detected as a bundle, so the postinstall's `install`
+        # it on a CI runner, silently, while the payload listing showed the files present.
+        # Ordinary files cannot be auto-detected as a bundle, so the postinstall's `install`
         # calls are the only thing that decides where this lands.
         #
-        # The same reasoning is why a SIGNED release carries the bundle's signature as loose
-        # files too (share/naudio/naudio-control.codesig/, written at cpack time by
-        # cmake/CodesignPayload.cmake, which explains why the bundle must be signed at all):
-        # a directory of data files is not a bundle either, and the postinstall installs them
-        # into Contents/_CodeSignature/ beside the other two.
+        # The same reasoning is why a SIGNED release carries the bundle's seal as loose files
+        # too (share/naudio/app.codesig/, written at cpack time by cmake/CodesignPayload.cmake,
+        # which explains why the bundle must be signed at all): a directory of data files is not
+        # a bundle either, and the postinstall installs them into Contents/_CodeSignature/
+        # beside the other pieces. The executable's own signature travels INSIDE it, as it does
+        # for any Mach-O: CodesignPayload.cmake signs the bundle and writes the bundle-signed
+        # executable back over the staged copy.
         configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/app/Info.plist.in"
                        "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.Info.plist" @ONLY)
-        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/app/naudio-control.in"
-                       "${CMAKE_CURRENT_BINARY_DIR}/naudio-control" @ONLY)
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.Info.plist"
                 DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
         # Read by the naudio_daemon_servicecheck arm: the agent's AssociatedBundleIdentifiers
-        # must be this file's CFBundleIdentifier (issue #102), asserted as a relation between
-        # the two generated files rather than as a literal either could drift from.
+        # must be this file's CFBundleIdentifier (issue #102), the agent's program must be the
+        # file's CFBundleExecutable inside the bundle named after its CFBundleName (issue
+        # #105) — asserted as relations between the two generated files rather than as
+        # literals either could drift from.
         set(NAUDIO_APP_INFO_PLIST
             "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.Info.plist" PARENT_SCOPE)
-        # PROGRAMS, not FILES: configure_file writes 0644, and LaunchServices does not report a
-        # bundle whose executable is not executable — it declines to open it, with no error the
-        # operator can act on.
-        install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/naudio-control"
-                DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
+        # The bundle's executable: the daemon, installed a SECOND time beside the plist. A
+        # target install, not a PROGRAMS copy of the build-tree file, so CPack strips it and
+        # rewrites its install RPATH exactly as it does the bin/ copy — the two must be the
+        # same bytes before signing. A symlink would not do: the kernel resolves it, so the
+        # process would be /usr/local/bin's again and TCC would name the file.
+        install(TARGETS na_audio_daemon
+                RUNTIME DESTINATION "${CMAKE_INSTALL_DATADIR}/naudio" COMPONENT tools)
         # The THIRD piece (issue #103): the bundle's icon, under the name Info.plist.in's
         # CFBundleIconFile gives it. The postinstall places it in Contents/Resources; the seal
         # covers Resources, so cmake/CodesignPayload.cmake assembles it into the bundle it
