@@ -452,6 +452,10 @@ function renderStream(s) {
   $('stateDetail').textContent = bits.join(' · ');
 
   if (s.state === 'error' && s.error) notice($('streamNotice'), 'err', s.error);
+  // A running stream whose capture is all floor is not a working stream, and the meters at
+  // -120 do not say why (issue #105). The daemon composes the sentence — the likely cause and
+  // where to fix it are its platform's — and sends it only once the floor has held long enough.
+  else if (s.state === 'running' && s.silenceHint) notice($('streamNotice'), 'warn', s.silenceHint);
   else if (s.state !== 'error') notice($('streamNotice'), null);
 
   const live = s.state === 'running';

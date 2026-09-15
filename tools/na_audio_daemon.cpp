@@ -164,14 +164,70 @@ struct SignalMeter {
     struct Snap {
         std::int64_t bytes, frames;
         double rmsL, rmsR, peakL, peakR;
+        // The running sums the RMS figures are made of, so two snapshots can be differenced
+        // into the RMS of just the frames that arrived BETWEEN them (SilenceWatch below).
+        double sumSqL, sumSqR;
     };
     Snap snapshot() const {
         std::lock_guard<std::mutex> lock(m);
         const double rmsL = frames ? std::sqrt(static_cast<double>(sumSqL / frames)) : 0.0;
         const double rmsR = frames ? std::sqrt(static_cast<double>(sumSqR / frames)) : 0.0;
-        return {bytes, frames, rmsL, rmsR, peakL, peakR};
+        return {bytes, frames, rmsL, rmsR, peakL, peakR,
+                static_cast<double>(sumSqL), static_cast<double>(sumSqR)};
     }
 };
+
+// ---- Silence watch (issue #105) ------------------------------------------------------------
+// The meter cannot tell "nothing on the band" from "nothing being captured", and on macOS the
+// second looks exactly like the first: a process whose Microphone permission was denied is
+// handed zeros at full rate and no error. The daemon captured 9 MB of them, reported PASS, and
+// the page showed a green `running` with both meters at the floor and nothing to explain it
+// (measured 2026-09-14). This watches for the shape the floor hides — frames arriving, every one
+// of them at the meter's floor, for longer than a live input is ever exactly quiet — and says
+// so. Fed once per monitor tick with the meter's snapshot; the difference from the previous
+// snapshot is that tick's interval. A stalled capture (no frames) neither counts nor resets:
+// that failure shows in the delivery figure and is a different diagnosis. Any interval with
+// signal resets it.
+struct SilenceWatch {
+    static constexpr std::int64_t kAlarmMs = 3000;  // longer than any real ADC is exactly quiet
+    std::int64_t silentMs = 0;                      // consecutive at-floor time; 0 once signal is seen
+    SignalMeter::Snap prev{};
+
+    // Returns true on the tick that crosses the alarm threshold, so a caller can log it once.
+    bool tick(const SignalMeter::Snap& s, std::int64_t dtMs) {
+        const std::int64_t frames = s.frames - prev.frames;
+        const double dL = s.sumSqL - prev.sumSqL;
+        const double dR = s.sumSqR - prev.sumSqR;
+        prev = s;
+        if (frames <= 0) return false;
+        // dbfs()'s floor: an interval RMS under one LSB on both channels is what the meters show
+        // as -120, and what a denied permission or a muted input delivers.
+        const bool floor = std::sqrt(dL / static_cast<double>(frames)) < 1.0 &&
+                           std::sqrt(dR / static_cast<double>(frames)) < 1.0;
+        const bool was = alarmed();
+        silentMs = floor ? silentMs + dtMs : 0;
+        return !was && alarmed();
+    }
+    bool alarmed() const { return silentMs >= kAlarmMs; }
+};
+
+// What the page, the log and the summaries say when the watch fires. The likely cause is named
+// per platform: on macOS the common one is a denied Microphone permission — the OS's answer to
+// "Don't Allow" is silence, not an error — so the pane that fixes it is named, along with the
+// name the service has there (TCC lists a launchd agent by its executable's file name). A muted
+// or mis-chosen input reads the same everywhere.
+std::string silenceHint(std::int64_t silentMs) {
+    const std::string secs = std::to_string(silentMs / 1000);
+#if defined(__APPLE__)
+    return "macOS has delivered " + secs + " s of silence at full rate. Check System Settings › "
+           "Privacy & Security › Microphone: na_audio_daemon must be allowed (a denied "
+           "permission is silence, not an error), then restart the stream. A muted input reads "
+           "the same.";
+#else
+    return "the capture device has delivered " + secs + " s of silence at full rate: check that "
+           "the input is not muted and that this is the radio's device.";
+#endif
+}
 
 // ---- CLI -----------------------------------------------------------------------------------
 struct Args {
@@ -198,6 +254,10 @@ struct Args {
     // between runs, and prove a saved choice follows the device, not its index. Empty means
     // PortAudio.
     std::string fakeDevices;
+    // --fake-tone (issue #105): with --fake-devices, the fake capture carries a sine at this
+    // frequency (-20 dBFS) instead of silence. It is the silence watch's negative control — a
+    // detector that only ever saw zeros has not been shown to tell them from signal. 0 = silence.
+    int fakeToneHz = 0;
 
     // Which settings BELONG IN THE FILE — the keys the config file already carried, plus the
     // ones the control page has just been asked to save. Not a setting itself; provenance.
@@ -270,6 +330,8 @@ void usage() {
         "  --fake-devices L  TESTS ONLY: enumerate the comma-separated names in L from an\n"
         "                    in-memory backend instead of PortAudio (paced silence); never a\n"
         "                    config key\n"
+        "  --fake-tone HZ    TESTS ONLY: with --fake-devices, capture a -20 dBFS sine at HZ\n"
+        "                    instead of silence (the silence diagnostic's negative control)\n"
         "  -h, --help        print this message\n\n"
         "  config file:      one `key = value` per line, '#' starts a comment line; keys are\n"
         "                    the setting names above without their leading dashes (e.g.\n"
@@ -305,10 +367,12 @@ void printDeviceList(const char* label, const std::vector<naudio::DeviceInfo>& d
 // --fake-devices named an in-memory list. The fake is deliberately dull — every name is a duplex
 // device at the declared rate, capture reads are silence paced to real time so the server's
 // capture loop neither spins nor races the meter — because its only job is to let a test
-// renumber the list between two runs of the SAME config file.
+// renumber the list between two runs of the SAME config file. Since issue #105 the silence is
+// also what the silence watch is tested against, and --fake-tone turns it into a sine so the
+// watch can be shown NOT to fire on signal.
 class FakeDeviceBackend : public naudio::DeviceBackend {
 public:
-    FakeDeviceBackend(const std::string& spec, int rate) {
+    FakeDeviceBackend(const std::string& spec, int rate, int toneHz) : toneHz_(toneHz) {
         std::size_t start = 0;
         int id = 0;
         while (start <= spec.size()) {
@@ -327,7 +391,7 @@ public:
     std::unique_ptr<naudio::CaptureStream> openCaptureStream(int backendId,
                                                             const naudio::AudioFormat& fmt) override {
         if (!has(backendId)) throw naudio::DeviceUnavailable("no fake device " + std::to_string(backendId));
-        return std::make_unique<PacedSilence>(fmt);
+        return std::make_unique<PacedCapture>(fmt, toneHz_);
     }
     std::unique_ptr<naudio::PlaybackStream> openPlaybackStream(int backendId,
                                                               const naudio::AudioFormat& fmt) override {
@@ -336,9 +400,10 @@ public:
     }
 
 private:
-    class PacedSilence : public naudio::CaptureStream {
+    // Silence by default; a -20 dBFS sine on every channel when a tone frequency was given.
+    class PacedCapture : public naudio::CaptureStream {
     public:
-        explicit PacedSilence(naudio::AudioFormat fmt) : fmt_(fmt) {}
+        PacedCapture(naudio::AudioFormat fmt, int toneHz) : fmt_(fmt), toneHz_(toneHz) {}
         naudio::IoResult read(void* buffer, int frames, int) override {
             // Paced against an absolute clock, not a per-read sleep: a sleep per read drifts
             // slow by the loop's own overhead and the delivery figure then reads 80%.
@@ -347,8 +412,21 @@ private:
             next_ += std::chrono::microseconds(static_cast<long long>(frames) * 1000000 /
                                                std::max(1, fmt_.sampleRate));
             std::this_thread::sleep_until(next_);
-            if (buffer && frames > 0)
-                std::memset(buffer, 0, static_cast<std::size_t>(frames) * fmt_.frameSize());
+            if (buffer && frames > 0) {
+                const std::size_t bytes = static_cast<std::size_t>(frames) * fmt_.frameSize();
+                std::memset(buffer, 0, bytes);
+                if (toneHz_ > 0) {
+                    auto* out = static_cast<std::uint8_t*>(buffer);
+                    const double step = 2.0 * 3.14159265358979323846 * toneHz_ /
+                                        std::max(1, fmt_.sampleRate);
+                    for (int i = 0; i < frames; ++i, ++sample_) {
+                        const auto v = static_cast<std::int16_t>(3277.0 * std::sin(step * sample_));
+                        for (int c = 0; c < fmt_.channels; ++c)
+                            std::memcpy(out + (static_cast<std::size_t>(i) * fmt_.channels + c) * 2,
+                                        &v, 2);
+                    }
+                }
+            }
             naudio::IoResult r;
             r.frames = frames;
             return r;
@@ -357,6 +435,8 @@ private:
 
     private:
         naudio::AudioFormat fmt_;
+        int toneHz_;
+        std::int64_t sample_ = 0;
         std::chrono::steady_clock::time_point next_;
     };
     bool has(int id) const {
@@ -364,10 +444,12 @@ private:
         return false;
     }
     std::vector<naudio::RawDevice> devices_;
+    int toneHz_;
 };
 
 std::unique_ptr<naudio::DeviceBackend> makeBackend(const Args& a) {
-    if (!a.fakeDevices.empty()) return std::make_unique<FakeDeviceBackend>(a.fakeDevices, a.rate);
+    if (!a.fakeDevices.empty())
+        return std::make_unique<FakeDeviceBackend>(a.fakeDevices, a.rate, a.fakeToneHz);
     return std::make_unique<naudio::PortAudioBackend>();
 }
 
@@ -559,11 +641,12 @@ int runCaptureProbe(const Args& a) {
     const int chunkFrames = (fmt.sampleRate / 10);  // ~100 ms per read
     std::vector<std::uint8_t> buf(static_cast<std::size_t>(chunkFrames) * fmt.frameSize());
     SignalMeter meter;
+    SilenceWatch silence;
     std::int64_t overflowReads = 0, totalReads = 0, framesRead = 0;
 
     const std::int64_t start = nowMs();
     const std::int64_t deadline = a.durationMs > 0 ? start + a.durationMs : 0;
-    std::int64_t nextTick = start + 1000;
+    std::int64_t nextTick = start + 1000, prevTick = start;
     std::printf("reading for %s ... (Ctrl-C to stop)\n",
                 a.durationMs > 0 ? (std::to_string(a.durationMs) + " ms").c_str() : "ever");
 
@@ -576,12 +659,18 @@ int runCaptureProbe(const Args& a) {
                           fmt.channels);
             framesRead += r.frames;
         }
-        if (nowMs() >= nextTick) {
+        if (const std::int64_t t = nowMs(); t >= nextTick) {
             const auto s = meter.snapshot();
             std::printf("  t=%2llds  frames=%-9lld  L=%.1f dBFS  R=%.1f dBFS  overflows=%lld\n",
-                        static_cast<long long>((nowMs() - start) / 1000),
+                        static_cast<long long>((t - start) / 1000),
                         static_cast<long long>(framesRead), dbfs(s.rmsL), dbfs(s.rmsR),
                         static_cast<long long>(overflowReads));
+            // Said once, when it starts, so a log read while the run is still going carries it.
+            if (silence.tick(s, t - prevTick)) {
+                std::printf("  [capture] silence: %s\n", silenceHint(silence.silentMs).c_str());
+                std::fflush(stdout);
+            }
+            prevTick = t;
             nextTick += 1000;
         }
     }
@@ -606,6 +695,10 @@ int runCaptureProbe(const Args& a) {
     std::printf("  LEFT signal    : %s\n",
                 signalLeft ? "present (real RX audio captured)"
                            : "below threshold (band quiet? wrong device? check level)");
+    // Not a gate: a quiet band is a legitimate PASS. But frames at full rate that are ALL at
+    // the floor is not a quiet band, and the line above must not be the last word on it.
+    if (silence.alarmed())
+        std::printf("  silence        : %s\n", silenceHint(silence.silentMs).c_str());
     return noOverruns ? 0 : 1;
 }
 
@@ -632,6 +725,9 @@ struct LiveStatus {
     double rmsL = 0.0, rmsR = 0.0;
     int clientErrors = 0, crcErrors = 0;
     std::int64_t queueDrops = 0, sequenceGaps = -1, fecRecovered = 0;
+    // How long the capture has been at the floor while frames kept arriving (issue #105);
+    // 0 while signal is seen. The page shows the hint once it passes SilenceWatch::kAlarmMs.
+    std::int64_t silentMs = 0;
 };
 
 // Record a failure reason for the control page. runHardware's error paths already print to
@@ -833,9 +929,11 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
         live->expectedBps = expectedBps;
         live->startedMs = start;
         live->rxBytes = live->bps = 0;
+        live->silentMs = 0;
     }
     const std::int64_t deadline = a.durationMs > 0 ? start + a.durationMs : 0;
     std::int64_t prevBytes = 0, prevMs = start, minBps = -1;
+    SilenceWatch silence;
     while (!stop.load() && (deadline == 0 || nowMs() < deadline)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         const std::int64_t t = nowMs();
@@ -847,6 +945,14 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
                     static_cast<long long>((t - start) / 1000), static_cast<long long>(s.bytes),
                     static_cast<long long>(bps), expectedBps ? 100.0 * bps / expectedBps : 0.0,
                     dbfs(s.rmsL), dbfs(s.rmsR), listener.connected.load() ? 1 : 0);
+        // The meter here is fed by the loopback CLIENT, so "frames arriving" is the whole
+        // pipeline delivering — which is exactly the case that used to read PASS on zeros.
+        // Said once, when it starts, and flushed: under a service this line is the operator's
+        // only record of it while the run is still going (the same reader as the capture line).
+        if (silence.tick(s, t - prevMs)) {
+            std::printf("  [capture] silence: %s\n", silenceHint(silence.silentMs).c_str());
+            std::fflush(stdout);
+        }
         if (live) {
             // Both snapshots are taken here, on the monitor thread, so the page never reaches
             // into the server or the client itself.
@@ -857,6 +963,7 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
             live->bps = bps;
             live->rmsL = s.rmsL;
             live->rmsR = s.rmsR;
+            live->silentMs = silence.silentMs;
             live->clients = ss.clientsConnected;
             live->crcErrors = ss.crcErrors;
             live->queueDrops = ss.queueDrops;
@@ -899,6 +1006,10 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
     std::printf("  LEFT signal    : %s\n",
                 signalLeft ? "present (real RX audio through the pipeline)"
                            : "below threshold (band quiet? check device/level)");
+    // As in capture-probe: not a gate, but the PASS above must not be the last word on a run
+    // that delivered nothing but the floor at full rate (issue #105).
+    if (silence.alarmed())
+        std::printf("  silence        : %s\n", silenceHint(silence.silentMs).c_str());
     if (realSink)
         std::printf("  virtual sink   : server RX is now flowing to '%s' — open it as the input\n"
                     "                   in your digital-mode app (or any consumer) to complete the bridge check\n",
@@ -1843,6 +1954,13 @@ private:
         // counts sequence gaps, and "0 gaps" would be a claim no one measured.
         out += ",\"sequenceGaps\":" + jnum(l.sequenceGaps);
         out += ",\"fecRecovered\":" + jnum(l.fecRecovered);
+        // The silence diagnostic (issue #105): how long the capture has been at the floor while
+        // frames arrive, and — once that is longer than a live input is ever exactly quiet —
+        // the sentence the page shows. The daemon composes it, not the page, because the
+        // likely cause and the pane to fix it in are the daemon's platform's, not the browser's.
+        const bool silent = l.state == "running" && l.silentMs >= SilenceWatch::kAlarmMs;
+        out += ",\"captureSilentMs\":" + jnum(l.state == "running" ? l.silentMs : 0);
+        out += ",\"silenceHint\":" + jstr(silent ? silenceHint(l.silentMs) : std::string());
         return out + "}";
     }
 
@@ -2305,6 +2423,17 @@ int main(int argc, char** argv) {
         // Not a Setting on purpose: a test seam must not be persistable by the page or readable
         // from a file a service starts on (issue #107).
         else if (a == "--fake-devices") args.fakeDevices = next("--fake-devices");
+        else if (a == "--fake-tone") {
+            // Strict like every other integer: a typo here would silently mean silence, and
+            // the arm that relies on the tone would then measure the wrong thing.
+            std::string verr;
+            long long hz = 0;
+            if (!parseInt("--fake-tone", next("--fake-tone"), 1, 20000, hz, verr)) {
+                std::fprintf(stderr, "error: %s\n", verr.c_str());
+                return 2;
+            }
+            args.fakeToneHz = static_cast<int>(hz);
+        }
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (const Setting* s =
                      a.compare(0, 2, "--") == 0 ? findSetting(a.substr(2)) : nullptr) {

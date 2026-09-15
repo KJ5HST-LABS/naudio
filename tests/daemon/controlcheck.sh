@@ -11,7 +11,7 @@
 # no exit code anywhere. So this arm drives the real HTTP server in the real binary and asserts
 # on status codes and bodies — never on the daemon merely having started.
 #
-# Five things are checked:
+# Six things are checked:
 #
 #   1. It serves. The page and its script come back with the right status and content type, and
 #      the script is a separate asset precisely so the page's CSP can forbid inline script — an
@@ -31,11 +31,17 @@
 #      the list renumbered between runs: the choice the page writes must resolve to the same
 #      NAME after the device before it disappears — and the stream, started, must capture that
 #      name — and must refuse by name, not open the device now holding the id, when it is gone.
+#   6. A stream of zeros is called silent, and a stream of signal is not (issue #105). The fake
+#      capture is paced zeros — what macOS hands a process whose Microphone permission was
+#      denied — so the running stream of section 4 must report itself silent with a hint; the
+#      same pipeline on a --fake-tone must not, and --mode capture-probe's summary must agree
+#      both ways.
 #
 # CONTAINMENT — why this is hardware-free despite driving the hardware tool. Control mode opens
 # no device at all until something asks it to: `--autostart false` (asserted here, not assumed)
 # means the pipeline stays idle at startup, and this script posts action=start ONLY to the
-# --fake-devices daemon of section 5, whose backend is in-memory and never touches PortAudio.
+# --fake-devices daemons of sections 4 and 5, whose backend is in-memory and never touches
+# PortAudio; the capture-probe runs of section 5 name a --fake-devices device the same way.
 # The one endpoint on the real daemon that touches PortAudio is /api/devices, which ENUMERATES
 # and opens nothing; whether even that works is decided by asking this host first (see the
 # --list-devices probe), so the assertion is definite on both kinds of machine rather than
@@ -151,7 +157,7 @@ CT='Content-Type: application/json'
 ORIGIN="Origin: http://127.0.0.1:$PORT"
 
 # ================================================================================================
-# 1/5 — it serves
+# 1/6 — it serves
 # ================================================================================================
 expect "GET /" 200 "/"
 body | grep -q 'naudio control' \
@@ -175,7 +181,7 @@ grep -qi "^content-type: text/html" "$TMP/head" \
 expect "GET /nope" 404 "/nope"
 
 # ================================================================================================
-# 2/5 — the three browser defences, each with its own positive control
+# 2/6 — the three browser defences, each with its own positive control
 # ================================================================================================
 # DNS rebinding: an attacker's hostname that resolves to 127.0.0.1 arrives with THEIR name here.
 expect "GET / with a foreign Host" 421 "/" -H "Host: evil.example"
@@ -198,7 +204,7 @@ expect "control: the same POST as application/json" 200 "/api/stream" \
     -X POST -H "$CT" -d '{"action":"stop"}'
 
 # ================================================================================================
-# 3/5 — it validates like the command line, and never half-writes
+# 3/6 — it validates like the command line, and never half-writes
 # ================================================================================================
 expect "GET /api/state" 200 "/api/state"
 [ "$(jget stream.state)" = "idle" ] \
@@ -380,7 +386,7 @@ else
 fi
 
 # ================================================================================================
-# 4/5 — a saved device follows the device, not its index (issue #107)
+# 4/6 — a saved device follows the device, not its index (issue #107)
 # ================================================================================================
 # A device id is a position in the enumeration at that moment. The operator's file on the Mac
 # that found this said `capture-id = 1`; a USB microphone that had been id 0 went away, every
@@ -395,10 +401,14 @@ FAKE_CONF="$TMP/fake.conf"
 : > "$FAKE_CONF"
 REAL_URL="$URL"
 
-start_fake_daemon() {  # start_fake_daemon <comma-separated device names>; sets URL, FAKE_PID
+start_fake_daemon() {  # start_fake_daemon <comma-separated device names> [flags...]; sets URL, FAKE_PID
+    local list="$1"; shift
     : > "$TMP/fake.log"
-    "$DAEMON" --mode control --config "$FAKE_CONF" --control-port 0 --autostart false \
-              --duration-ms 120000 --fake-devices "$1" > "$TMP/fake.log" 2>&1 &
+    # --port 0: the STREAM's port too, not just the page's. The default 4533 is the one a real
+    # service on the developer's machine is streaming on, and a bind clash there reads like the
+    # fake pipeline failing to start.
+    "$DAEMON" --mode control --config "$FAKE_CONF" --control-port 0 --port 0 --autostart false \
+              --duration-ms 120000 --fake-devices "$list" "$@" > "$TMP/fake.log" 2>&1 &
     FAKE_PID=$!
     URL=""
     for _ in $(seq 1 100); do
@@ -412,7 +422,7 @@ start_fake_daemon() {  # start_fake_daemon <comma-separated device names>; sets 
         cat "$TMP/fake.log"
         return 1
     fi
-    echo "fake daemon [$1]: $URL"
+    echo "fake daemon [$list]: $URL"
 }
 stop_fake_daemon() {
     [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2> /dev/null
@@ -473,6 +483,31 @@ if start_fake_daemon "USB Audio Device,MacBook Pro Microphone"; then
         grep -q 'server capture: device \[0\] USB Audio Device (matched by name "USB Audio Device", saved as device 1' "$TMP/fake.log" \
             && ok "  ... and the log names the device and the rule that chose it" \
             || bad "  ... the log's 'server capture' line does not say how the device was chosen"
+        # The silence diagnostic (issue #105). The fake capture is paced zeros at full rate —
+        # exactly what macOS hands a process whose Microphone permission was denied — so this
+        # running, 100%-delivering stream must be called out as silent once the floor has held
+        # for the watch's threshold: the state carries how long, the hint says what to check,
+        # and the log said so at the moment it started (ASCII prefix only — the sentence has
+        # non-ASCII in it on macOS). Polled, not slept: the threshold is 3 s of monitor ticks.
+        silent=""
+        for _ in $(seq 1 100); do
+            status "/api/state" > /dev/null
+            silent="$(jget stream.captureSilentMs)"
+            [ "${silent:-0}" -ge 3000 ] 2> /dev/null && break
+            sleep 0.1
+        done
+        if [ "${silent:-0}" -ge 3000 ] 2> /dev/null; then
+            ok "  ... a stream of zeros is reported silent after ${silent} ms at the floor"
+            case "$(jget stream.silenceHint)" in
+                *'silence at full rate'*) ok "  ... and the hint says so, naming what to check" ;;
+                *) bad "  ... but silenceHint is '$(jget stream.silenceHint)'" ;;
+            esac
+            grep -q '^  \[capture\] silence: ' "$TMP/fake.log" \
+                && ok "  ... and the log carried the line while the stream was still running" \
+                || bad "  ... the log has no '[capture] silence:' line"
+        else
+            bad "  ... captureSilentMs stayed at '${silent}' on a stream of zeros — the silence watch did not fire"
+        fi
     else
         bad "  ... the stream did not reach running (state '$got', error '$(jget stream.error)')"
     fi
@@ -523,7 +558,58 @@ if start_fake_daemon "USB Audio Device,MacBook Pro Microphone"; then
 fi
 
 # ================================================================================================
-# 5/5 — can-fail control (L222)
+# 5/6 — the silence diagnostic can tell zeros from signal (issue #105)
+# ================================================================================================
+# Run 2 showed the watch FIRING on a stream of zeros. A detector that has only ever seen zeros
+# has not been shown to be measuring anything (L222), so the same pipeline runs again with the
+# fake capture carrying a -20 dBFS tone, for longer than the threshold, and must NOT be called
+# silent. Then the same pair through --mode capture-probe, whose summary is the other place an
+# operator reads (it is what settled the original report): the silence line present on zeros,
+# absent on the tone.
+printf 'capture = USB Audio Device\ncapture-id = 0\n' > "$FAKE_CONF"
+if start_fake_daemon "USB Audio Device,MacBook Pro Microphone" --fake-tone 1000; then
+    expect "control: start the stream on a fake TONE" 200 "/api/stream" -X POST -H "$CT" -d '{"action":"start"}'
+    got="$(await_stream_state 'running|error|idle')"
+    if [ "$got" = "running" ]; then
+        # Long enough that zeros WOULD have fired (run 2 needed ~3 s), read, then judged.
+        sleep 4.5
+        status "/api/state" > /dev/null
+        rms="$(jget stream.rmsL)"
+        silent="$(jget stream.captureSilentMs)"
+        [ "${silent:-1}" = "0" ] && [ -z "$(jget stream.silenceHint)" ] \
+            && ok "control: a stream carrying a tone (L=${rms} dBFS) is not called silent" \
+            || bad "control did NOT hold — captureSilentMs=${silent}, hint='$(jget stream.silenceHint)' on a tone at L=${rms} dBFS"
+        grep -q '^  \[capture\] silence: ' "$TMP/fake.log" \
+            && bad "  ... and the log carries a silence line on a tone" \
+            || ok "  ... and the log carries no silence line"
+    else
+        bad "  ... the tone stream did not reach running (state '$got', error '$(jget stream.error)')"
+    fi
+    "$CURL" -sS -o /dev/null -X POST -H "$CT" -d '{"action":"stop"}' "${URL%/}/api/stream" 2> /dev/null
+    stop_fake_daemon
+fi
+
+probe_summary() {  # probe_summary [flags...] -> the capture-probe output, 4 s on the fake device
+    "$DAEMON" --mode capture-probe --no-config --fake-devices "USB Audio Device" \
+              --capture "USB Audio Device" --duration-ms 4000 "$@" 2>&1
+}
+if probe_summary > "$TMP/probe-zeros.log"; then
+    grep -q '^  silence        : ' "$TMP/probe-zeros.log" \
+        && ok "capture-probe on zeros: the summary carries the silence line" \
+        || { bad "capture-probe on zeros: no silence line in the summary"; tail -8 "$TMP/probe-zeros.log"; }
+else
+    bad "capture-probe on the fake device did not exit 0"; tail -8 "$TMP/probe-zeros.log"
+fi
+if probe_summary --fake-tone 1000 > "$TMP/probe-tone.log"; then
+    grep -q '^  silence        : ' "$TMP/probe-tone.log" \
+        && { bad "control did NOT hold — capture-probe on a tone carries the silence line"; tail -8 "$TMP/probe-tone.log"; } \
+        || ok "control: capture-probe on a tone carries no silence line"
+else
+    bad "capture-probe with --fake-tone did not exit 0"; tail -8 "$TMP/probe-tone.log"
+fi
+
+# ================================================================================================
+# 6/6 — can-fail control (L222)
 # ================================================================================================
 # Everything above ran against a live daemon. Re-point the same helper at a port with nothing on
 # it: if the assertions still pass, they were never reaching the server and none of this counts.
