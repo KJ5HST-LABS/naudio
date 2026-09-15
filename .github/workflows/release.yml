@@ -201,19 +201,23 @@ jobs:
           "$P/bin/na_audio_daemon" -h > /dev/null 2>&1
           "$P/bin/na_audio_source" --help > /dev/null
           "$P/bin/na_c_play_to_speakers" --help > /dev/null
-          echo "all four shipped binaries run env-free from the package"
+          # The daemon's second copy (#105): the control app's executable, carried beside
+          # the app's other pieces. Same bytes as bin/'s until signing; runs the same.
+          "$P/share/naudio/na_audio_daemon" -h > /dev/null 2>&1
+          echo "all four shipped binaries run env-free from the package (the daemon from both places)"
 
           # Self-containment: every load command outside @rpath//usr/lib//System
-          # is a finding. Cardinality-checked (L230): exactly 5 binaries scanned
-          # (2 tools + the demo pair + libnaudio). A bin/na_hamlib_bridge here
-          # would trip the count — the bridge is deliberately not packaged.
+          # is a finding. Cardinality-checked (L230): exactly 6 binaries scanned
+          # (2 tools, the daemon again as the app's executable, the demo pair,
+          # libnaudio). A bin/na_hamlib_bridge here would trip the count — the
+          # bridge is deliberately not packaged.
           scanned=0
-          for f in "$P"/bin/* "$P"/lib/libnaudio.*.*.*.dylib; do
+          for f in "$P"/bin/* "$P"/share/naudio/na_audio_daemon "$P"/lib/libnaudio.*.*.*.dylib; do
             scanned=$((scanned+1))
             bad=$(otool -L "$f" | tail -n +2 | grep -v '@rpath\|/usr/lib/\|/System/' || true)
             if [ -n "$bad" ]; then echo "::error::$f references non-system libraries:"; echo "$bad"; exit 1; fi
           done
-          [ "$scanned" -eq 5 ] || { echo "::error::expected to scan 5 binaries, scanned $scanned"; exit 1; }
+          [ "$scanned" -eq 6 ] || { echo "::error::expected to scan 6 binaries, scanned $scanned"; exit 1; }
           echo "otool scan clean over $scanned binaries"
 
           # The external-consumer gate, against the PACKAGE (find_package path).
@@ -282,16 +286,18 @@ jobs:
           /usr/local/bin/na_c_play_to_speakers --help > /dev/null
           test -f /usr/local/share/man/man1/na_audio_daemon.1
 
-          # otool self-containment on the INSTALLED files, cardinality 5 (L230).
+          # otool self-containment on the INSTALLED files, cardinality 6 (L230): the
+          # daemon in bin/ and again as the control app's executable (#105).
           scanned=0
           for f in /usr/local/bin/na_wav_tap /usr/local/bin/na_audio_daemon \
                    /usr/local/bin/na_audio_source /usr/local/bin/na_c_play_to_speakers \
+                   "$APP/Contents/MacOS/na_audio_daemon" \
                    /usr/local/lib/libnaudio.*.*.*.dylib; do
             scanned=$((scanned+1))
             bad=$(otool -L "$f" | tail -n +2 | grep -v '@rpath\|/usr/lib/\|/System/' || true)
             if [ -n "$bad" ]; then echo "::error::$f references non-system libraries:"; echo "$bad"; exit 1; fi
           done
-          [ "$scanned" -eq 5 ] || { echo "::error::expected to scan 5 installed binaries, scanned $scanned"; exit 1; }
+          [ "$scanned" -eq 6 ] || { echo "::error::expected to scan 6 installed binaries, scanned $scanned"; exit 1; }
 
           # Payload policy is runtime+tools ONLY — the absence half of the
           # control proven fireable above.
@@ -313,6 +319,15 @@ jobs:
           exec_path=$(plutil -extract ProgramArguments.0 raw -o - "$AGENT")
           test -x "$exec_path" \
             || { echo "::error::agent names '$exec_path', which the install did not create"; exit 1; }
+          # And that binary must be the control app's own executable (#105): macOS
+          # names a process in the Microphone prompt and in Privacy & Security after
+          # its bundle and after nothing else, so an agent run from bin/ is
+          # "na_audio_daemon" with a generic icon and one run from here is the
+          # service. A relation between the registered agent and the installed
+          # bundle's Info.plist, not a literal path.
+          app_exec_name=$(plutil -extract CFBundleExecutable raw -o - "$APP/Contents/Info.plist" 2>/dev/null || true)
+          [ -n "$app_exec_name" ] && [ "$exec_path" = "$APP/Contents/MacOS/$app_exec_name" ] \
+            || { echo "::error::agent runs '$exec_path', not the control app's executable '$APP/Contents/MacOS/$app_exec_name' — the Microphone prompt would name a file, not the service"; exit 1; }
 
           # The agent must NOT carry a Disabled key (#102). Until rc8 it did,
           # and Login Items then showed a switch that was ON while launchd had
@@ -392,15 +407,15 @@ jobs:
             || { echo "::error::$APP is not named after its CFBundleName ('$app_name') — the Finder would show a different name from Login Items"; exit 1; }
           [ "$app_display" = "$app_name" ] \
             || { echo "::error::$APP's CFBundleDisplayName ('$app_display') differs from its CFBundleName ('$app_name')"; exit 1; }
-          # A bundle whose executable is not executable is not opened by
-          # LaunchServices, and it says nothing about why (configure_file writes
-          # 0644, so this is the mode the CMake file(CHMOD) exists to fix).
-          test -x "$APP/Contents/MacOS/naudio-control" \
-            || { echo "::error::$APP's bundle executable is not executable"; exit 1; }
-          # It must exec a binary this install actually placed.
-          app_exec=$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$APP/Contents/MacOS/naudio-control")
-          test -x "$app_exec" \
-            || { echo "::error::$APP execs '$app_exec', which the install did not create"; exit 1; }
+          # The bundle's executable is the daemon (#105): a bundle whose executable
+          # is not executable is not opened by LaunchServices, and it says nothing
+          # about why. It must run env-free from inside the bundle, like bin/'s.
+          test -x "$APP/Contents/MacOS/$app_exec_name" \
+            || { echo "::error::$APP's executable Contents/MacOS/$app_exec_name is missing or not executable"; exit 1; }
+          "$APP/Contents/MacOS/$app_exec_name" -h > /dev/null 2>&1 \
+            || { echo "::error::$APP's executable does not run"; exit 1; }
+          test ! -e "$APP/Contents/MacOS/naudio-control" \
+            || { echo "::error::$APP still carries the pre-#105 launcher script"; exit 1; }
           # Its icon (#103): the installed plist names a file, and the postinstall
           # placed that file under Resources — a relation between two installed
           # files, not a literal name — and it is a complete .icns (iconutil
@@ -506,10 +521,12 @@ jobs:
           # bytes a user ends up running — and it needs no pkgutil --expand-full, whose
           # failure on this runner was invisible because its diagnostics go to STDOUT and an
           # earlier draft redirected that to /dev/null. Nothing here swallows output.
+          APP="/Applications/Network Audio Service.app"
           n=0
           entitled=0
           for f in /usr/local/bin/na_wav_tap /usr/local/bin/na_audio_daemon \
                    /usr/local/bin/na_audio_source /usr/local/bin/na_c_play_to_speakers \
+                   "$APP/Contents/MacOS/na_audio_daemon" \
                    /usr/local/lib/libnaudio.*.*.*.dylib; do
             test -e "$f" || { echo "::error::$f is not installed — the gate above should have"; exit 1; }
             n=$((n+1))
@@ -543,19 +560,21 @@ jobs:
             esac
             echo "  ok: $(basename "$f")"
           done
-          # Cardinality (L230), the same 5 the installer gate scans: four executables plus
-          # libnaudio. A loop that matched nothing would otherwise report success. And exactly
-          # the two capture tools entitled — a renamed tool would otherwise ship unable to hear.
-          [ "$n" -eq 5 ] || { echo "::error::expected 5 signed binaries, saw $n"; exit 1; }
-          [ "$entitled" -eq 2 ] || { echo "::error::expected 2 entitled capture tools, saw $entitled"; exit 1; }
+          # Cardinality (L230), the same 6 the installer gate scans: four executables, the
+          # daemon twice, plus libnaudio. A loop that matched nothing would otherwise report
+          # success. And exactly the capture tools entitled — both daemon copies and the
+          # source — a renamed tool would otherwise ship unable to hear.
+          [ "$n" -eq 6 ] || { echo "::error::expected 6 signed binaries, saw $n"; exit 1; }
+          [ "$entitled" -eq 3 ] || { echo "::error::expected 3 entitled capture tools, saw $entitled"; exit 1; }
 
-          # Network Audio Service.app (#102): sealed in CPack staging, carried as loose
-          # signature files, reassembled by the postinstall — so the only bundle worth
-          # verifying is the INSTALLED one. Its Team ID must be the installed daemon's:
-          # Background Task Management names the agent after the app only when they
-          # match, and drops the association silently otherwise. A relation between two
-          # installed files, not a literal team id.
-          APP="/Applications/Network Audio Service.app"
+          # Network Audio Service.app (#102, #105): sealed in CPack staging, its executable
+          # written back and its seal carried as loose files, reassembled by the postinstall
+          # — so the only bundle worth verifying is the INSTALLED one. Its Team ID must be
+          # the installed daemon's: Background Task Management names the agent after the app
+          # only when they match, and drops the association silently otherwise. A relation
+          # between two installed files, not a literal team id. And its executable must be
+          # signed AS the bundle — the identifier the seal binds it under is the bundle's,
+          # which is what TCC keys the Microphone grant on.
           codesign --verify --deep --strict "$APP" \
             || { echo "::error::$APP does not verify after the postinstall assembled it"; exit 1; }
           app_desc=$(codesign -dvv "$APP" 2>&1)
@@ -563,6 +582,10 @@ jobs:
             *"Authority=Developer ID Application"*) ;;
             *) echo "::error::$APP is not Developer ID signed"; echo "$app_desc"; exit 1 ;;
           esac
+          app_id=$(plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist")
+          exec_id=$(codesign -dvv "$APP/Contents/MacOS/na_audio_daemon" 2>&1 | sed -n 's/^Identifier=//p')
+          [ -n "$app_id" ] && [ "$exec_id" = "$app_id" ] \
+            || { echo "::error::$APP's executable is signed as '$exec_id', not as the bundle ('$app_id') — TCC would key the Microphone grant on a file, not the service"; exit 1; }
           app_team=$(printf '%s\n' "$app_desc" | sed -n 's/^TeamIdentifier=//p')
           daemon_team=$(codesign -dvv /usr/local/bin/na_audio_daemon 2>&1 | sed -n 's/^TeamIdentifier=//p')
           [ -n "$app_team" ] && [ "$app_team" = "$daemon_team" ] \

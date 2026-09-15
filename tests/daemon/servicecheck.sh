@@ -191,6 +191,31 @@ if [ "$KIND" = launchd ]; then
     while v="$(plutil -extract "ProgramArguments.$n" raw -o - "$UNIT" 2>/dev/null)"; do
         unit_args+=("$v"); n=$((n + 1))
     done
+
+    # The program is the control app's OWN executable (issue #105): macOS names a process in the
+    # Microphone prompt and in Privacy & Security after its bundle and after nothing else, so an
+    # agent run from bin/ is "na_audio_daemon" with a generic icon, and one run from inside the
+    # bundle is the service — an Info.plist embedded in the bare executable changed neither
+    # (measured 2026-09-15, macOS 27). Asserted as two relations between the generated files:
+    # the program's file name is the app plist's CFBundleExecutable, and it sits in Contents/MacOS
+    # of a bundle named after the plist's CFBundleName, the on-disk name the postinstall creates.
+    if [ -n "$APP_PLIST" ] && [ -f "$APP_PLIST" ]; then
+        exec_name="$(plutil -extract CFBundleExecutable raw -o - "$APP_PLIST" 2>/dev/null)"
+        app_name="$(plutil -extract CFBundleName raw -o - "$APP_PLIST" 2>/dev/null)"
+        prog="${unit_args[0]:-}"
+        if [ -z "$exec_name" ]; then
+            bad "the control app's Info.plist carries no CFBundleExecutable"
+        elif [ "$(basename "$prog")" != "$exec_name" ]; then
+            bad "the agent runs '$(basename "$prog")', not the control app's executable '$exec_name' — TCC would name a file, not the service"
+        else
+            ok "the agent runs the control app's own executable ($exec_name)"
+        fi
+        case "$prog" in
+            */"$app_name.app/Contents/MacOS/"*)
+                ok "... from inside $app_name.app, the bundle the postinstall assembles" ;;
+            *)  bad "the agent's program '$prog' is not inside '$app_name.app/Contents/MacOS/' — the process would not be the bundle" ;;
+        esac
+    fi
 elif [ "$KIND" = schtasks ]; then
     # A Task Scheduler logon task (issue #96 item 2, Windows half). Three of its defaults would
     # break a long-running audio service SILENTLY, so each is asserted rather than left to the

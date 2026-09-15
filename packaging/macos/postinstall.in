@@ -44,33 +44,43 @@ if [ "$console_uid" -ge 500 ] 2>/dev/null; then
 fi
 
 # "Network Audio Service.app" into /Applications (issue #96 item 4) — the shortcut that opens
-# the control page, named after the service because Login Items shows the agent under this
-# bundle's name (issue #102). Same reason as the plist: /Applications is not under the .pkg's
-# /usr/local payload prefix, so the payload carries the parts in share/naudio/ and this
-# assembles them. The on-disk name below is what the Finder shows — it ignores a
-# CFBundleDisplayName that differs from the file name — so it must equal the bundle's
-# CFBundleName; the release gate asserts that on the installed files.
+# the control page, and since issue #105 the process the service runs as: its executable is
+# a second copy of the daemon, and the agent registered above runs THAT copy, because macOS
+# names a process in the Microphone prompt and in Privacy & Security after its bundle and
+# after nothing else. Named after the service because Login Items shows the agent under this
+# bundle's name too (issue #102). Same reason as the plist: /Applications is not under the
+# .pkg's /usr/local payload prefix, so the payload carries the parts in share/naudio/ and this
+# assembles them. The on-disk name is what the Finder shows — it ignores a CFBundleDisplayName
+# that differs from the file name — so it is the bundle's CFBundleName, from the same CMake
+# variable; the release gate asserts that on the installed files.
 #
 # ASSEMBLED HERE rather than carried as a bundle. A .app inside the payload is auto-detected by
 # pkgbuild, which writes <relocate>/<strict-identifier>/<upgrade-bundle> into PackageInfo and
 # lets macOS Installer decide for itself where the bundle goes by looking the identifier up in
 # Spotlight. On a CI runner it decided not to place it at all, silently, with the files plainly
-# listed in the payload. Two ordinary files and three install(1) calls have no such opinion.
+# listed in the payload. Ordinary files and a few install(1) calls have no such opinion.
 #
 # Onto a REMOVED destination, not over a live one: a bundle updated in place can end up holding
 # files from two versions at once, and LaunchServices caches what it finds there. The bundle
 # rc7 and rc8 installed as "naudio Control.app" goes too: it carries the same identifier, and
 # two bundles with one identifier leave LaunchServices — and so Login Items — to pick either.
+#
+# The agent registered above names the executable placed here, so this block is not optional
+# on macOS: a payload without these pieces would register a service whose program does not
+# exist. The guard keeps the script honest about that rather than half-assembling.
 APP_SRC="${VOL}@NAUDIO_APP_PAYLOAD_DIR@"
-APP_DST="${VOL}/Applications/Network Audio Service.app"
+APP_DST="${VOL}@NAUDIO_APP_DIR@"
 APP_LEGACY="${VOL}/Applications/naudio Control.app"
-if [ -f "$APP_SRC/naudio-control" ] && [ -f "$APP_SRC/naudio-control.Info.plist" ]; then
+if [ -f "$APP_SRC/na_audio_daemon" ] && [ -f "$APP_SRC/naudio-control.Info.plist" ]; then
     rm -rf "$APP_DST" "$APP_LEGACY"
     install -d -m 0755 -o root -g wheel "$APP_DST/Contents/MacOS"
     install -m 0644 -o root -g wheel "$APP_SRC/naudio-control.Info.plist" \
             "$APP_DST/Contents/Info.plist"
-    install -m 0755 -o root -g wheel "$APP_SRC/naudio-control" \
-            "$APP_DST/Contents/MacOS/naudio-control"
+    # The daemon, as the bundle's executable. In a signed payload these are the bytes
+    # cmake/CodesignPayload.cmake wrote back after sealing the bundle — the executable's own
+    # signature travels inside it, and the seal below expects exactly this file.
+    install -m 0755 -o root -g wheel "$APP_SRC/na_audio_daemon" \
+            "$APP_DST/Contents/MacOS/na_audio_daemon"
     # The icon (issue #103), under the name Info.plist's CFBundleIconFile gives it. The seal
     # below covers Resources, so this file must be byte-identical to the one
     # cmake/CodesignPayload.cmake sealed — it is: both read the same staged payload file.
@@ -79,15 +89,15 @@ if [ -f "$APP_SRC/naudio-control" ] && [ -f "$APP_SRC/naudio-control.Info.plist"
         install -m 0644 -o root -g wheel "$APP_SRC/naudio.icns" \
                 "$APP_DST/Contents/Resources/naudio.icns"
     fi
-    # The bundle's Developer ID signature (issue #102), present when the payload was signed:
+    # The bundle's Developer ID seal (issue #102), present when the payload was signed:
     # codesign writes it as ordinary files under Contents/_CodeSignature/ — no extended
     # attributes — and a bundle reassembled this way verifies --deep --strict (measured;
     # cmake/CodesignPayload.cmake re-proves it on every signed package). Every file in the
     # directory, not a fixed list: the set codesign writes has varied across macOS releases.
     # An unsigned build ships no such directory and assembles the unsigned bundle as before.
-    if [ -d "$APP_SRC/naudio-control.codesig" ]; then
+    if [ -d "$APP_SRC/app.codesig" ]; then
         install -d -m 0755 -o root -g wheel "$APP_DST/Contents/_CodeSignature"
-        for sig in "$APP_SRC/naudio-control.codesig"/*; do
+        for sig in "$APP_SRC/app.codesig"/*; do
             [ -f "$sig" ] || continue
             install -m 0644 -o root -g wheel "$sig" "$APP_DST/Contents/_CodeSignature/"
         done
