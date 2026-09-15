@@ -288,6 +288,18 @@ are actions, not settings, and have no key.
 The control page writes this file when you save (see
 .B THE CONTROL PAGE
 above), so it is not a file you have to edit by hand.
+Device choices made on the page are written as
+.B capture
+and
+.B playback
+name patterns rather than
+.B capture-id
+or
+.BR playback-id .
+PortAudio ids are enumeration positions and can move when another USB, Bluetooth,
+or display audio device appears or disappears; a name continues to select the same
+device after that renumbering. Existing id-based files remain accepted and are
+migrated when the choice is next saved on the page.
 It is rewritten whole each time, which means comments you add are lost \(em
 edit it in one place or the other, not both.
 Only settings that differ from their defaults are written: a file listing

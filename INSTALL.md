@@ -207,7 +207,8 @@ The page has two tabs, **Setup** and **Stream**, in that order because the setti
 Start does. On **Setup** you:
 
 - **pick the capture device** — the radio's USB audio interface, chosen from a list rather than
-  typed as a name or an index;
+  typed by hand. The page saves its name, so adding or removing another USB, Bluetooth or display
+  audio device does not silently move the saved choice to a different enumeration index;
 - **set the transport, port, sample rate and channel count**, and save them, which writes the
   same configuration file `man na_audio_daemon` describes (so the background service below picks
   up exactly what you chose);

@@ -154,6 +154,22 @@ body | grep -q '<script src="/app.js">' \
 
 expect "GET /app.js" 200 "/app.js"
 body | grep -q "addEventListener" && ok "/app.js carries the page script" || bad "/app.js is not the script"
+# A picker choice must survive PortAudio renumbering. The HTTP half below proves that a name
+# round-trips through /api/config; these assertions prove the served page sends that name and
+# clears the transient id instead of doing the reverse. Assert on the served asset, not the source
+# file, so forgetting to embed a changed script fails this end-to-end arm too.
+body | grep -Fq "o.value = d.name" \
+    && ok "device picker values are durable names" \
+    || bad "device picker values are not device names"
+body | grep -Fq "out['capture'] = cap; out['capture-id'] = ''" \
+    && ok "saving capture writes its name and clears its enumeration id" \
+    || bad "saving capture does not migrate the enumeration id to a name"
+body | grep -Fq "out['playback'] = play; out['playback-id'] = ''" \
+    && ok "saving playback writes its name and clears its enumeration id" \
+    || bad "saving playback does not migrate the enumeration id to a name"
+body | grep -Fq 'is not currently connected' \
+    && ok "an unresolved saved device is visible to the operator" \
+    || bad "the page does not report an unresolved saved device"
 
 # The header that makes the separation worth having.
 "$CURL" -sS -D "$TMP/head" -o /dev/null "$URL" 2> /dev/null
@@ -245,7 +261,7 @@ expect "POST a bogus stream action" 400 "/api/stream" -X POST -H "$CT" -d '{"act
 
 # ---- the write that must work, and must round-trip --------------------------------------------
 expect "POST a valid settings change" 200 "/api/config" -X POST -H "$CT" \
-    -d '{"transport":"udp","port":"5001","channels":"1","autostart":"true","capture":"USB Codec"}'
+    -d '{"transport":"udp","port":"5001","channels":"1","autostart":"true","capture":"USB Codec","capture-id":""}'
 
 for want in 'transport = udp' 'port = 5001' 'channels = 1' 'autostart = true' 'capture = USB Codec'; do
     grep -qx -- "$want" "$CONF" \
@@ -276,6 +292,12 @@ expect "GET /api/state after the write" 200 "/api/state"
     || bad "the write did not reach the daemon's own settings"
 [ "$(jget settings.autostart.value)" = "true" ] && ok "the daemon now reports autostart = true" \
     || bad "autostart did not reach the daemon's settings"
+[ "$(jget settings.capture.value)" = "USB Codec" ] \
+    && ok "the durable capture name round-trips through /api/config" \
+    || bad "the durable capture name did not round-trip"
+[ -z "$(jget settings.capture-id.value)" ] \
+    && ok "the transient capture id is cleared when the name is saved" \
+    || bad "capture-id survived migration to the durable name"
 
 # The file the page wrote must be a file the daemon accepts. This is the assertion that catches a
 # renderer emitting a key the parser does not take — the page would look like it worked and the

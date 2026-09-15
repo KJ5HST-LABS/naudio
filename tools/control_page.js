@@ -99,10 +99,10 @@ function chooseInitialTab() {
 }
 
 // --- devices ----------------------------------------------------------------------------
-// The picker offers BOTH ways the daemon can name a device, because both exist in the config
-// file for a reason: an id is exact but moves when devices are re-enumerated, a name pattern
-// survives that but can match nothing. Selecting a device writes the id; "match by name"
-// keeps whatever pattern is already configured.
+// Device ids are positions in PortAudio's current enumeration and can move after a USB,
+// Bluetooth or display device appears or disappears. The picker therefore writes the selected
+// device's name pattern. Existing id-based files still resolve to the corresponding row and are
+// migrated to the name on the next save.
 function fillDeviceSelect(sel, list, dir, idKey, patKey) {
   const currentId = settings[idKey] ? settings[idKey].value : '';
   const currentPat = settings[patKey] ? settings[patKey].value : '';
@@ -110,8 +110,13 @@ function fillDeviceSelect(sel, list, dir, idKey, patKey) {
 
   const auto = document.createElement('option');
   auto.value = '';
+  const patternMatch = currentPat && list
+    ? list.find((d) => (`${d.name} ${d.hostApi}`).toLowerCase().includes(currentPat.toLowerCase()))
+    : null;
   auto.textContent = currentPat
-    ? `Match by name: “${currentPat}”`
+    ? (patternMatch
+        ? `Saved name “${currentPat}” resolves to [${patternMatch.id}] ${patternMatch.name}`
+        : `Saved name “${currentPat}” is not currently connected`)
     : (dir === 'capture' ? 'Automatic (first USB audio device)' : 'None — discard received audio');
   sel.appendChild(auto);
 
@@ -126,13 +131,18 @@ function fillDeviceSelect(sel, list, dir, idKey, patKey) {
   }
   for (const d of list) {
     const o = document.createElement('option');
-    o.value = String(d.id);
+    o.value = d.name;
+    o.dataset.deviceId = String(d.id);
     const ch = dir === 'capture' ? d.inputs : d.outputs;
     o.textContent = `[${d.id}] ${d.name} — ${ch} ch, ${Math.round(d.defaultRate)} Hz, ${d.hostApi}` +
                     (d.virtual ? ' (virtual)' : '');
     sel.appendChild(o);
   }
-  sel.value = list.some((d) => String(d.id) === currentId) ? currentId : '';
+  if (patternMatch) sel.value = patternMatch.name;
+  else {
+    const idMatch = list.find((d) => String(d.id) === currentId);
+    sel.value = idMatch ? idMatch.name : '';
+  }
 }
 
 function renderDevices() {
@@ -194,12 +204,12 @@ function formToSettings() {
     'control-port': $('controlPortInp').value.trim(),
     autostart: $('autostartChk').checked ? 'true' : 'false',
   };
-  // A chosen device writes its id and clears the name pattern; leaving the selector on the
-  // first entry keeps whichever pattern is configured and clears the id.
+  // A chosen device writes its durable name pattern and clears the enumeration id. Leaving the
+  // selector on the first entry keeps whichever pattern is configured and clears the id.
   const cap = $('captureSel').value;
   const play = $('playbackSel').value;
-  if (cap) { out['capture-id'] = cap; out['capture'] = ''; } else { out['capture-id'] = ''; }
-  if (play) { out['playback-id'] = play; out['playback'] = ''; } else { out['playback-id'] = ''; }
+  if (cap) { out['capture'] = cap; out['capture-id'] = ''; } else { out['capture-id'] = ''; }
+  if (play) { out['playback'] = play; out['playback-id'] = ''; } else { out['playback-id'] = ''; }
   return out;
 }
 
