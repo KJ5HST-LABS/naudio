@@ -93,6 +93,7 @@
 #include "naudio/PortAudioBackend.hpp"
 #include "naudio/Stream.hpp"
 #include "naudio/StreamOpener.hpp"
+#include "naudio/StringUtil.hpp"
 #include "naudio/Types.hpp"
 #include "naudio/net/AudioStreamClient.hpp"
 #include "naudio/net/AudioStreamServer.hpp"
@@ -190,6 +191,14 @@ struct Args {
     int controlPort = 8737;   // localhost-only HTTP control page; see runControl()
     bool autostart = false;   // control mode: begin capturing at startup rather than on a click
 
+    // --fake-devices (issue #107): a test seam, never a setting. Comma-separated device names
+    // enumerated from an in-memory backend INSTEAD of PortAudio, each a 2-in/2-out duplex device
+    // at the declared rate whose capture stream is paced silence. It exists so a hardware-free
+    // arm can start the daemon again and again on one config file with the list renumbered
+    // between runs, and prove a saved choice follows the device, not its index. Empty means
+    // PortAudio.
+    std::string fakeDevices;
+
     // Which settings BELONG IN THE FILE — the keys the config file already carried, plus the
     // ones the control page has just been asked to save. Not a setting itself; provenance.
     //
@@ -229,15 +238,20 @@ void usage() {
         "    control        serve the localhost control page: pick a device, save settings,\n"
         "                   start/stop the stream and watch it, all from a browser. Captures\n"
         "                   nothing until you press Start (or set autostart = true)\n\n"
-        "  --capture <pat>   capture device name substring (default: USB Audio CODEC)\n"
-        "  --capture-id N    force capture device backendId (skips name lookup)\n"
+        "  --capture <pat>   capture device name substring (default: USB Audio CODEC). A device's\n"
+        "                    exact name is preferred over a looser substring match\n"
+        "  --capture-id N    capture device backendId. Alone, it is opened as given. With\n"
+        "                    --capture it only breaks a tie between devices the pattern matches\n"
+        "                    (two identical codecs): ids renumber when a device comes or goes,\n"
+        "                    so the NAME decides, and a name that matches nothing refuses rather\n"
+        "                    than opening whatever now holds the id\n"
         "  --playback <pat>  hardware mode: client RX sink, e.g. BlackHole (the digital-mode feed);\n"
         "                    omitted/not-found => hardware-free FakeBackend drain\n"
         "                    WARNING: a pattern that matches NOTHING takes that same drain and the\n"
         "                    run can still exit 0 -- so a misspelled sink name reports a PASS for a\n"
         "                    check that never fed your digital-mode app. Confirm the 'client sink'\n"
         "                    line names a real device before trusting a hardware-mode pass.\n"
-        "  --playback-id N   force playback device backendId\n"
+        "  --playback-id N   playback device backendId; with --playback, a tie-breaker as above\n"
         "  --transport       tcp (default) | udp | dual\n"
         "  --rate HZ         capture/server sample rate, 8000..192000, divisible by 50 for an\n"
         "                    exact 20 ms frame (default 48000). naudio does NOT resample: the\n"
@@ -253,6 +267,9 @@ void usage() {
         "                    for the page's Start button (default false)\n"
         "  --open-page       control mode: open the page in the default browser at startup\n"
         "  --list-devices    enumerate capture + playback devices, then exit\n"
+        "  --fake-devices L  TESTS ONLY: enumerate the comma-separated names in L from an\n"
+        "                    in-memory backend instead of PortAudio (paced silence); never a\n"
+        "                    config key\n"
         "  -h, --help        print this message\n\n"
         "  config file:      one `key = value` per line, '#' starts a comment line; keys are\n"
         "                    the setting names above without their leading dashes (e.g.\n"
@@ -283,9 +300,80 @@ void printDeviceList(const char* label, const std::vector<naudio::DeviceInfo>& d
     }
 }
 
-int runListDevices() {
-    naudio::PortAudioBackend backend;
-    naudio::DeviceEnumerator enumerator(backend);
+// ---- the device backend, and the test seam behind it (issue #107) --------------------------
+// Everything that enumerates or opens a device goes through makeBackend(): PortAudio, unless
+// --fake-devices named an in-memory list. The fake is deliberately dull — every name is a duplex
+// device at the declared rate, capture reads are silence paced to real time so the server's
+// capture loop neither spins nor races the meter — because its only job is to let a test
+// renumber the list between two runs of the SAME config file.
+class FakeDeviceBackend : public naudio::DeviceBackend {
+public:
+    FakeDeviceBackend(const std::string& spec, int rate) {
+        std::size_t start = 0;
+        int id = 0;
+        while (start <= spec.size()) {
+            const std::size_t comma = spec.find(',', start);
+            const std::string name = spec.substr(start, comma == std::string::npos ? std::string::npos
+                                                                                   : comma - start);
+            if (!name.empty())
+                devices_.push_back(naudio::RawDevice{id++, name, "fake", 2, 2,
+                                                     static_cast<double>(rate)});
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    }
+    std::vector<naudio::RawDevice> enumerate() override { return devices_; }
+    bool probeFormat(int, const naudio::AudioFormat&, naudio::Direction) override { return true; }
+    std::unique_ptr<naudio::CaptureStream> openCaptureStream(int backendId,
+                                                            const naudio::AudioFormat& fmt) override {
+        if (!has(backendId)) throw naudio::DeviceUnavailable("no fake device " + std::to_string(backendId));
+        return std::make_unique<PacedSilence>(fmt);
+    }
+    std::unique_ptr<naudio::PlaybackStream> openPlaybackStream(int backendId,
+                                                              const naudio::AudioFormat& fmt) override {
+        if (!has(backendId)) throw naudio::DeviceUnavailable("no fake device " + std::to_string(backendId));
+        return std::make_unique<naudio::FakePlaybackStream>(fmt);
+    }
+
+private:
+    class PacedSilence : public naudio::CaptureStream {
+    public:
+        explicit PacedSilence(naudio::AudioFormat fmt) : fmt_(fmt) {}
+        naudio::IoResult read(void* buffer, int frames, int) override {
+            // Paced against an absolute clock, not a per-read sleep: a sleep per read drifts
+            // slow by the loop's own overhead and the delivery figure then reads 80%.
+            using clock = std::chrono::steady_clock;
+            if (next_ == clock::time_point{}) next_ = clock::now();
+            next_ += std::chrono::microseconds(static_cast<long long>(frames) * 1000000 /
+                                               std::max(1, fmt_.sampleRate));
+            std::this_thread::sleep_until(next_);
+            if (buffer && frames > 0)
+                std::memset(buffer, 0, static_cast<std::size_t>(frames) * fmt_.frameSize());
+            naudio::IoResult r;
+            r.frames = frames;
+            return r;
+        }
+        const naudio::AudioFormat& actualFormat() const override { return fmt_; }
+
+    private:
+        naudio::AudioFormat fmt_;
+        std::chrono::steady_clock::time_point next_;
+    };
+    bool has(int id) const {
+        for (const auto& d : devices_) if (d.backendId == id) return true;
+        return false;
+    }
+    std::vector<naudio::RawDevice> devices_;
+};
+
+std::unique_ptr<naudio::DeviceBackend> makeBackend(const Args& a) {
+    if (!a.fakeDevices.empty()) return std::make_unique<FakeDeviceBackend>(a.fakeDevices, a.rate);
+    return std::make_unique<naudio::PortAudioBackend>();
+}
+
+int runListDevices(const Args& a) {
+    auto backend = makeBackend(a);
+    naudio::DeviceEnumerator enumerator(*backend);
     printDeviceList("CAPTURE devices", enumerator.captureDevices());
     printDeviceList("PLAYBACK devices", enumerator.playbackDevices());
     std::printf(
@@ -300,36 +388,136 @@ naudio::AudioStreamConfig configFor(const std::string& transport) {
     return naudio::AudioStreamConfig{};  // tcp default
 }
 
-// Resolve the capture device into a DeviceInfo (for StreamOpener's mono-fallback policy).
-std::optional<naudio::DeviceInfo> resolveCapture(naudio::DeviceEnumerator& en, const Args& a) {
-    if (a.captureId >= 0) {
-        naudio::DeviceInfo d;
-        d.backendId = a.captureId;
-        d.captureBackendId = a.captureId;
-        d.name = "device #" + std::to_string(a.captureId);
-        return d;
+// ---- resolving a configured device against an enumeration (issue #107) ---------------------
+// A device id is a POSITION in the backend's enumeration at that moment; nothing ties it to the
+// hardware. Unplug a USB microphone before the next login and every id after it moves down one,
+// so a file that pins `capture-id = 1` follows the number, not the radio — measured on this Mac,
+// where the same file opened the laptop's microphone as "the radio" and fed the speakers back
+// into it. The name survives renumbering. So when both are saved the name decides and the id
+// only breaks a tie among the devices the name matches (two identical codecs, distinguishable
+// by nothing else), and a name that matches nothing REFUSES: opening whatever now holds the id
+// is exactly the failure, and it comes with no diagnostic because a microphone is a microphone.
+//
+// `how` says which rule chose the device, for the log line at start and the control page:
+//   name     the pattern matched; `moved` when the saved id no longer held it (or was not saved)
+//   id       an id with no pattern — a legacy file or a --capture-id flag — opened as given
+//   default  nothing saved; the built-in pattern list found one
+//   none     no device: `reason` says why, naming what now holds the saved id when it can
+struct DeviceChoice {
+    std::optional<naudio::DeviceInfo> device;
+    std::string how = "none";
+    bool moved = false;
+    std::string reason;
+};
+
+DeviceChoice resolveChoice(const std::vector<naudio::DeviceInfo>& devices, naudio::Direction dir,
+                           const std::string& pattern, int id,
+                           const std::vector<std::string>& defaults) {
+    DeviceChoice out;
+    auto atId = [&](int wanted) -> const naudio::DeviceInfo* {
+        for (const auto& d : devices)
+            if (d.backendIdFor(dir) == wanted) return &d;
+        return nullptr;
+    };
+    if (!pattern.empty()) {
+        // Every match, then the exact-name subset: a device's full name is what the page
+        // writes, and "USB Audio Device" must not settle on "USB Audio Device 2" while the
+        // device so named is present. Substring matching is kept for hand-written patterns.
+        std::vector<const naudio::DeviceInfo*> matches, exact;
+        for (const auto& d : devices) {
+            if (!naudio::DeviceEnumerator::matches(d, pattern)) continue;
+            matches.push_back(&d);
+            if (naudio::toLower(d.name) == naudio::toLower(pattern)) exact.push_back(&d);
+        }
+        const auto& pool = exact.empty() ? matches : exact;
+        if (pool.empty()) {
+            out.reason = "no device matches \"" + pattern + "\"";
+            if (const naudio::DeviceInfo* now = id >= 0 ? atId(id) : nullptr)
+                out.reason += " (device " + std::to_string(id) + " is now \"" + now->name + "\")";
+            else if (id >= 0)
+                out.reason += " (and there is no device " + std::to_string(id) + ")";
+            return out;
+        }
+        out.how = "name";
+        for (const naudio::DeviceInfo* d : pool) {
+            if (id >= 0 && d->backendIdFor(dir) == id) { out.device = *d; return out; }
+        }
+        out.device = *pool.front();
+        out.moved = id >= 0;
+        return out;
     }
-    auto caps = en.captureDevices();
-    const auto& pats = a.capturePattern.empty() ? kDefaultCapturePatterns
-                                                : std::vector<std::string>{a.capturePattern};
-    return en.find(caps, pats);
+    if (id >= 0) {
+        out.how = "id";
+        if (const naudio::DeviceInfo* found = atId(id)) {
+            out.device = *found;
+        } else {
+            // Not in this enumeration; hand PortAudio the id as given, as the flag always has,
+            // and let the open fail with its own message.
+            naudio::DeviceInfo d;
+            d.backendId = id;
+            if (dir == naudio::Direction::Capture) d.captureBackendId = id;
+            else d.playbackBackendId = id;
+            d.name = "device #" + std::to_string(id);
+            out.device = d;
+        }
+        return out;
+    }
+    // Devices outer, patterns inner — DeviceEnumerator::find's order, kept: the first DEVICE any
+    // default pattern matches, not the first pattern's match.
+    for (const auto& d : devices) {
+        for (const auto& p : defaults) {
+            if (naudio::DeviceEnumerator::matches(d, p)) {
+                out.how = "default";
+                out.device = d;
+                return out;
+            }
+        }
+    }
+    out.reason = defaults.empty() ? "no device configured" : "no device matches the default patterns";
+    return out;
+}
+
+// One sentence for the start-up log: which device, and by which rule.
+std::string describeChoice(const DeviceChoice& c, const std::string& pattern, int id) {
+    if (c.how == "name") {
+        std::string s = "matched by name \"" + pattern + "\"";
+        if (c.moved) s += ", saved as device " + std::to_string(id) + " — it moved";
+        else if (id >= 0) s += ", still device " + std::to_string(id);
+        return s;
+    }
+    if (c.how == "id") return "by id, as given";
+    if (c.how == "default") return "by the default pattern list";
+    return c.reason;
+}
+
+// Resolve the capture device into a DeviceInfo (for StreamOpener's mono-fallback policy).
+DeviceChoice resolveCapture(naudio::DeviceEnumerator& en, const Args& a) {
+    return resolveChoice(en.captureDevices(), naudio::Direction::Capture, a.capturePattern,
+                         a.captureId, kDefaultCapturePatterns);
+}
+
+DeviceChoice resolvePlayback(naudio::DeviceEnumerator& en, const Args& a) {
+    return resolveChoice(en.playbackDevices(), naudio::Direction::Playback, a.playbackPattern,
+                         a.playbackId, kDefaultVirtualSinkPatterns);
 }
 
 // ---- capture-probe mode --------------------------------------------------------------------
 int runCaptureProbe(const Args& a) {
-    naudio::PortAudioBackend backend;
-    naudio::DeviceEnumerator enumerator(backend);
-    naudio::StreamOpener opener(backend);
+    auto backend = makeBackend(a);
+    naudio::DeviceEnumerator enumerator(*backend);
+    naudio::StreamOpener opener(*backend);
 
-    auto dev = resolveCapture(enumerator, a);
+    const DeviceChoice choice = resolveCapture(enumerator, a);
+    const auto& dev = choice.device;
     if (!dev) {
-        std::fprintf(stderr, "error: no capture device matched (try --list-devices / --capture-id)\n");
+        std::fprintf(stderr, "error: no capture device matched: %s (try --list-devices)\n",
+                     choice.reason.c_str());
         return 1;
     }
     // backendIdFor: StreamOpener opens the per-direction id, so print that one rather than the
     // merged record's `backendId`, which on a split pair can name a different record entirely.
-    std::printf("capture-probe: device [%d] %s\n", dev->backendIdFor(naudio::Direction::Capture),
-                dev->name.c_str());
+    std::printf("capture-probe: device [%d] %s (%s)\n", dev->backendIdFor(naudio::Direction::Capture),
+                dev->name.c_str(), describeChoice(choice, a.capturePattern, a.captureId).c_str());
 
     naudio::AudioFormat requested;  // 48 kHz / 16-bit / stereo unless --rate/--channels declared
     requested.sampleRate = a.rate;
@@ -487,21 +675,33 @@ public:
 // process, and `live` (nullable) is the control page's window into a run in progress — every
 // number it publishes is one the loop below already computed for its own per-second line.
 int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
-    naudio::PortAudioBackend backend;
+    auto backendOwner = makeBackend(a);
+    naudio::DeviceBackend& backend = *backendOwner;
     naudio::DeviceEnumerator enumerator(backend);
 
     // --- Resolve the radio's capture device (required). ---
-    auto capDev = resolveCapture(enumerator, a);
+    const DeviceChoice capChoice = resolveCapture(enumerator, a);
+    const auto& capDev = capChoice.device;
     if (!capDev) {
-        std::fprintf(stderr, "error: no capture device matched (try --list-devices / --capture-id)\n");
-        liveFail(live, "no capture device matched — pick one from the device list");
+        // The reason names the pattern that missed and what now holds the saved id, so a
+        // renumbered enumeration reads as "your radio is not connected" rather than as a
+        // stream that started and captured the wrong microphone (issue #107).
+        std::fprintf(stderr, "error: no capture device matched: %s (try --list-devices)\n",
+                     capChoice.reason.c_str());
+        liveFail(live, "no capture device matched: " + capChoice.reason +
+                           " — plug it in and rescan, or pick another from the device list");
         return 1;
     }
     // backendIdFor, never backendId: on an ALSA-style split record the two directions live on
     // DIFFERENT backend ids and `backendId` is only the first-seen record's. Print the id that
-    // is actually opened, so the log names the device the server really uses.
+    // is actually opened, so the log names the device the server really uses — and the rule
+    // that chose it, so a device that moved is on the record.
     const int captureId = capDev->backendIdFor(naudio::Direction::Capture);
-    std::printf("server capture: device [%d] %s\n", captureId, capDev->name.c_str());
+    std::printf("server capture: device [%d] %s (%s)\n", captureId, capDev->name.c_str(),
+                describeChoice(capChoice, a.capturePattern, a.captureId).c_str());
+    // Flushed now, not at exit: under a service this line is the operator's only record of WHICH
+    // device a run opened, and a log that shows it only after the run ends answers nothing.
+    std::fflush(stdout);
 
     naudio::AudioStreamConfig cfg = configFor(a.transport);
     // #91 Phase A: the declared server-wide format (defaults match cfg's own, so this is a no-op
@@ -518,20 +718,10 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
     fmt.bitsPerSample = cfg.bitsPerSample;
     fmt.channels = cfg.channels;
 
-    std::optional<naudio::DeviceInfo> sinkDev;
-    if (a.playbackId >= 0) {
-        naudio::DeviceInfo d;
-        d.backendId = a.playbackId;
-        d.playbackBackendId = a.playbackId;
-        d.name = "device #" + std::to_string(a.playbackId);
-        sinkDev = d;
-    } else {
-        auto plays = enumerator.playbackDevices();
-        const auto& pats = a.playbackPattern.empty()
-                               ? kDefaultVirtualSinkPatterns
-                               : std::vector<std::string>{a.playbackPattern};
-        sinkDev = enumerator.find(plays, pats);
-    }
+    // Same rule as the capture side (issue #107): the name decides, the id breaks ties, and a
+    // name that matches nothing takes the drain below — never whatever now holds the id.
+    const DeviceChoice sinkChoice = resolvePlayback(enumerator, a);
+    const auto& sinkDev = sinkChoice.device;
 
     // The client is backend-agnostic; pick the backend for its REQUIRED playback line.
     naudio::FakeBackend fakeBackend;
@@ -542,8 +732,9 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
         clientBackend = &backend;  // share the one PortAudio init
         clientPlaybackId = sinkDev->backendIdFor(naudio::Direction::Playback);
         realSink = true;
-        std::printf("client sink  : device [%d] %s (real — external apps can read this)\n",
-                    clientPlaybackId, sinkDev->name.c_str());
+        std::printf("client sink  : device [%d] %s (real — external apps can read this; %s)\n",
+                    clientPlaybackId, sinkDev->name.c_str(),
+                    describeChoice(sinkChoice, a.playbackPattern, a.playbackId).c_str());
     } else {
         // Hardware-free drain: register the cfg playback format the client will open (the
         // negotiated format IS cfg's — the server announces it in AUDIO_CONFIG).
@@ -558,10 +749,10 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
         // the digital-mode app. Name the pattern that missed, so the drain is not mistaken for the
         // "no sink configured" case.
         if (!a.playbackPattern.empty()) {
-            std::printf("               NOTE: --playback '%s' matched NO device; this run does NOT\n"
-                        "               feed any external consumer, and a pass here says nothing\n"
+            std::printf("               NOTE: --playback '%s' matched NO device (%s); this run does\n"
+                        "               NOT feed any external consumer, and a pass here says nothing\n"
                         "               about your digital-mode app.\n",
-                        a.playbackPattern.c_str());
+                        a.playbackPattern.c_str(), sinkChoice.reason.c_str());
         }
     }
 
@@ -1661,16 +1852,47 @@ private:
         out += ",\"configPath\":" + jstr(configPath_);
         out += ",\"settings\":" + settingsJson();
         out += ",\"stream\":" + liveJson();
+        Args saved;
+        {
+            std::lock_guard<std::mutex> lock(settingsMutex_);
+            saved = settings_;
+        }
         {
             std::lock_guard<std::mutex> lock(devicesMutex_);
             out += ",\"devices\":" + (devicesJson_.empty() ? std::string("null") : devicesJson_);
             out += ",\"devicesStale\":" + std::string(devicesStale_ ? "true" : "false");
+            out += ",\"resolved\":" + resolvedJson(saved);
         }
         // The login service's switch (issue #102), read fresh on every poll so the page shows a
         // change made in System Settings within one poll rather than at the next page load.
         out += ",\"service\":" + serviceJson();
         out += "}";
         sendJson(sock, 200, "OK", out);
+    }
+
+    // What the SAVED device choices resolve to against the last device list (issue #107) — the
+    // same rule the pipeline applies at start, so the picker can show the device the stream
+    // would open, say when it moved to a different id, and say when it is not there at all.
+    // null until a list exists. Caller holds devicesMutex_ and passes its own copy of the
+    // settings, so the two mutexes are never nested.
+    std::string resolvedJson(const Args& s) {
+        if (devicesJson_.empty()) return "null";
+        auto one = [](const DeviceChoice& c, naudio::Direction dir) {
+            std::string o = "{\"id\":" + jnum(c.device ? c.device->backendIdFor(dir) : -1);
+            o += ",\"name\":" + jstr(c.device ? c.device->name : "");
+            o += ",\"how\":" + jstr(c.how);
+            o += ",\"moved\":" + std::string(c.moved ? "true" : "false");
+            o += ",\"reason\":" + jstr(c.reason);
+            return o + "}";
+        };
+        const DeviceChoice cap = resolveChoice(captureList_, naudio::Direction::Capture,
+                                               s.capturePattern, s.captureId,
+                                               kDefaultCapturePatterns);
+        const DeviceChoice play = resolveChoice(playbackList_, naudio::Direction::Playback,
+                                                s.playbackPattern, s.playbackId,
+                                                kDefaultVirtualSinkPatterns);
+        return "{\"capture\":" + one(cap, naudio::Direction::Capture) +
+               ",\"playback\":" + one(play, naudio::Direction::Playback) + "}";
     }
 
     // macOS only: the page's way into the pane that owns the switch (issue #102). A POST, not a
@@ -1730,23 +1952,35 @@ private:
             return;
         }
         std::string json;
+        std::vector<naudio::DeviceInfo> caps, plays;
+        Args saved;
+        {
+            std::lock_guard<std::mutex> lock(settingsMutex_);
+            saved = settings_;
+        }
         try {
-            naudio::PortAudioBackend backend;
-            naudio::DeviceEnumerator en(backend);
-            json = "{\"capture\":" + deviceArrayJson(en.captureDevices(), naudio::Direction::Capture) +
-                   ",\"playback\":" +
-                   deviceArrayJson(en.playbackDevices(), naudio::Direction::Playback) + "}";
+            auto backend = makeBackend(saved);
+            naudio::DeviceEnumerator en(*backend);
+            caps = en.captureDevices();
+            plays = en.playbackDevices();
+            json = "{\"capture\":" + deviceArrayJson(caps, naudio::Direction::Capture) +
+                   ",\"playback\":" + deviceArrayJson(plays, naudio::Direction::Playback) + "}";
         } catch (const std::exception& e) {
             sendError(sock, 500, "Internal Server Error",
                       std::string("device enumeration failed: ") + e.what());
             return;
         }
+        std::string resolved;
         {
             std::lock_guard<std::mutex> lock(devicesMutex_);
             devicesJson_ = json;
+            captureList_ = std::move(caps);
+            playbackList_ = std::move(plays);
             devicesStale_ = false;
+            resolved = resolvedJson(saved);
         }
-        sendJson(sock, 200, "OK", "{\"devices\":" + json + ",\"stale\":false}");
+        sendJson(sock, 200, "OK",
+                 "{\"devices\":" + json + ",\"stale\":false,\"resolved\":" + resolved + "}");
     }
 
     void postConfig(naudio::net::Socket& sock, const HttpRequest& req) {
@@ -1857,9 +2091,11 @@ private:
                 sendError(sock, 409, "Conflict", err);
                 return;
             }
+            // The name when there is one — it is what decides (issue #107); the id otherwise.
             std::printf("[control] pipeline starting (%s, capture '%s')\n", a.transport.c_str(),
-                        a.captureId >= 0 ? ("#" + std::to_string(a.captureId)).c_str()
-                                         : a.capturePattern.c_str());
+                        !a.capturePattern.empty() ? a.capturePattern.c_str()
+                        : a.captureId >= 0        ? ("#" + std::to_string(a.captureId)).c_str()
+                                                  : "(default)");
             std::fflush(stdout);
         }
         sendJson(sock, 200, "OK", "{\"ok\":true,\"stream\":" + liveJson() + "}");
@@ -1893,6 +2129,9 @@ private:
     int port_ = 0;
 
     std::string devicesJson_;
+    // The same list as DeviceInfo, kept so the saved choices can be resolved against it on every
+    // poll without re-enumerating (issue #107); PortAudio cannot be re-enumerated under a run.
+    std::vector<naudio::DeviceInfo> captureList_, playbackList_;
     bool devicesStale_ = true;
     std::mutex devicesMutex_;
 
@@ -2063,6 +2302,9 @@ int main(int argc, char** argv) {
         else if (a == "--no-config") {}                   // consumed in pass 1
         else if (a == "--open-page") {}                   // consumed in pass 1
         else if (a == "--list-devices") args.listDevices = true;
+        // Not a Setting on purpose: a test seam must not be persistable by the page or readable
+        // from a file a service starts on (issue #107).
+        else if (a == "--fake-devices") args.fakeDevices = next("--fake-devices");
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (const Setting* s =
                      a.compare(0, 2, "--") == 0 ? findSetting(a.substr(2)) : nullptr) {
@@ -2098,7 +2340,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, onSignal);
 
     try {
-        if (args.listDevices) return runListDevices();
+        if (args.listDevices) return runListDevices(args);
         if (args.mode == "capture-probe") return runCaptureProbe(args);
         if (args.mode == "hardware") return runHardware(args, g_stop, nullptr);
         if (args.mode == "control") return runControl(args, effectiveConfigPath, openPage);

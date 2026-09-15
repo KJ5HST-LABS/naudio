@@ -149,10 +149,16 @@ std::vector<DeviceInfo> DeviceEnumerator::playbackDevices() {
     return result;
 }
 
+bool DeviceEnumerator::matches(const DeviceInfo& device, const std::string& pattern) {
+    return containsAny(matchKey(device.name, device.hostApi), {pattern});
+}
+
 std::optional<DeviceInfo> DeviceEnumerator::find(const std::vector<DeviceInfo>& devices,
                                                  const std::vector<std::string>& patterns) const {
     for (const auto& d : devices) {
-        if (containsAny(matchKey(d.name, d.hostApi), patterns)) return d;
+        for (const auto& p : patterns) {
+            if (matches(d, p)) return d;
+        }
     }
     return std::nullopt;
 }

@@ -33,6 +33,12 @@ public:
     std::vector<DeviceInfo> captureDevices();
     std::vector<DeviceInfo> playbackDevices();
 
+    // The one predicate behind find(): does `pattern` match `device`? Case-insensitive
+    // substring of (name + " " + hostApi), the same key classification matches on. Public so a
+    // caller that needs EVERY match — or the exact-name subset of them — applies the same rule
+    // find() does rather than a copy of it.
+    static bool matches(const DeviceInfo& device, const std::string& pattern);
+
     // First device whose (name + hostApi) contains any pattern, case-insensitive.
     std::optional<DeviceInfo> find(const std::vector<DeviceInfo>& devices,
                                    const std::vector<std::string>& patterns) const;

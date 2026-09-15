@@ -11,7 +11,7 @@
 # no exit code anywhere. So this arm drives the real HTTP server in the real binary and asserts
 # on status codes and bodies — never on the daemon merely having started.
 #
-# Four things are checked:
+# Five things are checked:
 #
 #   1. It serves. The page and its script come back with the right status and content type, and
 #      the script is a separate asset precisely so the page's CSP can forbid inline script — an
@@ -26,13 +26,20 @@
 #      round-trips: what the page posts is what the file says and what the next read reports.
 #   4. It is honest about what it did not do. Every case here is decided before any device is
 #      opened; see the containment note below.
+#   5. A saved device follows the device, not its index (issue #107). A second daemon whose
+#      device list is in-memory (--fake-devices) is started four times on ONE config file with
+#      the list renumbered between runs: the choice the page writes must resolve to the same
+#      NAME after the device before it disappears — and the stream, started, must capture that
+#      name — and must refuse by name, not open the device now holding the id, when it is gone.
 #
 # CONTAINMENT — why this is hardware-free despite driving the hardware tool. Control mode opens
 # no device at all until something asks it to: `--autostart false` (asserted here, not assumed)
-# means the pipeline stays idle at startup, and this script never posts action=start. The one
-# endpoint that touches PortAudio is /api/devices, which ENUMERATES and opens nothing; whether
-# even that works is decided by asking this host first (see the --list-devices probe), so the
-# assertion is definite on both kinds of machine rather than tolerant on either.
+# means the pipeline stays idle at startup, and this script posts action=start ONLY to the
+# --fake-devices daemon of section 5, whose backend is in-memory and never touches PortAudio.
+# The one endpoint on the real daemon that touches PortAudio is /api/devices, which ENUMERATES
+# and opens nothing; whether even that works is decided by asking this host first (see the
+# --list-devices probe), so the assertion is definite on both kinds of machine rather than
+# tolerant on either.
 #
 # The arm ends with a can-fail control (L222): the same assertions are re-run against a port
 # with nothing on it, and they must fail. An arm that cannot produce a failure has not shown
@@ -56,9 +63,12 @@ TMP="$(mktemp -d)"
 CONF="$TMP/daemon.conf"
 : > "$CONF"
 DAEMON_PID=""
+FAKE_PID=""
 cleanup() {
     [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2> /dev/null
     [ -n "$DAEMON_PID" ] && wait "$DAEMON_PID" 2> /dev/null
+    [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2> /dev/null
+    [ -n "$FAKE_PID" ] && wait "$FAKE_PID" 2> /dev/null
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -141,7 +151,7 @@ CT='Content-Type: application/json'
 ORIGIN="Origin: http://127.0.0.1:$PORT"
 
 # ================================================================================================
-# 1/4 — it serves
+# 1/5 — it serves
 # ================================================================================================
 expect "GET /" 200 "/"
 body | grep -q 'naudio control' \
@@ -165,7 +175,7 @@ grep -qi "^content-type: text/html" "$TMP/head" \
 expect "GET /nope" 404 "/nope"
 
 # ================================================================================================
-# 2/4 — the three browser defences, each with its own positive control
+# 2/5 — the three browser defences, each with its own positive control
 # ================================================================================================
 # DNS rebinding: an attacker's hostname that resolves to 127.0.0.1 arrives with THEIR name here.
 expect "GET / with a foreign Host" 421 "/" -H "Host: evil.example"
@@ -188,7 +198,7 @@ expect "control: the same POST as application/json" 200 "/api/stream" \
     -X POST -H "$CT" -d '{"action":"stop"}'
 
 # ================================================================================================
-# 3/4 — it validates like the command line, and never half-writes
+# 3/5 — it validates like the command line, and never half-writes
 # ================================================================================================
 expect "GET /api/state" 200 "/api/state"
 [ "$(jget stream.state)" = "idle" ] \
@@ -370,7 +380,147 @@ else
 fi
 
 # ================================================================================================
-# 4/4 — can-fail control (L222)
+# 4/5 — a saved device follows the device, not its index (issue #107)
+# ================================================================================================
+# A device id is a position in the enumeration at that moment. The operator's file on the Mac
+# that found this said `capture-id = 1`; a USB microphone that had been id 0 went away, every
+# id after it moved down one, and the same file opened the laptop's microphone as "the radio" —
+# with no diagnostic, because a microphone is a microphone. The page now writes the device's
+# NAME beside its id, and the daemon lets the name decide. That is proved here, not described:
+# the same config file is read by three daemons whose in-memory device lists differ by one
+# device, and what each resolves — and what the started stream actually captures — is read off
+# /api/state. --fake-devices swaps PortAudio for that in-memory list; nothing here opens real
+# hardware, and the paced-silence capture the fake serves is what the stream reads.
+FAKE_CONF="$TMP/fake.conf"
+: > "$FAKE_CONF"
+REAL_URL="$URL"
+
+start_fake_daemon() {  # start_fake_daemon <comma-separated device names>; sets URL, FAKE_PID
+    : > "$TMP/fake.log"
+    "$DAEMON" --mode control --config "$FAKE_CONF" --control-port 0 --autostart false \
+              --duration-ms 120000 --fake-devices "$1" > "$TMP/fake.log" 2>&1 &
+    FAKE_PID=$!
+    URL=""
+    for _ in $(seq 1 100); do
+        URL="$(sed -n 's/^control page : //p' "$TMP/fake.log" 2> /dev/null | tr -d '\r')"
+        [ -n "$URL" ] && break
+        kill -0 "$FAKE_PID" 2> /dev/null || break
+        sleep 0.1
+    done
+    if [ -z "$URL" ]; then
+        bad "the --fake-devices daemon never announced a control page"
+        cat "$TMP/fake.log"
+        return 1
+    fi
+    echo "fake daemon [$1]: $URL"
+}
+stop_fake_daemon() {
+    [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2> /dev/null
+    [ -n "$FAKE_PID" ] && wait "$FAKE_PID" 2> /dev/null
+    FAKE_PID=""
+    URL="$REAL_URL"
+}
+# Wait for stream.state to reach one of the given values; prints the state it stopped on.
+await_stream_state() {  # await_stream_state <state>[|<state>...]
+    local want="$1" got=""
+    for _ in $(seq 1 100); do
+        status "/api/state" > /dev/null
+        got="$(jget stream.state)"
+        case "|$want|" in *"|$got|"*) break ;; esac
+        sleep 0.1
+    done
+    printf '%s' "$got"
+}
+
+# Run 1 — three devices; the radio is [1]. Save it the way the page does: name AND id.
+if start_fake_daemon "TKD Microphone,USB Audio Device,MacBook Pro Microphone"; then
+    expect "fake run 1: GET /api/devices" 200 "/api/devices"
+    [ "$(jget devices.capture)" != "" ] && ok "  ... three fake capture devices enumerate" \
+        || bad "  ... the fake list is empty"
+    expect "fake run 1: save the radio as name + id" 200 "/api/config" -X POST -H "$CT" \
+        -d '{"capture":"USB Audio Device","capture-id":"1"}'
+    grep -qx -- 'capture = USB Audio Device' "$FAKE_CONF" \
+        && ok "  ... the file carries the name" || bad "  ... the file is missing the name"
+    grep -qx -- 'capture-id = 1' "$FAKE_CONF" \
+        && ok "  ... and the id" || bad "  ... the file is missing the id"
+    expect "fake run 1: GET /api/state" 200 "/api/state"
+    [ "$(jget resolved.capture.id)" = "1" ] && [ "$(jget resolved.capture.how)" = "name" ] \
+        && [ "$(jget resolved.capture.moved)" = "false" ] \
+        && ok "  ... resolves to [1] by name, not moved" \
+        || bad "  ... resolved.capture is id=$(jget resolved.capture.id) how=$(jget resolved.capture.how) moved=$(jget resolved.capture.moved)"
+    stop_fake_daemon
+fi
+
+# Run 2 — the first device is gone: every id after it moved down one. The SAME file must open
+# the same radio, now [0]; the daemon that pinned the index would open "MacBook Pro Microphone".
+if start_fake_daemon "USB Audio Device,MacBook Pro Microphone"; then
+    expect "fake run 2: GET /api/devices after one device left" 200 "/api/devices"
+    [ "$(jget resolved.capture.id)" = "0" ] \
+        && [ "$(jget resolved.capture.name)" = "USB Audio Device" ] \
+        && [ "$(jget resolved.capture.moved)" = "true" ] \
+        && ok "  ... the saved choice resolves to [0] USB Audio Device and says it moved" \
+        || bad "  ... resolved.capture is id=$(jget resolved.capture.id) name='$(jget resolved.capture.name)' moved=$(jget resolved.capture.moved)"
+    expect "fake run 2: start the stream" 200 "/api/stream" -X POST -H "$CT" -d '{"action":"start"}'
+    got="$(await_stream_state 'running|error|idle')"
+    if [ "$got" = "running" ]; then
+        ok "  ... the stream is running"
+        [ "$(jget stream.captureName)" = "USB Audio Device" ] \
+            && ok "  ... and it captures \"USB Audio Device\", not whatever now holds id 1" \
+            || bad "  ... it captures '$(jget stream.captureName)' — the index was followed, not the device"
+        grep -q 'server capture: device \[0\] USB Audio Device (matched by name "USB Audio Device", saved as device 1 — it moved)' "$TMP/fake.log" \
+            && ok "  ... and the log names the device and the rule that chose it" \
+            || bad "  ... the log's 'server capture' line does not say how the device was chosen"
+    else
+        bad "  ... the stream did not reach running (state '$got', error '$(jget stream.error)')"
+    fi
+    expect "fake run 2: stop the stream" 200 "/api/stream" -X POST -H "$CT" -d '{"action":"stop"}'
+    [ "$(await_stream_state 'idle|error')" = "idle" ] && ok "  ... and it stopped" \
+        || bad "  ... the stream did not return to idle"
+    stop_fake_daemon
+fi
+
+# Run 3 — the radio is gone and a different device holds id 1. The name matches nothing, so the
+# choice resolves to NOTHING, and Start refuses naming the device — it must not open [1].
+if start_fake_daemon "MacBook Pro Microphone,MacBook Pro Speakers"; then
+    expect "fake run 3: GET /api/devices with the radio gone" 200 "/api/devices"
+    [ "$(jget resolved.capture.how)" = "none" ] && [ "$(jget resolved.capture.id)" = "-1" ] \
+        && ok "  ... the saved choice resolves to nothing" \
+        || bad "  ... resolved.capture is how=$(jget resolved.capture.how) id=$(jget resolved.capture.id)"
+    case "$(jget resolved.capture.reason)" in
+        *'no device matches "USB Audio Device"'*'device 1 is now "MacBook Pro Speakers"'*)
+            ok "  ... and the reason names the missing device and what holds its id now" ;;
+        *) bad "  ... the reason is '$(jget resolved.capture.reason)'" ;;
+    esac
+    expect "fake run 3: start the stream" 200 "/api/stream" -X POST -H "$CT" -d '{"action":"start"}'
+    got="$(await_stream_state 'running|error|idle')"
+    if [ "$got" = "error" ]; then
+        case "$(jget stream.error)" in
+            *'no device matches "USB Audio Device"'*) ok "  ... Start refused, naming the device" ;;
+            *) bad "  ... Start failed with '$(jget stream.error)', which does not name the device" ;;
+        esac
+    else
+        bad "  ... the stream reached '$got' (capturing '$(jget stream.captureName)') instead of refusing"
+        "$CURL" -sS -o /dev/null -X POST -H "$CT" -d '{"action":"stop"}' "${URL%/}/api/stream" 2> /dev/null
+    fi
+    stop_fake_daemon
+fi
+
+# Run 4 — a file that predates the page writing names carries the id alone. That still follows
+# the number (it is what the flag has always meant, and there is no name to prefer), which is
+# why the page upgrades such a file on its next save; asserted so the legacy path is on record
+# and this section can tell the two behaviours apart.
+printf 'capture-id = 1\n' > "$FAKE_CONF"
+if start_fake_daemon "USB Audio Device,MacBook Pro Microphone"; then
+    expect "fake run 4: GET /api/devices on a legacy id-only file" 200 "/api/devices"
+    [ "$(jget resolved.capture.how)" = "id" ] \
+        && [ "$(jget resolved.capture.name)" = "MacBook Pro Microphone" ] \
+        && ok "  ... an id alone is opened as given: [1] is \"MacBook Pro Microphone\" today" \
+        || bad "  ... resolved.capture is how=$(jget resolved.capture.how) name='$(jget resolved.capture.name)'"
+    stop_fake_daemon
+fi
+
+# ================================================================================================
+# 5/5 — can-fail control (L222)
 # ================================================================================================
 # Everything above ran against a live daemon. Re-point the same helper at a port with nothing on
 # it: if the assertions still pass, they were never reaching the server and none of this counts.

@@ -1036,8 +1036,9 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
     # the config file untouched, and that a valid write round-trips through the file and back.
     #
     # Hardware-free by construction, not by luck: control mode opens no device until something
-    # asks it to, the arm passes --autostart false and asserts the pipeline is idle, and it never
-    # posts a start.
+    # asks it to, the arm passes --autostart false and asserts the pipeline is idle, and the only
+    # start it posts goes to a second daemon whose device list is in-memory (--fake-devices),
+    # renumbered between runs to prove a saved device follows its name, not its index (#107).
     #
     # Two external tools, both LOCATED BY CMAKE and passed in rather than assumed by the script:
     # an HTTP client (found above, for the service-unit gate), and a Python to read JSON out of
