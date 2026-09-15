@@ -46,12 +46,16 @@ What the installers leave out are the files for *building software* against naud
 those are in every other format on this page.
 
 - **macOS** installs under `/usr/local` (`bin/`, `lib/`, `share/man/`), puts **Network Audio
-  Service** in `/Applications` (the entry that opens the control page), and registers the daemon
+  Service** in `/Applications` (the entry that opens the control page — and the program the
+  service runs as, so leave it there), and registers the daemon
   as a background service — listed as **Network Audio Service** under *System Settings › General
   › Login Items & Extensions* on a fresh install. Its
   switch there is the service's switch: it is on, so from your next login the daemon serves the
   control page and captures nothing until you press Start; turn it off there to stop it (see
-  *Running the daemon in the background* below). A Mac that already had the service from an
+  *Running the daemon in the background* below). The first time you press Start, macOS asks
+  whether to allow **Network Audio Service** to use the microphone — that is the radio's USB
+  audio interface; allow it (see *The microphone permission* below for what happens if you
+  don't, and how to change your answer). A Mac that already had the service from an
   earlier release keeps listing it under the developer's name: macOS names that entry once, when
   it first sees the service, and reinstalling over it does not rename it. To rename it, make
   macOS drop the old entry first: `sudo rm /Library/LaunchAgents/org.kj5hst.naudio.daemon.plist`,
@@ -223,7 +227,10 @@ Start does. On **Setup** you:
 On **Stream** you:
 
 - **start, stop and restart the stream**, and watch it: delivered percentage, connected clients,
-  per-channel levels, gaps and error counters;
+  per-channel levels, gaps and error counters. A stream whose levels sit at −120 dBFS while
+  audio is being delivered is not a working stream, and after a few seconds the page says so
+  and names the likely cause — on a Mac, a Microphone permission that was denied (see *The
+  microphone permission* below); anywhere, a muted input or the wrong device;
 - **quit the daemon**, since a program started from a shortcut has no window to close.
 
 The page opens on Setup until a capture device has been chosen, and **Start** stays off — with
@@ -254,7 +261,32 @@ Login Items & Extensions › Allow in the Background* as **Network Audio Service
 login the daemon is running and its page is a click away; turning the switch off there stops
 it and keeps it off, turning it on starts it again. There is no command to run — a
 `launchctl enable`/`disable` from the rc7 and rc8 instructions does not move that switch (the
-two are independent), so the installer clears one if you had run it.
+two are independent), so the installer clears one if you had run it. The service runs the copy
+of the daemon inside `/Applications/Network Audio Service.app` — that is what makes macOS call
+it by that name — so the app is part of the service, not just a shortcut to its page.
+
+### The microphone permission (macOS)
+
+The radio's USB audio interface is an input device, and macOS treats every input as a
+microphone: the first time the service opens it, macOS asks whether to allow **Network Audio
+Service** to access your microphone. Allow it. If the stream you had just started reports an
+error at that moment, press **Start** again — macOS sometimes fails the open while the question
+is on screen rather than waiting for your answer.
+
+If you click **Don't Allow**, nothing errors: the service keeps running, the stream starts,
+audio is delivered — and it is all silence, because that is what macOS hands a program it has
+denied. The page notices after a few seconds (the levels stay at −120 dBFS while audio arrives)
+and says so. To change your answer, open *System Settings › Privacy & Security › Microphone*,
+turn **Network Audio Service** on, and restart the stream from the page. Running
+`na_audio_daemon` from a terminal is not affected either way: there the permission belongs to
+the terminal application.
+
+Earlier releases listed the service there as `na_audio_daemon` — macOS names a program by its
+file when it runs outside an application, which is why the service now runs from inside the
+app. Upgrading from one of those, your old answer does not carry over: the next Start asks
+once more, under the new name, and the old `na_audio_daemon` row can be removed with the pane's
+**−** button. launchd also keeps the old definition of the service until you log in again (or
+turn its switch off and on in Login Items), so do that once after such an upgrade.
 
 On **Linux** the service arrives **switched off**, and turning it on is a deliberate,
 one-time step:

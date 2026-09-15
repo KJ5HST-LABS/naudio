@@ -201,6 +201,12 @@ command.
 Stream is Start / Stop / Restart / Quit for the stream, with the delivered
 percentage, connected clients, per-channel levels and error counters
 updating as it runs.
+A running stream whose levels sit at \-120 dBFS while audio keeps arriving
+is not a working stream, and the meters alone do not say why: after a few
+seconds of that the page says so and names the likely cause \(em on macOS a
+denied Microphone permission (see
+.B THE MICROPHONE PERMISSION
+below), anywhere a muted input or the wrong device.
 The page opens on Setup until a capture device has been chosen and saved,
 and
 .B Start
@@ -239,6 +245,18 @@ By hand, the equivalent is:
 na_audio_daemon \-\-mode control \-\-duration\-ms 0 \-\-open\-page
 .RE
 .fi
+.PP
+On macOS the application's executable
+.I is
+this program \(em a second copy of it, and the one the background service
+runs, because macOS names a process in the Microphone prompt and in
+.I "Privacy & Security"
+after its application and after nothing else (see
+.B THE MICROPHONE PERMISSION
+below).
+Launched with no arguments from inside an application bundle, it takes the
+three options above; with any argument at all it is the command line it
+always was.
 .SS What it is not
 The page binds
 .I 127.0.0.1
@@ -362,6 +380,12 @@ as the switch; they do not move the Login Items switch (the two are
 independent stores), so the installer clears a
 .B disable
 you may have run.
+The agent's program is the copy of this daemon inside
+.IR "/Applications/Network Audio Service.app" ,
+not the one in
+.IR /usr/local/bin ,
+so the application is part of the service and must stay where the installer
+put it.
 .PP
 On Linux the service arrives
 .I inert
@@ -446,6 +470,54 @@ launchd cannot distinguish exit statuses, so the agent instead retries every
 30 seconds and writes the same message to
 .IR /usr/local/var/log/naudio/daemon.log ,
 which is the file to read when a Mac service will not come up.
+.SH THE MICROPHONE PERMISSION
+macOS treats every audio input as a microphone, the radio's USB interface
+included, and asks before a program may open one.
+The first time the service (or the application) starts a stream, macOS asks
+whether to allow
+.B "Network Audio Service"
+to access your microphone.
+Allow it.
+If the stream that raised the question reports an error at that moment,
+press Start again: macOS sometimes fails the open while the question is on
+screen instead of waiting for the answer, and the error message says so.
+.PP
+A refusal does not look like one.
+macOS hands a denied program
+.I silence
+\(em frames at full rate, every sample zero, no error \(em so the service
+keeps running, the stream starts, audio is delivered, and the levels sit at
+\-120 dBFS.
+This daemon watches for exactly that shape: after three seconds of frames at
+the floor it prints a
+.B "[capture] silence:"
+line to its log, adds a
+.B silence
+line to the
+.B capture\-probe
+and
+.B hardware
+summaries (after the signal verdict; it is not a gate, since a quiet band is
+still a pass), and the control page shows the same sentence above the
+running stream.
+To change the answer, open
+.IR "System Settings > Privacy & Security > Microphone" ,
+turn
+.B "Network Audio Service"
+on, and restart the stream.
+A muted input reads the same and is the other thing to check.
+.PP
+The permission belongs to the process macOS attributes the request to.
+For the service that is the application, because the agent runs the copy of
+this program inside it; for a run from a terminal it is the terminal
+application, so a probe from a shell can hear a device the service cannot,
+and the other way round.
+Earlier releases ran the service from
+.I /usr/local/bin
+and macOS listed it as
+.BR na_audio_daemon ;
+that answer does not carry over, so after upgrading the next Start asks once
+more under the service's name, and the old row can be removed from the pane.
 .SH EXIT STATUS
 .TP
 .B 0
