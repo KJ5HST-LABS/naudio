@@ -182,6 +182,14 @@ function deviceHint(dir, res) {
            'is followed, so nothing needs changing.';
   }
   if (r.how === 'id') {
+    // An id the current list does not carry is handed to the backend as given (the flag's
+    // meaning), and the open fails; there is no name to pin, so say "not connected" here
+    // rather than promising the next Save something it cannot do.
+    const present = devices && devices[dir].some((d) => d.id === r.id);
+    if (!present) {
+      return `Not connected: there is no device ${currentId} in the current list. Plug it in ` +
+             'and rescan, or choose another device.';
+    }
     return `Saved by number only (device ${currentId}). Numbers change when a device is added or ` +
            'removed; the next Save pins it by name as well.';
   }
