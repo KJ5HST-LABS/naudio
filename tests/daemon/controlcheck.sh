@@ -467,7 +467,10 @@ if start_fake_daemon "USB Audio Device,MacBook Pro Microphone"; then
         [ "$(jget stream.captureName)" = "USB Audio Device" ] \
             && ok "  ... and it captures \"USB Audio Device\", not whatever now holds id 1" \
             || bad "  ... it captures '$(jget stream.captureName)' — the index was followed, not the device"
-        grep -q 'server capture: device \[0\] USB Audio Device (matched by name "USB Audio Device", saved as device 1 — it moved)' "$TMP/fake.log" \
+        # ASCII only, deliberately: the daemon's line ends "— it moved", and how MSVC encodes a
+        # non-ASCII narrow literal depends on the runner's code page (no /utf-8 is passed), so a
+        # match on the em dash would be a fact about the compiler, not the daemon.
+        grep -q 'server capture: device \[0\] USB Audio Device (matched by name "USB Audio Device", saved as device 1' "$TMP/fake.log" \
             && ok "  ... and the log names the device and the rule that chose it" \
             || bad "  ... the log's 'server capture' line does not say how the device was chosen"
     else
