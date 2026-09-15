@@ -207,7 +207,11 @@ The page has two tabs, **Setup** and **Stream**, in that order because the setti
 Start does. On **Setup** you:
 
 - **pick the capture device** — the radio's USB audio interface, chosen from a list rather than
-  typed as a name or an index;
+  typed as a name or an index. It is saved by *name*: device numbers move when something is
+  plugged in or unplugged, names do not, so the radio is still the radio after a USB microphone
+  comes or goes. The picker shows the device your choice resolves to now, says when it has moved
+  to another number, and says when it is not connected — in which case Start stays off and names
+  it rather than capturing whatever took its number;
 - **set the transport, port, sample rate and channel count**, and save them, which writes the
   same configuration file `man na_audio_daemon` describes (so the background service below picks
   up exactly what you chose);

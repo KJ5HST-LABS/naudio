@@ -67,11 +67,23 @@ External clients can connect to the same server while it runs.
 .TP
 .BI \-\-capture " pat"
 capture device name substring (default: \(lqUSB Audio CODEC\(rq).
+A device whose name equals
+.I pat
+is preferred over one that merely contains it.
 .TP
 .BI \-\-capture\-id " N"
-force the capture device by backend id (skips the name lookup).
-Ids come from
-.BR \-\-list\-devices .
+the capture device's backend id, as
+.B \-\-list\-devices
+prints it.
+On its own it is opened as given.
+Given together with
+.BR \-\-capture ,
+it only breaks a tie between devices the pattern matches (two identical
+codecs): a backend id is a position in the enumeration, and every id after a
+device that has been unplugged moves down one, so the
+.I name
+decides, and a name that matches nothing refuses to start rather than opening
+whatever holds the id now.
 .TP
 .BI \-\-playback " pat"
 hardware mode: the client's RX sink device, e.g. a virtual device feeding a
@@ -82,7 +94,11 @@ hardware-free fake backend instead (see
 below).
 .TP
 .BI \-\-playback\-id " N"
-force the playback device by backend id.
+the playback device's backend id; with
+.BR \-\-playback ,
+a tie-breaker exactly as
+.B \-\-capture\-id
+is.
 .TP
 .BI \-\-transport " tcp\fR|\fPudp\fR|\fPdual"
 server transport (default tcp).
@@ -162,6 +178,17 @@ reports, every setting in this manual as a form field, and
 .BR "Save settings" ,
 which writes the configuration file described below, so what you set on the
 page is what the service reads at your next login.
+The picker lists devices by number, but a choice is saved by
+.IR name ,
+with the number kept only to tell two identically named devices apart:
+numbers move when a device is plugged in or removed, names do not, so the
+radio stays the radio after a USB microphone comes or goes.
+What the picker shows selected is the device that choice resolves to
+.IR now ;
+the line under it says when the device has moved to another number (nothing
+to do) and when it is not connected, in which case
+.B Start
+stays off and names it.
 A
 .I "Runs at login"
 row there shows the background service's switch as the platform reports it
@@ -284,6 +311,18 @@ the wrong device or port while looking configured.
 and
 .B \-\-open\-page
 are actions, not settings, and have no key.
+.PP
+A device chosen on the control page is written as both
+.B capture
+and
+.BR capture\-id ,
+and read as described under
+.B \-\-capture\-id
+above: the name decides, the id breaks a tie.
+A file that carries
+.B capture\-id
+alone \(em written by an earlier naudio, or by hand \(em still opens that
+number as given; the page adds the name the next time you save.
 .PP
 The control page writes this file when you save (see
 .B THE CONTROL PAGE
