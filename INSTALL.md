@@ -66,14 +66,14 @@ those are in every other format on this page.
   installer, and an unsigned one needs a right-click → *Open* the first time. macOS installers have no
   uninstaller; to remove naudio, delete the installed files and forget the receipts
   (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
-- **Windows** installs into `C:\Program Files\naudio`, adds a **naudio Control** entry to the
-  Start menu, registers a logon task for the daemon (switched off until you turn it on), adds an
-  uninstaller (*Add or remove programs*, or `Uninstall.exe` in the install directory), and offers
-  to add the programs to `PATH`. The installer is unsigned, so SmartScreen warns: choose
-  *More info* → *Run anyway*.
+- **Windows** installs into `C:\Program Files\naudio`, adds **Network Audio Service** to the
+  Start menu (under *naudio*), registers a logon task for the daemon (switched off until you turn
+  it on), adds an uninstaller (*Add or remove programs*, or `Uninstall.exe` in the install
+  directory), and offers to add the programs to `PATH`. The installer is unsigned, so SmartScreen
+  warns: choose *More info* → *Run anyway*.
 
-Once it is installed, open **naudio Control** — the Start-menu entry, the desktop entry on Linux,
-or **Network Audio Service** in Applications on a Mac. It opens a page in your browser with two tabs:
+Once it is installed, open **Network Audio Service** — in the Start menu on Windows, the
+applications menu on Linux, or Applications on a Mac. It opens a page in your browser with two tabs:
 **Setup**, where you pick the radio's audio device, choose a transport and port, and save; then
 **Stream**, where you press Start. The page opens on Setup until a device is chosen, and Start waits
 until Setup is saved. Nothing captures audio until you press it.
@@ -201,11 +201,11 @@ package manager: `apt-get remove naudio`, `rpm -e naudio`, `brew uninstall naudi
 
 ## The control page — running naudio without a terminal
 
-Every package installs a shortcut that opens the page: **naudio Control** in the Start menu on
-Windows and the applications menu on Linux, `/Applications/Network Audio Service.app` on macOS
-(named after the service because that is also the name macOS lists it under in Login Items).
-Opening it starts the daemon in *control mode* and opens a page in your browser at
-`http://127.0.0.1:8737/`.
+Every package installs a shortcut that opens the page, named after the service: **Network Audio
+Service** in the Start menu on Windows and the applications menu on Linux, and
+`/Applications/Network Audio Service.app` on macOS, where that is also the name Login Items lists
+the service under. Opening it starts the daemon in *control mode* and opens a page in your browser
+at `http://127.0.0.1:8737/`.
 
 The page has two tabs, **Setup** and **Stream**, in that order because the settings decide what
 Start does. On **Setup** you:
@@ -222,7 +222,8 @@ Start does. On **Setup** you:
 - **see whether the service runs at login** — *Runs at login: On / Off / Not installed*, read
   from the platform's own switch every second. On a Mac the row's **Open Login Items…** button
   takes you to the pane that owns that switch (the page shows it; only System Settings can move
-  it); on Linux the row names the `systemctl --user` command.
+  it); on Linux and Windows the row names the command that flips it (`systemctl --user` and
+  `schtasks /Change`, the lines under *Running the daemon in the background* below).
 
 On **Stream** you:
 
@@ -295,6 +296,9 @@ one-time step:
 systemctl --user enable --now naudio-daemon
 ```
 
+The unit is `naudio-daemon`, which is what the commands take; `systemctl --user status
+naudio-daemon` describes it as **Network Audio Service**, the same name the other platforms show.
+
 Both run the daemon as **you**, not as a system account — that is what lets it reach your
 microphone and your sound system at all. The settings it uses come from the configuration
 file described in `man na_audio_daemon` (*CONFIGURATION FILE*); the service reads that file
@@ -320,7 +324,8 @@ schtasks /Change /TN "\naudio\naudio-daemon" /ENABLE
 schtasks /Run    /TN "\naudio\naudio-daemon"
 ```
 
-Turn it off again with `/DISABLE`, or from *Task Scheduler* under the **naudio** folder. Windows
+Turn it off again with `/DISABLE`, or from *Task Scheduler* under the **naudio** folder, where the
+task is `naudio-daemon` and its description names it **Network Audio Service**. Windows
 does not capture a task's output anywhere, so there is no equivalent of the log file above: a
 configuration mistake shows up as `LastTaskResult` 2 on the task, and on the control page.
 

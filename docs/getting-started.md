@@ -115,8 +115,9 @@ network involved (frame counts, overflow detection, signal levels), a `hardware`
 that serves the device while continuously measuring throughput, and a `control` mode that
 serves all of it as a page on `127.0.0.1` — pick the device from a list, save the settings,
 start and stop the stream, and watch it run, without a command line. The binary packages
-install a **naudio Control** shortcut that opens it, and register the daemon to start at
-login (switched off until you turn it on). Its manual page covers all three. If you only
+install a **Network Audio Service** shortcut that opens it, and register the daemon to start at
+login under that name (switched off until you turn it on, except on a Mac, where the Login Items
+switch is on). Its manual page covers all three. If you only
 want audio on the network, `na_audio_source` is enough.
 
 ## 8. For radio amateurs

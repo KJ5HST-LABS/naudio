@@ -195,9 +195,13 @@ row there shows the background service's switch as the platform reports it
 (On, Off, or Not installed), re-read every second; on macOS its
 .I "Open Login Items"
 button opens the pane that owns the switch, since only System Settings
-can move it, and on Linux the row names the
-.B systemctl \-\-user
-command.
+can move it, and on Linux and Windows the row names the command that
+flips it
+.RB ( "systemctl \-\-user"
+and
+.BR "schtasks /Change" ,
+given under
+.IR "SERVICE REGISTRATION" ).
 Stream is Start / Stop / Restart / Quit for the stream, with the delivered
 percentage, connected clients, per-channel levels and error counters
 updating as it runs.
@@ -217,13 +221,12 @@ the Stream tab says so and offers
 .BR Restart ,
 which applies them.
 .PP
-The installed packages create a shortcut that opens it: a
-.B naudio Control
-entry in the Windows Start menu, a
-.B naudio Control
-desktop entry on Linux, and
+The installed packages create a shortcut that opens it, named after the
+service:
+.B "Network Audio Service"
+in the Windows Start menu and the Linux applications menu, and
 .I "/Applications/Network Audio Service.app"
-on macOS \(em named after the service because a fresh install lists the
+on macOS \(em where a fresh install also lists the
 background service described below under that same name in
 .IR "System Settings > General > Login Items & Extensions" ;
 a Mac that already had the service from an earlier release keeps listing it
@@ -400,6 +403,14 @@ systemctl \-\-user enable \-\-now naudio\-daemon
 .RE
 .fi
 .PP
+The unit is
+.IR naudio\-daemon ,
+which is what the commands take;
+.B systemctl \-\-user status
+describes it as
+.BR "Network Audio Service" ,
+the name the other platforms show.
+.PP
 Both are session-scoped rather than system services, because capturing audio
 is a session privilege: a root daemon can never be granted a microphone by
 macOS, and a system-scope unit cannot reach your PipeWire or PulseAudio
@@ -412,7 +423,9 @@ the configuration file says; every other setting comes from that file.
 On Windows the installer registers a Task Scheduler
 .I logon task
 named
-.IR \(rsnaudio\(rsnaudio\-daemon .
+.IR \(rsnaudio\(rsnaudio\-daemon ,
+described there as
+.BR "Network Audio Service" .
 Enable it from Task Scheduler, or with:
 .PP
 .nf
