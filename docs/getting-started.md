@@ -120,19 +120,20 @@ login under that name (switched off until you turn it on, except on a Mac, where
 switch is on). Its manual page covers all three. If you only
 want audio on the network, `na_audio_source` is enough.
 
-## 8. For radio amateurs
+## 8. The Hamlib bridge (optional)
 
-naudio's original habitat: put a receiver's audio on the network by streaming its USB
-audio codec (steps 3–4, with the radio as the capture device), and record decoder-ready
-WAV files with `na_wav_tap` — it writes 12 kHz mono, aligned to FT8 periods with
-`--align15`, and the evidence-grade verification procedure lives in
-**[on-air-verification.md](on-air-verification.md)**. The optional `na_hamlib_bridge`
-connects naudio to Hamlib's rig-audio streaming API for rigs whose audio arrives through
-Hamlib rather than a sound device; it works hardware-free against Hamlib's test rig
-today, but no released Hamlib (and no real rig backend yet) supports the API it needs, so
-it is a from-source build and deliberately not in the binary packages — shipping it would
-embed a frozen pre-release hamlib beside whatever hamlib your other radio software uses.
-Status and build instructions: **[hamlib-streaming-bridge.md](hamlib-streaming-bridge.md)**.
+Everything above is generic: any capture device, any listener. The one piece of naudio that
+is specific to a domain is the optional `na_hamlib_bridge`, which connects naudio to the
+[Hamlib](https://github.com/Hamlib/Hamlib) rig-control project's audio-streaming API for
+equipment whose audio arrives through Hamlib rather than through a sound device. It works
+hardware-free against Hamlib's test rig today, but no released Hamlib (and no real backend
+yet) supports the API it needs, so it is a from-source build and deliberately not in the
+binary packages — shipping it would embed a frozen pre-release hamlib beside whatever hamlib
+your other software uses. Status and build instructions:
+**[hamlib-streaming-bridge.md](hamlib-streaming-bridge.md)**. The end-to-end verification
+procedure written around that use case — a capture device on one machine, a listener on
+another, and `na_wav_tap` recording what arrives for offline analysis — is
+**[on-air-verification.md](on-air-verification.md)**.
 
 ## Where next
 

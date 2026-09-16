@@ -24,15 +24,16 @@ third-party consumer of the shipped library receives \(em not what an
 internal buffer held.
 .PP
 It needs no audio device of its own, which makes it the natural remote end
-of an on-air check: run the server on the machine with the radio, run
+of an end-to-end check: run the server on the machine with the capture
+device, run
 .B na_wav_tap
-anywhere else, and feed the resulting WAV to a decoder (for a digital mode,
-\(lqthe audio survived the trip\(rq becomes objective \(em it either still
-decodes to real callsigns or it does not).
+anywhere else, and analyse the resulting WAV offline (for a signal a
+program can decode, \(lqthe audio survived the trip\(rq becomes objective
+\(em it either still decodes or it does not).
 .PP
 When the negotiated sample rate divides by 12000 (48\ kHz, 24\ kHz and
 12\ kHz all do), the output is downmixed to mono at 12000\ Hz \(em the rate
-WSJT-X-family decoders read.
+narrow-band analysis programs commonly read.
 Otherwise the file carries the negotiated rate unchanged.
 .B na_wav_tap
 takes no format flags: it reads the negotiated format back from the library
@@ -47,14 +48,14 @@ naudio server to connect to (default 127.0.0.1).
 server port (default 4533).
 .TP
 .BI \-\-seconds " S"
-record length in seconds (default 15, one FT8 period).
+record length in seconds (default 15).
 .TP
 .BI \-\-out " F"
 output WAV path (default tap.wav).
 .TP
 .B \-\-align15
-wait for a wall-clock 15-second boundary before recording, so the file
-aligns with FT8/FT4 transmit periods.
+wait for a wall-clock 15-second boundary before recording, so files from
+different machines line up on the same period.
 .TP
 .B \-\-tcp
 use TCP instead of the default UDP_WAN reliability profile.
@@ -82,11 +83,11 @@ na_wav_tap \-\-seconds 5 \-\-out hello.wav
 .RE
 .fi
 .PP
-Record one aligned FT8 period from the radio machine, for decoding:
+Record one aligned 15-second period from the serving machine, for analysis:
 .PP
 .nf
 .RS
-na_wav_tap \-\-host radio\-host \-\-port 4533 \-\-seconds 15 \-\-align15 \-\-out period.wav
+na_wav_tap \-\-host server\-host \-\-port 4533 \-\-seconds 15 \-\-align15 \-\-out period.wav
 .RE
 .fi
 .SH SEE ALSO

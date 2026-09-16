@@ -21,8 +21,8 @@ now; see the note under Option C.)
 > and a Windows setup `.exe`), TGZ for Linux and macOS, DEB, RPM, a Windows ZIP, and
 > `sha256sums.txt` — from the release page, or with
 > `gh release download v1.0.0rc9 -R KJ5HST-LABS/naudio`. The repository is public; the
-> Homebrew tap is not yet, and installs over ssh (Option B). naudio is ahead of its planned
-> Hamlib contribution, and this page is written for the durable state.
+> Homebrew tap is not yet, and installs over ssh (Option B). This page is written for the
+> durable state.
 
 ## Option A — binary release packages
 
@@ -30,7 +30,7 @@ Packages are attached to tagged releases on the
 [Releases page](https://github.com/KJ5HST-LABS/naudio/releases), named
 `naudio-<version>-<os>-<arch>` with a `sha256sums.txt` beside them. They are
 self-contained: the audio engine is built in, and nothing needs to be installed first.
-One thing is deliberately **not** in the packages: the optional Hamlib radio bridge
+One thing is deliberately **not** in the packages: the optional Hamlib bridge
 (`na_hamlib_bridge`), because it needs a version of Hamlib that has not been released
 yet. It joins the packages the day one is; until then it builds from source
 (`docs/hamlib-streaming-bridge.md`).
@@ -51,8 +51,8 @@ those are in every other format on this page.
   switch there is the service's switch: it is on, so from your next login the daemon serves the
   control page and captures nothing until you press Start; turn it off there to stop it (see
   *Running the daemon in the background* below). The first time you press Start, macOS asks
-  whether to allow **Network Audio Service** to use the microphone — that is the radio's USB
-  audio interface; allow it (see *The microphone permission* below for what happens if you
+  whether to allow **Network Audio Service** to use the microphone — macOS calls every audio
+  input a microphone, a USB audio interface included; allow it (see *The microphone permission* below for what happens if you
   don't, and how to change your answer). A Mac that already had the service from an
   earlier release keeps listing it under the developer's name: macOS names that entry once, when
   it first sees the service, and reinstalling over it does not rename it. To rename it, make
@@ -72,7 +72,7 @@ those are in every other format on this page.
 
 Once it is installed, open **Network Audio Service** — in the Start menu on Windows, the
 applications menu on Linux, or Applications on a Mac. It opens a page in your browser with two tabs:
-**Setup**, where you pick the radio's audio device, choose a transport and port, and save; then
+**Setup**, where you pick the capture device, choose a transport and port, and save; then
 **Stream**, where you press Start. The page opens on Setup until a device is chosen, and Start waits
 until Setup is saved. Nothing captures audio until you press it.
 
@@ -208,9 +208,9 @@ at `http://127.0.0.1:8737/`.
 The page has two tabs, **Setup** and **Stream**, in that order because the settings decide what
 Start does. On **Setup** you:
 
-- **pick the capture device** — the radio's USB audio interface, chosen from a list rather than
+- **pick the capture device** — the device whose audio you are streaming, chosen from a list rather than
   typed as a name or an index. It is saved by *name*: device numbers move when something is
-  plugged in or unplugged, names do not, so the radio is still the radio after a USB microphone
+  plugged in or unplugged, names do not, so your device is still your device after a USB microphone
   comes or goes. The picker shows the device your choice resolves to now, says when it has moved
   to another number, and says when it is not connected — in which case Start stays off and names
   it rather than capturing whatever took its number;
@@ -266,7 +266,7 @@ it by that name — so the app is part of the service, not just a shortcut to it
 
 ### The microphone permission (macOS)
 
-The radio's USB audio interface is an input device, and macOS treats every input as a
+A USB audio interface is an input device, and macOS treats every input as a
 microphone: the first time the service opens it, macOS asks whether to allow **Network Audio
 Service** to access your microphone. Allow it. If the stream you had just started reports an
 error at that moment, press **Start** again — macOS sometimes fails the open while the question

@@ -37,7 +37,7 @@ na_audio_daemon \- serve a real capture device as a naudio stream, or probe it
 .B na_audio_daemon
 is the hardware driver of the naudio toolkit: it opens a
 .I real
-audio capture device (a radio's USB codec, a sound card, a microphone) and
+audio capture device (a USB audio interface, a sound card, a microphone) and
 either probes it directly or serves its audio as a naudio (net-audio
 protocol) stream that any naudio client can receive \(em
 .BR na_wav_tap (1),
@@ -86,8 +86,8 @@ decides, and a name that matches nothing refuses to start rather than opening
 whatever holds the id now.
 .TP
 .BI \-\-playback " pat"
-hardware mode: the client's RX sink device, e.g. a virtual device feeding a
-digital-mode application.
+hardware mode: the client's RX sink device, e.g. a virtual device that another
+application reads from.
 When omitted \(em or when the pattern matches nothing \(em audio drains to a
 hardware-free fake backend instead (see
 .B CAVEATS
@@ -182,7 +182,7 @@ The picker lists devices by number, but a choice is saved by
 .IR name ,
 with the number kept only to tell two identically named devices apart:
 numbers move when a device is plugged in or removed, names do not, so the
-radio stays the radio after a USB microphone comes or goes.
+device is still the same device after a USB microphone comes or goes.
 What the picker shows selected is the device that choice resolves to
 .IR now ;
 the line under it says when the device has moved to another number (nothing
@@ -291,7 +291,7 @@ per line; the key is the option's name without its leading dashes:
 .PP
 .nf
 .RS
-# the radio's codec, served over UDP until stopped
+# a USB audio interface, served over UDP until stopped
 capture = USB Audio CODEC
 transport = udp
 port = 4533
@@ -484,7 +484,7 @@ launchd cannot distinguish exit statuses, so the agent instead retries every
 .IR /usr/local/var/log/naudio/daemon.log ,
 which is the file to read when a Mac service will not come up.
 .SH THE MICROPHONE PERMISSION
-macOS treats every audio input as a microphone, the radio's USB interface
+macOS treats every audio input as a microphone, a USB audio interface
 included, and asks before a program may open one.
 The first time the service (or the application) starts a stream, macOS asks
 whether to allow
@@ -553,7 +553,7 @@ check that never fed your application.
 Confirm the \(lqclient sink\(rq line in the output names a real device
 before trusting a hardware-mode pass.
 .SH EXAMPLES
-Find the radio's audio device:
+Find the capture device:
 .PP
 .nf
 .RS

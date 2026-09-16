@@ -18,11 +18,11 @@ Three things ship here:
 - **An open wire protocol** (*net-audio*, magic `0xAF01`), fully specified and frozen, so
   independent implementations can interoperate.
 
-naudio grew out of amateur radio — streaming a receiver's audio to operators and digital-mode
-software elsewhere on a network — and that remains a first-class use. But nothing in the library
-is radio-specific: it is a general-purpose audio transport. The one radio-specific piece, an
-optional bridge to the [Hamlib](https://github.com/Hamlib/Hamlib) rig-control project, is a
-separate bolt-on tool (off by default, built only on request) documented in
+naudio is a general-purpose audio transport: a capture device on one machine, listeners on
+others, over a network that may lose or reorder packets. Nothing in the library or the tools
+assumes what the audio is or where it comes from. The one exception is an optional bridge to the
+[Hamlib](https://github.com/Hamlib/Hamlib) rig-control project — a separate bolt-on tool, off by
+default and built only on request, documented in
 **[docs/hamlib-streaming-bridge.md](docs/hamlib-streaming-bridge.md)**.
 
 > **On the names:** *net-audio* is the wire **protocol** — the frozen `0xAF01` frame contract defined in [the spec](docs/audio-streaming-protocol-v1.md). *naudio* is this C/C++ **toolkit** that implements it. There is no separate "net-audio" package to find or install; the protocol name and this repository are the whole story.
@@ -33,7 +33,7 @@ separate bolt-on tool (off by default, built only on request) documented in
 - **Wire spec:** **[docs/audio-streaming-protocol-v1.md](docs/audio-streaming-protocol-v1.md)** — the frozen `0xAF01` v1 contract.
 - **Protocols overview:** **[docs/protocols.md](docs/protocols.md)** — the wire format at a glance.
 - **Conformance:** **[conformance/README.md](conformance/README.md)** — language-neutral golden vectors that pin every normative value in the wire spec.
-- **For radio amateurs:** **[docs/on-air-verification.md](docs/on-air-verification.md)** — verifying the toolkit against a real radio.
+- **Live verification:** **[docs/on-air-verification.md](docs/on-air-verification.md)** — verifying the toolkit end to end against real hardware (written around the Hamlib bridge's use case).
 
 
 ---
@@ -74,7 +74,7 @@ documented procedures rather than by CI; see **Known limitations** below.
 | `naudio_core` | static lib | **Pure, portable logic** — no fork/exec, no PortAudio, no sockets. Device classification/merge, format probing, the mono→stereo open policy, the `0xAF01` codec, and the reliability primitives (jitter / FEC / reorder / control-ACK). Fully unit-tested via a fake backend. |
 | `naudio_pa` | static lib | `naudio_core` + the PortAudio device backend. |
 | `naudio_net` | static lib | The transport layer — TCP/UDP sockets, per-client threads, the multi-tenant `AudioStreamServer`, and `AudioStreamClient`. Backend-agnostic (takes a `DeviceBackend*`). |
-| `naudio` | **shared lib** | The public artifact: the **C ABI** (`include/naudio.h`) over the internal backends, exporting **only** the `na_*` surface (hidden visibility + `SOVERSION`). This is what a C / Hamlib consumer links and what `make install` ships, alongside `naudio.pc`. |
+| `naudio` | **shared lib** | The public artifact: the **C ABI** (`include/naudio.h`) over the internal backends, exporting **only** the `na_*` surface (hidden visibility + `SOVERSION`). This is what a C consumer links and what `make install` ships, alongside `naudio.pc`. |
 | `tools/` | apps | The **device-serving daemon** (`na_audio_daemon`), which streams a real capture device, serves a localhost control page for configuring and running itself, and doubles as the hardware diagnostic (it exercises the live-device path the hardware-free test suite cannot reach); the **stream recorder** (`na_wav_tap`), which saves what a client receives as a WAV file; and the optional **Hamlib streaming bridge** (`na_hamlib_bridge`) — a radio-specific bolt-on, off by default, needing a libhamlib no release ships yet: see **[docs/hamlib-streaming-bridge.md](docs/hamlib-streaming-bridge.md)**. |
 | `examples/` | apps | The **examples suite** — a "play to speakers" client in C, C++, Python, Java, and Rust, plus `na_audio_source`, the demo server. The C client and the demo server **ship in the binary packages** as the out-of-the-box demo pair. Each example links the public shared `naudio` and uses **only** `naudio.h`, proving the C ABI is self-sufficient from C and from any FFI consumer. See **[examples/README.md](examples/README.md)**. |
 
@@ -107,7 +107,7 @@ shipped tools.
 
 ## The C ABI (`include/naudio.h`)
 
-For C / Hamlib / Python(+ffi) consumers. The implementation is C++ internally, so link the shared
+For C / Python(+ffi) consumers. The implementation is C++ internally, so link the shared
 `naudio` (the `naudio_c_abi_smoke` and `naudio_c_net_smoke` ctests are the C-callability proofs). The
 ABI has two surfaces.
 
@@ -367,7 +367,7 @@ consumer. The byte-identity tell for a correctly received stream is
   `netrigctl` only relays a remote backend that does not have it either — so the bridge's
   real-backend behaviour (format negotiation against real caps, `-k` keying around TX bursts, a
   short write from a radio that will not take a full buffer) is **unverified**, not merely untested.
-  The device layer *can* be verified with a radio today via its USB-audio interface; both the
+  The device layer *can* be verified with real equipment today via its USB-audio interface; both the
   measurement and that procedure are in
   **[docs/on-air-verification.md](docs/on-air-verification.md)**.
 - **No IP multicast; IPv4 only.** RX fan-out to multiple clients is **unicast replication** (O(N)
@@ -426,5 +426,5 @@ consumer. The byte-identity tell for a correctly received stream is
   | 48 kHz / 16 / stereo | 1.536 Mbps | 3× over — 33 % delivered |
   | 48 kHz / 16 / mono | 768 kbps | marginal |
   | 16 kHz / 16 / mono | 256 kbps | fits, 2× headroom |
-  | 12 kHz / 16 / mono | 192 kbps | fits, 2.6× headroom — covers SSB (≤3 kHz) and FT8 (≤3.1 kHz audio) |
+  | 12 kHz / 16 / mono | 192 kbps | fits, 2.6× headroom — covers narrow-band audio (≤3.1 kHz) |
   | 8 kHz / 16 / mono | 128 kbps | fits; voice-grade only |
