@@ -220,8 +220,12 @@ struct SilenceWatch {
 // per platform: on macOS the common one is a denied Microphone permission — the OS's answer to
 // "Don't Allow" is silence, not an error — so the pane that fixes it is named, along with the
 // name the service has there: the agent runs from inside Network Audio Service.app, which is
-// what TCC calls it (launchedFromBundle below). A muted or mis-chosen input reads the same
-// everywhere.
+// what TCC calls it (launchedFromBundle below). Windows has a microphone privacy switch of its
+// own, with a second one for desktop programs under it; whether a denial there reads as silence
+// or as an open error is not measured here, so the pane is named as one thing to check rather
+// than as the diagnosis. That branch is ASCII only: MSVC is not passed /utf-8, so a narrow
+// literal's non-ASCII bytes are the runner's code page (L366). A muted or mis-chosen input reads
+// the same everywhere.
 std::string silenceHint(std::int64_t silentMs) {
     const std::string secs = std::to_string(silentMs / 1000);
 #if defined(__APPLE__)
@@ -229,6 +233,10 @@ std::string silenceHint(std::int64_t silentMs) {
            "Privacy & Security › Microphone: Network Audio Service must be allowed (a denied "
            "permission is silence, not an error), then restart the stream. A muted input reads "
            "the same.";
+#elif defined(_WIN32)
+    return "the capture device has delivered " + secs + " s of silence at full rate: check that "
+           "the input is not muted, that this is the radio's device, and that Settings > Privacy "
+           "& security > Microphone allows microphone access for desktop apps.";
 #else
     return "the capture device has delivered " + secs + " s of silence at full rate: check that "
            "the input is not muted and that this is the radio's device.";

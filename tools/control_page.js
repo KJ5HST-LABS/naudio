@@ -320,8 +320,11 @@ async function stream(action) {
 // The daemon reports whether it is registered to run at login and whether that switch is on.
 // This row MIRRORS the switch; it does not offer one. On macOS the switch is Login Items, whose
 // state nothing outside System Settings can move (measured), so the honest control is a link
-// to the pane; on Linux and Windows the row names the command INSTALL.md gives. `service` is
-// null on a build with no service manager to ask, and the row stays hidden.
+// to the pane; on Linux and Windows the row names the command INSTALL.md gives, one per state,
+// and where the switch lives in the desktop. The service is Network Audio Service on all three
+// (the name Login Items, Task Scheduler's description and `systemctl --user status` show); the
+// task and the unit keep their own names, which is what the commands take. `service` is null
+// on a build with no service manager to ask, and the row stays hidden.
 let serviceManager = null;
 
 function renderService(svc) {
@@ -341,7 +344,11 @@ function renderService(svc) {
     'systemd': svc.enabled
              ? 'Turn it off with: systemctl --user disable --now naudio-daemon'
              : 'Turn it on with: systemctl --user enable --now naudio-daemon',
-    'task-scheduler': 'The switch is the naudio-daemon task in Task Scheduler (Enable / Disable).',
+    'task-scheduler': svc.enabled
+             ? 'Turn it off with: schtasks /Change /TN "\\naudio\\naudio-daemon" /DISABLE '
+               + '(or in Task Scheduler, under the naudio folder).'
+             : 'Turn it on with: schtasks /Change /TN "\\naudio\\naudio-daemon" /ENABLE '
+               + '(or in Task Scheduler, under the naudio folder).',
   };
   $('serviceHint').textContent = svc.installed
     ? (hints[svc.manager] || '')
@@ -362,8 +369,8 @@ async function quitDaemon() {
   const back = serviceManager === 'launchd'
     ? 'Start it again from Network Audio Service in Applications, or at your next login if it '
       + 'is on in Login Items.'
-    : 'Start it again from the naudio Control shortcut, or at your next login if the service '
-      + 'is enabled.';
+    : 'Start it again from Network Audio Service in the Start menu or the applications menu, '
+      + 'or at your next login if the service is enabled.';
   if (!window.confirm('Stop the naudio daemon? The stream ends and this page stops working. '
                     + back)) return;
   try {
