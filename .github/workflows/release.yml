@@ -885,6 +885,19 @@ jobs:
             || { echo "::error::$DESKTOP execs '$desktop_exec', which the DEB did not install"; exit 1; }
           grep -q '^Exec=.* --mode control ' "$DESKTOP" \
             || { echo "::error::$DESKTOP does not launch control mode"; exit 1; }
+          # Its name is the service's name on every platform — "Network Audio
+          # Service", what /Applications holds on a Mac and the Start menu on
+          # Windows — read off the INSTALLED entry, and the unit's Description=
+          # (what `systemctl --user status` prints) leads with the same string.
+          desktop_name=$(sed -n 's/^Name=\(.*\)$/\1/p' "$DESKTOP")
+          [ "$desktop_name" = "Network Audio Service" ] \
+            || { echo "::error::$DESKTOP's Name= is '$desktop_name', not the service's name"; exit 1; }
+          unit_desc=$(sed -n 's/^Description=\(.*\)$/\1/p' "$UNIT")
+          case "$unit_desc" in
+            "Network Audio Service"|"Network Audio Service "*) ;;
+            *) echo "::error::$UNIT's Description= is '$unit_desc' — it does not lead with the service's name"; exit 1 ;;
+          esac
+          echo "  name: $desktop_name (desktop entry); unit: $unit_desc"
           # Its icon (#103): Icon= is a theme NAME the desktop resolves through
           # share/icons/hicolor/<size>/apps/<name>.png, so the assertion is the
           # relation — the entry's name, and a PNG of that name at every size
@@ -1203,6 +1216,14 @@ jobs:
           if ($action.Arguments -notmatch '--mode\s+control') {
             Write-Output "::error::the task does not run --mode control: '$($action.Arguments)'"; exit 1 }
 
+          # The description Task Scheduler shows beside the task is where a Windows operator
+          # reads the service's name, and it must be the name the other two platforms show:
+          # "Network Audio Service", NAUDIO_APP_NAME in tools/CMakeLists.txt. Read back from the
+          # REGISTERED task — the installer re-rendered the template on its own, so the
+          # build-tree file the servicecheck arm asserted on is not this one.
+          if ($task.Description -notmatch '^Network Audio Service\b') {
+            Write-Output "::error::the registered task's description is '$($task.Description)' — it does not lead with the service's name"; exit 1 }
+
           # BEHAVIOUR: the task's OWN argument list, handed to the installed
           # binary. This is the check that catches a typo'd option — the task
           # would register perfectly and fail only at the operator's next logon.
@@ -1215,13 +1236,15 @@ jobs:
 
           # --- The control page (#96 item 4) ----------------------------------
           # The Start-menu shortcut is the thing #96's acceptance actually names.
-          # Both shell contexts are searched because a silent elevated install
-          # writes the all-users menu and a per-user one does not.
-          $lnk = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\naudio\naudio Control.lnk",
-                   "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\naudio\naudio Control.lnk") |
+          # It is "Network Audio Service" — the service's name on every platform,
+          # the string /Applications holds on a Mac — inside the package's own
+          # folder. Both shell contexts are searched because a silent elevated
+          # install writes the all-users menu and a per-user one does not.
+          $lnk = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\naudio\Network Audio Service.lnk",
+                   "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\naudio\Network Audio Service.lnk") |
                  Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $lnk) {
-            Write-Output "::error::no 'naudio Control' Start-menu shortcut was created"
+            Write-Output "::error::no 'Network Audio Service' Start-menu shortcut was created"
             Get-ChildItem "$env:ProgramData\Microsoft\Windows\Start Menu\Programs" -Recurse -Filter *.lnk |
               ForEach-Object { Write-Output "  found: $($_.FullName)" }
             exit 1 }

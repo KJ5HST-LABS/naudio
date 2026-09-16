@@ -37,10 +37,10 @@
 # capture pattern no device can match, so the request is refused at device resolution.
 set -u
 
-DAEMON="${1:?usage: servicecheck.sh <path-to-na_audio_daemon> <unit-file> <expected-exec-path> [app-info-plist] [curl]}"
+DAEMON="${1:?usage: servicecheck.sh <path-to-na_audio_daemon> <unit-file> <expected-exec-path> [app-info-plist] [curl] [app-name] [desktop-entry]}"
 UNIT="${2:?missing unit file}"
 WANT_EXEC="${3:?missing expected exec path}"
-# The generated naudio Control Info.plist — launchd units only, where the agent names the app
+# The generated control app Info.plist — launchd units only, where the agent names the app
 # (issue #102). Optional at the usage line because the other two unit kinds have no such file;
 # the launchd branch treats its absence as a harness fault, not a skip.
 APP_PLIST="${4:-}"
@@ -49,9 +49,20 @@ APP_PLIST="${4:-}"
 # Its absence is a harness fault, not a skip: a run of the unit's arguments whose state nobody
 # read would pass on a unit that captures at login (L321).
 CURL="${5:-curl}"
+# The name the service carries on every platform — NAUDIO_APP_NAME, owned in tools/CMakeLists.txt
+# and passed in so this arm asserts a RELATION between that variable and each generated file
+# rather than a literal either could drift from: the app plist's CFBundleName on macOS, the user
+# unit's Description= (and the desktop entry's Name=, the seventh argument) on Linux, the logon
+# task's description on Windows — where it is a literal in the template, because the installer
+# re-renders that template substituting the program path only, so this is the one check that
+# a rename of the variable reached it. Absent-as-harness-fault, like the HTTP client: a unit
+# nobody compared against a name proves nothing about the name.
+APP_NAME="${6:-}"
+DESKTOP="${7:-}"
 
 [ -x "$DAEMON" ] || { echo "FAIL: not executable: $DAEMON"; exit 1; }
 [ -f "$UNIT" ]   || { echo "FAIL: no generated unit file at: $UNIT"; exit 1; }
+[ -n "$APP_NAME" ] || { echo "FAIL: harness fault — no service name was handed in; the name checks cannot run"; exit 1; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -59,6 +70,47 @@ trap 'rm -rf "$TMP"' EXIT
 fails=0
 ok()   { echo "ok: $*"; }
 bad()  { echo "FAIL: $*"; fails=$((fails + 1)); }
+
+# leads_with_name <value> — true when the field a generated file shows the operator is the
+# service's name, alone or followed by ": " / " (" and more. One predicate for three unit kinds,
+# so each is the same claim.
+leads_with_name() {
+    case "$1" in
+        "$APP_NAME"|"$APP_NAME":*|"$APP_NAME"\ *) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+# check_name <label> <file> <extract-command...> — extracts the operator-visible field from
+# <file> with the command given (the file path is appended) and asserts it leads with the
+# name. Then the can-fail control (L222): the SAME extraction on a copy of the file with every
+# occurrence of the name replaced must fail the same predicate — or the extraction was reading
+# a field the name never reaches, and the pass above says nothing. The replacement is a plain
+# sed on the name, which holds letters and spaces only; a name that gained a sed metacharacter
+# would make the control fire spuriously, which is the loud direction.
+check_name() {
+    local label="$1" file="$2"; shift 2
+    local value
+    value="$("$@" "$file" 2>/dev/null | tr -d '\r')"
+    if [ -z "$value" ]; then
+        bad "$label is empty — the operator would see no name at all"
+    elif leads_with_name "$value"; then
+        ok "$label names the service ($value)"
+    else
+        bad "$label is '$value', which does not lead with the service's name '$APP_NAME' — two names for one service"
+    fi
+    local copy="$TMP/unnamed.$(basename "$file")"
+    sed "s/$APP_NAME/naudio Control/g" "$file" > "$copy"
+    value="$("$@" "$copy" 2>/dev/null | tr -d '\r')"
+    if leads_with_name "$value"; then
+        bad "control did NOT fire — $label still reads '$value' with the name replaced; the check above cannot be believed"
+    else
+        ok "control fires: $label with the name replaced reads '${value:-<empty>}' and is rejected"
+    fi
+}
+extract_plist_key() { plutil -extract "$1" raw -o - "$2"; }
+extract_task_description() { sed -n 's|.*<Description>\(.*\)</Description>.*|\1|p' "$1"; }
+extract_unit_description() { sed -n 's/^Description=//p' "$1"; }
+extract_desktop_name() { sed -n 's/^Name=//p' "$1"; }
 
 # `--mode zzz` is the containment guard (configcheck.sh's, not argcheck's --transport: mode is
 # validated last, so it never masks an earlier refusal). `--no-config` is the hermeticity guard:
@@ -150,6 +202,8 @@ if [ "$KIND" = launchd ]; then
         else
             ok "the control app has one name ($app_name)"
         fi
+        # ... and it is THE name, the one the Linux entry and the Windows shortcut carry too.
+        check_name "the control app's CFBundleName" "$APP_PLIST" extract_plist_key CFBundleName
 
         # The icon (issue #103): CFBundleIconFile must name a file the source tree carries under
         # packaging/icons/ — the payload installs it by that name and the postinstall places it
@@ -231,6 +285,12 @@ elif [ "$KIND" = schtasks ]; then
     grep -q '<LogonTrigger>' "$UNIT" && ok "runs at logon" \
         || bad "no LogonTrigger — the task would never start by itself"
 
+    # The description is what Task Scheduler shows beside the task, and it is where the Windows
+    # operator reads the service's name — a LITERAL in the template (the installer re-renders it
+    # substituting the program path only), so this is the check that a renamed NAUDIO_APP_NAME
+    # reached it.
+    check_name "the logon task's description" "$UNIT" extract_task_description
+
     # Every assertion below is TAG-ANCHORED, which is not style: this template documents its own
     # defaults in an XML comment, and a bare grep for PT0S would match the prose that explains
     # why PT0S is needed and pass on a file that had lost the setting (L230).
@@ -269,6 +329,17 @@ else
     # A user unit, never a system one: system scope cannot reach the session audio server.
     grep -q '^WantedBy=default\.target$'     "$UNIT" && ok "installs into default.target (user scope)" \
         || bad "no WantedBy=default.target"
+
+    # Description= is what `systemctl --user status` prints beside the unit, and Name= is the
+    # applications-menu entry: the two places a Linux operator reads the service's name.
+    check_name "the unit's Description=" "$UNIT" extract_unit_description
+    if [ -z "$DESKTOP" ]; then
+        bad "harness fault — no desktop entry was handed to the systemd branch"
+    elif [ ! -f "$DESKTOP" ]; then
+        bad "harness fault — no generated desktop entry at: $DESKTOP"
+    else
+        check_name "the desktop entry's Name=" "$DESKTOP" extract_desktop_name
+    fi
 
     line="$(sed -n 's/^ExecStart=//p' "$UNIT")"
     [ -n "$line" ] || bad "no ExecStart= line"
