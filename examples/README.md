@@ -4,7 +4,7 @@
 
 Worked examples that connect to a network-audio server and **play whatever it is
 streaming on your local speakers** — one client per language, plus a small demo
-server so you can hear something with no radio and no second machine.
+server so you can hear something with no capture device and no second machine.
 
 Every client uses **only** the public `naudio.h` C ABI
 ([`../include/naudio.h`](../include/naudio.h)) — never an internal C++ type. Together
@@ -32,7 +32,7 @@ ABI. It can broadcast a local audio input, or (with `--test-tone`) a fixed,
 hardware-free tone so a client works end to end on a headless box. Start it, point a
 client at it, and you hear what it sends.
 
-With `--playback-id N` it also plays the clients' transmit audio — the one TX channel the server arbitrates among them — on a local output device: the radio's TX audio input at a station, or the speakers on a desk. `--list-devices` lists the playback ids beside the capture ids; the option is capture-mode only, and an id that is not a playback-capable device is refused before the server starts. In either mode the server logs every change of TX owner with a wall-clock stamp (`[source] 2026-09-02T23:46:03.890-0400 tx owner=<id>`, or `none` on release) — local time with the UTC offset, the shape `rigctld -Z` uses, so a station running both on one host reads its PTT-to-audio latency as the difference between the two logs.
+With `--playback-id N` it also plays the clients' transmit audio — the one TX channel the server arbitrates among them — on a local output device: a line input on another piece of equipment, or the speakers on a desk. `--list-devices` lists the playback ids beside the capture ids; the option is capture-mode only, and an id that is not a playback-capable device is refused before the server starts. In either mode the server logs every change of TX owner with a wall-clock stamp (`[source] 2026-09-02T23:46:03.890-0400 tx owner=<id>`, or `none` on release) — local time with the UTC offset, the shape `rigctld -Z` uses, so a station running both on one host reads its PTT-to-audio latency as the difference between the two logs.
 
 [`c/inject_tone.c`](c/inject_tone.c) — `na_c_inject_tone`, the sending client: it injects a 1 kHz sawtooth as TX audio at the server's format from the hardware-free `null` backend, so the TX path is proved with no digital-mode application in the loop (see [`c/README.md`](c/README.md)). Built with the examples, not shipped.
 

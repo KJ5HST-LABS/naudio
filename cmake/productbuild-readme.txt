@@ -13,10 +13,11 @@ Network Audio Service — what this installer places, and where
   /usr/local/share/man  manual pages (man na_audio_daemon)
 
 Getting started: open Network Audio Service from Applications. On its
-Setup tab pick the radio's USB audio device and save; on Stream press
-Start. The first time, macOS asks whether to allow Network Audio
-Service to use the microphone — that is the radio's audio interface;
-allow it. Nothing is captured until you press Start.
+Setup tab pick the capture device whose audio you want to stream and
+save; on Stream press Start. The first time, macOS asks whether to
+allow Network Audio Service to use the microphone — macOS calls every
+audio input a microphone, including a USB audio interface; allow it.
+Nothing is captured until you press Start.
 
 The service starts with your next login and serves the page at
 http://127.0.0.1:8737/ (on this Mac only); it opens no device until

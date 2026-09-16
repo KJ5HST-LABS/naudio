@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later
  *
- * na_wav_tap — record what a naudio CLIENT actually receives, as a WAV a decoder can read.
+ * na_wav_tap — record what a naudio CLIENT actually receives, as a WAV another program can analyse.
  *
  * Copyright (C) 2025-2026 Terrell Deppe
  *
@@ -27,7 +27,7 @@
  * day the server is provisioned lower — e.g. na_audio_source --rate 12000 --channels 1 for a
  * constrained link. Measured before the fix: against a 12 kHz mono server it exited 0 while
  * writing a mangled file and blaming the network.) Channel 0 is taken, and when the negotiated
- * rate is an integer multiple of 12000 it is decimated to the 12 kHz the WSJT-X decoders want,
+ * rate is an integer multiple of 12000 it is decimated to the 12 kHz narrow-band analysis programs commonly want,
  * behind an N-sample box average — crude, but the receiver's own filter is ~3 kHz wide so there
  * is nothing near Nyquist to alias down. Any other rate is written as-is at the negotiated rate.
  * The delivered byte rate is still measured against what the negotiated format implies: a stream
@@ -79,8 +79,8 @@
    }
 #endif
 
-/* The decoders' rate. When the negotiated rate divides by it, output goes there. */
-#define WSJTX_RATE 12000
+/* The output rate narrow-band analysis programs commonly want. When the negotiated rate divides by it, output goes there. */
+#define TAP_RATE 12000
 
 typedef struct {
     short *out;
@@ -133,13 +133,13 @@ static void usage(void) {
         "usage: na_wav_tap [--host H] [--port N] [--seconds S] [--out F] [--align15]\n"
         "  --host H     naudio server (default 127.0.0.1)\n"
         "  --port N     server port (default 4533)\n"
-        "  --seconds S  record length (default 15, one FT8 period)\n"
+        "  --seconds S  record length in seconds (default 15)\n"
         "  --out F      output WAV, mono at %d Hz when the negotiated rate divides by it\n"
         "               (48k/24k/12k do), else at the negotiated rate (default tap.wav)\n"
-        "  --align15    wait for a wall-clock 15 s boundary before recording (FT8/FT4 periods)\n"
+        "  --align15    wait for a wall-clock 15 s boundary before recording\n"
         "  --tcp        use TCP instead of the UDP_WAN profile — the discriminating run when\n"
         "               UDP is short: TCP retransmits, so loss shows up as delay, not absence\n",
-        WSJTX_RATE);
+        TAP_RATE);
 }
 
 int main(int argc, char **argv) {
@@ -211,15 +211,15 @@ int main(int argc, char **argv) {
                 src_rate, src_bits, src_channels);
         na_client_disconnect(c); na_client_destroy(c); return 1;
     }
-    int decim    = (src_rate % WSJTX_RATE == 0) ? src_rate / WSJTX_RATE : 1;
+    int decim    = (src_rate % TAP_RATE == 0) ? src_rate / TAP_RATE : 1;
     int out_rate = src_rate / decim;
     fprintf(stderr, "na_wav_tap: negotiated %d Hz / 16-bit / %d ch -> %d Hz mono WAV "
                     "(channel 0, %d:1 box decimation)\n",
             src_rate, src_channels, out_rate, decim);
-    if (out_rate != WSJTX_RATE)
+    if (out_rate != TAP_RATE)
         fprintf(stderr, "na_wav_tap: note: %d Hz does not divide by %d — the WAV is correct at "
-                        "%d Hz but the WSJT-X decoders expect %d Hz\n",
-                src_rate, WSJTX_RATE, out_rate, WSJTX_RATE);
+                        "%d Hz rather than the %d Hz narrow-band analysis programs commonly expect\n",
+                src_rate, TAP_RATE, out_rate, TAP_RATE);
 
     t.cap = (size_t)out_rate * (size_t)(seconds + 2);
     t.out = (short *)calloc(t.cap, sizeof(short));
@@ -328,7 +328,7 @@ int main(int argc, char **argv) {
                         "  Pitch is still correct and the file may decode; it is short of wall time.\n"
                         "  Across a network this is loss on the hop. On loopback it means the "
                         "producer is not keeping up (this project's synthetic sources habitually do "
-                        "not: --test-tone ~75%%, the Hamlib dummy ~83%%). Off a real rig at ~100%%, "
+                        "not: --test-tone ~75%%, the Hamlib dummy ~83%%). Off a real capture device at ~100%%, "
                         "a shortfall is a genuine finding.\n",
                 100.0 * bps / want);
     }

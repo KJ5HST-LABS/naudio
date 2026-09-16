@@ -1,4 +1,4 @@
-Network Audio Service streams the audio your radio's USB audio interface receives to your digital-mode software, over the network.
+Network Audio Service streams audio from a capture device on this Mac to applications that listen for it over the network, and lets you set that up from a page in your browser.
 
 This installer places the service, its control page and the naudio command-line tools on this Mac. The service is listed in System Settings > General > Login Items & Extensions and starts at your next login; it opens no microphone until you press Start on its page.
 

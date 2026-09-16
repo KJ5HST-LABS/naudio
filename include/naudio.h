@@ -6,7 +6,7 @@
  * Copyright (C) 2025-2026 Terrell Deppe
  *
  * C ABI for the naudio device/audio layer. This is the boundary a
- * C / Hamlib-based consumer links against; the implementation is C++ internally.
+ * C consumer links against; the implementation is C++ internally.
  *
  * Lifecycle: create one na_context (initializes the audio backend once), pass it
  * to enumerate/probe/open, then destroy it. Errors are reported as negative
@@ -267,7 +267,7 @@ NA_EXPORT int na_probe_format(na_context* ctx, int backend_id, int sample_rate,
  *
  * Opaque RAII stream handles, opened from (and bound to) an na_context. The stream borrows
  * the context's backend, so the context must outlive the stream: close every stream with
- * na_close_* BEFORE na_context_destroy(). A C/Hamlib consumer opens a stream, reads/writes
+ * na_close_* BEFORE na_context_destroy(). A C consumer opens a stream, reads/writes
  * blocking PCM frames, and closes it.
  */
 typedef struct na_capture_stream na_capture_stream;
@@ -428,7 +428,7 @@ NA_EXPORT int na_discover(const char* broadcast_addr, int port, int timeout_ms,
 
 /* ---- Networking audio-streaming client (na_client_*) -----------------------------------
  *
- * A C consumer — Hamlib, a standalone C client, or a Python ctypes/cffi binding — drives the
+ * A C consumer — a standalone C client, or a Python ctypes/cffi binding — drives the
  * SAME bidirectional audio-streaming client the example clients use: it connects
  * to an AudioStreamServer, receives RX PCM (delivered to a C callback) into a local playback
  * device, and OPTIONALLY captures TX PCM from a local device to send to the server. The wire is
@@ -501,7 +501,7 @@ typedef enum na_reliability_profile {
     NA_RELIABILITY_UDP_LAN = 1,  /* UDP, low-latency LAN buffers, reorder + control-ARQ.            */
     NA_RELIABILITY_UDP_WAN = 2,  /* UDP, Internet buffers: XOR FEC + adaptive jitter + reorder +    */
                                  /*   control-ARQ. The resilient remote-operating profile.          */
-    NA_RELIABILITY_UDP_FT8 = 3,  /* UDP, FT8/digital: tight buffers, reorder + control-ARQ.         */
+    NA_RELIABILITY_UDP_FT8 = 3,  /* UDP, low-latency narrow-band: tight buffers, reorder + ARQ.     */
     NA_RELIABILITY_UDP_IQ  = 4,  /* UDP for SDR IQ (@since 0.3.0): 10 ms framing, wide 60/30/200 ms */
                                  /*   buffers, reorder + control-ARQ, no FEC, no adaptive jitter.   */
                                  /*   ITS DEFINING 192 kHz IS NOT APPLIED BY EITHER SETTER — pair   */
@@ -509,7 +509,7 @@ typedef enum na_reliability_profile {
                                  /*   server, which is the only end that decides the wire format.   */
                                  /*   See na_server_set_reliability_profile.                        */
     NA_RELIABILITY_DUAL    = 5,  /* TCP+UDP served on ONE port (@since 0.3.0), with conservative    */
-                                 /*   FT8-ish buffers + reorder + control-ARQ. A SERVER-SIDE        */
+                                 /*   the _FT8 profile's buffers + reorder + ARQ. A SERVER-SIDE      */
                                  /*   CAPABILITY: a client picks one transport, so this aliases to  */
                                  /*   TCP on the client exactly as NA_TRANSPORT_DUAL does, leaving  */
                                  /*   its reorder knobs inert there. See na_transport.              */
@@ -671,21 +671,21 @@ NA_EXPORT na_error_t na_client_set_reconnect_policy(na_stream_client* client, in
 /*
  * Which audio directions this client has open.
  *
- * READ THIS BEFORE USING IT AS PTT, BECAUSE IT IS NOT PTT. Setting a duplex mode is two local
- * mute flags and nothing else. It issues no CAT command, puts nothing on the wire, and the
- * server never learns your mode. Specifically:
+ * READ THIS BEFORE USING IT AS A SWITCH FOR ANYTHING, BECAUSE IT IS NOT ONE. Setting a duplex
+ * mode is two local mute flags and nothing else. It controls no device, puts nothing on the wire,
+ * and the server never learns your mode. Specifically:
  *
- *   - NA_DUPLEX_TALK does NOT key a transmitter. It lets your audio reach the server; whether a
- *     carrier goes up is somebody else's job. If nothing keys the rig, you are feeding audio to
- *     an unkeyed radio's input and nothing goes on the air, with no error anywhere.
- *   - NA_DUPLEX_LISTEN is NOT a transmit inhibit. It stops THIS client sending audio. It does not
- *     stop the radio transmitting -- VOX, a CAT controller, or another client's audio will still
- *     key it. Never treat this as a safety interlock.
+ *   - NA_DUPLEX_TALK does NOT switch anything on at the far end. It lets your audio reach the
+ *     server; what the output device does with it is somebody else's job. If nothing at the far
+ *     end is listening, you are feeding audio into silence with no error anywhere.
+ *   - NA_DUPLEX_LISTEN is NOT an inhibit. It stops THIS client sending audio. It does not stop the
+ *     server's output -- another client's audio will still drive it. Never treat this as a
+ *     safety interlock.
  *
- * Actual PTT belongs to rig control: Hamlib's rig_set_ptt. In this project na_hamlib_bridge keys
- * the rig from the server's TX-ARBITRATION OWNER (na_server_tx_owner), which is derived from who
- * is actually transmitting audio -- not from any client's duplex mode. naudio is the audio lane;
- * keeping that boundary is deliberate.
+ * Where the output is a transmitter, keying it belongs to rig control, not to this library: the
+ * Hamlib bridge (na_hamlib_bridge) keys from the server's TX-ARBITRATION OWNER
+ * (na_server_tx_owner), which is derived from who is actually transmitting audio -- never from
+ * any client's duplex mode. naudio is the audio lane; keeping that boundary is deliberate.
  *
  * What it IS good for: half-duplex voice, where the local speaker must not feed the local
  * microphone. NA_DUPLEX_FULL leaves both directions open for a relay, or for a headset where
@@ -1154,18 +1154,19 @@ NA_EXPORT na_error_t na_client_get_stats(na_stream_client* client, na_client_sta
 /* ---- Networking audio-streaming server (na_server_*) -----------------------------------
  *
  * The server side of the SAME frozen 0xAF01 v1 protocol the na_client_* surface speaks. A C
- * consumer — Hamlib, a standalone C server, or a Python ctypes/cffi binding —
- * runs an AudioStreamServer: it accepts multiple clients, BROADCASTS radio RX audio to all of
- * them, and RECEIVES TX audio from clients under priority-based arbitration to play to the radio.
+ * consumer — a standalone C server, or a Python ctypes/cffi binding —
+ * runs an AudioStreamServer: it accepts multiple clients, BROADCASTS the captured audio to all of
+ * them, and RECEIVES TX audio from clients under priority-based arbitration to play to the output.
  * This is a thin C surface over the C++ naudio::net::AudioStreamServer (+ AudioBroadcaster /
  * AudioMixer), not a re-implementation.
  *
- * TWO BACKENDS — pick the one that matches how YOUR program owns the radio audio:
- *   - NA_SERVER_BACKEND_NULL (hardware-free, the Hamlib-bridge / CI / self-test path): naudio
+ * TWO BACKENDS — pick the one that matches how YOUR program owns the audio:
+ *   - NA_SERVER_BACKEND_NULL (hardware-free — for a program that already owns the audio, and for
+ *     CI and self-tests): naudio
  *     touches no audio device. RX audio comes IN through na_server_inject_audio() (you read it from
- *     the radio and hand it to naudio to broadcast); mixed TX audio goes OUT through the
+ *     your own source and hand it to naudio to broadcast); mixed TX audio goes OUT through the
  *     na_server_tx_audio_cb (naudio hands you the arbitrated TX stream and you write it to the
- *     radio). No PortAudio init.
+ *     output). No PortAudio init.
  *   - NA_SERVER_BACKEND_SYSTEM (production, naudio owns the devices): RX is CAPTURED from the
  *     device set with na_server_set_capture_device(); mixed TX is PLAYED to the device set with
  *     na_server_set_playback_device(). The na_server_tx_audio_cb is NOT delivered on this backend
@@ -1217,9 +1218,9 @@ typedef enum na_server_backend {
 /* Opaque streaming-server handle. Create with na_server_create, free with na_server_destroy. */
 typedef struct na_audio_server na_audio_server;
 
-/* Mixed TX PCM destined for the radio: `pcm` / `n_bytes` is one arbitrated TX frame's payload,
+/* Mixed TX PCM destined for the output: `pcm` / `n_bytes` is one arbitrated TX frame's payload,
  * valid only for the duration of the call. Fires on the mixer playback thread (NULL backend only).
- * Silence frames are delivered when no client is transmitting (the radio expects a continuous
+ * Silence frames are delivered when no client is transmitting (the output expects a continuous
  * stream). */
 typedef void (*na_server_tx_audio_cb)(const unsigned char* pcm, size_t n_bytes, void* user);
 
@@ -1377,7 +1378,7 @@ NA_EXPORT int na_server_is_running(na_audio_server* server);
 NA_EXPORT int na_server_port(na_audio_server* server);
 
 /* --- Audio I/O --- */
-/* Broadcast `n_bytes` of RX PCM to every client that is ready to receive (the radio-RX-audio
+/* Broadcast `n_bytes` of RX PCM to every client that is ready to receive (the captured-audio
  * analog; NULL backend / inject-only). Returns NA_OK, or NA_ERR_INVALID on a NULL server / NULL
  * buffer / n_bytes <= 0.
  *
