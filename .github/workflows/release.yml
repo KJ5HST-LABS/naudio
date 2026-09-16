@@ -293,6 +293,25 @@ jobs:
           pkg=$(ls build/naudio-*.pkg)
           echo "installer: $pkg"
 
+          # What the Installer window calls the product — its <title>, which is the
+          # "Install …" in the title bar and the "Welcome to the … Installer" line — is
+          # the service's name, read off the built package's Distribution rather than
+          # off the CMake variable that was meant to set it. rc9's read "Install naudio"
+          # (operator, 2026-09-16). The welcome and read-me panes must be ours too:
+          # without a welcome file macOS shows its own sentence.
+          rm -rf "${{ runner.temp }}/pkg-x"
+          pkgutil --expand "$pkg" "${{ runner.temp }}/pkg-x"
+          dist_title=$(sed -n 's|.*<title>\(.*\)</title>.*|\1|p' "${{ runner.temp }}/pkg-x/Distribution")
+          [ "$dist_title" = "Network Audio Service" ] \
+            || { echo "::error::the Installer's title is '$dist_title', not the service's name"; exit 1; }
+          for pane in Welcome.txt ReadMe.txt; do
+            test -s "${{ runner.temp }}/pkg-x/Resources/$pane" \
+              || { echo "::error::the .pkg carries no $pane pane"; exit 1; }
+            grep -q 'Network Audio Service' "${{ runner.temp }}/pkg-x/Resources/$pane" \
+              || { echo "::error::the $pane pane does not name the service"; exit 1; }
+          done
+          echo "installer title: $dist_title; welcome and read-me panes name the service"
+
           # Positive control FIRST (L222): the dev-absence assertions below can
           # only mean something if the same paths exist in the full tree — the
           # TGZ tree gate 1 unpacked carries them.
@@ -1289,11 +1308,13 @@ jobs:
           # --- The control page (#96 item 4) ----------------------------------
           # The Start-menu shortcut is the thing #96's acceptance actually names.
           # It is "Network Audio Service" — the service's name on every platform,
-          # the string /Applications holds on a Mac — inside the package's own
-          # folder. Both shell contexts are searched because a silent elevated
-          # install writes the all-users menu and a per-user one does not.
-          $lnk = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\naudio\Network Audio Service.lnk",
-                   "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\naudio\Network Audio Service.lnk") |
+          # the string /Applications holds on a Mac — inside a folder of the same
+          # name, which NSIS derives from the installer's Name (CPACK_NSIS_PACKAGE_NAME,
+          # the product's name since 2026-09-16; it was "naudio", the library's).
+          # Both shell contexts are searched because a silent elevated install
+          # writes the all-users menu and a per-user one does not.
+          $lnk = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Network Audio Service\Network Audio Service.lnk",
+                   "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Network Audio Service\Network Audio Service.lnk") |
                  Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $lnk) {
             Write-Output "::error::no 'Network Audio Service' Start-menu shortcut was created"

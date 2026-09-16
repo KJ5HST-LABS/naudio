@@ -65,10 +65,10 @@ those are in every other format on this page.
   uninstaller; to remove naudio, delete the installed files and forget the receipts
   (`sudo pkgutil --forget org.kj5hst.naudio.runtime`, same for `….tools`).
 - **Windows** installs into `C:\Program Files\naudio`, adds **Network Audio Service** to the
-  Start menu (under *naudio*), registers a logon task for the daemon (switched off until you turn
-  it on), adds an uninstaller (*Add or remove programs*, or `Uninstall.exe` in the install
-  directory), and offers to add the programs to `PATH`. The installer is unsigned, so SmartScreen
-  warns: choose *More info* → *Run anyway*.
+  Start menu (in a folder of the same name), registers a logon task for the daemon (switched off
+  until you turn it on), adds an uninstaller (**Network Audio Service** under *Add or remove
+  programs*, or `Uninstall.exe` in the install directory), and offers to add the programs to
+  `PATH`. The installer is unsigned, so SmartScreen warns: choose *More info* → *Run anyway*.
 
 Once it is installed, open **Network Audio Service** — in the Start menu on Windows, the
 applications menu on Linux, or Applications on a Mac. It opens a page in your browser with two tabs:

@@ -5,6 +5,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **The installers call the product Network Audio Service.** The macOS Installer's window read *Install naudio* and its welcome pane was macOS's own sentence; the Windows setup, its Start-menu folder and its *Add or remove programs* entry said *naudio*. Now the Installer's title is the service's name and its Introduction and Read Me panes say what is being installed, where it goes, how the service is switched, what the Microphone question is and how to remove it all; on Windows the setup window, the Start-menu folder and the uninstall entry carry the name too. The identifiers people type do not move: the artifact file names, the DEB/RPM/Homebrew package name `naudio`, the install directories, the receipt ids and the uninstall registry key (so an upgrade still finds the previous install). The release pipeline's installer gate reads the title and the two panes back off the built `.pkg`, and looks for the Start-menu shortcut in the renamed folder.
+
 ## [1.0.0rc9] — 2026-09-16
 
 ### Added
