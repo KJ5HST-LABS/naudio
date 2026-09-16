@@ -203,51 +203,62 @@ jobs:
           "$P/bin/na_c_play_to_speakers" --help > /dev/null
           echo "all four shipped binaries run env-free from the package"
 
-          # The daemon's second copy (#105): the control app's executable, carried beside
-          # the app's other pieces for the .pkg postinstall to assemble. It is the same
+          # The daemon's second copy (#105): the control app's executable. It is the same
           # bytes as bin/'s only until signing: signed as the bundle's executable, its code
           # directory binds the bundle's Info.plist, so outside a bundle the signature is
           # invalid ("invalid Info.plist", codesign --verify) and the hardened runtime has
-          # the kernel kill it at exec — SIGKILL, exit 137. Measured 2026-09-16: this gate's
-          # first run, on rc9's first cut, ran it bare and died exactly so; the same copy
-          # taken out of an installed bundle dies the same way on a Mac, and the bin/ copy
-          # runs bare. So it is tested as what it is: assembled into the bundle the way the
-          # postinstall assembles it, it must run and (when signed) verify; run BARE, a
-          # signed copy must be killed — the control that this is the bundle-signed copy
-          # and not a stray duplicate of bin/'s, which would place a bundle that does not
-          # verify. Unsigned (no identity), the bare run succeeds and proves nothing, which
-          # is said rather than counted.
-          APPX="${{ runner.temp }}/tgz-app"; rm -rf "$APPX"
+          # the kernel kill it at exec — SIGKILL, exit 137 — and the notary rejects it as
+          # a loose file for the same reason. Measured 2026-09-16 on rc9's first cut: this
+          # gate's first run ran the loose copy bare and died exactly so, and the notary
+          # refused the .pkg over the same file. So a SIGNED payload carries the sealed
+          # bundle whole, as share/naudio/app.zip (cmake/CodesignPayload.cmake), and no
+          # loose executable; an UNSIGNED one carries the pieces the postinstall assembles.
+          # Either way the executable is tested as what it is — inside its bundle: it must
+          # run there and (when signed) verify. Two signed controls: the loose copy must be
+          # ABSENT (its presence is what the notary rejects), and a copy taken out of the
+          # extracted bundle and run bare must be killed — proof the executable is the
+          # bundle-signed one and not a duplicate of bin/'s. Unsigned, the bare run
+          # succeeds and proves nothing, which is said rather than counted.
+          APPX="${{ runner.temp }}/tgz-app"; rm -rf "$APPX"; mkdir -p "$APPX"
           app_name=$(plutil -extract CFBundleName raw -o - "$P/share/naudio/naudio-control.Info.plist")
           APPB="$APPX/$app_name.app"
-          mkdir -p "$APPB/Contents/MacOS" "$APPB/Contents/Resources"
-          cp "$P/share/naudio/na_audio_daemon" "$APPB/Contents/MacOS/"
-          cp "$P/share/naudio/naudio-control.Info.plist" "$APPB/Contents/Info.plist"
-          cp "$P/share/naudio/naudio.icns" "$APPB/Contents/Resources/"
-          if [ -d "$P/share/naudio/app.codesig" ]; then
-            mkdir -p "$APPB/Contents/_CodeSignature"
-            cp "$P/share/naudio/app.codesig/"* "$APPB/Contents/_CodeSignature/"
+          if [ -f "$P/share/naudio/app.zip" ]; then
+            ditto -x -k "$P/share/naudio/app.zip" "$APPX"
+            test -d "$APPB" || { echo "::error::app.zip did not extract to '$app_name.app' (found: $(ls "$APPX"))"; exit 1; }
+            how="extracted from app.zip"
+          else
+            mkdir -p "$APPB/Contents/MacOS" "$APPB/Contents/Resources"
+            cp "$P/share/naudio/na_audio_daemon" "$APPB/Contents/MacOS/"
+            cp "$P/share/naudio/naudio-control.Info.plist" "$APPB/Contents/Info.plist"
+            cp "$P/share/naudio/naudio.icns" "$APPB/Contents/Resources/"
+            how="assembled from the pieces"
           fi
           "$APPB/Contents/MacOS/na_audio_daemon" -h > /dev/null 2>&1 \
-            || { echo "::error::the app's executable does not run from inside the bundle assembled from the tarball's pieces"; exit 1; }
+            || { echo "::error::the app's executable does not run from inside the bundle $how"; exit 1; }
           if [ -n "${NAUDIO_CODESIGN_IDENTITY:-}" ]; then
+            test -f "$P/share/naudio/app.zip" \
+              || { echo "::error::the payload is signed but carries no share/naudio/app.zip — the sealed bundle did not ship"; exit 1; }
+            test ! -e "$P/share/naudio/na_audio_daemon" \
+              || { echo "::error::the signed payload still carries the loose share/naudio/na_audio_daemon — the notary rejects it as an invalid signature"; exit 1; }
             codesign --verify --deep --strict "$APPB" \
-              || { echo "::error::the bundle assembled from the tarball's pieces does not verify"; exit 1; }
-            set +e; "$P/share/naudio/na_audio_daemon" -h > /dev/null 2>&1; bare_rc=$?; set -e
+              || { echo "::error::the bundle $how does not verify"; exit 1; }
+            cp "$APPB/Contents/MacOS/na_audio_daemon" "$APPX/bare_copy"
+            set +e; "$APPX/bare_copy" -h > /dev/null 2>&1; bare_rc=$?; set -e
             [ "$bare_rc" -eq 137 ] \
-              || { echo "::error::the bundle's executable ran BARE (exit $bare_rc) — it is not the bundle-signed copy, so the postinstall would place a bundle that does not verify"; exit 1; }
-            echo "app executable: runs inside the assembled bundle, verifies, and is killed bare (137) as a bundle-bound signature must be"
+              || { echo "::error::the bundle's executable ran BARE (exit $bare_rc) — it is not the bundle-signed copy"; exit 1; }
+            echo "app executable: $how, runs inside the bundle, verifies, no loose copy shipped, and a copy taken out is killed (137) as a bundle-bound signature must be"
           else
-            echo "app executable: runs inside the assembled bundle (unsigned build; the bare-run control does not apply)"
+            echo "app executable: $how, runs inside the bundle (unsigned build; the signed controls do not apply)"
           fi
 
           # Self-containment: every load command outside @rpath//usr/lib//System
           # is a finding. Cardinality-checked (L230): exactly 6 binaries scanned
-          # (2 tools, the daemon again as the app's executable, the demo pair,
+          # (2 tools, the daemon again as the app's executable — read from the
+          # bundle above, wherever the payload carried it — the demo pair,
           # libnaudio). A bin/na_hamlib_bridge here would trip the count — the
           # bridge is deliberately not packaged.
           scanned=0
-          for f in "$P"/bin/* "$P"/share/naudio/na_audio_daemon "$P"/lib/libnaudio.*.*.*.dylib; do
+          for f in "$P"/bin/* "$APPB/Contents/MacOS/na_audio_daemon" "$P"/lib/libnaudio.*.*.*.dylib; do
             scanned=$((scanned+1))
             bad=$(otool -L "$f" | tail -n +2 | grep -v '@rpath\|/usr/lib/\|/System/' || true)
             if [ -n "$bad" ]; then echo "::error::$f references non-system libraries:"; echo "$bad"; exit 1; fi

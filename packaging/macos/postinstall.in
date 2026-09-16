@@ -68,10 +68,32 @@ fi
 # The agent registered above names the executable placed here, so this block is not optional
 # on macOS: a payload without these pieces would register a service whose program does not
 # exist. The guard keeps the script honest about that rather than half-assembling.
+#
+# A SIGNED payload carries the sealed bundle whole, as share/naudio/app.zip, and no loose
+# executable (measured on the v1.0.0rc9 tag, 2026-09-16): the notary validates every Mach-O in
+# a payload standalone, and the bundle's executable is valid only inside its bundle, so
+# cmake/CodesignPayload.cmake zips the bundle it sealed and removes the loose copy. ditto
+# extracts it with the seal, the modes and the layout intact — the same tool that packed it —
+# onto the removed destination, and the Finder's name is the zip's top-level entry, which is
+# the bundle's CFBundleName from the same CMake variable. The pieces still ship beside the
+# zip as the record the release gate reads, and an UNSIGNED payload — no identity, so the
+# signing script never ran and no zip exists — assembles the unsigned bundle from them below,
+# as before.
 APP_SRC="${VOL}@NAUDIO_APP_PAYLOAD_DIR@"
 APP_DST="${VOL}@NAUDIO_APP_DIR@"
 APP_LEGACY="${VOL}/Applications/naudio Control.app"
-if [ -f "$APP_SRC/na_audio_daemon" ] && [ -f "$APP_SRC/naudio-control.Info.plist" ]; then
+if [ -f "$APP_SRC/app.zip" ]; then
+    rm -rf "$APP_DST" "$APP_LEGACY"
+    install -d -m 0755 -o root -g wheel "$(dirname "$APP_DST")"
+    ditto -x -k "$APP_SRC/app.zip" "$(dirname "$APP_DST")"
+    # The zip's top-level entry must be the bundle the agent's program path names, or the
+    # service would point at nothing; a payload whose zip carried another name is a defect
+    # this script must not paper over with a rename (the seal covers the bundle's own name
+    # through Info.plist, not the directory — but the agent's path is the one that matters).
+    [ -x "$APP_DST/Contents/MacOS/na_audio_daemon" ] \
+        || { echo "naudio: $APP_SRC/app.zip did not extract to $APP_DST" >&2; exit 1; }
+    chown -R root:wheel "$APP_DST"
+elif [ -f "$APP_SRC/na_audio_daemon" ] && [ -f "$APP_SRC/naudio-control.Info.plist" ]; then
     rm -rf "$APP_DST" "$APP_LEGACY"
     install -d -m 0755 -o root -g wheel "$APP_DST/Contents/MacOS"
     install -m 0644 -o root -g wheel "$APP_SRC/naudio-control.Info.plist" \

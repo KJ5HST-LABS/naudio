@@ -167,10 +167,24 @@ message(STATUS "codesign: all ${_n} payload binaries carry Developer ID + harden
 # (measured, with controls that fail). This step assembles a temporary bundle from the staged
 # pieces, signs it with the capture entitlements and the hardened runtime — the executable is
 # the process that opens the microphone now — verifies it, writes the bundle-signed executable
-# back over the staged copy, and copies the seal files back as share/naudio/app.codesig/*,
-# which the postinstall installs into place beside the other pieces. A directory of data files
-# is not a bundle and cannot trip the auto-detection; the executable is a Mach-O the loop above
-# already counted, replaced in place, so the count does not move.
+# back over the staged copy, copies the seal files back as share/naudio/app.codesig/*, and
+# proves the pieces reassemble into a bundle that verifies. A directory of data files is not a
+# bundle and cannot trip the auto-detection.
+#
+# THEN THE SEALED BUNDLE GOES INTO THE PAYLOAD AS A ZIP, AND THE LOOSE EXECUTABLE COMES OUT
+# (measured on the v1.0.0rc9 tag, 2026-09-16 — the first notarization since #105). The notary
+# validates every Mach-O in a package payload STANDALONE, and a bundle's executable is valid
+# only inside its bundle: its code directory binds the bundle's Info.plist, so the loose copy
+# is "The signature of the binary is invalid" to the notary, exactly as it is to the kernel,
+# which kills it at exec (the release's tarball gate found the same thing the same hour). A
+# tool-signed copy cannot stand in for it either: the seal binds the executable both ways
+# ("code has no resources but signature indicates they must be present"). So a signed payload
+# carries share/naudio/app.zip — the bundle as ditto packs it, the form Apple's own tools
+# exchange signed bundles in, seal and modes intact — and the postinstall extracts it with
+# ditto instead of assembling the pieces. The plist, the icon and the seal files stay beside
+# it as the record the gates read; an unsigned build never runs this script and its
+# postinstall assembles the unsigned bundle from those pieces as before. The Mach-O count
+# therefore drops by exactly one here, and the cardinality check at the end says so.
 #
 # The seal covers Info.plist, which carries the project version — the roll happens before
 # cpack, so the seal is always of the rolled file.
@@ -439,10 +453,48 @@ if(_rc EQUAL 0)
         "executable, so the seal does not bind the executable and the write-back proof above "
         "says nothing")
 endif()
+
+# The payload's form of the bundle: a ditto zip of the sealed bundle (the temporary one, whose
+# every byte the checks above measured), beside the pieces. Proved on the artifact by
+# extracting it again, verifying the extracted bundle and comparing its executable to the
+# bundle-signed bytes — a zip that dropped the seal or a mode would pass ditto and fail here.
+set(_app_zip "${_app_payload_dir}/app.zip")
+file(REMOVE "${_app_zip}")
+execute_process(COMMAND ditto -c -k --keepParent "${_app}" "${_app_zip}"
+                RESULT_VARIABLE _rc ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0 OR NOT EXISTS "${_app_zip}")
+    message(FATAL_ERROR "codesign: ditto could not zip ${_bundle_name}.app into the payload: ${_err}")
+endif()
+set(_unzipped "${_app_work}/unzipped")
+file(REMOVE_RECURSE "${_unzipped}")
+execute_process(COMMAND ditto -x -k "${_app_zip}" "${_unzipped}"
+                RESULT_VARIABLE _rc ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR "codesign: ditto could not extract ${_app_zip} again: ${_err}")
+endif()
+execute_process(COMMAND codesign --verify --deep --strict "${_unzipped}/${_bundle_name}.app"
+                RESULT_VARIABLE _rc ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR
+        "codesign: ${_bundle_name}.app does not verify after a trip through ${_app_zip}: ${_err}")
+endif()
+execute_process(COMMAND cmp -s "${_unzipped}/${_bundle_name}.app/Contents/MacOS/${_app_exec_name}"
+                        "${_app_exec}" RESULT_VARIABLE _rc)
+if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR
+        "codesign: the executable inside ${_app_zip} is not the bundle-signed one")
+endif()
+# Now the loose copy goes: the notary would reject it, and nothing installs it any more.
+file(REMOVE "${_app_exec}")
+if(EXISTS "${_app_exec}")
+    message(FATAL_ERROR "codesign: could not remove the loose ${_app_exec} from the payload")
+endif()
 file(REMOVE_RECURSE "${_app_work}")
 
-# CARDINALITY, once more: this step must have added no Mach-O to the payload. The notary would
-# see a sixth binary this script never signed; the release gate counts five.
+# CARDINALITY, once more: this step must have removed exactly ONE Mach-O from the payload — the
+# bundle's executable, inside app.zip now — and added none. The notary would see a binary this
+# script never signed; the release gates count five loose plus the one in the bundle.
+math(EXPR _n_expected "${_n} - 1")
 set(_n_after 0)
 file(GLOB_RECURSE _after "${_stage}/*")
 foreach(_f ${_after})
@@ -455,12 +507,14 @@ foreach(_f ${_after})
         math(EXPR _n_after "${_n_after} + 1")
     endif()
 endforeach()
-if(NOT _n_after EQUAL _n)
+if(NOT _n_after EQUAL _n_expected)
     message(FATAL_ERROR
         "codesign: the payload carried ${_n} Mach-O files before the control app was signed and "
-        "${_n_after} after; the signature files must not be binaries")
+        "${_n_after} after; expected ${_n_expected} — the bundle's executable inside app.zip "
+        "and no other change (the signature files must not be binaries)")
 endif()
 
 message(STATUS "codesign: ${_bundle_name}.app sealed as ${_bundle_id} (TeamIdentifier "
                "${_daemon_team}); ${_nsig} signature files staged under "
-               "${_codesig_dst}")
+               "${_codesig_dst}; the sealed bundle carried as ${_app_zip}, "
+               "${_n_after} loose Mach-O files remain")
