@@ -450,14 +450,19 @@ start_unit() {
 }
 # pipeline_state <url> — the stream state the page polls, settled: a run that was asked to
 # start passes through "starting" before it lands, so a reading of "starting" is re-read
-# (bounded). Anchored on `"stream":{"state":` — the pipeline's own object, not any other key
-# in the document that happens to be called state.
+# (bounded). An EMPTY reading is re-read too: one refused or timed-out request is not a
+# state, and on windows-latest a single curl right after the daemon announced its page came
+# back with nothing while the daemon was alive and the next request answered (the v1.0.0rc9
+# tag's CI, 2026-09-16 — the same tree passed on the push a few minutes earlier). A daemon
+# that is really gone still reads empty at the end of the bound, and the caller dumps its
+# log. Anchored on `"stream":{"state":` — the pipeline's own object, not any other key in
+# the document that happens to be called state.
 pipeline_state() {
     local url="${1%/}" s="" i
     for i in $(seq 1 50); do
         s="$("$CURL" -fsS --max-time 3 "$url/api/state" 2> /dev/null | tr -d '\r' \
              | sed -n 's/.*"stream":{"state":"\([a-z]*\)".*/\1/p')"
-        [ "$s" = "starting" ] || break
+        [ "$s" = "starting" ] || [ -z "$s" ] || break
         sleep 0.1
     done
     printf '%s' "$s"
