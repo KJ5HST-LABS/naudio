@@ -42,11 +42,20 @@
   systemd's not-enabled state gives Linux. macOS is the odd one out (issue #102): it has a system
   switch for background items, Login Items, which disagrees with a Disabled key, so the launchd
   agent ships without one and is inert by its arguments instead. Windows has no such switch.
+
+  The Description names the service as every platform names it - "Network Audio Service", the
+  string tools/CMakeLists.txt owns as NAUDIO_APP_NAME and the Start-menu shortcut, the Linux
+  desktop entry and the macOS app all carry. It is a LITERAL here, not an @-token, because of the
+  second rendering above: the installer's PowerShell substitutes the program path and nothing
+  else, so a token would reach the registered task unreplaced. The servicecheck arm asserts the
+  CMake rendering's description contains NAUDIO_APP_NAME, which is what keeps this literal and
+  that variable one string. The task's own path stays \naudio\naudio-daemon: it is what the
+  documented schtasks commands, the daemon's own query and the uninstaller name.
 -->
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <URI>\naudio\naudio-daemon</URI>
-    <Description>Runs the naudio audio streaming daemon and its local control page at logon.</Description>
+    <Description>Network Audio Service: runs the naudio audio streaming daemon and its local control page at logon.</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>

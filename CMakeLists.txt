@@ -1014,7 +1014,11 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
     # #102: inertness is a behaviour of those arguments now, not a Disabled key) — located
     # here, shared with the control-page gate below, and absent-as-harness-fault for the same
     # reason as the fourth. It binds a socket and polls for the daemon's first line, so it gets
-    # the control-page gate's timeout.
+    # the control-page gate's timeout. The sixth is the name the service carries on every
+    # platform (NAUDIO_APP_NAME, owned in tools/): the arm asserts each unit kind names it —
+    # the app plist's CFBundleName, the user unit's Description=, the logon task's description —
+    # so a rename in one place that misses another fails here rather than shipping two names.
+    # The seventh is the generated desktop entry, Linux only, whose Name= must be that string.
     find_program(NAUDIO_GATE_CURL NAMES curl)
     if(NAUDIO_SERVICE_UNIT_FILE)
         add_test(NAME naudio_daemon_servicecheck
@@ -1024,7 +1028,9 @@ if(NAUDIO_BUILD_TESTS AND NAUDIO_DAEMON_GATE_SHELL AND TARGET na_audio_daemon)
                               "${NAUDIO_SERVICE_UNIT_FILE}"
                               "${NAUDIO_SERVICE_EXEC_PATH}"
                               "${NAUDIO_APP_INFO_PLIST}"
-                              "${NAUDIO_GATE_CURL}")
+                              "${NAUDIO_GATE_CURL}"
+                              "${NAUDIO_APP_NAME}"
+                              "${NAUDIO_DESKTOP_ENTRY_FILE}")
         set_tests_properties(naudio_daemon_servicecheck PROPERTIES TIMEOUT 180)
     endif()
     # Control-page gate (issue #96 item 4). The page is the surface an operator reaches INSTEAD of
@@ -1390,6 +1396,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # the issue's acceptance names. It is the same command line the .desktop file and the
         # macOS .app use, and clicking it twice is safe: control mode finds an already-running
         # page on the configured port, opens that, and exits 0 rather than failing to bind.
+        # It is named NAUDIO_APP_NAME — "Network Audio Service", the name the service carries on
+        # every platform (owned in tools/CMakeLists.txt, read here through PARENT_SCOPE) — inside
+        # the package's own folder, which NSIS names after CPACK_NSIS_PACKAGE_NAME. The Start
+        # menu is where a Windows operator meets the service, as Applications is on a Mac, so
+        # the two show the same string; the release gate asserts the .lnk by that name.
+        #
+        # Guarded on the name: it is set only when tools/ built the daemon, and a lib-only
+        # configure has nothing for a shortcut (or the logon task below) to run.
         #
         # $SMPROGRAMS/$STARTMENU_FOLDER are NSIS variables, literal to CMake (as $PROGRAMFILES64
         # is above); the whole command is an NSIS single-quoted string so the inner double quotes
@@ -1403,47 +1417,49 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # nor NSIS. Four makes the value hold two, which survives the round trip as one, which
         # is what NSIS gets. Reproduced end to end before being believed: two fails and four
         # round-trips to exactly the single backslashes below.
-        set(CPACK_NSIS_CREATE_ICONS_EXTRA
-            "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\naudio Control.lnk' '$INSTDIR\\\\bin\\\\na_audio_daemon.exe' '--mode control --duration-ms 0 --open-page'")
-        set(CPACK_NSIS_DELETE_ICONS_EXTRA
-            "Delete '$SMPROGRAMS\\\\$MUI_TEMP\\\\naudio Control.lnk'")
+        if(NAUDIO_APP_NAME)
+            set(CPACK_NSIS_CREATE_ICONS_EXTRA
+                "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\${NAUDIO_APP_NAME}.lnk' '$INSTDIR\\\\bin\\\\na_audio_daemon.exe' '--mode control --duration-ms 0 --open-page'")
+            set(CPACK_NSIS_DELETE_ICONS_EXTRA
+                "Delete '$SMPROGRAMS\\\\$MUI_TEMP\\\\${NAUDIO_APP_NAME}.lnk'")
 
-        # Service registration rides the installer here exactly as the .pkg postinstall carries
-        # it on macOS (issue #96 item 2, Windows half). The work is in a PowerShell script the
-        # package ships rather than in escaped one-liners here: it has to substitute the chosen
-        # $INSTDIR into the task XML and write it as UTF-16, and neither is reviewable through
-        # three layers of quoting. See packaging/windows/register-task.ps1.
-        #
-        # A failure is REPORTED, not fatal: a machine where schtasks refuses still gets a working
-        # installation with a Start-menu shortcut, and the release gate asserts the task really
-        # is registered, so a regression reddens CI rather than shipping quietly.
-        #
-        # THE QUOTES ARE ESCAPED TWICE, and this one is worse than the backslashes above because
-        # it does not fail — it CORRUPTS. CPack writes this value into CPackConfig.cmake raw
-        # (CPACK_VERBATIM_VARIABLES is off by default), so a bare double quote inside it closes
-        # the string early; cpack then re-parses the remainder as a LIST and every quote comes
-        # back as a semicolon. The result is a .nsi full of `DetailPrint ;Registering;the;`,
-        # produced with no error at any stage. Measured by mirroring cpack_encode_variables()
-        # exactly and re-parsing its output.
-        #
-        # StrCmp rather than LogicLib's ${If}: CPack's NSIS template includes MUI.nsh, Sections.nsh
-        # and WinMessages.NSH and NOTHING else (checked in the template itself, not assumed), so
-        # ${If} would fail to compile in makensis with an error naming a macro rather than a
-        # missing include. StrCmp is core NSIS and needs nothing.
-        set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "
-    DetailPrint \\\"Registering the naudio logon task (disabled until you enable it)...\\\"
+            # Service registration rides the installer here exactly as the .pkg postinstall carries
+            # it on macOS (issue #96 item 2, Windows half). The work is in a PowerShell script the
+            # package ships rather than in escaped one-liners here: it has to substitute the chosen
+            # $INSTDIR into the task XML and write it as UTF-16, and neither is reviewable through
+            # three layers of quoting. See packaging/windows/register-task.ps1.
+            #
+            # A failure is REPORTED, not fatal: a machine where schtasks refuses still gets a working
+            # installation with a Start-menu shortcut, and the release gate asserts the task really
+            # is registered, so a regression reddens CI rather than shipping quietly.
+            #
+            # THE QUOTES ARE ESCAPED TWICE, and this one is worse than the backslashes above because
+            # it does not fail — it CORRUPTS. CPack writes this value into CPackConfig.cmake raw
+            # (CPACK_VERBATIM_VARIABLES is off by default), so a bare double quote inside it closes
+            # the string early; cpack then re-parses the remainder as a LIST and every quote comes
+            # back as a semicolon. The result is a .nsi full of `DetailPrint ;Registering;the;`,
+            # produced with no error at any stage. Measured by mirroring cpack_encode_variables()
+            # exactly and re-parsing its output.
+            #
+            # StrCmp rather than LogicLib's ${If}: CPack's NSIS template includes MUI.nsh, Sections.nsh
+            # and WinMessages.NSH and NOTHING else (checked in the template itself, not assumed), so
+            # ${If} would fail to compile in makensis with an error naming a macro rather than a
+            # missing include. StrCmp is core NSIS and needs nothing.
+            set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "
+    DetailPrint \\\"Registering the ${NAUDIO_APP_NAME} logon task (disabled until you enable it)...\\\"
     nsExec::ExecToLog '\\\"$SYSDIR\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\\\" -NoProfile -ExecutionPolicy Bypass -File \\\"$INSTDIR\\\\share\\\\naudio\\\\register-task.ps1\\\" -InstallDir \\\"$INSTDIR\\\"'
     Pop $0
     StrCmp $0 \\\"0\\\" +2 0
       DetailPrint \\\"naudio: the logon task could not be registered (code $0). Everything else is installed.\\\"
 ")
-        # The same script with -Unregister, so the task NAME lives in exactly one file. The
-        # release gate asserts the task is gone after an uninstall, which is also what would
-        # catch this running after the payload had already been deleted.
-        set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "
+            # The same script with -Unregister, so the task NAME lives in exactly one file. The
+            # release gate asserts the task is gone after an uninstall, which is also what would
+            # catch this running after the payload had already been deleted.
+            set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "
     nsExec::ExecToLog '\\\"$SYSDIR\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\\\" -NoProfile -ExecutionPolicy Bypass -File \\\"$INSTDIR\\\\share\\\\naudio\\\\register-task.ps1\\\" -InstallDir \\\"$INSTDIR\\\" -Unregister'
     Pop $0
 ")
+        endif()
     endif()
 
     include(CPack)

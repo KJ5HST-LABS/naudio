@@ -136,6 +136,23 @@ if(NAUDIO_BUILD_APPS)
         # The task's <Command> must name a file that exists; without the suffix it names nothing.
         set(NAUDIO_SERVICE_EXEC "${NAUDIO_SERVICE_EXEC}.exe")
     endif()
+
+    # The name the service and its shortcut carry, on every platform. It is owned HERE, once:
+    # on macOS the app bundle, the launchd agent's Login Items row and the Microphone prompt
+    # all show it (issues #102 and #105 — the three must be one string, because the Finder
+    # shows the on-disk name and ignores a CFBundleDisplayName that differs from it, measured
+    # 2026-09-14, while Login Items shows the display name); on Linux it is the desktop entry's
+    # Name= and the user unit's Description=; on Windows it is the Start-menu shortcut (the
+    # top-level CMakeLists.txt's NSIS section reads it through PARENT_SCOPE) and the logon
+    # task's description. The Windows task template carries it as a LITERAL rather than a
+    # token, because that template is rendered a second time by the installer's PowerShell,
+    # which substitutes the program path and nothing else — so the servicecheck arm asserts the
+    # rendered file's description names this string, and a rename here that misses the template
+    # fails there. The name is the service's, not the library's: "naudio" means nothing to the
+    # person reading a permission prompt or a Start menu (operator, 2026-09-15).
+    set(NAUDIO_APP_NAME "Network Audio Service")
+    set(NAUDIO_APP_NAME "${NAUDIO_APP_NAME}" PARENT_SCOPE)
+
     if(APPLE)
         # On macOS the agent runs the daemon FROM INSIDE Network Audio Service.app (issue #105),
         # not from bin/: TCC names a process after its bundle, and after nothing else — the
@@ -144,11 +161,8 @@ if(NAUDIO_BUILD_APPS)
         # in that executable changed neither (measured 2026-09-15, macOS 27). Run as the
         # bundle's own executable, the same daemon is "Network Audio Service" with its icon in
         # both places, and the usage sentence in the bundle's Info.plist is the one the prompt
-        # shows. The name and the path are owned HERE, and the plist, the postinstall and the
-        # bundle's Info.plist all take them from here, because the three must be one string:
-        # the Finder shows the on-disk name and ignores a CFBundleDisplayName that differs
-        # from it (measured 2026-09-14), and Login Items shows the display name.
-        set(NAUDIO_APP_NAME "Network Audio Service")
+        # shows. The plist, the postinstall and the bundle's Info.plist all take the name and
+        # the path from here.
         set(NAUDIO_APP_DIR "/Applications/${NAUDIO_APP_NAME}.app")
         set(NAUDIO_SERVICE_EXEC "${NAUDIO_APP_DIR}/Contents/MacOS/na_audio_daemon")
         set(NAUDIO_SERVICE_LOGDIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/log/naudio")
@@ -192,8 +206,9 @@ if(NAUDIO_BUILD_APPS)
         # Like the plist it rides inside the payload and is placed by the postinstall, because
         # /Applications is not under the /usr/local install prefix either. Named after the
         # service rather than the page because on macOS this bundle IS the service: what Login
-        # Items shows the agent as (issue #102) and what the Microphone prompt names (#105);
-        # the Linux and Windows shortcuts below keep the page's name, having no such row.
+        # Items shows the agent as (issue #102) and what the Microphone prompt names (#105).
+        # The Linux and Windows shortcuts carry the same name — one service, one name on
+        # every platform — even though neither has a system row that borrows an app's.
         #
         # THE PAYLOAD CARRIES FLAT FILES, NOT A BUNDLE, and that is the whole point. Shipping
         # the assembled `.app` inside the payload made `pkgbuild` auto-detect it and write
@@ -270,6 +285,10 @@ if(NAUDIO_BUILD_APPS)
                        "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.desktop" @ONLY)
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.desktop"
                 DESTINATION "${CMAKE_INSTALL_DATADIR}/applications" COMPONENT tools)
+        # Read by the naudio_daemon_servicecheck arm: the entry's Name= must be NAUDIO_APP_NAME,
+        # the name the service carries on the other two platforms.
+        set(NAUDIO_DESKTOP_ENTRY_FILE
+            "${CMAKE_CURRENT_BINARY_DIR}/naudio-control.desktop" PARENT_SCOPE)
         # Its icon (issue #103): the desktop entry's Icon=naudio is resolved by the desktop's
         # icon theme through share/icons/hicolor/<size>x<size>/apps/naudio.png — a name, not a
         # path, so the theme picks the size the menu, the panel or the launcher wants. The

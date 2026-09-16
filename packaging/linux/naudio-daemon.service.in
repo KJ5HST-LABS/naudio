@@ -14,9 +14,16 @@
 # installing a package must not start capturing a microphone at the next login. The
 # operator enables it once with `systemctl --user enable --now naudio-daemon`; issue #96
 # item 4 turns that into a click.
+#
+# Description= leads with the service's name, the one string every platform shows
+# (NAUDIO_APP_NAME, owned in tools/CMakeLists.txt): it is what `systemctl --user status`
+# prints beside the unit, as Login Items prints it on a Mac and Task Scheduler's description
+# column on Windows. The unit's own name stays naudio-daemon — it is what the documented
+# systemctl commands and the daemon's own query name. The servicecheck arm asserts the
+# generated unit carries it.
 
 [Unit]
-Description=naudio audio streaming daemon
+Description=@NAUDIO_APP_NAME@ (naudio audio streaming daemon)
 Documentation=man:na_audio_daemon(1)
 
 [Service]

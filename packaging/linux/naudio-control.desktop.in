@@ -14,9 +14,14 @@
 # share/icons/hicolor/<size>x<size>/apps/naudio.png, which the package installs at every
 # standard size, and picks the one the menu or panel wants. Until #103 this borrowed the
 # theme's audio-card icon.
+#
+# Name= is the service's name, the one string every platform shows (NAUDIO_APP_NAME, owned in
+# tools/CMakeLists.txt): what /Applications holds on a Mac and the Start menu on Windows. The
+# servicecheck arm asserts the generated entry carries it. The file's own name stays
+# naudio-control.desktop — a path, referenced by the release gate, not a label anyone reads.
 Type=Application
 Version=1.0
-Name=naudio Control
+Name=@NAUDIO_APP_NAME@
 GenericName=Audio streaming control
 Comment=Pick a capture device, save settings and start streaming, in a browser
 Exec=@NAUDIO_SERVICE_EXEC@ --mode control --duration-ms 0 --open-page
