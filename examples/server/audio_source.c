@@ -5,7 +5,7 @@
 // Copyright (C) 2025-2026 Terrell Deppe
 //
 // A tiny streaming server so you can run one of the example clients and actually
-// HEAR something — no radio, no second machine. It speaks the same network-audio
+// HEAR something — no capture device, no second machine. It speaks the same network-audio
 // protocol the clients expect, over the public `naudio.h` C ABI only (it never
 // names a C++ type and links only the shared `naudio` library).
 //
@@ -22,7 +22,7 @@
 //      with no `--capture-id` the first capture-capable device is used.
 //      Add `--playback-id N` and the server also PLAYS the clients' TX audio — the
 //      one TX channel it arbitrates among them (na_server_tx_owner) — on that output
-//      device: the radio's TX audio input at a station, or the speakers on a desk.
+//      device: a line input on another piece of equipment, or the speakers on a desk.
 //      Both devices are opened at the server format; naudio does not resample.
 //      Whichever mode, every change of TX owner is logged with a wall-clock stamp
 //      (`[source] <stamp> tx owner=<id|none>`) — see stamp_now below for why that shape.

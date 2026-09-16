@@ -3,7 +3,7 @@
 # Demo audio source
 
 A tiny streaming server so you can run one of the example clients and actually
-**hear something** — no radio and no second machine required. It broadcasts audio
+**hear something** — no capture device and no second machine required. It broadcasts audio
 to every connected client over the network-audio protocol, using only the public
 `naudio.h` C ABI.
 

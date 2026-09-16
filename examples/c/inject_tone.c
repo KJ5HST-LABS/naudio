@@ -7,7 +7,7 @@
 // The transmitting client the demo pair lacked: na_audio_source serves RX and, with
 // --playback-id, plays its clients' TX on a device; this program SENDS TX — a sawtooth at the
 // server's format, from the hardware-free NULL backend, for N seconds. With it the TX path is
-// proved with no digital-mode application in the loop, and a silent bench splits into a
+// proved with no consuming application in the loop, and a silent bench splits into a
 // naudio-side fault or an application-side one. It is tests/c_tx_sustained.c with the
 // assertions taken out and the arguments put in.
 //
@@ -17,8 +17,8 @@
 // the only way a NULL-backend client transmits) and the NULL backend plays nothing. TCP, the
 // server's default transport. The server decides the format; this reads it back after connect
 // (na_client_get_audio_format) and builds the tone in it — nothing here resamples. Sending is
-// gated by NA_DUPLEX_TALK, which is NOT PTT (read the note on na_client_set_duplex): whether a
-// carrier goes up is rig control's job, and this program never keys anything.
+// gated by NA_DUPLEX_TALK, which switches nothing on at the far end (read the note on
+// na_client_set_duplex): what the output does with the audio is somebody else's job.
 //
 // Output: the human log goes to STDERR; one machine-readable RESULT line goes to STDOUT.
 

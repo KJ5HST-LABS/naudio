@@ -80,11 +80,11 @@ Real-speaker playback needs audio hardware, so it is not part of the automated t
 
 ## Send a tone as TX (`na_c_inject_tone`)
 
-The sending client, [`inject_tone.c`](inject_tone.c): it connects, reads the server's format back, and injects a 1 kHz sawtooth as TX audio for N seconds from the hardware-free `null` backend — no capture device, nothing played locally. With `na_audio_source --playback-id N` at the other end the tone comes out of that device and the server logs `tx owner=` for this client while it sends; against a naudio server that feeds a radio it proves the TX path with no digital-mode application in the loop, and splits a silent bench into a naudio-side or an application-side fault.
+The sending client, [`inject_tone.c`](inject_tone.c): it connects, reads the server's format back, and injects a 1 kHz sawtooth as TX audio for N seconds from the hardware-free `null` backend — no capture device, nothing played locally. With `na_audio_source --playback-id N` at the other end the tone comes out of that device and the server logs `tx owner=` for this client while it sends; against a naudio server that feeds an output device it proves the TX path with no consuming application in the loop, and splits a silent bench into a naudio-side or an application-side fault.
 
 ```sh
 cmake --build build --target na_c_inject_tone
 build/examples/na_c_inject_tone --host 192.168.1.10 --port 4533 --seconds 5
 ```
 
-`--name S` sets the display name; the owner id the server logs is its own (`audio-N`). Sending is gated by naudio's duplex mode, which is not PTT: this program keys nothing, and whether a carrier goes up is rig control's job. It ships in no package — it is built with the examples and driven by the `naudio_tx_owner_line` test arm, which asserts the server's owner line against it and against a client that connects and sends nothing.
+`--name S` sets the display name; the owner id the server logs is its own (`audio-N`). Sending is gated by naudio's duplex mode, which switches nothing on at the far end: what the output does with the audio is somebody else's job. It ships in no package — it is built with the examples and driven by the `naudio_tx_owner_line` test arm, which asserts the server's owner line against it and against a client that connects and sends nothing.
