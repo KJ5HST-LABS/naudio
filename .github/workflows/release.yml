@@ -201,10 +201,45 @@ jobs:
           "$P/bin/na_audio_daemon" -h > /dev/null 2>&1
           "$P/bin/na_audio_source" --help > /dev/null
           "$P/bin/na_c_play_to_speakers" --help > /dev/null
+          echo "all four shipped binaries run env-free from the package"
+
           # The daemon's second copy (#105): the control app's executable, carried beside
-          # the app's other pieces. Same bytes as bin/'s until signing; runs the same.
-          "$P/share/naudio/na_audio_daemon" -h > /dev/null 2>&1
-          echo "all four shipped binaries run env-free from the package (the daemon from both places)"
+          # the app's other pieces for the .pkg postinstall to assemble. It is the same
+          # bytes as bin/'s only until signing: signed as the bundle's executable, its code
+          # directory binds the bundle's Info.plist, so outside a bundle the signature is
+          # invalid ("invalid Info.plist", codesign --verify) and the hardened runtime has
+          # the kernel kill it at exec — SIGKILL, exit 137. Measured 2026-09-16: this gate's
+          # first run, on rc9's first cut, ran it bare and died exactly so; the same copy
+          # taken out of an installed bundle dies the same way on a Mac, and the bin/ copy
+          # runs bare. So it is tested as what it is: assembled into the bundle the way the
+          # postinstall assembles it, it must run and (when signed) verify; run BARE, a
+          # signed copy must be killed — the control that this is the bundle-signed copy
+          # and not a stray duplicate of bin/'s, which would place a bundle that does not
+          # verify. Unsigned (no identity), the bare run succeeds and proves nothing, which
+          # is said rather than counted.
+          APPX="${{ runner.temp }}/tgz-app"; rm -rf "$APPX"
+          app_name=$(plutil -extract CFBundleName raw -o - "$P/share/naudio/naudio-control.Info.plist")
+          APPB="$APPX/$app_name.app"
+          mkdir -p "$APPB/Contents/MacOS" "$APPB/Contents/Resources"
+          cp "$P/share/naudio/na_audio_daemon" "$APPB/Contents/MacOS/"
+          cp "$P/share/naudio/naudio-control.Info.plist" "$APPB/Contents/Info.plist"
+          cp "$P/share/naudio/naudio.icns" "$APPB/Contents/Resources/"
+          if [ -d "$P/share/naudio/app.codesig" ]; then
+            mkdir -p "$APPB/Contents/_CodeSignature"
+            cp "$P/share/naudio/app.codesig/"* "$APPB/Contents/_CodeSignature/"
+          fi
+          "$APPB/Contents/MacOS/na_audio_daemon" -h > /dev/null 2>&1 \
+            || { echo "::error::the app's executable does not run from inside the bundle assembled from the tarball's pieces"; exit 1; }
+          if [ -n "${NAUDIO_CODESIGN_IDENTITY:-}" ]; then
+            codesign --verify --deep --strict "$APPB" \
+              || { echo "::error::the bundle assembled from the tarball's pieces does not verify"; exit 1; }
+            set +e; "$P/share/naudio/na_audio_daemon" -h > /dev/null 2>&1; bare_rc=$?; set -e
+            [ "$bare_rc" -eq 137 ] \
+              || { echo "::error::the bundle's executable ran BARE (exit $bare_rc) — it is not the bundle-signed copy, so the postinstall would place a bundle that does not verify"; exit 1; }
+            echo "app executable: runs inside the assembled bundle, verifies, and is killed bare (137) as a bundle-bound signature must be"
+          else
+            echo "app executable: runs inside the assembled bundle (unsigned build; the bare-run control does not apply)"
+          fi
 
           # Self-containment: every load command outside @rpath//usr/lib//System
           # is a finding. Cardinality-checked (L230): exactly 6 binaries scanned
@@ -1128,12 +1163,18 @@ jobs:
             Write-Output "::error::na_audio_daemon.exe carries no icon resource — Explorer and the Start-menu shortcut would show the generic one"; exit 1 }
           $nsi = Get-ChildItem build/_CPack_Packages -Recurse -Filter project.nsi | Select-Object -First 1
           if (-not $nsi) { Write-Output "::error::CPack left no project.nsi to assert the installer icon on"; exit 1 }
-          $muiIcon = Select-String -Path $nsi.FullName -Pattern '^!define MUI_ICON "(.+)"' | Select-Object -First 1
+          # CPack writes the path through ConvertToWindowsOutputPath: backslashes, and quotes
+          # ONLY when the path holds a space. A runner's D:\a\naudio\... has none, so the line
+          # is `!define MUI_ICON D:\a\...\naudio.ico`, unquoted — this gate's first run, on
+          # rc9's first cut, matched only the quoted form an older CPack wrote and called a
+          # present icon absent. Both forms are accepted; the path is read back with the
+          # quotes off and the slashes normalised before it is compared.
+          $muiIcon = Select-String -Path $nsi.FullName -Pattern '^!define MUI_ICON\s+"?([^"]+?)"?\s*$' | Select-Object -First 1
           if (-not $muiIcon) { Write-Output "::error::the generated .nsi defines no MUI_ICON — the setup .exe carries NSIS's default icon"; exit 1 }
           $muiIconPath = $muiIcon.Matches[0].Groups[1].Value
-          if ($muiIconPath -notmatch 'packaging/icons/naudio\.ico$' -or -not (Test-Path -LiteralPath $muiIconPath)) {
+          if (($muiIconPath -replace '\\','/') -notmatch 'packaging/icons/naudio\.ico$' -or -not (Test-Path -LiteralPath $muiIconPath)) {
             Write-Output "::error::MUI_ICON is '$muiIconPath', not this checkout's packaging/icons/naudio.ico"; exit 1 }
-          if (-not (Select-String -Path $nsi.FullName -Pattern '^!define MUI_UNICON "(.+)naudio\.ico"' -Quiet)) {
+          if (-not (Select-String -Path $nsi.FullName -Pattern '^!define MUI_UNICON\s+"?[^"]*naudio\.ico"?\s*$' -Quiet)) {
             Write-Output "::error::the generated .nsi defines no MUI_UNICON naming naudio.ico — the uninstaller carries NSIS's default icon"; exit 1 }
           Write-Output "icon: na_audio_daemon.exe carries $daemonIcons icon group(s) (na_wav_tap.exe 0, as the control); setup and uninstaller use $muiIconPath"
 
