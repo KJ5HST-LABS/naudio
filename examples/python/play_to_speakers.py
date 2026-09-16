@@ -16,7 +16,7 @@
 #
 #     play_to_speakers.py --host 127.0.0.1 --port 4533
 #
-# Pair it with the demo source to hear something without a radio or a second
+# Pair it with the demo source to hear something without a capture device or a second
 # machine (see examples/server):
 #
 #     na_audio_source --test-tone --port 4533       # one terminal: a test tone
