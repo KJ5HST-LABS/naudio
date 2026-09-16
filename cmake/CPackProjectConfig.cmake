@@ -12,6 +12,19 @@
 # (the release gates diff/assert the other packages' contents).
 
 if(CPACK_GENERATOR STREQUAL "productbuild")
+    # The Installer's window title and "Welcome to the … Installer" line are the
+    # distribution's <title>, which CPack's template fills from CPACK_PACKAGE_NAME.
+    # The name shown is the service's — Network Audio Service, carried here as
+    # CPACK_NAUDIO_PRODUCT_NAME from CMakeLists.txt — not the library's; the
+    # operator opened rc9's .pkg and read "Install naudio" (2026-09-16). Scoped to
+    # this generator and set AFTER CPackConfig.cmake was read, so nothing derived
+    # from the name at configure time moves: the artifact file names come from
+    # CPACK_PACKAGE_FILE_NAME, the receipt ids from CPACK_PRODUCTBUILD_IDENTIFIER,
+    # and the DEB/RPM package name from the generators that never see this branch.
+    # The release gate reads the title back off the built .pkg's Distribution.
+    if(CPACK_NAUDIO_PRODUCT_NAME)
+        set(CPACK_PACKAGE_NAME "${CPACK_NAUDIO_PRODUCT_NAME}")
+    endif()
     set(CPACK_COMPONENTS_ALL runtime tools)
     # productbuild builds one inner pkg per component inside the single
     # product archive (grouping is not honored here — measured). Hide both
@@ -33,6 +46,10 @@ if(CPACK_GENERATOR STREQUAL "productbuild")
     # pane-sized text written for the installer, not the repo README.
     set(CPACK_RESOURCE_FILE_LICENSE "${CPACK_NAUDIO_LICENSE_TXT}")
     set(CPACK_RESOURCE_FILE_README "${CPACK_NAUDIO_PKG_README_TXT}")
+    # The welcome pane too (Introduction); without a file macOS shows its own sentence.
+    if(CPACK_NAUDIO_PKG_WELCOME_TXT)
+        set(CPACK_RESOURCE_FILE_WELCOME "${CPACK_NAUDIO_PKG_WELCOME_TXT}")
+    endif()
     # Registers the launchd agent after the payload lands (issue #96 item 2) — the
     # ".pkg postinstall" half of "registration rides the existing installers". Scoped
     # to this generator: the TGZ has no scripts, and the file is only defined when the

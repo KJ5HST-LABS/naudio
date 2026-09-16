@@ -1257,6 +1257,22 @@ endif()
 # ----------------------------------------------------------------------------
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CPACK_PACKAGE_NAME "naudio")
+    # The name the INSTALLERS show — the macOS Installer's title and panes, the Windows setup's
+    # title, Start-menu folder and Add/Remove Programs entry — is the service's, Network Audio
+    # Service (NAUDIO_APP_NAME, owned in tools/ and exported here), because that is who the
+    # person double-clicking a .pkg or a setup .exe is installing; "naudio" is the library's name
+    # and meant nothing to the operator reading "Install naudio" (2026-09-16). The package's
+    # IDENTIFIERS stay naudio: CPACK_PACKAGE_NAME above feeds the DEB/RPM package name, the
+    # artifact file names, the install directory and the receipt ids — the things people type
+    # into apt, brew, a shell or pkgutil. A lib-only configure has no service and keeps the
+    # library's name. The CPACK_ copy reaches cmake/CPackProjectConfig.cmake, which runs at
+    # cpack time in a separate context and applies it to the productbuild title.
+    if(NAUDIO_APP_NAME)
+        set(NAUDIO_PRODUCT_NAME "${NAUDIO_APP_NAME}")
+    else()
+        set(NAUDIO_PRODUCT_NAME "naudio")
+    endif()
+    set(CPACK_NAUDIO_PRODUCT_NAME "${NAUDIO_PRODUCT_NAME}")
     set(CPACK_PACKAGE_VENDOR "KJ5HST")
     set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
         "net-audio streaming toolkit: C ABI, multi-tenant server/client, reliability stack")
@@ -1357,6 +1373,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         configure_file(LICENSE "${CMAKE_CURRENT_BINARY_DIR}/cpack-resources/LICENSE.txt" COPYONLY)
         set(CPACK_NAUDIO_LICENSE_TXT "${CMAKE_CURRENT_BINARY_DIR}/cpack-resources/LICENSE.txt")
         set(CPACK_NAUDIO_PKG_README_TXT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/productbuild-readme.txt")
+        # The welcome pane, which otherwise shows macOS's own "This program will guide you
+        # through the installation of this software": a few lines saying what the service is.
+        set(CPACK_NAUDIO_PKG_WELCOME_TXT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/productbuild-welcome.txt")
         # Service registration rides the installer (issue #96 item 2): the payload
         # cannot place /Library/LaunchAgents/org.kj5hst.naudio.daemon.plist, because
         # every payload path is rooted at the /usr/local install prefix. A postinstall
@@ -1378,8 +1397,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # The tools are console programs: offer PATH so they run from any
         # prompt — the one thing a CLI payload needs from a GUI installer.
         set(CPACK_NSIS_MODIFY_PATH ON)
-        set(CPACK_NSIS_DISPLAY_NAME "naudio")
-        set(CPACK_NSIS_PACKAGE_NAME "naudio")
+        # What the setup window, the Start-menu folder (NSIS defaults it to the installer's
+        # Name) and Add/Remove Programs call the product: the service's name, from above. The
+        # uninstall registry key is CPACK_PACKAGE_NAME + version and does not move, so an
+        # upgrade still finds the previous install; the install directory stays naudio.
+        set(CPACK_NSIS_DISPLAY_NAME "${NAUDIO_PRODUCT_NAME}")
+        set(CPACK_NSIS_PACKAGE_NAME "${NAUDIO_PRODUCT_NAME}")
         set(CPACK_NSIS_URL_INFO_ABOUT "${CPACK_PACKAGE_HOMEPAGE_URL}")
         set(CPACK_NSIS_CONTACT "${CPACK_PACKAGE_CONTACT}")
         # The icon (issue #103), in the three places Windows shows one for an installed program:

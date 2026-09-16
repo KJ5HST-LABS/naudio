@@ -1,0 +1,5 @@
+Network Audio Service streams the audio your radio's USB audio interface receives to your digital-mode software, over the network.
+
+This installer places the service, its control page and the naudio command-line tools on this Mac. The service is listed in System Settings > General > Login Items & Extensions and starts at your next login; it opens no microphone until you press Start on its page.
+
+Read Me on the next pane says where everything goes and how to remove it.
