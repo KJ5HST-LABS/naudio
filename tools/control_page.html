@@ -162,12 +162,12 @@
   <section class="panel" role="tabpanel" id="panelSetup" aria-labelledby="tabSetup">
     <h2>Setup</h2>
     <!-- Shown until a capture device is chosen: the one sentence a first run needs. -->
-    <div id="setupIntro" class="notice info" hidden>Start here: choose the radio’s capture
+    <div id="setupIntro" class="notice info" hidden>Start here: choose the capture
       device, then save. Streaming waits on the Stream tab until Setup is saved.</div>
     <div id="configNotice" hidden></div>
     <div class="fields">
       <div class="field">
-        <label for="captureSel">Capture device (the radio)</label>
+        <label for="captureSel">Capture device (the audio source)</label>
         <select id="captureSel"></select>
         <span class="hint" id="captureHint"></span>
       </div>
@@ -177,7 +177,7 @@
       <div class="field">
         <label for="playbackSel">Send received audio to</label>
         <select id="playbackSel"></select>
-        <span class="hint" id="playbackHint">A virtual sink (BlackHole, VB-Cable, Loopback) is what a digital-mode app reads.</span>
+        <span class="hint" id="playbackHint">A virtual sink (BlackHole, VB-Cable, Loopback) is what another application reads the stream from.</span>
       </div>
       <div class="field">
         <label for="transportSel">Transport</label>

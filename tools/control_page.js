@@ -68,7 +68,7 @@ let applyPending = false; // settings were saved while the stream ran; a restart
 function markDirty() { dirty = true; refreshButtons(); }
 
 // --- tabs (issue #106) --------------------------------------------------------------------
-// Setup and Stream. The page opens on Setup until the radio's capture device is chosen, so the
+// Setup and Stream. The page opens on Setup until a capture device is chosen, so the
 // first thing a new operator sees is the choice they have to make; once it is chosen — or when
 // a stream is already running, which is worth seeing whatever the setup says — it opens on
 // Stream. After that the operator's clicks decide. Nothing here is remembered across loads.
@@ -201,9 +201,9 @@ function renderDevices() {
   fillDeviceSelect($('playbackSel'), devices && devices.playback, 'playback', 'playback-id', 'playback', resolved);
   $('captureHint').textContent = deviceHint('capture', resolved) || (devicesStale
     ? 'This list was captured earlier — stop the stream and rescan to see a device plugged in since.'
-    : 'Pick the radio’s USB audio interface. It is saved by name, so it is still the radio if its number changes.');
+    : 'Pick the device whose audio you are streaming. It is saved by name, so it is still the same device if its number changes.');
   $('playbackHint').textContent = deviceHint('playback', resolved) ||
-    'A virtual sink (BlackHole, VB-Cable, Loopback) is what a digital-mode app reads.';
+    'A virtual sink (BlackHole, VB-Cable, Loopback) is what another application reads the stream from.';
 }
 
 async function rescan() {
@@ -384,7 +384,7 @@ async function quitDaemon() {
 // Why Start is off, in one line, or null when it is not. Unsaved changes block it too: a stream
 // started on a form that differs from the file is the exact failure #106 reports.
 function startBlockedReason() {
-  if (!setupComplete()) return 'Choose the radio’s capture device in Setup and save it.';
+  if (!setupComplete()) return 'Choose a capture device in Setup and save it.';
   if (dirty) return 'Setup has unsaved changes — save or discard them first.';
   // The saved device is not in the current list (issue #107). Start would refuse anyway — the
   // daemon never opens whatever now holds the saved number — but the reason belongs here, before

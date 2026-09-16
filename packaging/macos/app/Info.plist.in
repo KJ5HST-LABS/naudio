@@ -62,7 +62,7 @@
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Network Audio Service streams the audio your radio's USB audio interface receives to your digital-mode software.</string>
+    <string>Network Audio Service streams audio from the capture device you choose to the applications that listen for it over the network.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright (C) 2025-2026 Terrell Deppe. LGPL-2.1-or-later.</string>
 </dict>

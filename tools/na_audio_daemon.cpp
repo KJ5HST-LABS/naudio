@@ -235,11 +235,11 @@ std::string silenceHint(std::int64_t silentMs) {
            "the same.";
 #elif defined(_WIN32)
     return "the capture device has delivered " + secs + " s of silence at full rate: check that "
-           "the input is not muted, that this is the radio's device, and that Settings > Privacy "
+           "the input is not muted, that this is the device you meant, and that Settings > Privacy "
            "& security > Microphone allows microphone access for desktop apps.";
 #else
     return "the capture device has delivered " + secs + " s of silence at full rate: check that "
-           "the input is not muted and that this is the radio's device.";
+           "the input is not muted and that this is the device you meant.";
 #endif
 }
 
@@ -307,7 +307,7 @@ void usage() {
         "  modes:\n"
         "    capture-probe  open the capture device directly; report frames/overflow/RMS\n"
         "                   (the real-hardware capture + no-overrun gate; capture only)\n"
-        "    hardware       (default) server captures the radio RX -> 127.0.0.1 transport ->\n"
+        "    hardware       (default) server captures the device -> 127.0.0.1 transport ->\n"
         "                   in-process RX-only client; measures sustained throughput + RMS\n"
         "    control        serve the localhost control page: pick a device, save settings,\n"
         "                   start/stop the stream and watch it, all from a browser. Captures\n"
@@ -319,11 +319,11 @@ void usage() {
         "                    (two identical codecs): ids renumber when a device comes or goes,\n"
         "                    so the NAME decides, and a name that matches nothing refuses rather\n"
         "                    than opening whatever now holds the id\n"
-        "  --playback <pat>  hardware mode: client RX sink, e.g. BlackHole (the digital-mode feed);\n"
+        "  --playback <pat>  hardware mode: client RX sink, e.g. BlackHole (the feed another app reads);\n"
         "                    omitted/not-found => hardware-free FakeBackend drain\n"
         "                    WARNING: a pattern that matches NOTHING takes that same drain and the\n"
         "                    run can still exit 0 -- so a misspelled sink name reports a PASS for a\n"
-        "                    check that never fed your digital-mode app. Confirm the 'client sink'\n"
+        "                    check that never fed your application. Confirm the 'client sink'\n"
         "                    line names a real device before trusting a hardware-mode pass.\n"
         "  --playback-id N   playback device backendId; with --playback, a tie-breaker as above\n"
         "  --transport       tcp (default) | udp | dual\n"
@@ -473,7 +473,7 @@ int runListDevices(const Args& a) {
     printDeviceList("CAPTURE devices", enumerator.captureDevices());
     printDeviceList("PLAYBACK devices", enumerator.playbackDevices());
     std::printf(
-        "\nPick the radio's USB-audio device for --capture (or --capture-id), and a virtual\n"
+        "\nPick the capture device for --capture (or --capture-id), and a virtual\n"
         "sink (e.g. BlackHole) for --playback if you want to feed an external app.\n");
     return 0;
 }
@@ -856,12 +856,12 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
         std::printf("client sink  : FakeBackend drain (no virtual sink found; pipeline-only)\n");
         // An EXPLICIT --playback that matched nothing takes this same silent fallback, and the run
         // can still exit 0 — so a misspelled sink name reports a pass for a check that never fed
-        // the digital-mode app. Name the pattern that missed, so the drain is not mistaken for the
+        // the consuming app. Name the pattern that missed, so the drain is not mistaken for the
         // "no sink configured" case.
         if (!a.playbackPattern.empty()) {
             std::printf("               NOTE: --playback '%s' matched NO device (%s); this run does\n"
                         "               NOT feed any external consumer, and a pass here says nothing\n"
-                        "               about your digital-mode app.\n",
+                        "               about your application.\n",
                         a.playbackPattern.c_str(), sinkChoice.reason.c_str());
         }
     }
@@ -1037,7 +1037,7 @@ int runHardware(const Args& a, std::atomic<bool>& stop, LiveStatus* live) {
         std::printf("  silence        : %s\n", silenceHint(silence.silentMs).c_str());
     if (realSink)
         std::printf("  virtual sink   : server RX is now flowing to '%s' — open it as the input\n"
-                    "                   in your digital-mode app (or any consumer) to complete the bridge check\n",
+                    "                   in the application that consumes it to complete the check\n",
                     sinkDev->name.c_str());
     return (gotStream && noErrors) ? 0 : 1;
 }
