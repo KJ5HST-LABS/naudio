@@ -73,7 +73,23 @@
 
 // mkdir, for the control page creating the config file's parent directory; on POSIX also the
 // exit-status macros and getuid(), for reading the login service's switch (issue #102).
+//
+// On Windows the Win32 headers too: CreateProcess with CREATE_NO_WINDOW (the login service's
+// switch is read by running schtasks, and a std::system()/_popen() child would flash a console
+// window once a second under the windowed build), ShellExecute (opening the page without a
+// cmd.exe window), and — in the windowed build, NAUDIO_WINDOWED — the tray icon's window and
+// Shell_NotifyIcon. winsock2.h first: windows.h drags in the old winsock.h otherwise, which the
+// transport headers this file includes cannot coexist with.
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <windows.h>
+#include <shellapi.h>
 #include <direct.h>
 #else
 #include <sys/stat.h>
@@ -1710,18 +1726,67 @@ void sendError(naudio::net::Socket& sock, int status, const std::string& reason,
 // the daemon takes no dependency on a service-manager library to save a fork.
 
 // Run a shell command with its output discarded; the child's exit status, or -1 if it could not
-// be run. std::system's raw value is wait(2)-encoded on POSIX and the exit status on Windows.
+// be run. std::system's raw value is wait(2)-encoded. POSIX only: on Windows the reads below go
+// through runHidden, because a std::system() child is a console window.
+#if !defined(_WIN32)
 int runQuiet(const std::string& cmd) {
     const int rc = std::system(cmd.c_str());
-#if defined(_WIN32)
-    return rc;
-#else
     if (rc == -1 || !WIFEXITED(rc)) return -1;
     return WEXITSTATUS(rc);
-#endif
 }
+#endif
 
 bool fileExists(const std::string& path) { return std::ifstream(path).good(); }
+
+#if defined(_WIN32)
+// Run a command line with NO console window and collect its stdout; the child's exit code, or
+// -1 if it could not be started. std::system() and _popen() go through cmd.exe, and under the
+// windowed build (a GUI-subsystem process with no console of its own) every such child gets a
+// console window of its own — for the schtasks read below, a flash on the operator's screen once
+// a second. CreateProcess with CREATE_NO_WINDOW is the same work with no window, in either build.
+int runHidden(const std::string& cmdline, std::string* out) {
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof sa;
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOA si{};
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    PROCESS_INFORMATION pi{};
+    std::string cmd = cmdline;  // CreateProcessA may write into the buffer
+    const BOOL ok = CreateProcessA(nullptr, &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+                                   nullptr, nullptr, &si, &pi);
+    CloseHandle(wr);
+    if (!ok) {
+        CloseHandle(rd);
+        return -1;
+    }
+    std::string acc;
+    char buf[512];
+    DWORD n = 0;
+    while (ReadFile(rd, buf, sizeof buf, &n, nullptr) && n > 0) acc.append(buf, n);
+    CloseHandle(rd);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    if (out) *out = acc;
+    return static_cast<int>(code);
+}
+
+// %SystemRoot%\System32\schtasks.exe by its full path: the service's environment is the
+// operator's, and a PATH that lost System32 would otherwise read as "no task registered".
+std::string schtasksPath() {
+    char dir[MAX_PATH];
+    const UINT n = GetSystemDirectoryA(dir, MAX_PATH);
+    return (n > 0 && n < MAX_PATH) ? std::string(dir) + "\\schtasks.exe" : "schtasks.exe";
+}
+#endif
 
 // {"manager":..., "installed":bool, "enabled":bool} — or null where this build has no service
 // manager to ask. `manager` names the platform's mechanism so the page can word the row and
@@ -1742,18 +1807,15 @@ std::string serviceJson() {
     // The task the installer registers (packaging/windows/register-task.ps1). A query of a
     // task that exists exits 0; its enabled state is the Status column of the CSV listing,
     // "Disabled" when off and "Ready" or "Running" when on — the one read that needs output.
-    const bool installed =
-        runQuiet("schtasks /Query /TN \\naudio\\naudio-daemon >NUL 2>&1") == 0;
+    // Both through runHidden: a cmd.exe child would put a console window on the screen once a
+    // second under the windowed build.
+    const std::string schtasks = "\"" + schtasksPath() + "\" /Query /TN \\naudio\\naudio-daemon";
+    const bool installed = runHidden(schtasks, nullptr) == 0;
     bool enabled = false;
     if (installed) {
-        if (FILE* p = _popen("schtasks /Query /TN \\naudio\\naudio-daemon /FO CSV /NH 2>NUL",
-                             "r")) {
-            char line[512];
-            std::string out;
-            while (std::fgets(line, sizeof line, p)) out += line;
-            _pclose(p);
+        std::string out;
+        if (runHidden(schtasks + " /FO CSV /NH", &out) == 0)
             enabled = !out.empty() && out.find("\"Disabled\"") == std::string::npos;
-        }
     }
     return std::string("{\"manager\":\"task-scheduler\",\"installed\":") +
            (installed ? "true" : "false") + ",\"enabled\":" + (enabled ? "true" : "false") + "}";
@@ -2293,16 +2355,22 @@ private:
 // why the URL is printed first, unconditionally.
 void openInBrowser(const std::string& url) {
 #if defined(_WIN32)
-    // The empty "" is start's TITLE argument; without it start treats a quoted URL as the title
-    // and opens a console window instead.
-    const std::string cmd = "start \"\" \"" + url + "\"";
-#elif defined(__APPLE__)
+    // ShellExecute, not `start` through std::system(): the latter is a cmd.exe child, which
+    // under the windowed build is a console window flashing on the operator's screen. The
+    // return is an HINSTANCE by history; > 32 means it launched.
+    const auto rc = reinterpret_cast<INT_PTR>(
+        ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    if (rc <= 32)
+        std::fprintf(stderr, "note: could not open a browser; visit %s yourself\n", url.c_str());
+#else
+#if defined(__APPLE__)
     const std::string cmd = "open '" + url + "'";
 #else
     const std::string cmd = "xdg-open '" + url + "' >/dev/null 2>&1";
 #endif
     if (std::system(cmd.c_str()) != 0)
         std::fprintf(stderr, "note: could not open a browser; visit %s yourself\n", url.c_str());
+#endif
 }
 
 // Is a naudio control page ALREADY answering on this port? Asked when the bind fails, because
@@ -2334,6 +2402,154 @@ bool naudioControlPageAnswers(int port) {
     }
     return got.rfind("HTTP/1.1 200", 0) == 0 && got.find("naudio control") != std::string::npos;
 }
+
+#if defined(_WIN32) && defined(NAUDIO_WINDOWED)
+// ---- the windowed build (na_audio_daemonw.exe) ---------------------------------------------
+// The same program built for the GUI subsystem, the way pythonw and javaw are: no console window
+// at all, so the logon task and the Start-menu shortcut run it and nothing appears on the screen
+// but the tray icon — and closing a window can no longer end the service. The console build
+// stays for the terminal and for every test. Two things the missing console changes:
+//
+//   * Where the output goes. A GUI-subsystem process has no stdout unless its parent handed it
+//     one (a redirect, a pipe — a test does that), so on a bare launch stdout and stderr are
+//     reopened onto %LOCALAPPDATA%\naudio\daemon.log — the per-user log the launchd agent's
+//     StandardOutPath gives macOS and journald gives Linux, and the file INSTALL.md names for a
+//     config-file refusal. Appended, like launchd's; unbuffered, because a log read while the
+//     service runs must not lag by a buffer (L368).
+//   * How the operator reaches it. A tray icon with the daemon's own icon resource and two
+//     menu items: open the control page, quit the service. It lives on its own thread, because a
+//     Win32 window must be created and pumped by the same thread and the control loop is busy
+//     sleeping; the thread ends when the loop asks it to. If the shell has no tray (a session with
+//     no Explorer), Shell_NotifyIcon fails, the note goes to the log, and the service runs on —
+//     the page is the interface; the icon is a convenience.
+//
+// A bare launch (no arguments at all — a double-click on the .exe) takes the shortcut's
+// arguments, as the macOS bundle's does: control mode, no time limit, open the page.
+
+namespace tray {
+constexpr UINT kCallback = WM_APP + 1;
+constexpr UINT kIdOpen = 1;
+constexpr UINT kIdQuit = 2;
+constexpr char kClass[] = "NaudioTrayWindow";
+
+std::string g_url;
+HWND g_hwnd = nullptr;
+std::thread g_thread;
+
+LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == kCallback) {
+        // Without NOTIFYICON_VERSION_4, lParam IS the mouse message. Either button opens the
+        // menu; SetForegroundWindow first, or the menu never dismisses (documented behaviour).
+        if (l == WM_RBUTTONUP || l == WM_LBUTTONUP || l == WM_CONTEXTMENU) {
+            HMENU menu = CreatePopupMenu();
+            AppendMenuA(menu, MF_STRING, kIdOpen, "Open control page");
+            AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(menu, MF_STRING, kIdQuit, "Quit Network Audio Service");
+            POINT pt{};
+            GetCursorPos(&pt);
+            SetForegroundWindow(h);
+            const UINT cmd = static_cast<UINT>(TrackPopupMenu(
+                menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr));
+            DestroyMenu(menu);
+            if (cmd == kIdOpen) {
+                openInBrowser(g_url);
+            } else if (cmd == kIdQuit) {
+                std::printf("[tray] quit requested from the tray icon\n");
+                std::fflush(stdout);
+                g_stop.store(true);
+            }
+        }
+        return 0;
+    }
+    if (msg == WM_DESTROY) {
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(h, msg, w, l);
+}
+
+void run() {
+    WNDCLASSA wc{};
+    wc.lpfnWndProc = wndProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = kClass;
+    if (!RegisterClassA(&wc)) return;
+    // An ordinary top-level window that is never shown: message-only windows do not receive
+    // every shell notification, and a hidden one costs nothing.
+    HWND h = CreateWindowExA(0, kClass, "Network Audio Service", WS_OVERLAPPED, 0, 0, 0, 0,
+                             nullptr, nullptr, wc.hInstance, nullptr);
+    if (!h) return;
+    NOTIFYICONDATAA nid{};
+    nid.cbSize = sizeof nid;
+    nid.hWnd = h;
+    nid.uID = 1;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = kCallback;
+    // The daemon's own icon resource (packaging/windows/na_audio_daemon.rc.in, group id 1) —
+    // the same one Explorer and the shortcut show; the stock application icon if a build
+    // somehow lacks it, rather than no icon.
+    nid.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
+    if (!nid.hIcon) nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    std::snprintf(nid.szTip, sizeof nid.szTip, "%s", "Network Audio Service");
+    if (!Shell_NotifyIconA(NIM_ADD, &nid)) {
+        std::fprintf(stderr, "note: no tray icon (Shell_NotifyIcon failed, error %lu); the page "
+                             "is still at %s\n", GetLastError(), g_url.c_str());
+        DestroyWindow(h);
+        return;
+    }
+    g_hwnd = h;
+    std::printf("[tray] icon added; right-click it to open the page or quit\n");
+    std::fflush(stdout);
+    MSG msg{};
+    while (GetMessageA(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    Shell_NotifyIconA(NIM_DELETE, &nid);
+    g_hwnd = nullptr;
+}
+
+void start(const std::string& url) {
+    g_url = url;
+    g_thread = std::thread(run);
+}
+
+void stop() {
+    if (g_hwnd) PostMessageA(g_hwnd, WM_CLOSE, 0, 0);
+    if (g_thread.joinable()) g_thread.join();
+}
+}  // namespace tray
+
+// The log file for a bare launch. Per user, always writable by the user the logon task runs as;
+// the directory is created on the way.
+std::string windowedLogPath() {
+    const char* base = std::getenv("LOCALAPPDATA");
+    std::string dir;
+    if (base && *base) {
+        dir = std::string(base) + "\\naudio";
+    } else {
+        const char* tmp = std::getenv("TEMP");
+        dir = std::string(tmp && *tmp ? tmp : ".") + "\\naudio";
+    }
+    _mkdir(dir.c_str());
+    return dir + "\\daemon.log";
+}
+
+// Called first thing in main(). A parent that handed this process a stdout — a pipe, a
+// redirect, a test harness — keeps it: the output is theirs to read. Only a bare launch, where
+// there is no stdout at all, goes to the log.
+void windowedSetup() {
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (out != nullptr && out != INVALID_HANDLE_VALUE) return;
+    const std::string path = windowedLogPath();
+    FILE* f = nullptr;
+    if (freopen_s(&f, path.c_str(), "a", stdout) != 0) return;
+    freopen_s(&f, path.c_str(), "a", stderr);
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::printf("---- Network Audio Service (na_audio_daemonw) starting; this file is its log ----\n");
+}
+#endif
 
 int runControl(const Args& a, const std::string& configPath, bool openPage) {
     Pipeline pipeline;
@@ -2370,6 +2586,9 @@ int runControl(const Args& a, const std::string& configPath, bool openPage) {
     std::fflush(stdout);
 
     if (openPage) openInBrowser(url);
+#if defined(_WIN32) && defined(NAUDIO_WINDOWED)
+    tray::start(url);
+#endif
     if (a.autostart && !pipeline.start(a, err))
         std::fprintf(stderr, "error: autostart failed: %s\n", err.c_str());
 
@@ -2383,6 +2602,9 @@ int runControl(const Args& a, const std::string& configPath, bool openPage) {
 
     std::printf("\nstopping ...\n");
     std::fflush(stdout);
+#if defined(_WIN32) && defined(NAUDIO_WINDOWED)
+    tray::stop();
+#endif
     pipeline.stop();
     server.stop();
     return 0;
@@ -2409,13 +2631,26 @@ bool launchedFromBundle() {
 int main(int argc, char** argv) {
     Args args;
 
-#if defined(__APPLE__)
-    // A bare launch from inside a bundle takes the app's arguments (above). Only the bare launch:
-    // the agent passes its own, and a command line inside the bundle is still a command line.
+#if defined(_WIN32) && defined(NAUDIO_WINDOWED)
+    // Before the first printf: a bare launch of the windowed build has nowhere to print but the
+    // log file (windowedSetup above).
+    windowedSetup();
+#endif
+
+#if defined(__APPLE__) || (defined(_WIN32) && defined(NAUDIO_WINDOWED))
+    // A bare launch — from inside the macOS bundle, or of the windowed Windows build (a
+    // double-click on na_audio_daemonw.exe) — takes the app's arguments (above). Only the bare
+    // launch: the agent and the logon task pass their own, and a command line is still a
+    // command line.
     static const char* const kAppLaunch[] = {"--mode", "control", "--duration-ms", "0",
                                              "--open-page"};
     std::vector<char*> appArgv;
-    if (argc == 1 && launchedFromBundle()) {
+#if defined(__APPLE__)
+    const bool bareAppLaunch = argc == 1 && launchedFromBundle();
+#else
+    const bool bareAppLaunch = argc == 1;
+#endif
+    if (bareAppLaunch) {
         appArgv.push_back(argv[0]);
         for (const char* s : kAppLaunch) appArgv.push_back(const_cast<char*>(s));
         argv = appArgv.data();

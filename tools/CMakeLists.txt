@@ -94,6 +94,36 @@ if(NAUDIO_BUILD_APPS)
                 DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
     endif()
 
+    # na_audio_daemonw.exe — the same program built for the GUI subsystem, the way pythonw.exe
+    # and javaw.exe stand beside python.exe and java.exe. The console build opens a console
+    # window whatever launches it, so the logon task and the Start-menu shortcut put a black
+    # window on the operator's screen and closing it ended the service (operator, 2026-09-16:
+    # "instead of running in shell window"); a Windows service proper is not the answer (session
+    # 0 has no audio endpoints — see packaging/windows/naudio-daemon-task.xml.in). The windowed
+    # build has no console: on a bare launch it logs to %LOCALAPPDATA%\naudio\daemon.log and
+    # shows a tray icon (na_audio_daemon.cpp, NAUDIO_WINDOWED); a parent that hands it a stdout
+    # keeps it. The task, the shortcut and NAUDIO_SERVICE_EXEC below name this one; the console
+    # build stays for the terminal and for every test. Same sources, same libraries, the same
+    # icon resource (the shortcut shows its target's icon, and the tray icon is loaded from it);
+    # WIN32_EXECUTABLE sets /SUBSYSTEM:WINDOWS and /ENTRY:mainCRTStartup keeps main() as the entry
+    # point, so nothing in the source is WinMain-shaped (MSVC; MinGW's -mwindows finds main on
+    # its own).
+    if(WIN32)
+        add_executable(na_audio_daemonw na_audio_daemon.cpp
+                                        "${CMAKE_CURRENT_BINARY_DIR}/control_page.cpp"
+                                        ${_daemon_icon_sources})
+        target_link_libraries(na_audio_daemonw PRIVATE naudio_net naudio_pa)
+        target_compile_definitions(na_audio_daemonw
+                                   PRIVATE NAUDIO_TOOL_VERSION="${PROJECT_VERSION}"
+                                           NAUDIO_WINDOWED=1)
+        set_target_properties(na_audio_daemonw PROPERTIES WIN32_EXECUTABLE TRUE)
+        if(MSVC)
+            target_link_options(na_audio_daemonw PRIVATE "/ENTRY:mainCRTStartup")
+        endif()
+        install(TARGETS na_audio_daemonw
+                RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
+    endif()
+
     # ------------------------------------------------------------------------
     # Service registration (issue #96 item 2) — run the daemon without a terminal.
     #
@@ -133,8 +163,9 @@ if(NAUDIO_BUILD_APPS)
     # ------------------------------------------------------------------------
     set(NAUDIO_SERVICE_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/na_audio_daemon")
     if(WIN32)
+        # The windowed build (above): the service must not put a console window on the screen.
         # The task's <Command> must name a file that exists; without the suffix it names nothing.
-        set(NAUDIO_SERVICE_EXEC "${NAUDIO_SERVICE_EXEC}.exe")
+        set(NAUDIO_SERVICE_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/na_audio_daemonw.exe")
     endif()
 
     # The name the service and its shortcut carry, on every platform. It is owned HERE, once:

@@ -1423,7 +1423,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # every platform (owned in tools/CMakeLists.txt, read here through PARENT_SCOPE) — inside
         # the package's own folder, which NSIS names after CPACK_NSIS_PACKAGE_NAME. The Start
         # menu is where a Windows operator meets the service, as Applications is on a Mac, so
-        # the two show the same string; the release gate asserts the .lnk by that name.
+        # the two show the same string; the release gate asserts the .lnk by that name. Its
+        # target is the WINDOWED build, na_audio_daemonw.exe (tools/CMakeLists.txt): the console
+        # build would open a console window on the operator's screen and closing it would end
+        # the daemon; the windowed one logs to %LOCALAPPDATA%\naudio\daemon.log and shows a tray
+        # icon instead.
         #
         # Guarded on the name: it is set only when tools/ built the daemon, and a lib-only
         # configure has nothing for a shortcut (or the logon task below) to run.
@@ -1442,7 +1446,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # round-trips to exactly the single backslashes below.
         if(NAUDIO_APP_NAME)
             set(CPACK_NSIS_CREATE_ICONS_EXTRA
-                "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\${NAUDIO_APP_NAME}.lnk' '$INSTDIR\\\\bin\\\\na_audio_daemon.exe' '--mode control --duration-ms 0 --open-page'")
+                "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\${NAUDIO_APP_NAME}.lnk' '$INSTDIR\\\\bin\\\\na_audio_daemonw.exe' '--mode control --duration-ms 0 --open-page'")
             set(CPACK_NSIS_DELETE_ICONS_EXTRA
                 "Delete '$SMPROGRAMS\\\\$MUI_TEMP\\\\${NAUDIO_APP_NAME}.lnk'")
 

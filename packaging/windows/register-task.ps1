@@ -40,7 +40,10 @@ if ($Unregister) {
 }
 
 $template = Join-Path $InstallDir 'share\naudio\naudio-daemon-task.xml.in'
-$exe = Join-Path $InstallDir 'bin\na_audio_daemon.exe'
+# The WINDOWED build: the console one would open a console window at every logon, and closing
+# it would end the service. na_audio_daemonw.exe has no console — it logs to
+# %LOCALAPPDATA%\naudio\daemon.log and shows a tray icon (tools/CMakeLists.txt).
+$exe = Join-Path $InstallDir 'bin\na_audio_daemonw.exe'
 if (-not (Test-Path -LiteralPath $template)) {
     Write-Output "naudio: no task template at $template"; exit 1
 }

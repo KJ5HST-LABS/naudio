@@ -33,9 +33,11 @@
     - MultipleInstancesPolicy defaults to IgnoreNew, which is what we want: logging in twice
       must not start a second daemon fighting for the same control port.
 
-  Task Scheduler does NOT redirect stdout/stderr, so there is no equivalent of the launchd log
-  file or journald. A config-file error is visible on the control page and in the task's
-  LastTaskResult (exit 2), not in a log file. The man page says so.
+  Task Scheduler does NOT redirect stdout/stderr, and the command below is the WINDOWED build,
+  na_audio_daemonw.exe, which has no console at all: it writes its own log to
+  %LOCALAPPDATA%\naudio\daemon.log (the launchd agent's log file, one platform over) and shows
+  a tray icon. A config-file error is there, on the control page, and in the task's
+  LastTaskResult (exit 2). The man page says so.
 
   Enabled is FALSE: installing a package must not start capturing at the next logon. The NSIS
   section registers the task disabled and the operator enables it, which is the same property
