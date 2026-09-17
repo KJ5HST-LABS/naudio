@@ -1117,6 +1117,11 @@ jobs:
           $pw = Start-Process -Wait -PassThru -FilePath "$($P.FullName)/bin/na_audio_daemonw.exe" -ArgumentList '--help'
           if ($pw.ExitCode -ne 0) { Write-Output "::error::na_audio_daemonw.exe --help exited $($pw.ExitCode)"; exit 1 }
           if (-not (Test-Path $wlog)) { Write-Output "::error::na_audio_daemonw.exe wrote no log at $wlog — a bare launch has nowhere else to print"; exit 1 }
+          # Both streams announce themselves at startup; the usage text is stderr's. The first
+          # run of this gate had the stdout banner and nothing from stderr (freopen alone left it
+          # dark), which is why the stderr banner is asserted separately from the usage text.
+          if (-not (Select-String -Path $wlog -Pattern 'stderr is this file too' -Quiet)) {
+            Write-Output "::error::the windowed daemon's stderr did not reach its log"; Get-Content $wlog; exit 1 }
           if (-not (Select-String -Path $wlog -Pattern '^usage: na_audio_daemon' -Quiet)) {
             Write-Output "::error::the windowed daemon's log carries no usage text"; Get-Content $wlog; exit 1 }
           Write-Output "na_audio_daemonw.exe: PE subsystem $subW (console build $subC); --help exit 0 with its usage in $wlog"
