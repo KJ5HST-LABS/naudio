@@ -1267,10 +1267,15 @@ void AudioStreamServer::rejectClient(const std::shared_ptr<ClientConnection>& co
     //
     // A no-op on UDP, which has no reset semantics and whose server connections share one socket.
     //
-    // 20 ms is a CEILING, not a cost: the ordinary call finds the request already buffered, reads
-    // it, and exits on the next read's 2 ms timeout. It is bounded at all because this runs on the
-    // accept thread, where time spent is time no other client is admitted.
-    connection->discardPendingInput(/*budgetMs=*/20);
+    // 50 ms is a CEILING, not a cost: the ordinary call finds the request buffered, or arriving
+    // within a few milliseconds, reads it, and exits on the next read's 2 ms timeout. The drain
+    // waits THROUGH the quiet before the first byte (issue #104): the request is sent by a peer
+    // thread that must be scheduled after its connect() returns, and on a loaded windows-latest
+    // that took longer than the 2 ms a first empty read allowed, so the close landed on the
+    // request and reset the peer — the #87 failure again, one attempt in ~fifty. Only a peer that
+    // sends nothing pays the whole budget. It is bounded at all because this runs on the accept
+    // thread, where time spent is time no other client is admitted.
+    connection->discardPendingInput(/*budgetMs=*/50);
 
     evictConnection(connection);
 }

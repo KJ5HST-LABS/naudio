@@ -98,10 +98,14 @@ public:
     bool isClosed() const { return closed_.load(); }
     void close();
 
-    // Reads and DISCARDS whatever is already sitting in the receive buffer, then returns the
-    // byte count. Bounded twice over: each read waits at most a couple of milliseconds, and the
-    // whole call gives up after `budgetMs` however much keeps arriving, so a peer that floods
-    // cannot pin the caller.
+    // Reads and DISCARDS whatever the peer has sent or is about to send, then returns the byte
+    // count. It WAITS for the first byte, up to `budgetMs`: the caller has just decided a
+    // reject at accept, before the peer's request could have arrived, so quiet at the start is
+    // the request still in flight, not an empty buffer (issue #104). Once something has been
+    // read, the next quiet read ends the call. Bounded twice over: each read waits at most a
+    // couple of milliseconds, and the whole call gives up after `budgetMs` however much keeps
+    // arriving — or however little — so a peer that floods, or never speaks, cannot pin the
+    // caller beyond the budget.
     //
     // This exists for ONE caller — the server's reject path — and the reason is a socket rule
     // rather than anything about this protocol. Closing a TCP socket that still holds unread

@@ -295,11 +295,24 @@ std::size_t AudioProtocolHandler::discardPendingInput(int budgetMs) {
     std::size_t discarded = 0;
     for (;;) {
         RecvResult r = socket_.recv(scratch, sizeof scratch);
-        // Anything but Ok means we are done: TimedOut is the buffer being empty (the expected
-        // exit), Closed is the peer having already gone, Error is a socket about to be thrown
-        // away anyway.
-        if (r.status != IoStatus::Ok) break;
-        discarded += r.bytes;
+        if (r.status == IoStatus::Ok) {
+            discarded += r.bytes;
+        } else if (r.status == IoStatus::TimedOut) {
+            // Quiet. That is the exit ONLY once something has been read. The reject this drain
+            // serves was decided at accept, before the peer's CONNECT_REQUEST could possibly have
+            // arrived — the peer sends it right after connect() returns, on a thread that has to
+            // be scheduled first — so for the first few milliseconds the request is still in
+            // flight, and a drain that took the first empty read as "nothing to drain" closed on
+            // top of the request when it landed: RST, reject discarded, #87 back by a hair
+            // (issue #104: seven times on windows-latest in two days, every time on attempt N of
+            // 8 with the fix in place). So the empty reads before the first byte are waited
+            // through, up to the budget; a peer that never sends anything costs the budget and
+            // nothing else.
+            if (discarded > 0) break;
+        } else {
+            // Closed is the peer having already gone, Error a socket about to be thrown away.
+            break;
+        }
         if (std::chrono::steady_clock::now() >= deadline) break;
     }
     // The receive timeout is deliberately left as set — this socket is closed immediately after.
