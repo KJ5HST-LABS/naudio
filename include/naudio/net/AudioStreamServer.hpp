@@ -124,6 +124,13 @@ struct ServerStats {
 // threads via the activeThreads_ barrier before the server is destroyed).
 class AudioStreamServer {
 public:
+    // How long the reject path waits for a turned-away peer's CONNECT_REQUEST before closing on
+    // it (issues #87, #104) — a CEILING paid in full only by a peer that never sends, and paid on
+    // the accept thread, where every millisecond is one no other client is admitted. Public so a
+    // test can bound "a silent peer must not pin the accept thread" against the number that
+    // governs it rather than a copy of it. See rejectClient() for the rule.
+    static constexpr int REJECT_DRAIN_BUDGET_MS = 50;
+
     explicit AudioStreamServer(std::uint16_t port, AudioStreamConfig config = AudioStreamConfig{},
                                std::string bindHost = "");
     ~AudioStreamServer();

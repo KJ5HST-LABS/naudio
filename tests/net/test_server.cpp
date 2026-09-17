@@ -1924,12 +1924,16 @@ TEST(Server, GateRejectedClientsLeaveNoTraceInTheRosterGauge) {
         // reject is not lost to an RST), so the map entry is released up to the drain budget AFTER
         // the client has already read its reject. The contract this arm pins is that a rejected
         // client LEAVES the map — not that it leaves before an observer can look. Measured: without
-        // this wait the arm read packetsSent == 1, the final attempt still inside its 20 ms drain.
+        // this wait the arm read packetsSent == 1, the final attempt still inside its drain
+        // (20 ms then; REJECT_DRAIN_BUDGET_MS now, and since #104 a silent peer pays all of it).
         //
-        // It stays a real detector: a leak that never resolves still fails, because the budget is
-        // 100x the drain. Confirmed by re-running the M-A mutation after this wait was added.
+        // It stays a real detector: a leak that never resolves still fails, because the settle
+        // window is 40x the drain — derived from the budget, so it moves with it. Confirmed by
+        // re-running the M-A mutation after this wait was added.
         ServerStats after = server.stats();
-        const auto settleBy = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+        const auto settleBy =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(40 * AudioStreamServer::REJECT_DRAIN_BUDGET_MS);
         while ((after.packetsSent != 0 || after.bytesSent != 0) &&
                std::chrono::steady_clock::now() < settleBy) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -2091,9 +2095,12 @@ TEST(Server, ARejectedClientReceivesItsReasonWhenItBehavesLikeARealClient) {
 // MEASURED PRE-FIX on windows-latest: fails deterministically (every attempt); macOS and Linux
 // deliver the reject either way, their stacks leaving queued data readable after an RST, so this
 // arm is a Windows detector and a documentation of the rule everywhere else. The delay is a
-// fraction of the 50 ms budget so a slow runner cannot push the send past the drain — the case
-// past the budget is the "reason is best-effort" clause on AudioStreamServer::rejectClient, and
-// it is not this arm's to prove.
+// fifth of REJECT_DRAIN_BUDGET_MS so a slow runner has room before the send lands past the drain
+// — the case past the budget is the "reason is best-effort" clause on
+// AudioStreamServer::rejectClient, and it is not this arm's to prove. That room is smaller than
+// it looks: Windows sleeps in 15.6 ms quanta, so the asked-for 10 ms is 16-31 ms in practice. So
+// the arm MEASURES the gap it actually produced and prints it with the failure — a gap inside
+// the budget is #104 back; a gap past it is a stalled runner, and the two must not read alike.
 TEST(Server, ARejectedClientThatSendsLateStillReceivesItsReason) {
     AudioStreamConfig config{};
     config.maxClients = 1;
@@ -2115,16 +2122,24 @@ TEST(Server, ARejectedClientThatSendsLateStillReceivesItsReason) {
         auto c = t.connect("127.0.0.1", port, 2000, &err);
         ASSERT_TRUE(c) << "attempt " << i << ": " << err;
         // The scheduling gap, made real: longer than the old drain's first-read exit (2 ms),
-        // shorter than the budget (50 ms) by a margin a slow runner cannot eat.
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // a fifth of the budget by request — and measured, because the request is not the gap.
+        const auto connectedAt = std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(AudioStreamServer::REJECT_DRAIN_BUDGET_MS / 5));
+        const auto sentAfterMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - connectedAt)
+                                     .count();
         ASSERT_TRUE(c->sendControl(
             ControlMessage::connectRequest("late-" + std::to_string(i), AudioPacket::VERSION)))
             << "attempt " << i;
 
         auto reject = recvUntil(*c, PacketType::Control, ControlType::ConnectReject, 3000);
         ASSERT_TRUE(reject.has_value())
-            << "attempt " << i << ": a client that sent its CONNECT_REQUEST 10 ms after "
-            << "connecting got no CONNECT_REJECT — the server closed on the request and reset it";
+            << "attempt " << i << ": a client that sent its CONNECT_REQUEST " << sentAfterMs
+            << " ms after connecting got no CONNECT_REJECT (budget "
+            << AudioStreamServer::REJECT_DRAIN_BUDGET_MS << " ms) — inside the budget this is "
+            << "#104 back: the server closed on the request and reset it; past the budget it is "
+            << "a stalled runner, not a regression";
         auto msg = ControlMessage::deserialize(reject->payload());
         ASSERT_TRUE(msg.has_value()) << "attempt " << i;
         const auto reason = msg->parseErrorMessage();
@@ -2134,6 +2149,57 @@ TEST(Server, ARejectedClientThatSendsLateStillReceivesItsReason) {
         c->close();
     }
 
+    server.stop();
+}
+
+// #104's other edge — a peer that connects and NEVER sends must not pin the accept thread past the
+// drain budget.
+//
+// The #104 fix made the drain wait for a first byte, so for a silent peer the budget's deadline
+// became the ONLY way out of the loop (AudioProtocolHandler::discardPendingInput); before it, the
+// first quiet read was a second exit, and the deadline never had to hold alone. Nothing in this
+// file exercised it alone either: every silent peer here closes its own socket after reading its
+// reject, or lets server.stop() close the transport under the drain — both return Closed/Error and
+// leave before the deadline is reached. MEASURED (S180 review): with the deadline check deleted,
+// all 228 tests in this binary stayed green. This arm is the one that goes red — the silent peer
+// HOLDS its socket, and a second client, whose reject is decided on the same accept thread, must
+// still be answered. Mutation-checked: without the deadline it reads "waited 1013 ms" and fails;
+// with it, the second reject lands inside the budget plus scheduling.
+//
+// The bound is derived from REJECT_DRAIN_BUDGET_MS, not restated: ten budgets is generous on a
+// loaded runner; the receive wait is twice that, so a pinned thread shows as a measured wait past
+// the bound with the reject still missing, not as a bare timeout.
+TEST(Server, ASilentPeerCannotPinTheAcceptThreadPastTheDrainBudget) {
+    AudioStreamServer server{0};  // no capture device, not inject-only => reject all
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+    const auto port = static_cast<std::uint16_t>(server.port());
+
+    TcpClientTransport t0;
+    auto silent = t0.connect("127.0.0.1", port, 2000, &err);
+    ASSERT_TRUE(silent) << err;
+    ASSERT_TRUE(recvUntil(*silent, PacketType::Control, ControlType::ConnectReject, 2000)
+                    .has_value());
+    // ... and HOLDS the socket, sending nothing, for the rest of the arm.
+
+    constexpr int kBoundMs = 10 * AudioStreamServer::REJECT_DRAIN_BUDGET_MS;
+    const auto t = std::chrono::steady_clock::now();
+    TcpClientTransport t1;
+    auto next = t1.connect("127.0.0.1", port, 2000, &err);
+    ASSERT_TRUE(next) << err;
+    auto reject = recvUntil(*next, PacketType::Control, ControlType::ConnectReject, 2 * kBoundMs);
+    const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t)
+                              .count();
+    EXPECT_TRUE(reject.has_value())
+        << "second client got no CONNECT_REJECT within " << 2 * kBoundMs
+        << " ms — the accept thread is pinned by the silent peer (waited " << waitedMs << " ms)";
+    EXPECT_LT(waitedMs, kBoundMs)
+        << "second client waited " << waitedMs << " ms for its reject; the drain budget is "
+        << AudioStreamServer::REJECT_DRAIN_BUDGET_MS << " ms";
+
+    silent->close();
+    next->close();
     server.stop();
 }
 

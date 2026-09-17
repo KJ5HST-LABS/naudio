@@ -287,8 +287,10 @@ std::size_t AudioProtocolHandler::discardPendingInput(int budgetMs) {
     // at once and only the read that finds the buffer empty pays the wait, so the ordinary cost of
     // this call is one 2 ms timeout rather than the whole budget. That matters because the only
     // caller runs on the ACCEPT THREAD — every millisecond spent here is a millisecond no other
-    // client can be accepted.
-    socket_.setRecvTimeout(2);
+    // client can be accepted. If the timeout cannot be set there is no bound at all: a read
+    // would block until the peer spoke or left, so the drain is skipped rather than run unbounded
+    // — the reject was already sent, and "best-effort" is this call's contract on that path.
+    if (!socket_.setRecvTimeout(2)) return 0;
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
     std::uint8_t scratch[2048];

@@ -207,8 +207,11 @@ public:
     virtual bool isClosed() const = 0;
     virtual void close() = 0;
 
-    // Reads and discards already-buffered input so that the close which follows emits a FIN
-    // rather than an RST, and returns how many bytes went. Bounded by `budgetMs`.
+    // Reads and discards what the peer has sent — WAITING up to `budgetMs` for its first byte,
+    // because the one caller decides its reject before the peer's request can have arrived
+    // (issue #104) — so that the close which follows emits a FIN rather than an RST, and returns
+    // how many bytes went. Bounded by `budgetMs` in every case; a peer that never sends costs the
+    // whole budget. An implementation that exits on its first quiet read reopens #104.
     //
     // DEFAULTS TO A NO-OP, and that default is correct for every non-TCP connection rather than
     // merely convenient. UDP has no such rule to work around — there is no connection state to
