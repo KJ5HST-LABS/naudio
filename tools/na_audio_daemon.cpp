@@ -90,6 +90,8 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <shellapi.h>
+#include <io.h>
+#include <share.h>
 #include <direct.h>
 #else
 #include <sys/stat.h>
@@ -2554,6 +2556,15 @@ void windowedSetup() {
     const std::string path = windowedLogPath();
     FILE* f = nullptr;
     if (freopen_s(&f, path.c_str(), "a", stdout) != 0) return;
+    // freopen_s is the "secure" variant: it opens the file denying every other process, and a
+    // log nobody can read while the service runs is not a log (measured on windows-latest,
+    // 2026-09-16: the release gate's read of it failed for as long as the daemon ran). So the
+    // descriptor under stdout is replaced by one opened with sharing allowed; the exclusive
+    // handle closes with the swap.
+    if (FILE* shared = _fsopen(path.c_str(), "a", _SH_DENYNO)) {
+        _dup2(_fileno(shared), _fileno(stdout));
+        std::fclose(shared);
+    }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // stderr is stdout in this build — see the #define after the includes. Measured on
     // windows-latest, 2026-09-16, in two runs: freopen_s on a GUI process's stderr leaves it
