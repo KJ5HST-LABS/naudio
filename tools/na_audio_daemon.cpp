@@ -90,7 +90,6 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <shellapi.h>
-#include <io.h>
 #include <direct.h>
 #else
 #include <sys/stat.h>
@@ -120,6 +119,16 @@
 #include "naudio/net/AudioStreamClient.hpp"
 #include "naudio/net/AudioStreamServer.hpp"
 #include "naudio/net/Socket.hpp"
+
+#if defined(_WIN32) && defined(NAUDIO_WINDOWED)
+// In the windowed build every stderr write in this file goes to stdout, which windowedSetup()
+// (below) has reopened onto the log file. A GUI-subsystem process's stderr cannot be reopened
+// the same way: freopen_s leaves it dark and its _fileno is -2 (both measured on windows-latest,
+// 2026-09-16), so rather than fight the CRT the two streams are one. After every include, so
+// nothing a header declared is affected; the CRT's own stderr is never touched.
+#undef stderr
+#define stderr stdout
+#endif
 
 // The page, embedded at build time from tools/control_page.html and tools/control_page.js (see
 // tools/CMakeLists.txt). Between them they reference NOTHING off this daemon — the machine may
@@ -2545,16 +2554,11 @@ void windowedSetup() {
     const std::string path = windowedLogPath();
     FILE* f = nullptr;
     if (freopen_s(&f, path.c_str(), "a", stdout) != 0) return;
-    // stderr too — and then the descriptor underneath it. freopen_s alone redirected stdout and
-    // left stderr dark on this build's first run (windows-latest, 2026-09-16: the stdout banner
-    // reached the log, the usage text — stderr — did not), so fd 2 is made a duplicate of fd 1,
-    // which is the log now, whatever the FILE layer made of a GUI process's stderr.
-    freopen_s(&f, path.c_str(), "a", stderr);
-    _dup2(_fileno(stdout), _fileno(stderr));
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::setvbuf(stderr, nullptr, _IONBF, 0);
-    // Both streams announce themselves, so the log states which of them arrived; the release
-    // gate reads both lines.
+    // stderr is stdout in this build — see the #define after the includes. Measured on
+    // windows-latest, 2026-09-16, in two runs: freopen_s on a GUI process's stderr leaves it
+    // dark (the stdout banner reached the log, the usage text on stderr did not), and its
+    // _fileno is -2, so _dup2 onto it fast-fails the process (0xC0000409). One stream, one file.
     std::printf("---- Network Audio Service (na_audio_daemonw) starting; this file is its log (stdout) ----\n");
     std::fprintf(stderr, "---- stderr is this file too ----\n");
 }
