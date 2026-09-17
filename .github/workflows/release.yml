@@ -1408,6 +1408,38 @@ jobs:
             Write-Output "::error::the shortcut does not open the control page: '$($sc.Arguments)'"; exit 1 }
           Write-Output "Start-menu shortcut opens the control page: $lnk"
 
+          # The Desktop icon (2026-09-17). The setup's Install Options page — CPack's, shown
+          # because CPACK_NSIS_MODIFY_PATH offers PATH — has a "Create … Desktop Icon" box
+          # that CPack wires only to CPACK_CREATE_DESKTOP_LINKS, which this project does not
+          # use: the box was shown and created nothing, and its label read the library's
+          # name beside a header that read the product's. A silent install takes the .ini's
+          # default (unticked), so the box cannot be exercised here; what CAN be asserted is
+          # the two files CPack rendered: the .ini's label names the product, and the .nsi
+          # carries the $DESKTOP shortcut under CPack's own $INSTALL_DESKTOP guard, with the
+          # matching guarded delete in the uninstaller. Control: the old label's shape must
+          # be absent — a rename that reached the header and not the fields is exactly what
+          # shipped. Field 1 names the install DIRECTORY ("By default naudio does not add
+          # its directory…") and that is the directory's name on purpose, so the control
+          # is on the "add/Create <name>" fields, not on the word.
+          $ini = Get-ChildItem build/_CPack_Packages -Recurse -Filter NSIS.InstallOptions.ini | Select-Object -First 1
+          if (-not $ini) { Write-Output "::error::CPack left no NSIS.InstallOptions.ini to assert the options page on"; exit 1 }
+          if (-not (Select-String -Path $ini.FullName -Pattern '^Text=Create Network Audio Service Desktop Icon\s*$' -Quiet)) {
+            Write-Output "::error::the options page's desktop-icon box is not labelled 'Create Network Audio Service Desktop Icon'"
+            Select-String -Path $ini.FullName -Pattern '^Text=' | ForEach-Object { Write-Output "  $($_.Line)" }
+            exit 1 }
+          if (Select-String -Path $ini.FullName -Pattern '^Text=(Create|Add|Do not add) naudio ' -Quiet) {
+            Write-Output "::error::the options page still names the library in a field:"
+            Select-String -Path $ini.FullName -Pattern '^Text=' | ForEach-Object { Write-Output "  $($_.Line)" }
+            exit 1 }
+          $desktopGuard = @(Select-String -Path $nsi.FullName -Pattern '^\s*StrCmp ''\$INSTALL_DESKTOP'' ''1'' 0 \+2\s*$').Count
+          $desktopMake = @(Select-String -Path $nsi.FullName -Pattern '^\s*CreateShortCut ''\$DESKTOP\\Network Audio Service\.lnk'' ''\$INSTDIR\\bin\\na_audio_daemonw\.exe'' ''--mode control --duration-ms 0 --open-page''\s*$').Count
+          $desktopDrop = @(Select-String -Path $nsi.FullName -Pattern '^\s*Delete ''\$DESKTOP\\Network Audio Service\.lnk''\s*$').Count
+          if ($desktopMake -ne 1 -or $desktopDrop -ne 1 -or $desktopGuard -lt 2) {
+            Write-Output "::error::the .nsi does not carry the guarded desktop shortcut and its delete (guards $desktopGuard, create $desktopMake, delete $desktopDrop; expected >=2, 1, 1)"
+            Select-String -Path $nsi.FullName -Pattern 'DESKTOP' | ForEach-Object { Write-Output "  $($_.LineNumber): $($_.Line)" }
+            exit 1 }
+          Write-Output "desktop icon: the options page offers 'Create Network Audio Service Desktop Icon'; the .nsi creates and deletes `$DESKTOP\Network Audio Service.lnk under `$INSTALL_DESKTOP ($desktopGuard guards)"
+
           # ...and the page really is served by the INSTALLED binary. Hardware-free:
           # control mode opens no device until asked, and nothing here asks.
           $ctlLog = "$env:TEMP\naudio-control.log"

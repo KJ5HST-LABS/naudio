@@ -58,6 +58,20 @@ if(CPACK_GENERATOR STREQUAL "productbuild")
         set(CPACK_POSTFLIGHT_TOOLS_SCRIPT "${CPACK_NAUDIO_POSTFLIGHT_SCRIPT}")
     endif()
 elseif(CPACK_GENERATOR STREQUAL "NSIS")
+    # The setup's "Install Options" page (shown because CPACK_NSIS_MODIFY_PATH is
+    # on) renders its four fields from CPACK_PACKAGE_NAME — "Add naudio to the
+    # system PATH…", "Create naudio Desktop Icon" — under a header that already
+    # said Network Audio Service (CPACK_NSIS_PACKAGE_NAME); the operator read the
+    # mismatch off the installer (2026-09-17). CPack's NSIS template uses
+    # CPACK_PACKAGE_NAME in that .ini and nowhere else, so this is the same
+    # cpack-time, generator-scoped override the productbuild branch makes for
+    # the .pkg title, and safe for the same reason: the artifact file name, the
+    # uninstall registry key and the install directory were derived from the
+    # library's name at configure time and are already in CPackConfig.cmake by
+    # the time this runs. The release gate reads the rendered .ini back.
+    if(CPACK_NAUDIO_PRODUCT_NAME)
+        set(CPACK_PACKAGE_NAME "${CPACK_NAUDIO_PRODUCT_NAME}")
+    endif()
     set(CPACK_COMPONENTS_ALL runtime tools)
     set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
 endif()

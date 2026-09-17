@@ -68,7 +68,8 @@ those are in every other format on this page.
   Start menu (in a folder of the same name), registers a logon task for the daemon (switched off
   until you turn it on), adds an uninstaller (**Network Audio Service** under *Add or remove
   programs*, or `Uninstall.exe` in the install directory), and offers to add the programs to
-  `PATH`. The installer is unsigned, so SmartScreen warns: choose *More info* → *Run anyway*.
+  `PATH` and to put a **Network Audio Service** icon on the desktop (the same shortcut as the
+  Start menu's). The installer is unsigned, so SmartScreen warns: choose *More info* → *Run anyway*.
 
 Once it is installed, open **Network Audio Service** — in the Start menu on Windows, the
 applications menu on Linux, or Applications on a Mac. It opens a page in your browser with two tabs:

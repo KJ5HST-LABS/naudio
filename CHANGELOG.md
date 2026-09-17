@@ -5,6 +5,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **The Windows setup's options page names the product, and its "Create Desktop Icon" box creates one.** The page (the one that offers to add the programs to `PATH`) read "Add naudio to the system PATH" and "Create naudio Desktop Icon" under a header that already said *Network Audio Service*, and ticking the box did nothing: CPack wires it only to shortcuts it generates itself, and naudio's shortcut is its own. The fields now say **Network Audio Service**, and the box puts a *Network Audio Service* icon on the desktop that opens the control page — the Start-menu shortcut's twin — which the uninstaller removes with it. The install directory is still `C:\Program Files\naudio`, and the page's first line still says so. The release pipeline reads the rendered page and the generated installer script back.
+
 ## [1.0.0rc9] — 2026-09-16
 
 ### Added

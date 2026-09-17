@@ -1444,11 +1444,27 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # nor NSIS. Four makes the value hold two, which survives the round trip as one, which
         # is what NSIS gets. Reproduced end to end before being believed: two fails and four
         # round-trips to exactly the single backslashes below.
+        #
+        # The DESKTOP icon is the same shortcut, made only when the setup's "Create … Desktop
+        # Icon" box is ticked. That box is CPack's — it is on the Install Options page that
+        # CPACK_NSIS_MODIFY_PATH turns on — and CPack wires it to nothing but the executables
+        # listed in CPACK_CREATE_DESKTOP_LINKS, which this project does not use (its generated
+        # shortcuts take no arguments, and this one needs three). So until 2026-09-17 the box
+        # was shown, read into $INSTALL_DESKTOP, saved to the registry as InstallToDesktop, and
+        # created nothing (cmCPackNSISGenerator.cxx: the $DESKTOP CreateShortCut is emitted
+        # per CPACK_CREATE_DESKTOP_LINKS entry, guarded on $INSTALL_DESKTOP). The guard here is
+        # CPack's own, so the box means what it says; the uninstaller reads InstallToDesktop
+        # back before DELETE_ICONS_EXTRA runs and removes the icon under the same guard. Single
+        # quotes throughout, for the reason below; NSIS takes either.
         if(NAUDIO_APP_NAME)
             set(CPACK_NSIS_CREATE_ICONS_EXTRA
-                "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\${NAUDIO_APP_NAME}.lnk' '$INSTDIR\\\\bin\\\\na_audio_daemonw.exe' '--mode control --duration-ms 0 --open-page'")
+                "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\${NAUDIO_APP_NAME}.lnk' '$INSTDIR\\\\bin\\\\na_audio_daemonw.exe' '--mode control --duration-ms 0 --open-page'
+  StrCmp '$INSTALL_DESKTOP' '1' 0 +2
+    CreateShortCut '$DESKTOP\\\\${NAUDIO_APP_NAME}.lnk' '$INSTDIR\\\\bin\\\\na_audio_daemonw.exe' '--mode control --duration-ms 0 --open-page'")
             set(CPACK_NSIS_DELETE_ICONS_EXTRA
-                "Delete '$SMPROGRAMS\\\\$MUI_TEMP\\\\${NAUDIO_APP_NAME}.lnk'")
+                "Delete '$SMPROGRAMS\\\\$MUI_TEMP\\\\${NAUDIO_APP_NAME}.lnk'
+  StrCmp '$INSTALL_DESKTOP' '1' 0 +2
+    Delete '$DESKTOP\\\\${NAUDIO_APP_NAME}.lnk'")
 
             # Service registration rides the installer here exactly as the .pkg postinstall carries
             # it on macOS (issue #96 item 2, Windows half). The work is in a PowerShell script the
