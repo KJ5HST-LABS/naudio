@@ -438,11 +438,18 @@ schtasks /Run    /TN "\(rsnaudio\(rsnaudio\-daemon"
 It is a logon task and deliberately not a Windows service: services run in
 session 0, which has no audio endpoints, so one would install cleanly and then
 capture nothing.
-Unlike the other two platforms, Task Scheduler does not redirect a task's
-output anywhere, so there is no log file to read \(em a configuration error
-shows as
+The task and the Start-menu shortcut run
+.BR na_audio_daemonw.exe ,
+the same program built without a console window: nothing appears on the
+screen but a tray icon (right-click it to open the page or quit), and its
+output goes to
+.IR %LOCALAPPDATA%\naudio\daemon.log ,
+which is where a configuration error is named by file and line (it also shows
+as
 .B LastTaskResult
-2 on the task, and on the control page.
+2 on the task, and on the control page).
+.B na_audio_daemon.exe
+is the same program with a console, for the terminal.
 .PP
 All three units run
 .BR "\-\-mode control" ,

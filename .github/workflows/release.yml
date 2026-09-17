@@ -1093,6 +1093,34 @@ jobs:
           & "$($P.FullName)/bin/na_c_play_to_speakers.exe" --help
           if ($LASTEXITCODE -ne 0) { Write-Output "::error::na_c_play_to_speakers.exe from the package will not run"; exit 1 }
 
+          # The windowed daemon (na_audio_daemonw.exe): the same program for the GUI subsystem,
+          # which the logon task and the shortcut run so no console window appears. Two
+          # relations, read off the PE headers rather than assumed from the CMake flag: the
+          # windowed build's Subsystem field is 2 (WINDOWS_GUI) and the console build's is 3
+          # (WINDOWS_CUI) — the console one is the control that the reader reads the field.
+          # Then it must run: Start-Process -Wait, because PowerShell does not wait for a GUI
+          # process it invoked bare; with no stdout handed to it, its usage text goes to its
+          # log file, and that file must say so.
+          function Get-PeSubsystem([string]$path) {
+            $b = [System.IO.File]::ReadAllBytes($path)
+            $pe = [BitConverter]::ToInt32($b, 0x3C)
+            # PE signature (4) + COFF file header (20), then Subsystem at +0x44 of the optional
+            # header for PE32 and PE32+ alike.
+            return [BitConverter]::ToUInt16($b, $pe + 4 + 20 + 0x44)
+          }
+          $subW = Get-PeSubsystem "$($P.FullName)/bin/na_audio_daemonw.exe"
+          $subC = Get-PeSubsystem "$($P.FullName)/bin/na_audio_daemon.exe"
+          if ($subC -ne 3) { Write-Output "::error::control broken: na_audio_daemon.exe's PE Subsystem reads $subC, not 3 (console) — the reader cannot be believed"; exit 1 }
+          if ($subW -ne 2) { Write-Output "::error::na_audio_daemonw.exe's PE Subsystem is $subW, not 2 (Windows GUI) — it would open a console window"; exit 1 }
+          $wlog = "$env:LOCALAPPDATA\naudio\daemon.log"
+          if (Test-Path $wlog) { Remove-Item $wlog }
+          $pw = Start-Process -Wait -PassThru -FilePath "$($P.FullName)/bin/na_audio_daemonw.exe" -ArgumentList '--help'
+          if ($pw.ExitCode -ne 0) { Write-Output "::error::na_audio_daemonw.exe --help exited $($pw.ExitCode)"; exit 1 }
+          if (-not (Test-Path $wlog)) { Write-Output "::error::na_audio_daemonw.exe wrote no log at $wlog — a bare launch has nowhere else to print"; exit 1 }
+          if (-not (Select-String -Path $wlog -Pattern '^usage: na_audio_daemon' -Quiet)) {
+            Write-Output "::error::the windowed daemon's log carries no usage text"; Get-Content $wlog; exit 1 }
+          Write-Output "na_audio_daemonw.exe: PE subsystem $subW (console build $subC); --help exit 0 with its usage in $wlog"
+
           # Runtime proof ON THE ARTIFACT: test-tone server -> null-backend client,
           # byte-tell asserted (examples/README.md) — no audio device involved.
           $srv = Start-Process -PassThru -NoNewWindow -FilePath "$($P.FullName)/bin/na_audio_source.exe" `
@@ -1170,7 +1198,7 @@ jobs:
 
           # The shipped binaries and the uninstaller are in place; the tools run
           # from the installed tree (naudio.dll beside them in bin/).
-          foreach ($f in 'bin/na_audio_daemon.exe','bin/na_wav_tap.exe','bin/na_audio_source.exe','bin/na_c_play_to_speakers.exe','bin/naudio.dll','Uninstall.exe') {
+          foreach ($f in 'bin/na_audio_daemon.exe','bin/na_audio_daemonw.exe','bin/na_wav_tap.exe','bin/na_audio_source.exe','bin/na_c_play_to_speakers.exe','bin/naudio.dll','Uninstall.exe') {
             if (-not (Test-Path "$I/$f")) { Write-Output "::error::installed tree is missing $f"; exit 1 } }
           & "$I/bin/na_wav_tap.exe" --help
           if ($LASTEXITCODE -ne 0) { Write-Output "::error::installed na_wav_tap.exe will not run"; exit 1 }
@@ -1191,6 +1219,11 @@ jobs:
             Write-Output "::error::control broken: na_wav_tap.exe reports $tapIcons icon(s) and carries none — the count cannot be believed"; exit 1 }
           if ($daemonIcons -lt 1) {
             Write-Output "::error::na_audio_daemon.exe carries no icon resource — Explorer and the Start-menu shortcut would show the generic one"; exit 1 }
+          # The windowed build is the shortcut's target and the tray icon's source, so it must
+          # carry the resource too.
+          $daemonwIcons = [Naudio.Shell]::ExtractIconEx("$I\bin\na_audio_daemonw.exe", -1, $null, $null, 0)
+          if ($daemonwIcons -lt 1) {
+            Write-Output "::error::na_audio_daemonw.exe carries no icon resource — the shortcut and the tray would show the generic one"; exit 1 }
           $nsi = Get-ChildItem build/_CPack_Packages -Recurse -Filter project.nsi | Select-Object -First 1
           if (-not $nsi) { Write-Output "::error::CPack left no project.nsi to assert the installer icon on"; exit 1 }
           # CPack writes the path through ConvertToWindowsOutputPath: backslashes, and quotes
@@ -1282,8 +1315,8 @@ jobs:
           $action = $task.Actions[0]
           if (-not (Test-Path -LiteralPath $action.Execute)) {
             Write-Output "::error::the task runs '$($action.Execute)', which the install did not create"; exit 1 }
-          if ($action.Execute -ne "$I\bin\na_audio_daemon.exe") {
-            Write-Output "::error::the task runs '$($action.Execute)', expected $I\bin\na_audio_daemon.exe"; exit 1 }
+          if ($action.Execute -ne "$I\bin\na_audio_daemonw.exe") {
+            Write-Output "::error::the task runs '$($action.Execute)', expected $I\bin\na_audio_daemonw.exe (the windowed build)"; exit 1 }
           if ($action.Arguments -notmatch '--mode\s+control') {
             Write-Output "::error::the task does not run --mode control: '$($action.Arguments)'"; exit 1 }
 
@@ -1298,12 +1331,54 @@ jobs:
           # BEHAVIOUR: the task's OWN argument list, handed to the installed
           # binary. This is the check that catches a typo'd option — the task
           # would register perfectly and fail only at the operator's next logon.
+          # The binary is the windowed build, launched the way the task launches it:
+          # Start-Process with no stdout handed over, so the refusal has nowhere to go
+          # but the log file — which is the second thing measured here. -Wait, because
+          # PowerShell does not wait for a GUI-subsystem process it invoked bare.
           $taskArgs = $action.Arguments.Split(' ') + @('--mode','zzz','--no-config')
-          & $action.Execute @taskArgs 2>&1 | Tee-Object -FilePath task-args.log
-          if ($LASTEXITCODE -ne 2 -or -not (Select-String -Path task-args.log -Pattern "invalid --mode 'zzz'" -Quiet)) {
-            Write-Output "::error::the task's own arguments did not parse (exit $LASTEXITCODE)"
-            Get-Content task-args.log; exit 1 }
-          Write-Output "logon task registered, disabled, no time limit, battery-safe, running $($action.Execute)"
+          $wlog = "$env:LOCALAPPDATA\naudio\daemon.log"
+          if (Test-Path $wlog) { Remove-Item $wlog }
+          $pt = Start-Process -Wait -PassThru -FilePath $action.Execute -ArgumentList $taskArgs
+          if ($pt.ExitCode -ne 2) {
+            Write-Output "::error::the task's own arguments did not parse (exit $($pt.ExitCode))"
+            if (Test-Path $wlog) { Get-Content $wlog }; exit 1 }
+          if (-not (Test-Path $wlog) -or -not (Select-String -Path $wlog -Pattern "invalid --mode 'zzz'" -Quiet)) {
+            Write-Output "::error::the windowed daemon's refusal did not reach its log at $wlog"
+            if (Test-Path $wlog) { Get-Content $wlog }; exit 1 }
+          Write-Output "logon task registered, disabled, no time limit, battery-safe, running $($action.Execute); its refusals land in $wlog"
+
+          # The windowed build in the task's own mode, for real: control mode on a free port
+          # for a few seconds, launched bare. Its log must announce the page — and say what
+          # the tray did: "[tray] icon added" when the runner's session has a shell tray,
+          # or the note that it has none, either of which is a measurement of the tray code
+          # running rather than an assertion about a desktop this job cannot see. The URL
+          # is read from the log and the page fetched from it, so the windowed process is
+          # proved to serve as the console one does.
+          if (Test-Path $wlog) { Remove-Item $wlog }
+          $pc = Start-Process -PassThru -FilePath $action.Execute -ArgumentList '--mode','control','--control-port','0','--autostart','false','--no-config','--duration-ms','20000'
+          $wurl = $null
+          foreach ($attempt in 1..60) {
+            if (Test-Path $wlog) {
+              $wline = Select-String -Path $wlog -Pattern '^control page : (\S+)' | Select-Object -First 1
+              if ($wline) { $wurl = $wline.Matches[0].Groups[1].Value; break }
+            }
+            Start-Sleep -Milliseconds 250
+          }
+          if (-not $wurl) {
+            Write-Output "::error::the windowed daemon announced no control page in its log"
+            if (Test-Path $wlog) { Get-Content $wlog }
+            Stop-Process -Id $pc.Id -ErrorAction SilentlyContinue; exit 1 }
+          $wpage = (Invoke-WebRequest -UseBasicParsing -Uri $wurl).Content
+          if ($wpage -notmatch 'naudio control') {
+            Write-Output "::error::the windowed daemon's page is not the control page"
+            Stop-Process -Id $pc.Id -ErrorAction SilentlyContinue; exit 1 }
+          Start-Sleep -Seconds 2
+          $trayLine = Select-String -Path $wlog -Pattern '\[tray\]|no tray icon' | Select-Object -First 1
+          if (-not $trayLine) {
+            Write-Output "::error::the windowed daemon's log says nothing about the tray icon — the tray code did not run"
+            Get-Content $wlog; Stop-Process -Id $pc.Id -ErrorAction SilentlyContinue; exit 1 }
+          Write-Output "windowed daemon: serves $wurl from a bare launch; tray: $($trayLine.Line.Trim())"
+          Stop-Process -Id $pc.Id -ErrorAction SilentlyContinue
 
           # --- The control page (#96 item 4) ----------------------------------
           # The Start-menu shortcut is the thing #96's acceptance actually names.
@@ -1322,7 +1397,7 @@ jobs:
               ForEach-Object { Write-Output "  found: $($_.FullName)" }
             exit 1 }
           $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-          if ($sc.TargetPath -ne "$I\bin\na_audio_daemon.exe") {
+          if ($sc.TargetPath -ne "$I\bin\na_audio_daemonw.exe") {
             Write-Output "::error::the shortcut points at '$($sc.TargetPath)'"; exit 1 }
           if ($sc.Arguments -notmatch '--mode control' -or $sc.Arguments -notmatch '--open-page') {
             Write-Output "::error::the shortcut does not open the control page: '$($sc.Arguments)'"; exit 1 }
@@ -1383,7 +1458,7 @@ jobs:
           # with spaces and no quoting, so the quotes ride inside the string.
           $un = Start-Process -PassThru -Wait -FilePath "$I/Uninstall.exe" -ArgumentList '/S',"`"_?=$I`""
           if ($un.ExitCode -ne 0) { Write-Output "::error::silent uninstall exited $($un.ExitCode)"; exit 1 }
-          foreach ($gone in 'bin/na_wav_tap.exe','bin/na_audio_daemon.exe') {
+          foreach ($gone in 'bin/na_wav_tap.exe','bin/na_audio_daemon.exe','bin/na_audio_daemonw.exe') {
             if (Test-Path "$I/$gone") { Write-Output "::error::uninstaller left $gone behind"; exit 1 } }
           # ...including the logon task. This is also what would catch the
           # uninstall section running AFTER the payload (and therefore the

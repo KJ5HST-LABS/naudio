@@ -129,7 +129,8 @@ cmake -S . -B build -DCMAKE_PREFIX_PATH=~/naudio
 ### Windows (.zip)
 
 The ZIP carries the library (`naudio.dll` + import library), the headers, the CMake
-package, and four programs: the daemon (`na_audio_daemon.exe`), the demo pair
+package, and the programs: the daemon (`na_audio_daemon.exe`, and `na_audio_daemonw.exe`, the same
+program without a console window — see *Running the daemon in the background*), the demo pair
 (`na_audio_source.exe`, `na_c_play_to_speakers.exe`) and the stream recorder
 (`na_wav_tap.exe`). Expand it anywhere:
 
@@ -309,7 +310,7 @@ systemctl --user restart naudio-daemon                          # Linux
 
 If the service will not start, the usual cause is a mistake in the configuration file, and
 the message names the line: `systemctl --user status naudio-daemon` on Linux, or
-`/usr/local/var/log/naudio/daemon.log` on a Mac. To switch the service off again, turn it off
+`/usr/local/var/log/naudio/daemon.log` on a Mac, `%LOCALAPPDATA%\naudio\daemon.log` on Windows. To switch the service off again, turn it off
 in Login Items on a Mac, or use `systemctl --user disable --now naudio-daemon` on Linux.
 
 On **Windows** the installer registers a Task Scheduler **logon task** rather than a Windows
@@ -323,9 +324,13 @@ schtasks /Run    /TN "\naudio\naudio-daemon"
 ```
 
 Turn it off again with `/DISABLE`, or from *Task Scheduler* under the **naudio** folder, where the
-task is `naudio-daemon` and its description names it **Network Audio Service**. Windows
-does not capture a task's output anywhere, so there is no equivalent of the log file above: a
-configuration mistake shows up as `LastTaskResult` 2 on the task, and on the control page.
+task is `naudio-daemon` and its description names it **Network Audio Service**. The task — and
+the Start-menu shortcut — run `na_audio_daemonw.exe`, a build of the daemon with **no console
+window**: nothing appears on the screen but a **tray icon** (right-click it to open the control
+page or to quit the service), and its output goes to a log file, `%LOCALAPPDATA%\naudio\daemon.log`,
+which is where a configuration mistake is explained by file and line (it also shows as
+`LastTaskResult` 2 on the task, and on the control page). `na_audio_daemon.exe`, the same program
+with a console, is what you run from a terminal.
 
 All three services run the daemon in **control mode**, so a service that is on gives you the
 control page at every login and captures nothing until you ask it to. If you want capture to start
