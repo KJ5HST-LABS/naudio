@@ -1520,8 +1520,13 @@ jobs:
           $desktopGuard = @(Select-String -Path $nsi.FullName -Pattern '^\s*StrCmp ''\$INSTALL_DESKTOP'' ''1'' 0 \+2\s*$').Count
           $desktopMake = @(Select-String -Path $nsi.FullName -Pattern '^\s*CreateShortCut ''\$DESKTOP\\Network Audio Service\.lnk'' ''\$INSTDIR\\bin\\na_audio_daemonw\.exe'' ''--mode control --duration-ms 0 --open-page''\s*$').Count
           $desktopDrop = @(Select-String -Path $nsi.FullName -Pattern '^\s*Delete ''\$DESKTOP\\Network Audio Service\.lnk''\s*$').Count
-          if ($desktopMake -ne 1 -or $desktopDrop -ne 1 -or $desktopGuard -lt 2) {
-            Write-Output "::error::the .nsi does not carry the guarded desktop shortcut and its delete (guards $desktopGuard, create $desktopMake, delete $desktopDrop; expected >=2, 1, 1)"
+          # EXACT counts, from the template's shape: CPack substitutes DELETE_ICONS_EXTRA at TWO
+          # sites in its Uninstall section (once for the Start-menu folder in use, once for the
+          # registered one, in case the user moved it), so the guarded delete appears twice and
+          # the guard three times (one install, two uninstall). The first run of this step
+          # expected one delete and failed on the .nsi CPack actually wrote — measured, not read.
+          if ($desktopMake -ne 1 -or $desktopDrop -ne 2 -or $desktopGuard -ne 3) {
+            Write-Output "::error::the .nsi does not carry the guarded desktop shortcut and its deletes (guards $desktopGuard, create $desktopMake, delete $desktopDrop; expected 3, 1, 2)"
             Select-String -Path $nsi.FullName -Pattern 'DESKTOP' | ForEach-Object { Write-Output "  $($_.LineNumber): $($_.Line)" }
             exit 1 }
           Select-String -Path $ini.FullName -Pattern '^Text=' | ForEach-Object { Write-Output "options page: $($_.Line)" }
