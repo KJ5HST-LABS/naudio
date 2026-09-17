@@ -2047,7 +2047,11 @@ TEST(Server, ARejectedClientReceivesItsReasonWhenItBehavesLikeARealClient) {
     ASSERT_TRUE(clientHandshake(*resident, "resident"));
     ASSERT_TRUE(waitForClientsUpdate(*resident, 1, 3000));
 
-    const int kAttempts = 8;
+    // 32, not 8 (issue #104): one lost reject in eight attempts is a flake that shows one run
+    // in ten on windows-latest; the same window at 32 shows almost every run. A detector is
+    // worth more red than it is worth green, and the fix it now measures is the drain waiting
+    // for the request (AudioProtocolHandler::discardPendingInput).
+    const int kAttempts = 32;
     for (int i = 0; i < kAttempts; i++) {
         TcpClientTransport t;
         auto c = t.connect("127.0.0.1", port, 2000, &err);
@@ -2062,6 +2066,65 @@ TEST(Server, ARejectedClientReceivesItsReasonWhenItBehavesLikeARealClient) {
             << "attempt " << i << ": no CONNECT_REJECT reached a client that had sent a "
             << "CONNECT_REQUEST first — the reason was lost in transit, not withheld";
 
+        auto msg = ControlMessage::deserialize(reject->payload());
+        ASSERT_TRUE(msg.has_value()) << "attempt " << i;
+        const auto reason = msg->parseErrorMessage();
+        EXPECT_TRUE(reason.has_value() &&
+                    reason->find("Maximum clients") != std::string::npos)
+            << "attempt " << i << " reason: " << reason.value_or("<none>");
+        c->close();
+    }
+
+    server.stop();
+}
+
+// #104 — the window the arm above hit one attempt in ~fifty on windows-latest, opened on purpose.
+//
+// The reject is decided at accept, before the client's CONNECT_REQUEST can have arrived; the
+// client sends it from a thread that has to be scheduled after connect() returns. The server's
+// drain used to take its first empty 2 ms read as "nothing to drain" and close — and when the
+// request then landed on the closed socket, the stack answered RST, which on Windows throws away
+// the client's unread receive buffer, the reject with it. On a loaded runner a scheduling gap
+// over 2 ms is ordinary. Here the gap is made deliberately: the client connects, WAITS, and only
+// then sends its request — inside the drain's budget, well past the old first-read exit.
+//
+// MEASURED PRE-FIX on windows-latest: fails deterministically (every attempt); macOS and Linux
+// deliver the reject either way, their stacks leaving queued data readable after an RST, so this
+// arm is a Windows detector and a documentation of the rule everywhere else. The delay is a
+// fraction of the 50 ms budget so a slow runner cannot push the send past the drain — the case
+// past the budget is the "reason is best-effort" clause on AudioStreamServer::rejectClient, and
+// it is not this arm's to prove.
+TEST(Server, ARejectedClientThatSendsLateStillReceivesItsReason) {
+    AudioStreamConfig config{};
+    config.maxClients = 1;
+    AudioStreamServer server{0, config};
+    server.setInjectOnlyMode(true);
+    std::string err;
+    ASSERT_TRUE(server.start(&err)) << err;
+    const auto port = static_cast<std::uint16_t>(server.port());
+
+    TcpClientTransport t0;
+    auto resident = t0.connect("127.0.0.1", port, 2000, &err);
+    ASSERT_TRUE(resident) << err;
+    ASSERT_TRUE(clientHandshake(*resident, "resident"));
+    ASSERT_TRUE(waitForClientsUpdate(*resident, 1, 3000));
+
+    const int kAttempts = 8;
+    for (int i = 0; i < kAttempts; i++) {
+        TcpClientTransport t;
+        auto c = t.connect("127.0.0.1", port, 2000, &err);
+        ASSERT_TRUE(c) << "attempt " << i << ": " << err;
+        // The scheduling gap, made real: longer than the old drain's first-read exit (2 ms),
+        // shorter than the budget (50 ms) by a margin a slow runner cannot eat.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        ASSERT_TRUE(c->sendControl(
+            ControlMessage::connectRequest("late-" + std::to_string(i), AudioPacket::VERSION)))
+            << "attempt " << i;
+
+        auto reject = recvUntil(*c, PacketType::Control, ControlType::ConnectReject, 3000);
+        ASSERT_TRUE(reject.has_value())
+            << "attempt " << i << ": a client that sent its CONNECT_REQUEST 10 ms after "
+            << "connecting got no CONNECT_REJECT — the server closed on the request and reset it";
         auto msg = ControlMessage::deserialize(reject->payload());
         ASSERT_TRUE(msg.has_value()) << "attempt " << i;
         const auto reason = msg->parseErrorMessage();
