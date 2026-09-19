@@ -16,11 +16,11 @@ package for `find_package(naudio)`. The double-click installers deliberately lea
 out; pick any other format. (The optional Hamlib bridge is a from-source build only for
 now; see the note under Option C.)
 
-> **Current availability (2026-09).** The current packaged release, **v1.0.0rc9** (a
+> **Current availability (2026-09).** The current packaged release, **v1.0.0rc10** (a
 > prerelease), carries everything on this page: the double-click installers (a macOS `.pkg`
 > and a Windows setup `.exe`), TGZ for Linux and macOS, DEB, RPM, a Windows ZIP, and
 > `sha256sums.txt` — from the release page, or with
-> `gh release download v1.0.0rc9 -R KJ5HST-LABS/naudio`. The repository is public; the
+> `gh release download v1.0.0rc10 -R KJ5HST-LABS/naudio`. The repository is public; the
 > Homebrew tap is not yet, and installs over ssh (Option B). This page is written for the
 > durable state.
 

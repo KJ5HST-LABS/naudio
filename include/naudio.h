@@ -115,7 +115,7 @@ extern "C" {
  * procedure in CONTRIBUTING.md says so. It is deliberately NOT read by the CMake version gate,
  * which compares only MAJOR/MINOR/PATCH against project(VERSION) — a pre-release tag is not part
  * of the SONAME and must not change it. */
-#define NAUDIO_VERSION_PRERELEASE "-rc9"
+#define NAUDIO_VERSION_PRERELEASE "-rc10"
 
 /* The largest value NA_VERSION_ENCODE accepts for minor and for patch. Above it a lower component
  * would carry into a higher one and the ordering would stop being total; CMakeLists.txt refuses to
