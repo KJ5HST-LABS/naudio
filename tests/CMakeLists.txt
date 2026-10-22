@@ -27,7 +27,7 @@ target_link_libraries(naudio_tests PRIVATE naudio_core GTest::gtest_main Threads
 # sample-rate negotiation policy (issue #84). It is deliberately not in include/naudio/ —
 # that tree is installed and ships upstream, and this is one tool's policy, not library
 # API. The header pulls in no hamlib and no naudio headers, so these arms build and run on
-# the whole CI matrix while the bridge that uses it stays opt-in and POSIX-only.
+# the whole CI matrix while the bridge that uses it stays opt-in.
 target_include_directories(naudio_tests PRIVATE "${CMAKE_SOURCE_DIR}/tools")
 
 include(GoogleTest)
