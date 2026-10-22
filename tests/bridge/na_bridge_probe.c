@@ -214,10 +214,26 @@ static long transmit_tone(na_stream_client* c, int ms, int peak) {
     return total;
 }
 
-/* Build a configured, connected UDP client. The bridge always selects a UDP reliability profile,
- * so a client left on the ABI-default TCP transport is refused at connect with SO_ERROR=61 — that
- * is not a bridge fault, it is the documented default (CLAUDE.md Learning 7). */
-static na_stream_client* attach(const char* host, int port, const char* who, int tx_inject) {
+/* --profile values. `tcp` makes no profile call at all, which leaves the client on the C ABI's
+ * default transport, plain TCP: the configuration of a consumer that never selects a profile, as
+ * WSJT-X's does. The others select the named UDP profile. */
+#define PROBE_PROFILE_TCP     (-1)
+#define PROBE_PROFILE_UNKNOWN (-2)
+
+static int parse_probe_profile(const char* s) {
+    if (strcmp(s, "tcp") == 0) return PROBE_PROFILE_TCP;
+    if (strcmp(s, "wan") == 0) return NA_RELIABILITY_UDP_WAN;
+    if (strcmp(s, "lan") == 0) return NA_RELIABILITY_UDP_LAN;
+    if (strcmp(s, "ft8") == 0) return NA_RELIABILITY_UDP_FT8;
+    return PROBE_PROFILE_UNKNOWN;
+}
+
+/* Build a configured, connected client. Its transport must match the server's: the bridge's
+ * default -R wan serves UDP only, so a client left on the ABI-default TCP transport is refused at
+ * connect with SO_ERROR=61 — that is not a bridge fault, it is the documented default (CLAUDE.md
+ * Learning 7). --profile tcp is that client on purpose, for a bridge on -R tcp or -R dual. */
+static na_stream_client* attach(const char* host, int port, const char* who, int tx_inject,
+                                int profile) {
     char err[256];
     err[0] = '\0';
     na_stream_client* c = na_client_create(NA_CLIENT_BACKEND_NULL, host, port, who);
@@ -236,8 +252,9 @@ static na_stream_client* attach(const char* host, int port, const char* who, int
     }
     /* The profile selects the transport too, so it is NOT paired with na_client_set_transport —
      * pairing them would make this probe an ordering test by accident (c_client_profile.c owns
-     * that claim). UDP_WAN matches the bridge's own default (-R wan). */
-    if (na_client_set_reliability_profile(c, NA_RELIABILITY_UDP_WAN) != NA_OK) {
+     * that claim). The default, UDP_WAN, matches the bridge's own default (-R wan). */
+    if (profile != PROBE_PROFILE_TCP &&
+        na_client_set_reliability_profile(c, (na_reliability_profile)profile) != NA_OK) {
         fprintf(stderr, "na_bridge_probe: reliability profile rejected\n");
         na_client_destroy(c);
         return NULL;
@@ -434,7 +451,8 @@ static int run_selftest(void) {
     }
 
     const int port = na_server_port(srv);
-    na_stream_client* cli = attach("127.0.0.1", port, "bridge-probe-selftest", 1);
+    na_stream_client* cli = attach("127.0.0.1", port, "bridge-probe-selftest", 1,
+                                   NA_RELIABILITY_UDP_WAN);
     if (cli == NULL) {
         na_server_stop(srv);
         na_server_destroy(srv);
@@ -484,10 +502,13 @@ static int run_selftest(void) {
 
 static void usage(void) {
     fprintf(stderr,
-        "usage: na_bridge_probe [--host H] [--port N] [--seconds S]\n"
+        "usage: na_bridge_probe [--host H] [--port N] [--seconds S] [--profile P]\n"
         "                       [--expect content|silence] [--min-rate BYTES_PER_SEC] [--tx]\n"
         "       na_bridge_probe --selftest\n"
         "\n"
+        "  --profile wan|lan|ft8|tcp  the client's transport (default wan, the bridge's\n"
+        "                     default -R). tcp selects no profile: the C ABI's default,\n"
+        "                     plain TCP, which a bridge serves on -R tcp or -R dual.\n"
         "  --expect content   require peak |sample| > 0   (a silent stream FAILS)\n"
         "  --expect silence   require peak |sample| == 0  (the negative control)\n"
         "  --min-rate N       also require the delivered byte rate >= N. OFF by default:\n"
@@ -506,6 +527,7 @@ int main(int argc, char** argv) {
     const char* expect = NULL;
     long min_rate = 0;
     int tx = 0;
+    const char* profile_name = "wan";
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -518,19 +540,22 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--seconds") == 0)  seconds = atoi(argv[++i]);
         else if (strcmp(a, "--expect") == 0)   expect = argv[++i];
         else if (strcmp(a, "--min-rate") == 0) min_rate = strtol(argv[++i], NULL, 10);
+        else if (strcmp(a, "--profile") == 0)  profile_name = argv[++i];
         else { usage(); return EXIT_HARNESS; }
     }
     if (expect != NULL && strcmp(expect, "content") != 0 && strcmp(expect, "silence") != 0) {
         usage();
         return EXIT_HARNESS;
     }
+    const int profile = parse_probe_profile(profile_name);
+    if (profile == PROBE_PROFILE_UNKNOWN) { usage(); return EXIT_HARNESS; }
     if (seconds <= 0 || port <= 0 || port > 65535) { usage(); return EXIT_HARNESS; }
 
     reset_detector();
-    na_stream_client* c = attach(host, port, "bridge-probe", tx);
+    na_stream_client* c = attach(host, port, "bridge-probe", tx, profile);
     if (c == NULL) return EXIT_HARNESS;
-    printf("na_bridge_probe: attached to %s:%d, sampling %d s%s\n", host, port, seconds,
-           tx ? " (transmitting)" : "");
+    printf("na_bridge_probe: attached to %s:%d (%s), sampling %d s%s\n", host, port,
+           profile_name, seconds, tx ? " (transmitting)" : "");
     fflush(stdout);
     if (tx) {
         /* Transmitting IS the sampling window here — transmit_tone paces itself at 10 ms a frame,
