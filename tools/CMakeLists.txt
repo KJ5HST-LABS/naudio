@@ -395,7 +395,16 @@ endif()
 # ----------------------------------------------------------------------------
 option(NAUDIO_BUILD_HAMLIB_BRIDGE
        "Build the Hamlib streaming <-> naudio bridge (needs libhamlib with rig_stream_*)" OFF)
-if(NAUDIO_BUILD_HAMLIB_BRIDGE)
+# MSVC has neither getopt nor pthreads, so with a libhamlib found the bridge would fail to
+# compile there. Skipped with a WARNING like every skip below, so the flag cannot break an MSVC
+# build.
+if(NAUDIO_BUILD_HAMLIB_BRIDGE AND MSVC)
+    message(WARNING "NAUDIO_BUILD_HAMLIB_BRIDGE: na_hamlib_bridge builds on Windows with "
+                    "MinGW-w64 (MSYS2 UCRT64), not MSVC, which has no getopt or pthreads; "
+                    "skipping na_hamlib_bridge"
+                    "\n  Details:    docs/hamlib-streaming-bridge.md")
+endif()
+if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT MSVC)
     # Every skip below is a WARNING, not an error: the flag is opt-in and the rest
     # of the build stays green. That makes the skip easy to scroll past, so each
     # one says where to get the missing dependency.
