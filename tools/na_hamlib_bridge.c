@@ -67,7 +67,19 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_failed = 0;
-static void on_signal(int sig) { (void)sig; g_stop = 1; }
+/* On Windows the CRT runs this on a thread of its own when the console delivers Ctrl-C or
+ * Ctrl-Break, and resets the handler to SIG_DFL before calling it. Re-installing it keeps a second
+ * Ctrl-C during teardown from ending the process on the spot, with the rig open and, under -k,
+ * PTT still keyed. glibc and macOS keep a handler installed once it has run, so on POSIX there is
+ * nothing to re-install. */
+static void on_signal(int sig) {
+#if defined(_WIN32)
+    signal(sig, on_signal);
+#else
+    (void)sig;
+#endif
+    g_stop = 1;
+}
 
 /* A worker that stops for any reason other than an operator-requested shutdown must take the
  * process down with it. The bridge runs unattended at the radio site, so its expected failure —
@@ -922,6 +934,11 @@ int main(int argc, char **argv) {
      * reported and exits non-zero on its own path, which is still an orderly teardown. */
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+#if defined(_WIN32)
+    /* Windows never raises SIGTERM. Ctrl-Break is its other console interrupt, and the only one a
+     * supervisor can send to a bridge it started in a process group of its own. */
+    signal(SIGBREAK, on_signal);
+#endif
 
     b.rig = rig_init((rig_model_t)model);
     if (!b.rig) {

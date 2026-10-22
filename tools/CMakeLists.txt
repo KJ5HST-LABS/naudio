@@ -386,10 +386,25 @@ endif()
 # No released Hamlib has rig_stream_*, so that prefix has to be built. Build one
 # with tools/build-streaming-hamlib.sh; docs/hamlib-streaming-bridge.md covers
 # the manual path and why a skipped target looks like a broken flag.
+#
+# Windows builds it with MinGW-w64 (MSYS2 UCRT64), the toolchain Hamlib builds
+# with there; the windows-hamlib-bridge CI job runs it. The NOT WIN32 that sat
+# here came from moving the directory-wide gate inward (923b5f6), not from
+# anything the bridge needs: MinGW supplies getopt, pthreads, nanosleep and
+# clock_gettime, and a streaming libhamlib builds for it.
 # ----------------------------------------------------------------------------
 option(NAUDIO_BUILD_HAMLIB_BRIDGE
        "Build the Hamlib streaming <-> naudio bridge (needs libhamlib with rig_stream_*)" OFF)
-if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
+# MSVC has neither getopt nor pthreads, so with a libhamlib found the bridge would fail to
+# compile there. Skipped with a WARNING like every skip below, so the flag cannot break an MSVC
+# build.
+if(NAUDIO_BUILD_HAMLIB_BRIDGE AND MSVC)
+    message(WARNING "NAUDIO_BUILD_HAMLIB_BRIDGE: na_hamlib_bridge builds on Windows with "
+                    "MinGW-w64 (MSYS2 UCRT64), not MSVC, which has no getopt or pthreads; "
+                    "skipping na_hamlib_bridge"
+                    "\n  Details:    docs/hamlib-streaming-bridge.md")
+endif()
+if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT MSVC)
     # Every skip below is a WARNING, not an error: the flag is opt-in and the rest
     # of the build stays green. That makes the skip easy to scroll past, so each
     # one says where to get the missing dependency.
@@ -485,9 +500,12 @@ if(NAUDIO_BUILD_HAMLIB_BRIDGE AND NOT WIN32)
                 install(TARGETS na_hamlib_bridge
                         RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT tools)
                 # Installed only when the target is: a man page for a tool the
-                # package does not carry would document a phantom.
-                install(FILES "${naudio_SOURCE_DIR}/docs/man/na_hamlib_bridge.1"
-                        DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
+                # package does not carry would document a phantom. Not on
+                # Windows, for na_wav_tap's reason: no man tree, no man(1).
+                if(NOT WIN32)
+                    install(FILES "${naudio_SOURCE_DIR}/docs/man/na_hamlib_bridge.1"
+                            DESTINATION "${CMAKE_INSTALL_MANDIR}/man1" COMPONENT tools)
+                endif()
                 if(NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)
                     target_compile_definitions(na_hamlib_bridge
                                                PRIVATE NAUDIO_HAMLIB_HAS_STREAM_CHANNEL_LIST)

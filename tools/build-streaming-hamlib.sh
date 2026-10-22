@@ -41,9 +41,22 @@
 #                  probe included. naudio's build detects the static-only
 #                  prefix and links the static closure (tools/CMakeLists.txt).
 #   -h, --help
+#   -- ARGS...     everything after -- goes to Hamlib's ./configure unchanged
+#
+# CC, CFLAGS, CPPFLAGS and LDFLAGS from the environment reach Hamlib's
+# ./configure as configure reads them; the configure step prints any that are
+# set. CFLAGS replaces autoconf's default -g -O2, so restate it when adding to
+# it. Hamlib also hands CPPFLAGS to windres on Windows (src/Makefile.am), so
+# compiler-only options such as -include belong in CFLAGS there.
 #
 # The prefix must be durable: naudio's CMakeCache.txt records an ABSOLUTE path
 # into it, so a prefix under /tmp silently breaks every later rebuild.
+#
+# On Windows, run it from an MSYS2 UCRT64 shell and give --prefix in Windows
+# form with forward slashes (cygpath -m, e.g. C:/hamlib-streaming). hamlib.pc
+# records the prefix and is read by native Windows programs (CMake, pkg-config,
+# gcc), to which an MSYS path such as /c/hamlib-streaming means \c\... on the
+# current drive.
 #
 # See docs/hamlib-streaming-bridge.md for the manual equivalent and for what to
 # do when the build is skipped anyway.
@@ -69,6 +82,7 @@ ref="$default_ref"
 repo="$default_repo"
 jobs=""
 static=0
+configure_args=()
 
 die() { printf 'build-streaming-hamlib: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -90,20 +104,22 @@ while [ $# -gt 0 ]; do
     --repo)   [ $# -ge 2 ] || die "--repo needs an argument";   repo="$2";   shift 2 ;;
     --jobs)   [ $# -ge 2 ] || die "--jobs needs an argument";   jobs="$2";   shift 2 ;;
     --static) static=1; shift ;;
+    --)       shift; configure_args=("$@"); break ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
 done
 
 # An absolute prefix is not a style preference: it is baked into hamlib.pc and
-# from there into naudio's CMakeCache.txt.
+# from there into naudio's CMakeCache.txt. A drive-letter path (C:/...) is
+# absolute too, and on Windows it is the form hamlib.pc needs (see the header).
 case "$prefix" in
-  /*) ;;
+  /*|[A-Za-z]:/*) ;;
   *) prefix="$(pwd)/$prefix" ;;
 esac
 [ -n "$src" ] || src="$prefix/src"
 case "$src" in
-  /*) ;;
+  /*|[A-Za-z]:/*) ;;
   *) src="$(pwd)/$src" ;;
 esac
 
@@ -132,6 +148,7 @@ if [ -n "$missing" ]; then
   printf 'build-streaming-hamlib: missing build tools:%s\n\n' "$missing" >&2
   printf '  macOS:         brew install autoconf automake libtool pkg-config\n' >&2
   printf '  Debian/Ubuntu: sudo apt-get install autoconf automake libtool pkg-config build-essential\n' >&2
+  printf '  MSYS2 UCRT64:  pacman -S git make autoconf automake libtool mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkg-config\n' >&2
   exit 1
 fi
 printf '    ok — git, autoconf, automake, libtool, pkg-config, make\n'
@@ -205,11 +222,20 @@ step "Bootstrapping (autoreconf)"
 shape_desc="shared"
 [ "$static" = 1 ] && shape_desc="static"
 step "Configuring --prefix=$prefix ($shape_desc libhamlib)"
+for v in CC CFLAGS CPPFLAGS LDFLAGS; do
+  if [ -n "${!v:-}" ]; then printf '    %s from the environment: %s\n' "$v" "${!v}"; fi
+done
+if [ ${#configure_args[@]} -gt 0 ]; then
+  printf '    passed through: %s\n' "${configure_args[*]}"
+fi
 # shellcheck disable=SC2086  # shape_flags is a deliberate word-split
+# The odd expansion of configure_args is what bash 3.2 (macOS) needs for an
+# empty array under set -u.
 ( cd "$src" && ./configure --prefix="$prefix" \
                            --without-cxx-binding \
                            $shape_flags \
-                           --disable-dependency-tracking )
+                           --disable-dependency-tracking \
+                           ${configure_args[@]+"${configure_args[@]}"} )
 
 step "Building (make -j$jobs)"
 ( cd "$src" && make -j"$jobs" )

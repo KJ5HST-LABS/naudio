@@ -146,8 +146,9 @@ Consume it from CMake with `-DCMAKE_PREFIX_PATH=<unpacked-dir>`; `naudio.dll` si
 `key = value` per line — or from any file you name with `--config`. You do not have to write
 that file by hand: `na_audio_daemon --mode control --open-page` opens the control page in your
 browser and writes it for you. The ZIP registers nothing, so nothing starts at logon; the setup
-`.exe` above is the path that registers a logon task. (The Hamlib bridge is still not built on
-Windows.)
+`.exe` above is the path that registers a logon task. (The Hamlib bridge is not in the ZIP either;
+on Windows it builds from source with MSYS2, see
+[docs/hamlib-streaming-bridge.md](docs/hamlib-streaming-bridge.md#building-on-windows-msys2-ucrt64).)
 
 ## Option B — Homebrew (macOS)
 

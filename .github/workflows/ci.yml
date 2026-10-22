@@ -6,7 +6,8 @@ name: CI
 # on CI runners. The real-hardware smokes (na_audio_daemon / on-air audio) are
 # gated out here — they need a real sound device.
 #
-# Six job families (tri-platform + FetchContent + sanitizers + FFI + the Hamlib bridge):
+# Seven job families (tri-platform + FetchContent + sanitizers + FFI + the Hamlib bridge on Linux
+# and on Windows):
 #   * build-and-test  — Ubuntu + macOS with a SYSTEM PortAudio (the supported path);
 #                       full ctest + install smoke + the external-consumer find_package
 #                       / pkg-config gate.
@@ -39,6 +40,10 @@ name: CI
 #                       tracked tools/build-streaming-hamlib.sh, then asserts on the BINARY and
 #                       on named passing tests — never on an exit code, because both the skipped
 #                       build and the empty test selection exit 0.
+#   * windows-hamlib-bridge — Windows, MSYS2 UCRT64: the same bridge built with MinGW against a
+#                       static streaming libhamlib, run from a directory holding only it and the
+#                       DLLs it needs: -h, the Dummy's tone over -R tcp, and a clean exit on Ctrl-C
+#                       and on Ctrl-Break.
 
 on:
   push:
@@ -635,6 +640,236 @@ jobs:
         with:
           name: hamlib-bridge-ctest-log
           path: bridge-ctest.log
+
+  windows-hamlib-bridge:
+    name: hamlib bridge (windows-latest, MSYS2 UCRT64, libhamlib built from source)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    # na_hamlib_bridge had never been built for Windows. Its NOT WIN32 gate came from moving the
+    # directory-wide gate inward (923b5f6), not from anything the bridge needs: MinGW-w64 supplies
+    # getopt, pthreads, nanosleep and clock_gettime, and the streaming libhamlib builds with it, given
+    # the two workarounds in the Hamlib step for upstream defects that only a native MSYS2 build
+    # reaches. UCRT64 is the MSYS2 environment WSJT-X's Windows build uses, and the UCRT is the C runtime
+    # naudio's MSVC packages use.
+    #
+    # WHICH HAMLIB. The same as the Linux job: tools/build-streaming-hamlib.sh's defaults, upstream
+    # master at its head (issue #81), so both platforms build one Hamlib source. Static (--static),
+    # so the bridge embeds libhamlib and needs no libhamlib DLL beside it.
+    #
+    # WHY POWERSHELL STARTS THE BRIDGE. A `kill -INT` from MSYS2's bash does not reach a native
+    # program: run 39869456383 measured the bridge still running 30 s after it, on every options-arm
+    # row that stops it that way. Started from PowerShell, the bridge's own exit code is read
+    # directly; MSYS2's `kill -f -W` delivers the console event, as CTRL_C_EVENT for INT and
+    # CTRL_BREAK_EVENT for QUIT, through a remote thread running kernel32's CtrlRoutine in the
+    # bridge (exit_process.h), and PowerShell has no way to send either to a single process.
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Keep LF line endings (the bash scripts run under MSYS2)
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git make autoconf automake libtool
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkg-config
+
+      - name: "Build a static streaming libhamlib (Hamlib master, as the Linux job) from source"
+        env:
+          CC: gcc
+          # Upstream defect: lib/precise_time.c's __WIN32__ branch calls assert() without including
+          # <assert.h>, and GCC 14+ rejects the implicit declaration. A cross-build never reaches
+          # that branch: it is taken only when _POSIX_TIMERS is undefined, and mingw-w64 stopped
+          # defining it in winpthreads' pthread_time.h on 2026-10-09 (mingw-w64 1cbc9aef43), which
+          # MSYS2's headers carry. -include is compiler-only, so it goes in CFLAGS (Hamlib hands
+          # CPPFLAGS to windres too), restating autoconf's default -g -O2 that CFLAGS replaces.
+          CFLAGS: "-g -O2 -include assert.h"
+        run: |
+          # Windows form (D:/a/...): hamlib.pc records the prefix, and the native CMake, pkg-config
+          # and gcc that read it take /d/a/... for a path on the current drive.
+          prefix="$(cygpath -m "$RUNNER_TEMP")/hamlib-streaming"
+          echo "HAMLIB_PREFIX=$prefix" >> "$GITHUB_ENV"
+          # --without-readline, upstream defect two: the runner's MSYS2 has wineditline (pcre2 depends
+          # on it), whose libedit passes Hamlib's readline link check while its header is
+          # editline/readline.h, which Hamlib does not look for. rigctl, rotctl and ampctl then fall
+          # back to `extern char *readline();`, which C23, GCC 16's default, reads as taking no
+          # arguments, and fail to compile. The bridge uses none of them.
+          bash tools/build-streaming-hamlib.sh --static --prefix "$prefix" -- --without-readline
+
+      - name: Configure with the bridge enabled
+        run: |
+          # Apps off: this job is about the bridge, and the probe it needs is a test target.
+          # PortAudio bundled into libnaudio.dll, as the release packages do (issue #93), so the
+          # DLL set dist/ collects below is the one the guide lists.
+          PKG_CONFIG_PATH="$HAMLIB_PREFIX/lib/pkgconfig" \
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                  -DNAUDIO_BUILD_APPS=OFF -DNAUDIO_BUNDLE_PORTAUDIO=ON \
+                  -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON 2>&1 | tee configure.log
+          # Every skip in tools/CMakeLists.txt is a WARNING; the configure succeeds either way.
+          grep -q 'naudio: na_hamlib_bridge enabled' configure.log \
+            || { echo "::error::na_hamlib_bridge was skipped at configure — see the WARNING above"; exit 1; }
+
+      - name: Build the bridge and the probe
+        run: cmake --build build --target na_hamlib_bridge naudio_bridge_probe
+
+      - name: Assemble dist/ — the bridge, the probe and the DLLs they import
+        run: |
+          test -f build/tools/na_hamlib_bridge.exe \
+            || { echo "::error::na_hamlib_bridge.exe was not built"; exit 1; }
+          mkdir -p dist
+          cp build/tools/na_hamlib_bridge.exe build/naudio_bridge_probe.exe build/libnaudio.dll dist/
+          # Follow the imports until nothing new appears, copying each DLL MSYS2 supplies. Windows'
+          # own DLLs are not in /ucrt64/bin and stay out, so dist/ is what an operator ships.
+          added=1
+          while [ "$added" = 1 ]; do
+            added=0
+            for f in dist/*.exe dist/*.dll; do
+              for dll in $(objdump -p "$f" | sed -n 's/^[[:space:]]*DLL Name: //p'); do
+                if [ ! -e "dist/$dll" ] && [ -e "/ucrt64/bin/$dll" ]; then
+                  cp "/ucrt64/bin/$dll" dist/
+                  added=1
+                fi
+              done
+            done
+          done
+          ls -l dist
+          imports="$(objdump -p dist/na_hamlib_bridge.exe | sed -n 's/^[[:space:]]*DLL Name: //p')"
+          echo "--- na_hamlib_bridge.exe imports:"
+          echo "$imports"
+          # grep -c, not -q: under pipefail an early-exiting grep can fail the pipe and hide a match.
+          if [ "$(echo "$imports" | grep -ci hamlib)" != 0 ]; then
+            echo "::error::na_hamlib_bridge.exe imports a libhamlib DLL; it should embed the static one"
+            exit 1
+          fi
+
+      - name: "Run it from dist/: -h, the Dummy's tone over -R tcp, a clean exit on Ctrl-C and Ctrl-Break"
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $dist = (Resolve-Path dist).Path
+          # dist/ and Windows itself, nothing else: a DLL dist/ lacks fails here, not on an operator's
+          # machine.
+          $env:PATH = "$dist;$env:SystemRoot\System32;$env:SystemRoot"
+          $bridge = Join-Path $dist 'na_hamlib_bridge.exe'
+          $probe = Join-Path $dist 'naudio_bridge_probe.exe'
+          $kill = Join-Path $env:MSYS2_LOCATION 'usr\bin\kill.exe'
+
+          # -h writes to stderr and exits 0. A load failure is a negative NTSTATUS
+          # (-1073741515 = STATUS_DLL_NOT_FOUND).
+          $help = & $bridge -h 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::na_hamlib_bridge -h exited $LASTEXITCODE from dist/"; exit 1 }
+          if ($help -notmatch '(?m)^usage: .*na_hamlib_bridge') { $help; Write-Output "::error::-h printed no usage line"; exit 1 }
+          Write-Output "na_hamlib_bridge -h runs from dist/"
+
+          function Start-Bridge([string]$label, [string[]]$bridgeArgs) {
+            $out = "bridge-$label.out"
+            $p = Start-Process -FilePath $bridge -ArgumentList $bridgeArgs -NoNewWindow -PassThru `
+                   -RedirectStandardOutput $out -RedirectStandardError "bridge-$label.err"
+            $null = $p.Handle   # held, or ExitCode cannot be read once the process has gone
+            for ($i = 0; $i -lt 150; $i++) {
+              if ($p.HasExited) { break }
+              if ((Test-Path $out) -and (Select-String -Path $out -Pattern '-> naudio :' -SimpleMatch -Quiet)) { return $p }
+              Start-Sleep -Milliseconds 100
+            }
+            Get-Content $out, "bridge-$label.err"
+            Write-Output "::error::the $label bridge never reported itself listening"
+            exit 1
+          }
+
+          # MSYS2's kill reaches a Windows PID with -f -W; INT is delivered as CTRL_C_EVENT and QUIT as
+          # CTRL_BREAK_EVENT. The bridge must stop through its own handler and exit 0.
+          function Stop-Bridge($p, [string]$label, [string]$sig, [string]$key) {
+            & $kill -f -W -s $sig $p.Id
+            if (-not $p.WaitForExit(30000)) {
+              Stop-Process -Id $p.Id -Force
+              Write-Output "::error::${label}: the bridge was still running 30 s after $key"
+              exit 1
+            }
+            $p.WaitForExit()
+            Get-Content "bridge-$label.out", "bridge-$label.err"
+            $code = $p.ExitCode
+            if ($code -ne 0) {
+              # 130: MSYS2 ended the process itself because no handler took the event.
+              # -1073741510 (STATUS_CONTROL_C_EXIT): Windows' default handler ended it.
+              Write-Output "::error::${label}: the bridge exited $code after $key, expected 0"
+              exit 1
+            }
+            if (-not (Select-String -Path "bridge-$label.out" -Pattern 'na_hamlib_bridge: stopping...' -SimpleMatch -Quiet)) {
+              Write-Output "::error::${label}: exit 0 but no 'stopping...' line; the shutdown did not go through the bridge's teardown"
+              exit 1
+            }
+            Write-Output "${label}: $key stopped the bridge cleanly (exit 0)"
+          }
+
+          # The Dummy's tone must reach a TCP client: -R tcp serves the C ABI's default transport.
+          $b = Start-Bridge 'tone' @('-m', '1', '-S', 'tone', '-R', 'tcp', '-p', '46533')
+          & $probe --port 46533 --seconds 6 --expect content --profile tcp 2>&1 | Tee-Object -FilePath probe-tone.log
+          $probeRc = $LASTEXITCODE
+          if ($probeRc -ne 0 -or -not (Select-String -Path probe-tone.log -Pattern 'RESULT content .* peak_abs_sample=[1-9]' -Quiet)) {
+            Stop-Process -Id $b.Id -Force
+            Get-Content bridge-tone.out, bridge-tone.err
+            Write-Output "::error::no tone reached the TCP client (probe exited $probeRc)"
+            exit 1
+          }
+          Stop-Bridge $b 'tone' 'INT' 'Ctrl-C'
+
+          # The control: a silent source must fail the same content check, or a pass above means
+          # nothing. Stopped with Ctrl-Break, the console event a supervisor can aim at one process
+          # group.
+          $b = Start-Bridge 'silence' @('-m', '1', '-S', 'silence', '-R', 'tcp', '-p', '46534')
+          & $probe --port 46534 --seconds 6 --expect content --profile tcp 2>&1 | Tee-Object -FilePath probe-silence.log
+          $probeRc = $LASTEXITCODE
+          if ($probeRc -ne 1 -or -not (Select-String -Path probe-silence.log -Pattern 'every sample is zero' -SimpleMatch -Quiet)) {
+            Stop-Process -Id $b.Id -Force
+            Write-Output "::error::control broken: the probe did not fail a silent source (exited $probeRc, expected 1)"
+            exit 1
+          }
+          Stop-Bridge $b 'silence' 'QUIT' 'Ctrl-Break'
+          # Every check above exits on its own; the runner would otherwise take the step's status
+          # from the last native command's exit code.
+          exit 0
+
+      - name: "Options arm under MSYS2 bash — the rows the bridge ends by itself are asserted"
+        run: |
+          # The arm's other rows stop the bridge with SIGINT and require 0; from this bash the
+          # signal never reaches it (see this job's header), so they are run and shown but not
+          # asserted. The rows below end on their own with 1 or 2, and must not print a -C value.
+          set +e
+          NA_BRIDGE_OPTIONS_PORT=46602 bash tests/bridge/options_arm.sh \
+            "$PWD/dist/na_hamlib_bridge.exe" "$PWD/dist/naudio_bridge_probe.exe" > options-arm.log 2>&1
+          rc=$?
+          set -e
+          cat options-arm.log
+          echo "--- options_arm exited ${rc} (informational; the assertions are on named rows) ---"
+          for row in bogus conf/unknown conf/no-equals conf/bare-value conf/joined conf/colon \
+                     conf/space conf/bad-name conf/empty-token conf/limit conf/refused conf/open-fails; do
+            grep -qF "  options_arm/${row}: OK" options-arm.log \
+              || { echo "::error::options_arm/${row} did not pass on Windows"; exit 1; }
+          done
+
+      - name: Upload the bridge logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-hamlib-bridge-logs
+          path: |
+            configure.log
+            bridge-*.out
+            bridge-*.err
+            probe-*.log
+            options-arm.log
+          if-no-files-found: ignore
 
   windows-wav-tap:
     name: windows tools artifact (na_wav_tap, the demo pair, na_c_inject_tone — the station-host end)

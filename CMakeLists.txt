@@ -948,9 +948,9 @@ endif()
 # about na_audio_daemon — "the daemon is a hardware smoke CI never runs". That reason does not
 # generalise to the directory: na_wav_tap opens no device at all (NA_CLIENT_BACKEND_NULL) and is
 # most useful on Windows precisely because issue #12 item 1 wants a REMOTE client, which is
-# whatever machine the operator has spare. So the gate moved INWARD, per target, in tools/. The
-# Windows-excluded set is unchanged — the daemon and the Hamlib bridge are still guarded there —
-# this only stops a device-free client tool from being excluded by association.
+# whatever machine the operator has spare. So the gate moved INWARD, per target, in tools/. Both
+# per-target gates have since come off as well — the daemon's in issue #96 item 3, the Hamlib
+# bridge's when it was built with MinGW — so nothing in tools/ is excluded from Windows now.
 # ----------------------------------------------------------------------------
 add_subdirectory(tools)
 
@@ -1076,6 +1076,13 @@ endif()
 # skip that reads like coverage. Must come after add_subdirectory(tools), where that target is
 # defined. The detector this arm leans on is proved unconditionally and on every platform by
 # naudio_bridge_probe --selftest above, so the portable half never depends on this one running.
+#
+# Still NOT WIN32, although the bridge itself builds there. The arms stop the bridge with SIGINT and
+# require exit status 0, and a `kill -INT` from MSYS2's bash does not reach a native program: the
+# windows-hamlib-bridge job's run 39869456383 found the bridge still running 30 s after it, on every
+# options-arm row that stops it that way. The fault arm also needs a preload shim, which Windows has
+# no equivalent of, and a single-config build tree does not put libnaudio.dll beside the bridge.
+# The windows-hamlib-bridge CI job drives the bridge natively instead.
 # ----------------------------------------------------------------------------
 if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudio_bridge_probe)
     add_test(NAME naudio_bridge_arm
