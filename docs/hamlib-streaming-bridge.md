@@ -227,7 +227,8 @@ pacman -S --needed git make autoconf automake libtool \
     mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
     mingw-w64-ucrt-x86_64-pkg-config
 
-CC=gcc tools/build-streaming-hamlib.sh --static --prefix C:/hamlib-streaming
+CC=gcc CFLAGS='-g -O2 -include assert.h' \
+  tools/build-streaming-hamlib.sh --static --prefix C:/hamlib-streaming -- --without-readline
 
 PKG_CONFIG_PATH=C:/hamlib-streaming/lib/pkgconfig \
   cmake -S . -B build -G Ninja -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON
@@ -241,6 +242,22 @@ the prefix, and the CMake, pkg-config and gcc that read it are native Windows pr
 embed libhamlib, so no libhamlib DLL travels with it, and `NAUDIO_BUNDLE_PORTAUDIO` builds
 PortAudio into `libnaudio.dll`, as the release packages do. `CC=gcc` names the compiler for the
 script's final link check, which uses `cc` otherwise.
+
+The other two settings work around Hamlib defects that only a native MSYS2 build reaches:
+
+- **`CFLAGS='-g -O2 -include assert.h'`.** `lib/precise_time.c` takes its `__WIN32__` branch when
+  `_POSIX_TIMERS` is undefined, and that branch calls `assert()` without including `<assert.h>`,
+  which GCC 14 and later reject. mingw-w64 stopped defining `_POSIX_TIMERS` in winpthreads'
+  `pthread_time.h` on 2026-10-09 (winpthreads has no `timer_*` functions), and MSYS2's headers carry
+  that change; an older mingw-w64, such as Homebrew's 14.0.0, still defines it, so a cross-build
+  takes the `clock_gettime` branch and never meets the defect. `-include` goes in `CFLAGS`, not
+  `CPPFLAGS`, because Hamlib hands `CPPFLAGS` to `windres` as well, which rejects it; and `CFLAGS`
+  replaces autoconf's default `-g -O2`, so the default is restated.
+- **`-- --without-readline`**, which the script hands to Hamlib's `./configure`. MSYS2's
+  `wineditline` (installed with `pcre2`) passes Hamlib's readline link check, but its header is
+  `editline/readline.h`, which Hamlib does not look for, so `rigctl`, `rotctl` and `ampctl` fall
+  back to `extern char *readline();` — no parameters, as C23 (GCC 16's default) reads it — and fail
+  to compile. The bridge uses none of those programs.
 
 The same sources also cross-compile on macOS with Homebrew's `mingw-w64`: Hamlib with
 `./configure --host=x86_64-w64-mingw32` (the script does not cross-compile), and naudio with a

@@ -647,8 +647,9 @@ jobs:
     timeout-minutes: 60
     # na_hamlib_bridge had never been built for Windows. Its NOT WIN32 gate came from moving the
     # directory-wide gate inward (923b5f6), not from anything the bridge needs: MinGW-w64 supplies
-    # getopt, pthreads, nanosleep and clock_gettime, and the streaming libhamlib builds with it.
-    # UCRT64 is the MSYS2 environment WSJT-X's Windows build uses, and the UCRT is the C runtime
+    # getopt, pthreads, nanosleep and clock_gettime, and the streaming libhamlib builds with it, given
+    # the two workarounds in the Hamlib step for upstream defects that only a native MSYS2 build
+    # reaches. UCRT64 is the MSYS2 environment WSJT-X's Windows build uses, and the UCRT is the C runtime
     # naudio's MSVC packages use.
     #
     # WHICH HAMLIB. The same as the Linux job: tools/build-streaming-hamlib.sh's defaults, upstream
@@ -688,12 +689,24 @@ jobs:
       - name: "Build a static streaming libhamlib (Hamlib master, as the Linux job) from source"
         env:
           CC: gcc
+          # Upstream defect: lib/precise_time.c's __WIN32__ branch calls assert() without including
+          # <assert.h>, and GCC 14+ rejects the implicit declaration. A cross-build never reaches
+          # that branch: it is taken only when _POSIX_TIMERS is undefined, and mingw-w64 stopped
+          # defining it in winpthreads' pthread_time.h on 2026-10-09 (mingw-w64 1cbc9aef43), which
+          # MSYS2's headers carry. -include is compiler-only, so it goes in CFLAGS (Hamlib hands
+          # CPPFLAGS to windres too), restating autoconf's default -g -O2 that CFLAGS replaces.
+          CFLAGS: "-g -O2 -include assert.h"
         run: |
           # Windows form (D:/a/...): hamlib.pc records the prefix, and the native CMake, pkg-config
           # and gcc that read it take /d/a/... for a path on the current drive.
           prefix="$(cygpath -m "$RUNNER_TEMP")/hamlib-streaming"
           echo "HAMLIB_PREFIX=$prefix" >> "$GITHUB_ENV"
-          bash tools/build-streaming-hamlib.sh --static --prefix "$prefix"
+          # --without-readline, upstream defect two: the runner's MSYS2 has wineditline (pcre2 depends
+          # on it), whose libedit passes Hamlib's readline link check while its header is
+          # editline/readline.h, which Hamlib does not look for. rigctl, rotctl and ampctl then fall
+          # back to `extern char *readline();`, which C23, GCC 16's default, reads as taking no
+          # arguments, and fail to compile. The bridge uses none of them.
+          bash tools/build-streaming-hamlib.sh --static --prefix "$prefix" -- --without-readline
 
       - name: Configure with the bridge enabled
         run: |
