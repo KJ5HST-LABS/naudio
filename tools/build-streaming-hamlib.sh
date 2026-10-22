@@ -45,6 +45,12 @@
 # The prefix must be durable: naudio's CMakeCache.txt records an ABSOLUTE path
 # into it, so a prefix under /tmp silently breaks every later rebuild.
 #
+# On Windows, run it from an MSYS2 UCRT64 shell and give --prefix in Windows
+# form with forward slashes (cygpath -m, e.g. C:/hamlib-streaming). hamlib.pc
+# records the prefix and is read by native Windows programs (CMake, pkg-config,
+# gcc), to which an MSYS path such as /c/hamlib-streaming means \c\... on the
+# current drive.
+#
 # See docs/hamlib-streaming-bridge.md for the manual equivalent and for what to
 # do when the build is skipped anyway.
 #
@@ -96,14 +102,15 @@ while [ $# -gt 0 ]; do
 done
 
 # An absolute prefix is not a style preference: it is baked into hamlib.pc and
-# from there into naudio's CMakeCache.txt.
+# from there into naudio's CMakeCache.txt. A drive-letter path (C:/...) is
+# absolute too, and on Windows it is the form hamlib.pc needs (see the header).
 case "$prefix" in
-  /*) ;;
+  /*|[A-Za-z]:/*) ;;
   *) prefix="$(pwd)/$prefix" ;;
 esac
 [ -n "$src" ] || src="$prefix/src"
 case "$src" in
-  /*) ;;
+  /*|[A-Za-z]:/*) ;;
   *) src="$(pwd)/$src" ;;
 esac
 
@@ -132,6 +139,7 @@ if [ -n "$missing" ]; then
   printf 'build-streaming-hamlib: missing build tools:%s\n\n' "$missing" >&2
   printf '  macOS:         brew install autoconf automake libtool pkg-config\n' >&2
   printf '  Debian/Ubuntu: sudo apt-get install autoconf automake libtool pkg-config build-essential\n' >&2
+  printf '  MSYS2 UCRT64:  pacman -S git make autoconf automake libtool mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkg-config\n' >&2
   exit 1
 fi
 printf '    ok — git, autoconf, automake, libtool, pkg-config, make\n'
