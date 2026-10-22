@@ -24,7 +24,8 @@ cmake --build build -j
 ```
 
 If `build/tools/na_hamlib_bridge` does not exist afterwards, the build **skipped** it — see
-[Confirm you actually got the bridge](#confirm-you-actually-got-the-bridge).
+[Confirm you actually got the bridge](#confirm-you-actually-got-the-bridge). On Windows, see
+[Building on Windows](#building-on-windows-msys2-ucrt64).
 
 ---
 
@@ -214,6 +215,92 @@ ldd    build/tools/na_hamlib_bridge | grep hamlib       # Linux
 
 ---
 
+## Building on Windows (MSYS2 UCRT64)
+
+The bridge builds with MinGW-w64 in [MSYS2](https://www.msys2.org/)'s UCRT64 environment; Hamlib's
+own Windows builds use MinGW-w64 too (its `scripts/build-w64.sh`). MinGW-w64 supplies the POSIX
+calls the bridge makes (`getopt`, pthreads, `nanosleep`, `clock_gettime`). In a UCRT64 shell, from
+the naudio checkout:
+
+```bash
+pacman -S --needed git make autoconf automake libtool \
+    mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+    mingw-w64-ucrt-x86_64-pkg-config
+
+CC=gcc tools/build-streaming-hamlib.sh --static --prefix C:/hamlib-streaming
+
+PKG_CONFIG_PATH=C:/hamlib-streaming/lib/pkgconfig \
+  cmake -S . -B build -G Ninja -DNAUDIO_BUNDLE_PORTAUDIO=ON -DNAUDIO_BUILD_HAMLIB_BRIDGE=ON
+cmake --build build --target na_hamlib_bridge
+./build/tools/na_hamlib_bridge.exe -h
+```
+
+Give `--prefix` in Windows form with forward slashes (`cygpath -m` prints it). `hamlib.pc` records
+the prefix, and the CMake, pkg-config and gcc that read it are native Windows programs, to which
+`/c/hamlib-streaming` means `\c\hamlib-streaming` on the current drive. `--static` makes the bridge
+embed libhamlib, so no libhamlib DLL travels with it, and `NAUDIO_BUNDLE_PORTAUDIO` builds
+PortAudio into `libnaudio.dll`, as the release packages do. `CC=gcc` names the compiler for the
+script's final link check, which uses `cc` otherwise.
+
+The same sources also cross-compile on macOS with Homebrew's `mingw-w64`: Hamlib with
+`./configure --host=x86_64-w64-mingw32` (the script does not cross-compile), and naudio with a
+CMake toolchain file that names `x86_64-w64-mingw32-gcc`, with `PKG_CONFIG_LIBDIR` pointed at the
+cross prefix so the host's own `.pc` files stay out.
+
+### What to copy with it
+
+`na_hamlib_bridge.exe` finds its DLLs beside itself or on `PATH`. Measured with `objdump -p` on a
+MinGW-w64 GCC 16.2 build against a static libhamlib, following each DLL's own imports:
+
+| DLL | From | Needed by |
+|---|---|---|
+| `libnaudio.dll` | this build (`build/`) | the bridge |
+| `libwinpthread-1.dll` | the MinGW toolchain | the bridge and `libnaudio.dll` |
+| `libstdc++-6.dll`, `libgcc_s_seh-1.dll` | the MinGW toolchain | `libnaudio.dll` |
+
+In MSYS2 the toolchain's DLLs are in `/ucrt64/bin`. Everything else the two import is part of
+Windows 10 and later: the Universal C Runtime (`api-ms-win-crt-*`), `KERNEL32`, `WS2_32`,
+`IPHLPAPI`, `ADVAPI32`, `USER32`, `ole32`, `SETUPAPI` and `WINMM`. A missing DLL shows as exit
+status -1073741515 (`STATUS_DLL_NOT_FOUND`) before the bridge prints anything.
+
+### Stopping it on Windows
+
+Ctrl-C in the console stops the bridge as `SIGINT` does elsewhere: it closes the streams and the
+rig, releases PTT if `-k` keyed it, and exits 0. A second Ctrl-C during that shutdown is absorbed,
+as on POSIX. Ctrl-Break does the same. Windows has no `SIGTERM`, and it disables Ctrl-C for a
+program started in a process group of its own, so a supervisor that starts the bridge that way stops
+it with `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, <group>)`. Closing the console window or ending
+the process from Task Manager skips the shutdown, as a hangup or `SIGKILL` does on POSIX.
+
+### What CI checks on Windows
+
+The `windows-hamlib-bridge` job (windows-latest, MSYS2 UCRT64) builds Hamlib from
+`dchristle/Hamlib` at `291f73549`, the revision WSJT-X's direct-streaming PR #723 pins: upstream
+`master` plus Hamlib PR #2178's Icom network backends and later fixes. That is a pin, unlike the
+Linux job's upstream `master` (see [Provenance](#provenance)), and it puts the Icom network backends
+into the Windows build. It runs the bridge from a directory holding only it and the DLLs above, with
+nothing else on `PATH`:
+
+- `-h`;
+- the Dummy's tone delivered to a TCP client over `-R tcp`, with a silent Dummy as the control
+  (`naudio_bridge_probe` must fail it);
+- exit status 0 through the bridge's own shutdown after Ctrl-C, and after Ctrl-Break.
+
+PowerShell starts the bridge there, and MSYS2's `kill -f -W` delivers the console event. From
+MSYS2's bash a native program runs under a stub process, and when none of its stdio is a terminal,
+as in CI or under ctest, a `kill -INT` sent to it comes back as "killed by SIGINT" (exit status 130)
+whatever the program returned (msys2-runtime 3.6.11: `exceptions.cc`, `pinfo.cc`, `spawn.cc`). That
+is read from msys2-runtime's source, and the job measures it: it runs `tests/bridge/options_arm.sh`
+under that bash and requires the rows the bridge ends by itself — an unknown `-R` and every
+malformed or refused `-C` — while the rows that stop it with `SIGINT` are shown and not asserted.
+The ctest bridge arms stay unregistered on Windows for the same reason, and because the fault arm's
+preload shim has no Windows equivalent.
+
+Not checked on Windows: a radio, and the Icom network backends at run time. They compile and link
+into the bridge; nothing has run them there.
+
+---
+
 ## Confirm you actually got the bridge
 
 CMake *warns* when it skips the target — it does not fail — so a successful `cmake --build` is not
@@ -267,7 +354,9 @@ ctest --test-dir build -R naudio_bridge_arm --output-on-failure   # ~10 s, two a
 CI runs this arm and the fault arm below on `ubuntu-latest` (the `hamlib-bridge` job), building
 libhamlib from source with the script above. That job asserts on the **binary** and on named
 passing tests rather than on exit codes, because a skipped bridge and an empty test selection both
-exit 0. It is the only place the bridge is compiled against glibc and gcc.
+exit 0. It is the only place the bridge is compiled against glibc and gcc. On Windows these arms
+are not registered; the `windows-hamlib-bridge` job checks the bridge there instead (see
+[What CI checks on Windows](#what-ci-checks-on-windows)).
 
 It runs two arms, and the second is the one that matters. `-S tone` must deliver **content** and
 `-S silence` must deliver **silence** — because those two runs are indistinguishable on every
@@ -502,6 +591,7 @@ quietly keep using them.
 | Changed `PKG_CONFIG_PATH`, reconfigured, still the old prefix | `pkg_check_modules` cached the paths; the reconfigure no-ops and still reports success | [Invalidate the cached hamlib vars](#changing-the-prefix-later-needs-the-cache-invalidated) with `-U 'HAMLIB*' -U 'pkgcfg_lib_HAMLIB*'` |
 | `./bootstrap` fails on `libtoolize` | Apple's `/usr/bin/libtool` is not GNU libtool | `brew install libtool` (provides `glibtoolize`) |
 | Link/include errors on a rebuild that used to work | The prefix was moved or cleared | Rebuild the prefix, then invalidate the cache as above |
+| Windows: the bridge prints nothing and exits -1073741515 | A DLL it needs is not beside it or on `PATH` | Copy the [DLLs it needs](#what-to-copy-with-it) beside it |
 
 ---
 

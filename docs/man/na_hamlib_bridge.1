@@ -147,6 +147,18 @@ disable the TX (operator-to-rig) direction; RX only.
 .TP
 .B \-h
 print usage and exit.
+.SH SIGNALS
+.B SIGINT
+and
+.B SIGTERM
+stop the bridge cleanly: it closes the streams and the rig, releases PTT if
+.B \-k
+keyed it, and exits 0.
+On Windows, Ctrl-C and Ctrl-Break in the console do the same, and a second
+Ctrl-C during the shutdown is absorbed; Windows has no
+.BR SIGTERM .
+A supervisor that starts the bridge in a process group of its own, where
+Windows disables Ctrl-C, stops it with a Ctrl-Break event.
 .SH EXIT STATUS
 .TP
 .B 0
