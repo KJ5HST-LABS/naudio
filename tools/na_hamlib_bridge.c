@@ -470,6 +470,59 @@ static const char *parse_profile(const char *s, na_reliability_profile *out) {
     return NULL;
 }
 
+/* -C's argument is token=value with a non-empty token. Checked at parse time so a malformed one
+ * stops the bridge before any Hamlib call. With no '=' the whole argument is the token, so naming
+ * it shows no value. */
+static int conf_arg_ok(const char *arg) {
+    const char *eq = strchr(arg, '=');
+    if (eq == NULL) {
+        fprintf(stderr, "na_hamlib_bridge: -C %s: expected token=value\n", arg);
+        return 0;
+    }
+    if (eq == arg) {
+        fprintf(stderr, "na_hamlib_bridge: -C: no token name before '='\n");
+        return 0;
+    }
+    return 1;
+}
+
+/* Apply each -C in command-line order, after -r and -S, so a -C naming the same token wins.
+ * Returns 0, or -1 having named the token that failed. The value is never printed: for a network
+ * radio it is a login (net_username, net_password). Nor is rigerror(): it returns libhamlib's
+ * saved debug history, every level included, and a backend may have logged the value there;
+ * rigerror2() is the one-line message alone. */
+static int apply_conf(RIG *rig, int model, const char *const *conf, int n) {
+    for (int i = 0; i < n; i++) {
+        const char *eq = strchr(conf[i], '=');
+        size_t len = (size_t)(eq - conf[i]);
+        char *name = (char *)malloc(len + 1);
+        if (name == NULL) {
+            fprintf(stderr, "na_hamlib_bridge: -C: out of memory\n");
+            return -1;
+        }
+        memcpy(name, conf[i], len);
+        name[len] = '\0';
+        int rc = RIG_OK;
+        hamlib_token_t token = rig_token_lookup(rig, name);
+        if (token == RIG_CONF_END) {
+            fprintf(stderr, "na_hamlib_bridge: -C %s: model %d has no such token "
+                            "(rigctl -m %d -L lists its tokens)\n", name, model, model);
+            rc = -RIG_EINVAL;
+        } else {
+            rc = rig_set_conf(rig, token, eq + 1);
+            if (rc != RIG_OK) {
+                const char *why = rigerror2(rc);
+                size_t wn = strlen(why);
+                while (wn > 0 && (why[wn - 1] == '\n' || why[wn - 1] == '\r')) wn--;
+                fprintf(stderr, "na_hamlib_bridge: -C %s: refused: %.*s\n", name, (int)wn, why);
+            }
+        }
+        free(name);
+        if (rc != RIG_OK) return -1;
+    }
+    return 0;
+}
+
 /* Print a 0-terminated int list from struct rig_stream_caps. `cap` is the array's own bound, so a
  * caps block that fills every slot without a terminator cannot run off the end — pass the bound
  * belonging to the array being printed, not a shared constant: the rate and channel-count lists
@@ -700,12 +753,18 @@ static int open_stream(RIG *rig, rig_stream_type_t type, int channels, int rate,
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [-m model] [-r host:port] [-p naudio_port] [-c channels]\n"
-        "          [-R wan|lan|ft8|tcp|dual] [-S stream_mode] [-k] [-x]\n"
+        "usage: %s [-m model] [-r address] [-p naudio_port] [-c channels]\n"
+        "          [-R wan|lan|ft8|tcp|dual] [-S stream_mode] [-C token=value]...\n"
+        "          [-k] [-x]\n"
         "  -m  Hamlib model (default 1=DUMMY hardware-free; 2=NETRIGCTL)\n"
-        "  -r  netrigctl target host:port (model 2), e.g. localhost:5555\n"
+        "  -r  rig address (Hamlib rig_pathname): rigctld host:port for model 2,\n"
+        "      e.g. localhost:5555; the radio's own address for a network radio\n"
         "  -S  backend stream_mode conf (dummy: tone|silence|loopback|counter).\n"
         "      'loopback' feeds TX back out of RX — a hardware-free TX round-trip.\n"
+        "  -C  set a Hamlib configuration token before the rig opens; repeatable,\n"
+        "      applied in order after -r and -S. An Icom network radio's login:\n"
+        "      -C net_username=USER -C net_password=PASS. Other local users can\n"
+        "      read command-line arguments. rigctl -m <model> -L lists the tokens.\n"
         "  -p  naudio server port (default 4533)\n"
         "  -c  channels 1 or 2 (default 1)\n"
         "  -R  naudio transport: wan (default; UDP with FEC), lan, ft8 (UDP),\n"
@@ -754,13 +813,15 @@ int main(int argc, char **argv) {
     int channels = 1;
     na_reliability_profile profile = NA_RELIABILITY_UDP_WAN;
     const char *profile_name = "wan";
+    const char *conf[64];              /* -C arguments, pointers into argv */
+    int n_conf = 0;
     int use_ptt = 0;
     int want_tx = 1;
 
     rig_set_debug(RIG_DEBUG_WARN);   /* a bridge daemon, not a trace tool */
 
     int opt;
-    while ((opt = getopt(argc, argv, "m:r:p:c:R:S:kxh")) != -1) {
+    while ((opt = getopt(argc, argv, "m:r:p:c:R:S:C:kxh")) != -1) {
         switch (opt) {
             case 'm': model = atoi(optarg); break;
             case 'r': rig_file = optarg; break;
@@ -774,6 +835,14 @@ int main(int argc, char **argv) {
                     usage(argv[0]);
                     return 2;
                 }
+                break;
+            case 'C':
+                if (!conf_arg_ok(optarg)) return 2;
+                if (n_conf == (int)(sizeof conf / sizeof conf[0])) {
+                    fprintf(stderr, "na_hamlib_bridge: more than %d -C options\n", n_conf);
+                    return 2;
+                }
+                conf[n_conf++] = optarg;
                 break;
             case 'k': use_ptt = 1; break;
             case 'x': want_tx = 0; break;
@@ -848,6 +917,12 @@ int main(int argc, char **argv) {
         if (rc != RIG_OK)
             fprintf(stderr, "na_hamlib_bridge: warning: set stream_mode(%s): %s\n",
                     stream_mode, rigerror(rc));
+    }
+    if (apply_conf(b.rig, model, conf, n_conf) != 0) {
+        rig_cleanup(b.rig);
+        ring_free(&b.txring);
+        rx_meter_free(&b.rxm);
+        return 1;
     }
     int r = rig_open(b.rig);
     if (r != RIG_OK) {

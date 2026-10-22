@@ -1084,9 +1084,10 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
                           "$<TARGET_FILE:naudio_bridge_probe>")
     message(STATUS "naudio: naudio_bridge_arm enabled (na_hamlib_bridge present)")
 
-    # Options arm — the bridge's -R transports. A client that selects no reliability profile (the C
-    # ABI's default, plain TCP) must get audio from -R tcp and -R dual and be refused by -R wan, and
-    # an unknown -R must be refused.
+    # Options arm — the bridge's -R transports and -C configuration tokens. A client that selects no
+    # reliability profile (the C ABI's default, plain TCP) must get audio from -R tcp and -R dual and
+    # be refused by -R wan; an unknown -R must be refused; -C must reach the backend after -S, and
+    # stop the bridge on an unknown token, a missing '=' or a refused value without printing it.
     add_test(NAME naudio_bridge_options_arm
              COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/bridge/options_arm.sh"
                           "$<TARGET_FILE:na_hamlib_bridge>"

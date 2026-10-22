@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
-# naudio tests — na_hamlib_bridge's -R transports, driven for real.
+# naudio tests — na_hamlib_bridge's -R transports and -C configuration tokens, driven for real.
 #
 # Copyright (C) 2025-2026 Terrell Deppe
 #
@@ -17,6 +17,18 @@
 #                     `--profile tcp` quietly ran UDP would pass them both, and fails this one
 #   bogus             -R bogus exits 2 with the usage text instead of coming up as wan
 #
+# -C. A Hamlib configuration token set before rig_open — an Icom network radio's login is two of
+# them (net_username, net_password). The dummy backend's stream_mode is the token every streaming
+# libhamlib has, and its default is `tone`, so:
+#   conf/silence      -C stream_mode=silence delivers silence. Content here means -C reached nothing
+#   conf/after-S      -S silence -C stream_mode=tone delivers content: -C acts as -S does, and is
+#                     applied after it
+#   conf/unknown      a token the model lacks stops the bridge (exit 1), naming the token
+#   conf/no-equals    -C with no '=' stops it (exit 2), naming the token
+#   conf/refused      a value the backend refuses stops it (exit 1), naming the token
+# The last three also require that the VALUE never reaches the output: for a network radio it is
+# a password.
+#
 # macOS SIP TRAP (CLAUDE.md Learning 6): every child is launched DIRECTLY from this script, never
 # through `timeout` or another shell — see deadline.sh.
 set -u
@@ -30,6 +42,7 @@ SECS="${NA_BRIDGE_OPTIONS_SECONDS:-4}"
 # Long enough for a refusal to have happened, short enough that a bridge which came up instead of
 # refusing costs seconds, not minutes.
 REFUSE_DEADLINE=10
+SECRET="s3cret-VALUE-never-printed"
 
 for exe in "$BRIDGE" "$PROBE"; do
     if [ ! -x "$exe" ]; then
@@ -146,7 +159,7 @@ run_wan_refuses_tcp () {
 }
 
 # One refusal row: the bridge must exit on its own with exactly $want_exit, never come up, and its
-# output must match $must (an ERE).
+# output must match $must (an ERE) and must not contain $SECRET.
 run_refused () {
     local label="$1" want_exit="$2" must="$3"; shift 3
     local log="$workdir/bridge.${label//\//_}.log"
@@ -170,6 +183,10 @@ run_refused () {
         echo "FAIL options_arm/$label: nothing in its output matches /$must/" >&2
         arc=1
     fi
+    if grep -Fq -- "$SECRET" "$log"; then
+        echo "FAIL options_arm/$label: the -C value reached the output — it may be a password" >&2
+        arc=1
+    fi
     if [ "$arc" -ne 0 ]; then
         sed 's/^/    | /' "$log" >&2
         return "$arc"
@@ -186,9 +203,16 @@ run_served dual dual content "tcp ft8" -S tone -R dual || fail $?
 run_wan_refuses_tcp || fail $?
 run_refused bogus 2 '^usage: ' -S tone -R bogus || fail $?
 
+run_served conf/silence wan silence wan -C stream_mode=silence           || fail $?
+run_served conf/after-S wan content wan -S silence -C stream_mode=tone || fail $?
+run_refused conf/unknown   1 '-C no_such_token: ' -C "no_such_token=$SECRET" || fail $?
+run_refused conf/no-equals 2 '-C stream_mode: '   -C stream_mode             || fail $?
+run_refused conf/refused   1 '-C stream_mode: '   -C "stream_mode=$SECRET"   || fail $?
+
 if [ "$rc" -eq 0 ]; then
-    echo "options_arm: OK — -R tcp and -R dual serve TCP clients, -R wan refuses them, and an" \
-         "unknown -R is refused"
+    echo "options_arm: OK — -R tcp and -R dual serve TCP clients, -R wan refuses them, an unknown" \
+         "-R is refused, and -C reaches the backend after -S and stops the bridge on any failure" \
+         "without printing its value"
 fi
 na_harness_done
 exit "$rc"
