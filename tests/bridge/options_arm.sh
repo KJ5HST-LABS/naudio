@@ -29,6 +29,7 @@
 #                     applied after it
 #   conf/after-r      -r A -C rig_pathname=B applies B, which the startup line reads back from
 #                     libhamlib: -C is applied after -r too
+#   conf/path-only    -C rig_pathname=B with no -r names B on the startup line, not "(local)"
 #   conf/unknown      a token the model lacks stops the bridge (exit 1), naming the token
 #   conf/no-equals    an argument with no '=' stops it (exit 2) and is not printed at any part, since
 #   conf/bare-value   it may be a value: -C stream_mode, a forgotten token (-C <value>), a forgotten
@@ -260,6 +261,8 @@ run_served conf/after-S wan content wan -S silence -C stream_mode=tone || fail $
 # The dummy takes any rig_pathname and opens nothing with it, so both addresses are inert here.
 run_started conf/after-r ' s80-path-from-C -> naudio :' 's80-path-from-r' \
     -S tone -r s80-path-from-r -C rig_pathname=s80-path-from-C || fail $?
+run_started conf/path-only ' s80-path-only-C -> naudio :' '(local)' \
+    -S tone -C rig_pathname=s80-path-only-C || fail $?
 run_refused conf/unknown   1 '-C no_such_token: ' "$SECRET" -C "no_such_token=$SECRET" || fail $?
 NO_EQUALS='^na_hamlib_bridge: -C: expected token=value'
 run_refused conf/no-equals  2 "$NO_EQUALS" stream_mode    -C stream_mode                 || fail $?
