@@ -1084,6 +1084,15 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
                           "$<TARGET_FILE:naudio_bridge_probe>")
     message(STATUS "naudio: naudio_bridge_arm enabled (na_hamlib_bridge present)")
 
+    # Options arm — the bridge's -R transports. A client that selects no reliability profile (the C
+    # ABI's default, plain TCP) must get audio from -R tcp and -R dual and be refused by -R wan, and
+    # an unknown -R must be refused.
+    add_test(NAME naudio_bridge_options_arm
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/bridge/options_arm.sh"
+                          "$<TARGET_FILE:na_hamlib_bridge>"
+                          "$<TARGET_FILE:naudio_bridge_probe>")
+    message(STATUS "naudio: naudio_bridge_options_arm enabled (na_hamlib_bridge present)")
+
     # Fault-injection arm (issue #35) — the same gate, one target further. naudio_failshim is a
     # PRELOAD library, never linked by anything: it is inserted into the bridge's process at launch
     # and interposes libhamlib's two stream calls, which is the only way to reach the error paths
@@ -1176,7 +1185,7 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
     # The bridge arms bind fixed ports and all drive a dummy backend, so they are serialised rather
     # than left to race a port bind under `ctest -j`. The netrigctl arm binds a second (TCP) port of
     # its own for rigctld and is held under the same lock for the same reason.
-    set(NAUDIO_BRIDGE_ARMS naudio_bridge_arm)
+    set(NAUDIO_BRIDGE_ARMS naudio_bridge_arm naudio_bridge_options_arm)
     if(NOT NAUDIO_HAMLIB_STATIC_ONLY)
         list(APPEND NAUDIO_BRIDGE_ARMS naudio_bridge_fault_arm)
     endif()

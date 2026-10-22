@@ -443,10 +443,31 @@ static void *tx_thread(void *arg) {
 
 /* ------------------------------------------------------------------ helpers */
 
-static na_reliability_profile parse_profile(const char *s) {
-    if (strcmp(s, "lan") == 0) return NA_RELIABILITY_UDP_LAN;
-    if (strcmp(s, "ft8") == 0) return NA_RELIABILITY_UDP_FT8;
-    return NA_RELIABILITY_UDP_WAN;   /* default */
+/* The -R names. The first three serve UDP only, and a client that selects no reliability profile
+ * is on the C ABI's default transport, plain TCP — a UDP-only server refuses it at connect. `tcp`
+ * serves that client; `dual` serves it and a UDP client on the same port. */
+static const struct {
+    const char *name;
+    na_reliability_profile profile;
+} k_profiles[] = {
+    { "wan",  NA_RELIABILITY_UDP_WAN },   /* the default */
+    { "lan",  NA_RELIABILITY_UDP_LAN },
+    { "ft8",  NA_RELIABILITY_UDP_FT8 },
+    { "tcp",  NA_RELIABILITY_DEFAULT },
+    { "dual", NA_RELIABILITY_DUAL },
+};
+
+/* The table's name for `s`, with its profile in *out, or NULL for a name the table does not have.
+ * An unknown name used to fall through to wan without a word, so `-R tcp` came up as a UDP server
+ * that the TCP client it was meant for could not reach. */
+static const char *parse_profile(const char *s, na_reliability_profile *out) {
+    for (size_t i = 0; i < sizeof k_profiles / sizeof k_profiles[0]; i++) {
+        if (strcmp(s, k_profiles[i].name) == 0) {
+            *out = k_profiles[i].profile;
+            return k_profiles[i].name;
+        }
+    }
+    return NULL;
 }
 
 /* Print a 0-terminated int list from struct rig_stream_caps. `cap` is the array's own bound, so a
@@ -680,17 +701,20 @@ static int open_stream(RIG *rig, rig_stream_type_t type, int channels, int rate,
 static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s [-m model] [-r host:port] [-p naudio_port] [-c channels]\n"
-        "          [-R lan|wan|ft8] [-S stream_mode] [-k] [-x]\n"
+        "          [-R wan|lan|ft8|tcp|dual] [-S stream_mode] [-k] [-x]\n"
         "  -m  Hamlib model (default 1=DUMMY hardware-free; 2=NETRIGCTL)\n"
         "  -r  netrigctl target host:port (model 2), e.g. localhost:5555\n"
         "  -S  backend stream_mode conf (dummy: tone|silence|loopback|counter).\n"
         "      'loopback' feeds TX back out of RX — a hardware-free TX round-trip.\n"
         "  -p  naudio server port (default 4533)\n"
         "  -c  channels 1 or 2 (default 1)\n"
-        "  -R  reliability profile: wan (default, FEC), lan, ft8\n"
+        "  -R  naudio transport: wan (default; UDP with FEC), lan, ft8 (UDP),\n"
+        "      tcp (plain TCP), dual (TCP and UDP on one port). A client that\n"
+        "      selects no profile, such as WSJT-X, connects over TCP: use tcp or dual.\n"
         "  -k  key rig PTT around client TX bursts\n"
         "  -x  disable the TX (operator->rig) direction; RX only\n"
-        "Runs at the radio site, upstream of the lossy hop.\n", argv0);
+        "Runs where Hamlib reaches the radio, upstream of the lossy hop -R wan\n"
+        "protects.\n", argv0);
 }
 
 /* What to tell an operator who is staring at the gap signature below. The diagnosis is the same
@@ -729,6 +753,7 @@ int main(int argc, char **argv) {
     int na_port = 4533;
     int channels = 1;
     na_reliability_profile profile = NA_RELIABILITY_UDP_WAN;
+    const char *profile_name = "wan";
     int use_ptt = 0;
     int want_tx = 1;
 
@@ -742,7 +767,14 @@ int main(int argc, char **argv) {
             case 'S': stream_mode = optarg; break;
             case 'p': na_port = atoi(optarg); break;
             case 'c': channels = atoi(optarg); break;
-            case 'R': profile = parse_profile(optarg); break;
+            case 'R':
+                profile_name = parse_profile(optarg, &profile);
+                if (profile_name == NULL) {
+                    fprintf(stderr, "na_hamlib_bridge: -R %s: unknown profile\n", optarg);
+                    usage(argv[0]);
+                    return 2;
+                }
+                break;
             case 'k': use_ptt = 1; break;
             case 'x': want_tx = 0; break;
             case 'h': default: usage(argv[0]); return (opt == 'h') ? 0 : 2;
@@ -896,9 +928,7 @@ int main(int argc, char **argv) {
     }
 
     printf("na_hamlib_bridge: model=%d %s -> naudio :%d  profile=%s  rate=%d  channels=%d  tx=%s\n",
-           model, rig_file ? rig_file : "(local)", na_server_port(b.srv),
-           profile == NA_RELIABILITY_UDP_WAN ? "wan" :
-           profile == NA_RELIABILITY_UDP_LAN ? "lan" : "ft8",
+           model, rig_file ? rig_file : "(local)", na_server_port(b.srv), profile_name,
            rate, channels, b.tx ? (use_ptt ? "on+ptt" : "on") : "off");
     fflush(stdout);   /* redirected to a file this sits in the buffer until the first health tick,
                        * landing AFTER any stderr diagnostic it is supposed to precede */

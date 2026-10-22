@@ -623,8 +623,8 @@ jobs:
           # that matches nothing prints "No tests were found!!!" and exits 0. That is the identical
           # failure this job's binary check exists to catch, one layer down — a silently skipped
           # bridge registers no arms, so an exit-code check reports green having run nothing.
-          for t in naudio_bridge_probe_selftest naudio_bridge_arm naudio_bridge_fault_arm \
-                   naudio_netrigctl_arm; do
+          for t in naudio_bridge_probe_selftest naudio_bridge_arm naudio_bridge_options_arm \
+                   naudio_bridge_fault_arm naudio_netrigctl_arm; do
             grep -qE "Test +#[0-9]+: ${t} +\.+ +Passed" bridge-ctest.log \
               || { echo "::error::${t} did not run, or did not pass"; exit 1; }
           done
