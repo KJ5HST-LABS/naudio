@@ -53,12 +53,20 @@
  *   NA_FAIL_TX_SHORT=D   offer only n/D of each write to the real rig_stream_write (D >= 2), so
  *                        it accepts less than the bridge offered — issue #6's short write, which
  *                        is a NORMAL-operation case under backpressure, not an error path.
+ *   NA_FAIL_OPEN_MARK=T  every rig_stream_open records T in libhamlib's saved debug history, at a
+ *                        level the bridge does not print, then fails with -NA_FAIL_CODE without
+ *                        opening anything. rigerror() returns that history, so a bridge that
+ *                        reports the failure with rigerror() prints T. The shim checks T really is
+ *                        in the history and says so (`open mark is in libhamlib's history`), so a
+ *                        libhamlib that stopped recording unprinted levels reads as a harness fault
+ *                        rather than a pass. T itself is never printed by this file.
  */
 #include <hamlib/rig.h>
 
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifndef __APPLE__
 #  ifndef _GNU_SOURCE
@@ -72,11 +80,13 @@
  * the backend happens to be. A plain call count is what the driver script can predict. */
 static atomic_long g_rx_calls = 0;
 static atomic_long g_tx_calls = 0;
+static atomic_long g_open_calls = 0;
 
 static long g_rx_after   = -1;   /* < 0 disables */
 static long g_tx_after   = -1;
 static long g_tx_short   = 0;    /* 0 disables; >= 2 is the divisor */
 static int  g_fail_code  = RIG_EIO;
+static const char *g_open_mark = NULL;   /* NULL disables */
 
 static long env_long(const char *name, long dflt) {
     const char *s = getenv(name);
@@ -90,12 +100,14 @@ __attribute__((constructor)) static void na_failshim_init(void) {
     g_tx_short  = env_long("NA_FAIL_TX_SHORT", 0);
     g_fail_code = (int)env_long("NA_FAIL_CODE", RIG_EIO);
     if (g_tx_short == 1) g_tx_short = 0;   /* n/1 is the whole buffer — not a short write */
+    g_open_mark = getenv("NA_FAIL_OPEN_MARK");
+    if (g_open_mark != NULL && *g_open_mark == '\0') g_open_mark = NULL;
 
     /* The marker every arm greps for. stderr is unbuffered, but flush anyway: the bridge's output
      * is redirected to a file by the driver, and this line has to be there before the first
      * assertion reads it. */
-    fprintf(stderr, "na_failshim: armed rx_after=%ld tx_after=%ld tx_short=%ld code=%d\n",
-            g_rx_after, g_tx_after, g_tx_short, g_fail_code);
+    fprintf(stderr, "na_failshim: armed rx_after=%ld tx_after=%ld tx_short=%ld code=%d open=%s\n",
+            g_rx_after, g_tx_after, g_tx_short, g_fail_code, g_open_mark ? "fail" : "pass");
     fflush(stderr);
 }
 
@@ -105,6 +117,7 @@ typedef int (*read_fn)(RIG *, rig_stream_t *, void *, size_t, size_t *, int,
                        struct rig_stream_read_info *);
 typedef int (*write_fn)(RIG *, rig_stream_t *, const void *, size_t, size_t *, int,
                         const struct rig_stream_write_info *);
+typedef int (*open_fn)(RIG *, const struct rig_stream_config *, rig_stream_t **);
 
 /* The BOUND marker (issue #39). Printed from inside the interposed call, so a shim that loaded
  * without binding — the ELF visibility trap, a missing __DATA,__interpose entry — cannot produce it
@@ -159,6 +172,25 @@ static int shim_write(write_fn real, RIG *rig, rig_stream_t *s, const void *buf,
     return real(rig, s, buf, n_bytes, written, timeout_ms, info);
 }
 
+static int shim_open(open_fn real, RIG *rig, const struct rig_stream_config *cfg,
+                     rig_stream_t **out) {
+    const long n = atomic_fetch_add(&g_open_calls, 1) + 1;
+    if (n == 1) announce_bound("rig_stream_open");
+    if (g_open_mark != NULL) {
+        /* VERBOSE: recorded in the history at every level, printed only at the bridge's WARN and
+         * above — the same path a -C value such as `client` takes into it. */
+        rig_debug(RIG_DEBUG_VERBOSE, "na_failshim: planted %s\n", g_open_mark);
+        const char *history = rigerror(RIG_OK);
+        fprintf(stderr, "na_failshim: open mark is %sin libhamlib's history\n",
+                (history != NULL && strstr(history, g_open_mark) != NULL) ? "" : "NOT ");
+        fprintf(stderr, "na_failshim: rig_stream_open #%ld -> -%d (forced)\n", n, g_fail_code);
+        fflush(stderr);
+        if (out != NULL) *out = NULL;
+        return -g_fail_code;
+    }
+    return real(rig, cfg, out);
+}
+
 /* ---- platform interposition ------------------------------------------------------------------- */
 
 #ifdef __APPLE__
@@ -187,6 +219,11 @@ static int na_failshim_write(RIG *rig, rig_stream_t *s, const void *buf, size_t 
 }
 DYLD_INTERPOSE(na_failshim_write, rig_stream_write)
 
+static int na_failshim_open(RIG *rig, const struct rig_stream_config *cfg, rig_stream_t **out) {
+    return shim_open(rig_stream_open, rig, cfg, out);
+}
+DYLD_INTERPOSE(na_failshim_open, rig_stream_open)
+
 #else
 
 /* ELF: LD_PRELOAD puts these definitions ahead of libhamlib's in the global lookup order, so the
@@ -214,6 +251,17 @@ int rig_stream_write(RIG *rig, rig_stream_t *s, const void *buf, size_t n_bytes,
         return -RIG_EINTERNAL;
     }
     return shim_write(real, rig, s, buf, n_bytes, written, timeout_ms, info);
+}
+
+int rig_stream_open(RIG *rig, const struct rig_stream_config *cfg, rig_stream_t **out) {
+    static open_fn real = NULL;
+    if (real == NULL) real = (open_fn)dlsym(RTLD_NEXT, "rig_stream_open");
+    if (real == NULL) {
+        fprintf(stderr, "na_failshim: dlsym(rig_stream_open) failed — not interposing\n");
+        fflush(stderr);
+        return -RIG_EINTERNAL;
+    }
+    return shim_open(real, rig, cfg, out);
 }
 
 #endif

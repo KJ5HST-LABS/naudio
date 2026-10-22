@@ -28,6 +28,8 @@
 #   B  control   no fault armed     the bridge must STAY UP and report short=0
 #   C  tx-short  NA_FAIL_TX_SHORT   the bridge must COUNT the short writes  (short > 0)
 #   D  tx-fail   NA_FAIL_TX_AFTER   the bridge must EXIT NON-ZERO   (the TX half of #5)
+#   E  open-fail NA_FAIL_OPEN_MARK  a failed rig_stream_open must EXIT NON-ZERO without printing
+#                                   libhamlib's saved debug history, where -C values land
 #
 # Without arm B, arm C proves nothing: a bridge that short-writes during ordinary operation would
 # satisfy "short > 0" with no fault injected at all, and arms A and D cannot tell "exited because of
@@ -54,6 +56,7 @@
 #   B  control   read + write   — short=0 is satisfied by a shim that never bound; this is the fix
 #   C  tx-short  read + write   — short=0 is reported as issue #6 regressing; same trap, inverted
 #   D  tx-fail   read           — plus its stronger forced-write gate, which subsumes the write one
+#   E  open-fail open           — the stream never opens, so neither read nor write is called
 #
 # macOS SIP TRAP (CLAUDE.md Learning 6): the bridge is launched DIRECTLY, never through `timeout`,
 # `perl` or a nested shell. Exec'ing a SIP-protected binary strips DYLD_* from the environment with
@@ -407,6 +410,55 @@ arm_tx_fail () {
     return 0
 }
 
+# ------------------------------------------- arm E: a failed stream open prints no libhamlib history
+#
+# rigerror() returns libhamlib's saved debug history at every level, not just the message, and -C
+# values reach that history — `-C client=X` is recorded as "Client claims to be X". So every error
+# the bridge prints goes through rigerror2(); this arm guards the stream-open one, which no
+# hardware-free backend can make fail. The shim plants a line in the history, confirms it is there
+# (the positive control: without it a libhamlib that records nothing would pass this arm), and fails
+# the open. The bridge must exit non-zero, report the failed open, and never print the planted line.
+OPEN_MARK="s80-planted-history-line"
+arm_open_fail () {
+    log="$workdir/open_fail.log"
+    env "$PRELOAD_VAR=$SHIM" NA_FAIL_OPEN_MARK="$OPEN_MARK" \
+        "$BRIDGE" -m 1 -S tone -p "$PORT" >"$log" 2>&1 &
+    bpid=$!
+    na_wait_pid "$bpid" "$NA_STOP_DEADLINE" "bridge_fault_arm/open-fail bridge"
+    bexit=$NA_DEADLINE_RC
+
+    assert_shim_loaded "$log" open-fail || return 2
+    assert_shim_bound "$log" open-fail rig_stream_open || return 2
+    if ! grep -q "na_failshim: open mark is in libhamlib's history" "$log" 2>/dev/null; then
+        echo "FAIL bridge_fault_arm/open-fail: the planted line never reached libhamlib's saved" >&2
+        echo "  history, so this arm cannot tell a bridge that prints the history from one that" >&2
+        echo "  does not. A HARNESS fault: this libhamlib no longer records unprinted levels." >&2
+        sed 's/^/    | /' "$log" >&2
+        return 2
+    fi
+    arc=0
+    if [ "$bexit" -eq 124 ] || [ "$bexit" -eq 0 ]; then
+        echo "FAIL bridge_fault_arm/open-fail: the RX stream never opened and the bridge exited" >&2
+        echo "  $bexit (124: still running); expected a non-zero exit of its own" >&2
+        arc=1
+    fi
+    if ! grep -q '^na_hamlib_bridge: rig_stream_open(type=' "$log" 2>/dev/null; then
+        echo "FAIL bridge_fault_arm/open-fail: the bridge never reported the failed stream open" >&2
+        arc=1
+    fi
+    if grep -Fq -- "$OPEN_MARK" "$log" 2>/dev/null; then
+        echo "FAIL bridge_fault_arm/open-fail: the bridge printed libhamlib's saved debug history" >&2
+        echo "  (the planted line is in its output). A -C value — a password — can be there too." >&2
+        arc=1
+    fi
+    if [ "$arc" -ne 0 ]; then
+        sed 's/^/    | /' "$log" >&2
+        return "$arc"
+    fi
+    echo "  bridge_fault_arm/open-fail: OK (exited $bexit, reported the open, printed no history)"
+    return 0
+}
+
 echo "bridge_fault_arm: $BRIDGE on :$PORT under $(basename "$SHIM")"
 
 arm_rx_fail                                        || rc=$?
@@ -415,9 +467,11 @@ arm_rx_fail                                        || rc=$?
 arm_tx control  zero                               || { a=$?; [ "$rc" -eq 0 ] && rc=$a; }
 arm_tx tx-short nonzero NA_FAIL_TX_SHORT=2         || { a=$?; [ "$rc" -eq 0 ] && rc=$a; }
 arm_tx_fail                                        || { a=$?; [ "$rc" -eq 0 ] && rc=$a; }
+arm_open_fail                                      || { a=$?; [ "$rc" -eq 0 ] && rc=$a; }
 
 if [ "$rc" -eq 0 ]; then
-    echo "bridge_fault_arm: OK — a dead RX or TX worker stops the bridge, and short writes counted"
+    echo "bridge_fault_arm: OK — a dead RX or TX worker stops the bridge, short writes are counted," \
+         "and a failed stream open prints no libhamlib history"
 fi
 na_harness_done
 exit "$rc"

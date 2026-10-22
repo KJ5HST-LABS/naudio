@@ -1096,7 +1096,7 @@ if(NAUDIO_BUILD_TESTS AND NOT WIN32 AND TARGET na_hamlib_bridge AND TARGET naudi
 
     # Fault-injection arm (issue #35) — the same gate, one target further. naudio_failshim is a
     # PRELOAD library, never linked by anything: it is inserted into the bridge's process at launch
-    # and interposes libhamlib's two stream calls, which is the only way to reach the error paths
+    # and interposes libhamlib's stream calls, which is the only way to reach the error paths
     # issues #5 and #6 describe (the Hamlib dummy has no error-injection knob, and it routes reads
     # through its own caps->stream_read hook).
     #

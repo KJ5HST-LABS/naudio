@@ -275,7 +275,8 @@ run_refused conf/refused   1 '-C stream_mode: '   "$SECRET" -C "stream_mode=$SEC
 # The row has no positive control of its own. It means something only while libhamlib records the
 # `client` value in its saved history — frontend_set_conf's VERBOSE "Client claims to be %s" in
 # src/conf.c, present in 9f412fe, master 06335264d and 0748e823e. Upstream dropping that line
-# would make this row pass whatever the bridge prints.
+# would make this row pass whatever the bridge prints; the fault arm's open-fail row plants its own
+# history line and checks that it is there.
 run_refused conf/open-fails 1 '^na_hamlib_bridge: rig_open: ' "$CLIENT_VALUE" \
     -m 2 -r "127.0.0.1:$PORT" -C "client=$CLIENT_VALUE" || fail $?
 

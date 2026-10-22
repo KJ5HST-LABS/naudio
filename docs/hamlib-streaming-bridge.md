@@ -359,23 +359,31 @@ originally checked with a hand-built shim in a scratchpad that evaporated with i
 | `control` | *none* — shim loaded, no fault armed | stay up and report `short=0` |
 | `tx-short` | every `rig_stream_write` truncated to half | **count** the short writes (`short > 0`) |
 | `tx-fail` | `rig_stream_write` fails after 10 calls | **exit non-zero** and name the dead worker |
+| `open-fail` | `rig_stream_open` fails, after the shim plants a line in libhamlib's debug history | **exit non-zero**, report the failed open, and **not** print the planted line |
 
 `rx-fail` and `tx-fail` are the two halves of the same bug, and one arm does not cover both: the two
 workers reach `worker_failed()` from separate call sites, so deleting only `tx_thread`'s call leaves
 `rx-fail` entirely green. `tx-fail` costs **0.9 s** of the total — it needs no health-line
 interval, because process exit and the `tx worker stopped` line are both immediate.
 
+`open-fail` guards [the one-line error rule](#hamlib-configuration-tokens--c) on the one path no
+hardware-free backend can reach: `rigerror()` returns libhamlib's saved debug history, where `-C`
+values land, so a bridge that reported the failed open with it would print them. The shim confirms
+the planted line really is in the history before it fails the open; if it is not, the arm reports a
+harness fault rather than passing over a libhamlib that no longer records it.
+
 ```bash
-ctest --test-dir build -R naudio_bridge_fault_arm --output-on-failure   # ~18 s, four arms
+ctest --test-dir build -R naudio_bridge_fault_arm --output-on-failure   # ~19 s, five arms
 ```
 
 Neither fault is reachable from outside the process: the Hamlib dummy has no error-injection knob,
 and it routes reads through its own `caps->stream_read` hook, so libhamlib's error and `closing`
 paths cannot be provoked however the backend is configured. `tests/bridge/failshim.c` is therefore
-preloaded into the bridge (`DYLD_INSERT_LIBRARIES` on macOS, `LD_PRELOAD` on ELF) and interposes the
-two stream calls. It is armed entirely by environment variables — `NA_FAIL_RX_AFTER`,
-`NA_FAIL_TX_AFTER`, `NA_FAIL_CODE`, `NA_FAIL_TX_SHORT` — and with none of them set it is a pure
-pass-through, which is exactly what the `control` arm runs.
+preloaded into the bridge (`DYLD_INSERT_LIBRARIES` on macOS, `LD_PRELOAD` on ELF) and interposes
+`rig_stream_read`, `rig_stream_write` and `rig_stream_open`. It is armed entirely by environment
+variables — `NA_FAIL_RX_AFTER`, `NA_FAIL_TX_AFTER`, `NA_FAIL_CODE`, `NA_FAIL_TX_SHORT`,
+`NA_FAIL_OPEN_MARK` — and with none of them set it is a pure pass-through, which is exactly what the
+`control` arm runs.
 
 **The `control` arm is what makes the others mean anything.** A bridge that short-writes during
 ordinary operation would satisfy `tx-short` with no fault injected at all. Same shim, same probe,
@@ -387,7 +395,7 @@ two checks because they are two different failures with one symptom:
 | Marker | Printed from | Proves |
 |---|---|---|
 | `na_failshim: armed …` | the constructor | the library **loaded** |
-| `na_failshim: interposed <fn>` | inside `shim_read` / `shim_write` | that call **bound** |
+| `na_failshim: interposed <fn>` | inside `shim_read` / `shim_write` / `shim_open` | that call **bound** |
 
 The first is needed because a preload that fails to load produces exactly the output of a healthy
 run — no error, no diagnostic — so "no short writes were reported" and "interposition never
@@ -406,6 +414,7 @@ which calls it actually makes, measured rather than assumed:
 | `control` | read + write | `short=0` is satisfied by a shim that never bound — the case it exists for |
 | `tx-short` | read + write | `short=0` is reported as issue #6 regressing; the same trap inverted |
 | `tx-fail` | read | plus its forced-write line, which is strictly stronger for the write side |
+| `open-fail` | open | the stream never opens, so neither read nor write is called |
 
 Proved by removing both `DYLD_INTERPOSE` entries, so the shim loads and binds nothing: **all four
 arms report a harness fault (exit 2)**, none blames the bridge. Against the harness as it stood
