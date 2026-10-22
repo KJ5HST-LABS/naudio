@@ -315,6 +315,7 @@ Registered wherever `naudio_bridge_arm` is, and run by the same CI job. It drive
 | `bogus` | `-R bogus` | exit 2 with the usage text, never serving |
 | `conf/silence` | `-C stream_mode=silence` | deliver silence (the dummy's default is `tone`) |
 | `conf/after-S` | `-S silence -C stream_mode=tone` | deliver content: `-C` is applied after `-S` |
+| `conf/after-r` | `-r A -C rig_pathname=B` | name `B` on the startup line: `-C` is applied after `-r` |
 | `conf/unknown` | `-C no_such_token=…` | exit 1, naming the token |
 | `conf/no-equals` | `-C stream_mode` | exit 2, naming the token |
 | `conf/colon`, `conf/space` | `-C stream_mode:…`, `-C 'stream_mode …'` | exit 2, naming at most `stream_mode` |

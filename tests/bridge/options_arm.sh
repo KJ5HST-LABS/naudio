@@ -23,6 +23,8 @@
 #   conf/silence      -C stream_mode=silence delivers silence. Content here means -C reached nothing
 #   conf/after-S      -S silence -C stream_mode=tone delivers content: -C acts as -S does, and is
 #                     applied after it
+#   conf/after-r      -r A -C rig_pathname=B applies B, which the startup line reads back from
+#                     libhamlib: -C is applied after -r too
 #   conf/unknown      a token the model lacks stops the bridge (exit 1), naming the token
 #   conf/no-equals    -C stream_mode, with no '=', stops it (exit 2), naming the token
 #   conf/colon        -C stream_mode:<value> and -C 'stream_mode <value>' (the likeliest typos of
@@ -169,6 +171,30 @@ run_wan_refuses_tcp () {
     return "$arc"
 }
 
+# One started row: run_started <label> <must> <never> <bridge args...>. The bridge must come up, its
+# startup line must match <must> (an ERE) and not contain <never>, and it must stop cleanly.
+run_started () {
+    local label="$1" must="$2" never="$3"; shift 3
+    start_bridge "$label" "$@" || return $?
+    local arc=0 line
+    line=$(grep -m1 -- '-> naudio :' "$blog")
+    if ! printf '%s\n' "$line" | grep -Eq -- "$must"; then
+        echo "FAIL options_arm/$label: the startup line does not match /$must/" >&2
+        arc=1
+    fi
+    if [ -n "$never" ] && printf '%s\n' "$line" | grep -Fq -- "$never"; then
+        echo "FAIL options_arm/$label: the startup line names $never" >&2
+        arc=1
+    fi
+    stop_bridge "$label" || { [ "$arc" -eq 0 ] && arc=1; }
+    if [ "$arc" -ne 0 ]; then
+        sed 's/^/    | /' "$blog" >&2
+        return "$arc"
+    fi
+    echo "  options_arm/$label: OK ($line)"
+    return 0
+}
+
 # One refusal row: run_refused <label> <exit> <must> <never> <bridge args...>. The bridge must exit
 # on its own with exactly <exit>, never come up, and its output must match <must> (an ERE) and must
 # not contain <never>, the -C value the row passed — "" for a row that passes none.
@@ -217,6 +243,9 @@ run_refused bogus 2 '^usage: ' "" -S tone -R bogus || fail $?
 
 run_served conf/silence wan silence wan -C stream_mode=silence           || fail $?
 run_served conf/after-S wan content wan -S silence -C stream_mode=tone || fail $?
+# The dummy takes any rig_pathname and opens nothing with it, so both addresses are inert here.
+run_started conf/after-r ' s80-path-from-C -> naudio :' 's80-path-from-r' \
+    -S tone -r s80-path-from-r -C rig_pathname=s80-path-from-C || fail $?
 run_refused conf/unknown   1 '-C no_such_token: ' "$SECRET" -C "no_such_token=$SECRET" || fail $?
 run_refused conf/no-equals 2 '^na_hamlib_bridge: -C stream_mode: expected token=value' "" \
     -C stream_mode || fail $?

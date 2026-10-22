@@ -510,6 +510,14 @@ static int conf_arg_ok(const char *arg) {
     return 0;
 }
 
+/* Whether any -C argument sets the token `name`. */
+static int conf_sets(const char *const *conf, int n, const char *name) {
+    size_t len = strlen(name);
+    for (int i = 0; i < n; i++)
+        if (strncmp(conf[i], name, len) == 0 && conf[i][len] == '=') return 1;
+    return 0;
+}
+
 /* Apply each -C in command-line order, after -r and -S, so a -C naming the same token wins.
  * Returns 0, or -1 having named the token that failed. The value is never printed: for a network
  * radio it is a login (net_username, net_password). */
@@ -1020,8 +1028,16 @@ int main(int argc, char **argv) {
         goto teardown_all;
     }
 
+    /* The rig address as libhamlib holds it, read back rather than taken from -r: a -C
+     * rig_pathname=… is applied after -r and overrides it. */
+    char where[512] = "(local)";
+    if (rig_file != NULL || conf_sets(conf, n_conf, "rig_pathname")) {
+        if (rig_get_conf2(b.rig, rig_token_lookup(b.rig, "rig_pathname"), where,
+                          (int)sizeof where) != RIG_OK)
+            snprintf(where, sizeof where, "%s", rig_file != NULL ? rig_file : "(set by -C)");
+    }
     printf("na_hamlib_bridge: model=%d %s -> naudio :%d  profile=%s  rate=%d  channels=%d  tx=%s\n",
-           model, rig_file ? rig_file : "(local)", na_server_port(b.srv), profile_name,
+           model, where, na_server_port(b.srv), profile_name,
            rate, channels, b.tx ? (use_ptt ? "on+ptt" : "on") : "off");
     fflush(stdout);   /* redirected to a file this sits in the buffer until the first health tick,
                        * landing AFTER any stderr diagnostic it is supposed to precede */
