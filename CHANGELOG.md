@@ -14,7 +14,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - **An unknown `na_hamlib_bridge -R` name is refused instead of quietly becoming `wan`.** `parse_profile` returned the default for any name it did not know, so `-R tcp` — or a typo — brought the bridge up as a UDP server that the client it was meant for could not reach, with nothing on the console to say so. It now prints the usage text and exits 2.
 
 ### Changed
-- **The bridge's man page no longer says that no real radio backend implements `stream_caps`.** That was true of upstream Hamlib when it was written (2026-08-30) and still is of upstream master, but Hamlib PR #2178 (open) adds Icom network backends that implement it. The man page and `docs/hamlib-streaming-bridge.md` now say so, and that naudio has not run the bridge against a radio. Both also document `-R tcp`, `-R dual` and `-C`, name the `-R` a TCP-only client such as WSJT-X needs, and give an Icom network example.
+- **The bridge's man page, the README and `docs/on-air-verification.md` no longer say that no real radio backend implements `stream_caps`.** That was true of upstream Hamlib when they were written and still is of upstream master, but Hamlib PR #2178 (open) adds Icom network backends that implement it. They, and `docs/hamlib-streaming-bridge.md`, now say so, and that naudio has not run the bridge against a radio; the on-air procedure's bridge path gains the network topology, and no longer says the bridge cannot pass `serial_speed`, `civaddr`, `ptt_type` or `ptt_pathname` — `-C` passes them. Both also document `-R tcp`, `-R dual` and `-C`, name the `-R` a TCP-only client such as WSJT-X needs, and give an Icom network example.
 
 ## [1.0.0rc10] — 2026-09-19
 
