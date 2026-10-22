@@ -312,6 +312,7 @@ Registered wherever `naudio_bridge_arm` is, and run by the same CI job. It drive
 | `tcp` | `-R tcp` | deliver the dummy's tone to a `--profile tcp` client |
 | `dual` | `-R dual` | deliver it to a `tcp` client and to an `ft8` (UDP) client, on one port |
 | `control/wan-tcp` | default `-R wan` | **refuse** a `tcp` client at connect |
+| `tcp-udp` | `-R tcp` | **refuse** a `wan` (UDP) client: `tcp` is not `dual` |
 | `bogus` | `-R bogus` | exit 2 with the usage text, never serving |
 | `conf/silence` | `-C stream_mode=silence` | deliver silence (the dummy's default is `tone`) |
 | `conf/after-S` | `-S silence -C stream_mode=tone` | deliver content: `-C` is applied after `-S` |
@@ -321,18 +322,20 @@ Registered wherever `naudio_bridge_arm` is, and run by the same CI job. It drive
 | `conf/colon`, `conf/space` | `-C stream_mode:…`, `-C 'stream_mode …'` | exit 2, naming at most `stream_mode` |
 | `conf/bad-name` | `-C stream_mode:…=tone` | exit 2, naming at most `stream_mode` |
 | `conf/empty-token` | `-C =…` | exit 2, printing no part of the argument |
+| `conf/limit` | 65 × `-C stream_mode=tone` | exit 2: the bridge keeps 64 |
 | `conf/refused` | `-C stream_mode=…` (a mode the dummy refuses) | exit 1, naming the token |
 | `conf/open-fails` | `-m 2 -r` a closed port, `-C client=…` | exit 1 on the failed `rig_open` |
 
 The control row is what makes the first two mean anything: a probe whose `--profile tcp` quietly
-connected over UDP would pass them, and fails it. Every row that puts a value on the command line
+connected over UDP would pass them, and fails it. A refusal row counts only with the probe's own
+`connect … failed` line, since a probe that wedged or could not run exits 2 as well. Every row that puts a value on the command line
 (each `…` above) also requires that the **value** never appears in the bridge's output, since for a
 network radio it is a password. `conf/open-fails`
 uses `client` because libhamlib records that token's value in its saved debug history, so the row
 fails if any error path prints that history.
 
 ```bash
-ctest --test-dir build -R naudio_bridge_options_arm --output-on-failure   # ~30 s
+ctest --test-dir build -R naudio_bridge_options_arm --output-on-failure   # ~40 s
 ```
 
 Every row was driven red before it was trusted: against the bridge as it was before these options

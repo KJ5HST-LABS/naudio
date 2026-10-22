@@ -15,6 +15,10 @@
 #   dual              -R dual serves the same tone to a TCP client and to a UDP client, on one port
 #   control/wan-tcp   -R wan REFUSES a TCP client. The control for the two rows above: a probe whose
 #                     `--profile tcp` quietly ran UDP would pass them both, and fails this one
+#   tcp-udp           -R tcp REFUSES a UDP client: tcp is TCP only, not dual. Costs the probe's 10 s
+#                     handshake timeout, since nothing answers a UDP connect to a TCP-only port
+# A refusal counts only with the probe's own "connect … failed" line: a probe that wedged or could
+# not run also exits 2, and must not pass a refusal row.
 #   bogus             -R bogus exits 2 with the usage text instead of coming up as wan
 #
 # -C. A Hamlib configuration token set before rig_open — an Icom network radio's login is two of
@@ -31,6 +35,7 @@
 #   conf/space        a password option) stop it (exit 2), naming at most the leading name
 #   conf/bad-name     a token name with a character no token has, before an '=', likewise
 #   conf/empty-token  -C =<value> stops it (exit 2) and prints no argument at all
+#   conf/limit        a 65th -C stops it (exit 2): the bridge keeps 64
 #   conf/refused      a value the backend refuses stops it (exit 1), naming the token
 #   conf/open-fails   a rig_open that fails after -C stops it (exit 1) without printing a -C value
 # Every row that puts a value on the command line also requires that the VALUE never reaches the
@@ -151,20 +156,22 @@ run_served () {
     return "$arc"
 }
 
-# The control: a TCP client against the default -R wan must be refused at connect. The probe exits 2
-# when it cannot attach — that is the PASS here, and anything else fails the row.
-run_wan_refuses_tcp () {
-    local label="control/wan-tcp"
-    start_bridge "$label" -S tone || return $?
-    local arc=0
-    probe "$label" --profile tcp --expect content
-    local prc=$?
-    if [ "$prc" -eq 2 ]; then
-        echo "  options_arm/$label: OK — -R wan refuses a TCP client"
+# A refusal row: run_refuses_client <label> <-R> <client profile>. The client must be refused at
+# connect: the probe exits 2 AND prints its "connect to … failed" line. Any other outcome fails.
+run_refuses_client () {
+    local label="$1" profile="$2" client="$3"
+    start_bridge "$label" -S tone -R "$profile" || return $?
+    local arc=0 plog="$workdir/probe.${label//\//_}.log"
+    na_run_deadline $(( SECS + NA_PROBE_MARGIN )) "options_arm/$label probe" "$plog" \
+        "$PROBE" --port "$PORT" --seconds "$SECS" --profile "$client" --expect content
+    local prc=$NA_DEADLINE_RC
+    if [ "$prc" -eq 2 ] && grep -q "^na_bridge_probe: connect to 127.0.0.1:$PORT failed" "$plog"; then
+        echo "  options_arm/$label: OK — -R $profile refuses a $client client"
     else
-        echo "FAIL options_arm/$label: a TCP client against -R wan exited $prc, expected 2 (refused)." >&2
-        echo "  Either the probe's --profile tcp is not TCP, which makes the tcp and dual rows" >&2
-        echo "  meaningless, or -R wan now serves TCP." >&2
+        echo "FAIL options_arm/$label: a $client client against -R $profile exited $prc without the" >&2
+        echo "  probe's connect-failed line; expected it to be refused at connect. Either the" >&2
+        echo "  probe's --profile $client is not the transport it names, or -R $profile serves it." >&2
+        sed 's/^/    p /' "$plog" >&2
         arc=1
     fi
     stop_bridge "$label" || { [ "$arc" -eq 0 ] && arc=1; }
@@ -238,7 +245,8 @@ echo "options_arm: $BRIDGE on :$PORT, ${SECS}s per probe"
 # Every row runs whatever an earlier one did: each names a different fault.
 run_served tcp  tcp  content "tcp"     -S tone -R tcp  || fail $?
 run_served dual dual content "tcp ft8" -S tone -R dual || fail $?
-run_wan_refuses_tcp || fail $?
+run_refuses_client control/wan-tcp wan tcp || fail $?
+run_refuses_client tcp-udp          tcp wan || fail $?
 run_refused bogus 2 '^usage: ' "" -S tone -R bogus || fail $?
 
 run_served conf/silence wan silence wan -C stream_mode=silence           || fail $?
@@ -257,15 +265,23 @@ run_refused conf/bad-name    2 '^na_hamlib_bridge: -C stream_mode' "$SECRET" \
     -C "stream_mode:$SECRET=tone" || fail $?
 run_refused conf/empty-token 2 "^na_hamlib_bridge: -C: no token name before '='" "$SECRET" \
     -C "=$SECRET" || fail $?
+limit_args=()
+for _ in $(seq 1 65); do limit_args+=(-C stream_mode=tone); done
+run_refused conf/limit 2 '^na_hamlib_bridge: more than 64 -C options' "" "${limit_args[@]}" || fail $?
 run_refused conf/refused   1 '-C stream_mode: '   "$SECRET" -C "stream_mode=$SECRET"   || fail $?
 # -m 2 (the later -m wins over the helper's -m 1) against this arm's own port, where nothing
 # listens for TCP: netrigctl's rig_open is refused at connect in every streaming libhamlib.
-run_refused conf/open-fails 1 'rig_open: ' "$CLIENT_VALUE" \
+#
+# The row has no positive control of its own. It means something only while libhamlib records the
+# `client` value in its saved history — frontend_set_conf's VERBOSE "Client claims to be %s" in
+# src/conf.c, present in 9f412fe, master 06335264d and 0748e823e. Upstream dropping that line
+# would make this row pass whatever the bridge prints.
+run_refused conf/open-fails 1 '^na_hamlib_bridge: rig_open: ' "$CLIENT_VALUE" \
     -m 2 -r "127.0.0.1:$PORT" -C "client=$CLIENT_VALUE" || fail $?
 
 if [ "$rc" -eq 0 ]; then
-    echo "options_arm: OK — -R tcp and -R dual serve TCP clients, -R wan refuses them, an unknown" \
-         "-R is refused, and -C reaches the backend after -S and stops the bridge on any failure" \
+    echo "options_arm: OK — -R tcp and -R dual serve TCP clients, -R wan refuses them and -R tcp" \
+         "refuses UDP ones, an unknown -R is refused, and -C reaches the backend after -S and stops the bridge on any failure" \
          "without printing its value, a failed rig_open included"
 fi
 na_harness_done
