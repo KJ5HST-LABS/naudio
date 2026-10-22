@@ -5,6 +5,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **`na_hamlib_bridge -R tcp` and `-R dual` serve a client that selects no reliability profile.** Such a client is on the C ABI's default transport, plain TCP, and the bridge served only its three UDP profiles, which refuse a TCP client at connect — so it could not feed WSJT-X's naudio client, which selects none. `-R tcp` serves plain TCP; `-R dual` serves TCP and UDP on one port (`NA_RELIABILITY_DUAL`). The default stays `-R wan`, UDP with FEC, for the lossy hop the bridge exists for; TCP retransmits instead and runs no FEC. `naudio_bridge_probe` gains `--profile wan|lan|ft8|tcp` to be either kind of client.
+- **`na_hamlib_bridge -C token=value` sets any Hamlib configuration token before the rig opens, so an Icom network radio can log in.** The bridge could set only `rig_pathname` (`-r`) and `stream_mode` (`-S`), and the Icom network backends of Hamlib PR #2178 (open; models 3095–3100) take their login as `net_username` and `net_password`. `-C` is repeatable and applied in order after `-r` and `-S`, so `-C stream_mode=tone` does what `-S tone` does. A token the model lacks, an argument with no `=`, or a value the backend refuses stops the bridge before it serves, with a message naming the token and never the value — and with libhamlib's one-line error, not `rigerror()`, which returns the library's saved debug history. Command-line arguments are visible to other local users, which the man page and the guide say beside the example. Checked against model 3095 with no radio attached (the tokens are accepted, and `rig_open` then times out); not run against a radio.
+- **`naudio_bridge_options_arm` drives both options for real** wherever the bridge is built, and the `hamlib-bridge` CI job asserts it by name. `-R tcp` and `-R dual` must deliver the dummy's tone to a TCP client (and `dual` to a UDP one too); `-R wan` must refuse a TCP client, the control that keeps the probe's TCP mode honest; an unknown `-R` must exit 2; `-C stream_mode=silence` must deliver silence where the default is tone, and `-S silence -C stream_mode=tone` content; and each `-C` failure must stop the bridge naming the token without printing the value. Every row but the control fails against the previous bridge, and seven targeted mutants of the new code are each failed by the row meant for them.
+
+### Fixed
+- **An unknown `na_hamlib_bridge -R` name is refused instead of quietly becoming `wan`.** `parse_profile` returned the default for any name it did not know, so `-R tcp` — or a typo — brought the bridge up as a UDP server that the client it was meant for could not reach, with nothing on the console to say so. It now prints the usage text and exits 2.
+
+### Changed
+- **The bridge's man page no longer says that no real radio backend implements `stream_caps`.** That was true of upstream Hamlib when it was written (2026-08-30) and still is of upstream master, but Hamlib PR #2178 (open) adds Icom network backends that implement it. The man page and `docs/hamlib-streaming-bridge.md` now say so, and that naudio has not run the bridge against a radio. Both also document `-R tcp`, `-R dual` and `-C`, name the `-R` a TCP-only client such as WSJT-X needs, and give an Icom network example.
+
 ## [1.0.0rc10] — 2026-09-19
 
 ### Fixed

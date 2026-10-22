@@ -282,7 +282,12 @@ it needs no libhamlib — so it can be pointed at anything speaking the naudio w
 ```bash
 ./build/naudio_bridge_probe --help
 ./build/naudio_bridge_probe --port 4533 --seconds 8 --expect content
+./build/naudio_bridge_probe --port 4533 --seconds 8 --expect content --profile tcp   # -R tcp / dual
 ```
+
+`--profile` picks the client's transport: `wan` (the default, matching the bridge's default `-R`),
+`lan`, `ft8`, or `tcp`, which selects no profile at all and so connects over the C ABI's default
+transport, plain TCP.
 
 Its exit status is a tri-state: `0` the expectation held, `1` it did not, `2` the probe itself could
 not run — so a broken harness is never read as a clean negative result. `--selftest` proves the
@@ -294,6 +299,39 @@ be refused entirely with PTT off.
 Absolute rate is reported but never asserted: a correct run against a dummy backend sits near 83% of
 nominal because the backend paces itself off `nanosleep`, so any threshold tight enough to catch a
 fault also fires on a healthy run. `--min-rate` exists for that comparison and is off by default.
+
+---
+
+## Verifying the transports and the configuration tokens (`naudio_bridge_options_arm`)
+
+Registered wherever `naudio_bridge_arm` is, and run by the same CI job. It drives the bridge's
+[`-R`](#serving-a-tcp-client--r-tcp--r-dual) and [`-C`](#hamlib-configuration-tokens--c) options:
+
+| Row | Bridge | Must |
+|---|---|---|
+| `tcp` | `-R tcp` | deliver the dummy's tone to a `--profile tcp` client |
+| `dual` | `-R dual` | deliver it to a `tcp` client and to an `ft8` (UDP) client, on one port |
+| `control/wan-tcp` | default `-R wan` | **refuse** a `tcp` client at connect |
+| `bogus` | `-R bogus` | exit 2 with the usage text, never serving |
+| `conf/silence` | `-C stream_mode=silence` | deliver silence (the dummy's default is `tone`) |
+| `conf/after-S` | `-S silence -C stream_mode=tone` | deliver content: `-C` is applied after `-S` |
+| `conf/unknown` | `-C no_such_token=…` | exit 1, naming the token |
+| `conf/no-equals` | `-C stream_mode` | exit 2, naming the token |
+| `conf/refused` | `-C stream_mode=…` (a mode the dummy refuses) | exit 1, naming the token |
+
+The control row is what makes the first two mean anything: a probe whose `--profile tcp` quietly
+connected over UDP would pass them, and fails it. The last three also require that the **value**
+never appears in the bridge's output, since for a network radio it is a password.
+
+```bash
+ctest --test-dir build -R naudio_bridge_options_arm --output-on-failure   # ~30 s
+```
+
+Every row was driven red before it was trusted: against the bridge as it was before these options
+existed, every row but the control fails, and seven targeted mutants of the new code (`-C` applied
+before `-S`, the whole `-C` argument printed, an unknown token or a refused value skipped, `dual`
+served as plain TCP, `tcp` served as UDP, an unknown `-R` falling back to `wan`) are each failed by
+the row meant for them.
 
 ---
 
@@ -444,8 +482,77 @@ a radio:
 
 `-S loopback` matters for any TX test: the dummy backend's default `stream_mode` is `tone`, so a
 round-trip run without it shows RX bytes flowing from the tone generator and proves nothing about
-your TX path. `-h` lists the rest (`-m 2` for netrigctl, `-p` port, `-c` channels, `-R` reliability
-profile, `-k` PTT keying, `-x` RX-only).
+your TX path. `-h` lists the rest (`-m 2` for netrigctl, `-p` port, `-c` channels, `-R` transport,
+`-C` Hamlib configuration tokens, `-k` PTT keying, `-x` RX-only).
+
+### Serving a TCP client (`-R tcp`, `-R dual`)
+
+`-R` picks what the bridge's naudio server speaks, and the client has to speak the same thing:
+
+| `-R` | Serves | For |
+|---|---|---|
+| `wan` (default) | UDP, XOR FEC + adaptive jitter + reorder | a lossy hop — the reason the bridge exists |
+| `lan` | UDP, reorder, no FEC | a clean LAN |
+| `ft8` | UDP, tight buffers, reorder, no FEC | low latency on a clean link |
+| `tcp` | plain TCP | a client that selects no profile, on the same host or a LAN |
+| `dual` | TCP and UDP on one port (the UDP half on `ft8`-style buffers, no FEC) | both kinds of client at once |
+
+**A client that never selects a reliability profile connects over TCP** — the C ABI's default
+transport — and the three UDP profiles refuse it at connect (`SO_ERROR=61`, connection refused, on
+macOS). WSJT-X's naudio client is one of these, so a bridge feeding WSJT-X runs `-R tcp`, or
+`-R dual` if UDP clients share it:
+
+```bash
+./build/tools/na_hamlib_bridge -m 1 -R tcp            # a TCP-only client on this host or LAN
+```
+
+TCP retransmits, so on a lossy link it delivers late rather than short, and naudio's FEC does not
+run on it; for a lossy hop keep `wan` and a client that selects `NA_RELIABILITY_UDP_WAN`. Any other
+`-R` name is refused with the usage text and exit status 2.
+
+### Hamlib configuration tokens (`-C`)
+
+`-C token=value` sets any Hamlib configuration token on the rig before it opens — what `rigctl -C`
+does, one token per `-C` (so a value may contain commas). Repeat it as needed. They are applied in
+the order given, **after** `-r` and `-S`, so `-C stream_mode=tone` does what `-S tone` does and
+overrides it. `rigctl -m <model> -L` lists a model's tokens.
+
+Any failure stops the bridge before it serves anything, with a message that names the token and
+never the value:
+
+| Cause | Exit | Message |
+|---|---|---|
+| no `=` | 2 | `-C stream_mode: expected token=value` |
+| a token the model does not have | 1 | `-C no_such_token: model 1 has no such token (rigctl -m 1 -L lists its tokens)` |
+| a value the backend refuses | 1 | `-C net_password: refused: Invalid parameter` |
+
+The refusal is libhamlib's one-line message (`rigerror2`), not `rigerror`, which returns the library's
+saved debug history at every level and could carry a value a backend had logged.
+
+### An Icom network radio
+
+Hamlib PR [#2178](https://github.com/Hamlib/Hamlib/pull/2178) (open) adds Icom backends that reach
+the radio over its LAN protocol and implement the streaming subsystem: models 3095–3100 (IC-7610,
+IC-9700, IC-705, IC-905, IC-7760 and IC-7300MK2, each "(Network)"). `-r` is the radio's own address
+and the login is the **network user configured in the radio's menu**, set with two tokens:
+
+```bash
+./build/tools/na_hamlib_bridge -m 3095 -r 192.168.1.50 \
+    -C net_username=USER -C net_password=PASS
+```
+
+Add `-R tcp` when the client is WSJT-X or another TCP-only client. The bridge then needs no station
+computer of its own: it can run on the operator's machine, beside the client.
+
+> **The password is on the command line, and command-line arguments are visible to other users of
+> the machine** (`ps`, `/proc/<pid>/cmdline` on Linux). Run the bridge where that is acceptable.
+
+What has been checked, and what has not. Against a libhamlib built from `0748e823e` (Hamlib master
+with PR #2178 and later fixes on top), model 3095 accepts `net_username` and `net_password` through
+`-C` and the bridge goes on to `rig_open`, which with no radio at the address fails
+`Communication timed out` and exits 1; a 17-character password is refused at `-C`, naming the token.
+**naudio has not run the bridge against an Icom radio**, so streaming from one through it is
+unverified.
 
 ### The sample rate is negotiated, not assumed (issue #84)
 
@@ -511,11 +618,15 @@ asks for 48 kHz exactly as it always did.
 > backend advertises 48 kHz natively, so no hardware-free path exercises a negotiated rate; issue
 > [#12](https://github.com/KJ5HST-LABS/naudio/issues/12) is still the open on-air check.
 >
-> **And it cannot be closed by attaching a radio to this bridge today.** Measured against upstream
-> master `0839c03`: **1 of 313 Hamlib models advertises `stream_caps`, and it is the Dummy** —
-> no real radio backend implements the streaming subsystem, and `netrigctl` only relays a remote
-> backend that does not have it either. See
-> [`on-air-verification.md`](on-air-verification.md) for the measurement, the one-command
+> **Upstream Hamlib still has no radio backend for it.** Measured against upstream master
+> `0839c03`: **1 of 313 Hamlib models advertises `stream_caps`, and it is the Dummy**; on master
+> `06335264d` (2026-10-19) the Dummy's is still the only `.stream_caps` in `rigs/`, and `netrigctl`
+> only relays a remote backend. Hamlib PR [#2178](https://github.com/Hamlib/Hamlib/pull/2178)
+> (open) adds the first radio backends that implement it, the Icom network models — the same scan
+> against a libhamlib built from `0748e823e` (master with PR #2178 and later fixes) reports
+> **7 of 321**: the Dummy and models 3095–3100. The bridge takes them as it takes any model (see
+> [An Icom network radio](#an-icom-network-radio)), but **naudio has not run them against a
+> radio**. See [`on-air-verification.md`](on-air-verification.md) for the scan, the one-command
 > re-check, and the device-layer path that a radio *can* verify in the meantime.
 
 ### Over a remote `rigctld` (`-m 2`)
@@ -529,8 +640,10 @@ rigctld -m 1 -t 5599 -C stream_mode=tone           # streaming rigctld, dummy ba
 
 Set the backend's `stream_mode` on **`rigctld`** with `-C`. The bridge's `-S` sets the conf on its
 *local* netrigctl rig object, which is not where the dummy backend lives, so `-S` on an `-m 2` run
-does not reach the thing generating audio. `rig_stream_net_parse_caps_line: missing required 'type'
-field` on bridge startup is normal noise on this path, not a failure.
+does not reach the thing generating audio. The bridge's own `-C` sets tokens on that same local
+object, so it takes netrigctl's tokens, not the remote rig's: `-C stream_mode=tone` with `-m 2`
+stops the bridge with `model 2 has no such token`. `rig_stream_net_parse_caps_line: missing
+required 'type' field` on bridge startup is normal noise on this path, not a failure.
 
 ### What has been verified on this path
 

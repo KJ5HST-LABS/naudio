@@ -1,5 +1,5 @@
 .\" SPDX-License-Identifier: LGPL-2.1-or-later
-.TH NA_HAMLIB_BRIDGE 1 "2026-08-30" "naudio" "naudio manual"
+.TH NA_HAMLIB_BRIDGE 1 "2026-10-22" "naudio" "naudio manual"
 .SH NAME
 na_hamlib_bridge \- bridge a Hamlib rig_stream audio stream onto the naudio wire
 .SH SYNOPSIS
@@ -7,15 +7,17 @@ na_hamlib_bridge \- bridge a Hamlib rig_stream audio stream onto the naudio wire
 .RB [ \-m
 .IR model ]
 .RB [ \-r
-.IR host:port ]
+.IR address ]
 .RB [ \-p
 .IR naudio_port ]
 .RB [ \-c
 .IR channels ]
 .RB [ \-R
-.IR lan | wan | ft8 ]
+.IR wan | lan | ft8 | tcp | dual ]
 .RB [ \-S
 .IR stream_mode ]
+.RB [ \-C
+.IR token = value ]\ ...
 .RB [ \-k ]
 .RB [ \-x ]
 .SH DESCRIPTION
@@ -32,18 +34,25 @@ stream while feeding client TX audio back to the rig.
 .PP
 The streaming subsystem it is built on is Hamlib PR #2116 (Hamlib 5.0+),
 which no released Hamlib ships yet \(em the bridge must be linked against a
-streaming-capable libhamlib, and as of this writing no real radio backend
-implements
-.IR stream_caps ,
-so real-rig behaviour is unverified.
+streaming-capable libhamlib.
+In upstream Hamlib master the Dummy is still the only backend with
+.IR stream_caps .
+Hamlib PR #2178 (open) adds Icom network backends (models 3095\(en3100)
+that implement them; naudio has not run the bridge against a radio, so
+real-rig behaviour is unverified.
 The Dummy backend (model 1) exercises the full path hardware-free.
 .SH OPTIONS
 .TP
 .BI \-m " model"
 Hamlib model number (default 1 = DUMMY, hardware-free; 2 = NETRIGCTL).
 .TP
-.BI \-r " host:port"
-netrigctl target for model 2, e.g. localhost:5555.
+.BI \-r " address"
+the rig's address, set as Hamlib's
+.I rig_pathname
+token: host:port of a
+.BR rigctld (1)
+for model 2, e.g. localhost:5555, or the radio's own address for a
+network radio.
 .TP
 .BI \-S " stream_mode"
 backend stream_mode configuration.
@@ -55,6 +64,34 @@ The Dummy backend accepts
 .I loopback
 feeds TX back out of RX \(em a hardware-free TX round trip.
 .TP
+.BI \-C " token\fR=\fPvalue"
+set a Hamlib configuration token before the rig is opened.
+Repeatable; applied in the order given, after
+.B \-r
+and
+.BR \-S ,
+so
+.B \-C stream_mode=tone
+does what
+.B \-S tone
+does and overrides it.
+An Icom network radio logs in with two of these,
+.I net_username
+and
+.IR net_password .
+.B rigctl \-m
+.I model
+.B \-L
+lists a model's tokens.
+A token the model does not have, an argument with no
+.BR = ,
+or a value the backend refuses stops the bridge with a message naming the
+token; the value is never printed.
+Command-line arguments are visible to other users of the machine (for
+example through
+.BR ps (1)),
+so a password given here is too.
+.TP
 .BI \-p " naudio_port"
 port the bridge's naudio server listens on (default 4533).
 .TP
@@ -65,8 +102,24 @@ Stereo over netrigctl needs a libhamlib at or after Hamlib commit
 .B this
 side; the bridge prints the applicable advice when it detects RX gaps.
 .TP
-.BI \-R " lan\fR|\fPwan\fR|\fPft8"
-naudio reliability profile (default wan, with FEC).
+.BI \-R " wan\fR|\fPlan\fR|\fPft8\fR|\fPtcp\fR|\fPdual"
+naudio transport and reliability profile.
+.IR wan ,
+the default, is UDP with FEC, for a lossy hop;
+.I lan
+and
+.I ft8
+are UDP without FEC.
+.I tcp
+serves plain TCP, and
+.I dual
+serves TCP and UDP on the same port.
+A client that selects no profile connects over TCP \(em WSJT-X's naudio
+client is one \(em and the UDP profiles refuse it, so serve it with
+.I tcp
+or
+.IR dual .
+Any other name is a usage error.
 .TP
 .B \-k
 key the rig's PTT around client TX bursts.
@@ -82,10 +135,17 @@ print usage and exit.
 clean run.
 .TP
 .B 1
-startup or streaming failure.
+startup or streaming failure, including a
+.B \-C
+token the model does not have or a value it refuses.
 .TP
 .B 2
-usage error.
+usage error, including an unknown
+.B \-R
+profile and a
+.B \-C
+argument with no
+.BR = .
 .SH EXAMPLES
 Hardware-free end to end, serving a test tone from the Dummy rig:
 .PP
@@ -100,6 +160,25 @@ Bridge a remote rigctld, RX only, FT8-tuned reliability:
 .nf
 .RS
 na_hamlib_bridge \-m 2 \-r radio\-host:5555 \-x \-R ft8
+.RE
+.fi
+.PP
+Serve a TCP-only client such as WSJT-X, on the same machine or LAN:
+.PP
+.nf
+.RS
+na_hamlib_bridge \-m 1 \-S tone \-R tcp
+.RE
+.fi
+.PP
+An Icom IC-7610 on the LAN, logging in as the network user configured in
+the radio's menu (needs a libhamlib with Hamlib PR #2178's Icom network
+backends; naudio has not run this against a radio):
+.PP
+.nf
+.RS
+na_hamlib_bridge \-m 3095 \-r 192.168.1.50 \e
+    \-C net_username=USER \-C net_password=PASS
 .RE
 .fi
 .SH SEE ALSO
