@@ -1078,10 +1078,9 @@ endif()
 # naudio_bridge_probe --selftest above, so the portable half never depends on this one running.
 #
 # Still NOT WIN32, although the bridge itself builds there. The arms stop the bridge with SIGINT and
-# require exit status 0, which MSYS2's bash does not report for a native program: it delivers the
-# signal as a console Ctrl-C and then, when none of the program's stdio is a terminal (as under
-# ctest), reports it as killed by SIGINT, 130, whatever it returned (msys2-runtime 3.6.11:
-# exceptions.cc, pinfo.cc, spawn.cc). The fault arm also needs a preload shim, which Windows has
+# require exit status 0, and a `kill -INT` from MSYS2's bash does not reach a native program: the
+# windows-hamlib-bridge job's run 39869456383 found the bridge still running 30 s after it, on every
+# options-arm row that stops it that way. The fault arm also needs a preload shim, which Windows has
 # no equivalent of, and a single-config build tree does not put libnaudio.dll beside the bridge.
 # The windows-hamlib-bridge CI job drives the bridge natively instead.
 # ----------------------------------------------------------------------------

@@ -656,14 +656,12 @@ jobs:
     # master at its head (issue #81), so both platforms build one Hamlib source. Static (--static),
     # so the bridge embeds libhamlib and needs no libhamlib DLL beside it.
     #
-    # WHY POWERSHELL STARTS THE BRIDGE. A native program started from MSYS2's bash runs under a stub
-    # process, and when none of its stdio is a terminal, as here, a `kill -INT` sent to it comes back
-    # as "killed by SIGINT" (130) whatever the program returned (msys2-runtime: exceptions.cc sets
-    # sigExeced, pinfo.cc reports it, spawn.cc clears it only on the terminal path). Started from
-    # PowerShell, the bridge's own exit code is read directly; MSYS2's `kill -f -W` still delivers the
-    # console event, as CTRL_C_EVENT for INT and CTRL_BREAK_EVENT for QUIT, through a remote thread
-    # running kernel32's CtrlRoutine in the bridge (exit_process.h), and PowerShell has no way to send
-    # either to a single process.
+    # WHY POWERSHELL STARTS THE BRIDGE. A `kill -INT` from MSYS2's bash does not reach a native
+    # program: run 39869456383 measured the bridge still running 30 s after it, on every options-arm
+    # row that stops it that way. Started from PowerShell, the bridge's own exit code is read
+    # directly; MSYS2's `kill -f -W` delivers the console event, as CTRL_C_EVENT for INT and
+    # CTRL_BREAK_EVENT for QUIT, through a remote thread running kernel32's CtrlRoutine in the
+    # bridge (exit_process.h), and PowerShell has no way to send either to a single process.
     defaults:
       run:
         shell: msys2 {0}
@@ -844,9 +842,9 @@ jobs:
 
       - name: "Options arm under MSYS2 bash — the rows the bridge ends by itself are asserted"
         run: |
-          # The arm's other rows stop the bridge with SIGINT and require 0, which MSYS2 reports as
-          # 130 (see this job's header), so they are run and shown but not asserted. The rows below
-          # end on their own with 1 or 2, and must not print a -C value.
+          # The arm's other rows stop the bridge with SIGINT and require 0; from this bash the
+          # signal never reaches it (see this job's header), so they are run and shown but not
+          # asserted. The rows below end on their own with 1 or 2, and must not print a -C value.
           set +e
           NA_BRIDGE_OPTIONS_PORT=46602 bash tests/bridge/options_arm.sh \
             "$PWD/dist/na_hamlib_bridge.exe" "$PWD/dist/naudio_bridge_probe.exe" > options-arm.log 2>&1

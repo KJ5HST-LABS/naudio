@@ -300,13 +300,12 @@ runs the bridge from a directory holding only it and the DLLs above, with nothin
   (`naudio_bridge_probe` must fail it);
 - exit status 0 through the bridge's own shutdown after Ctrl-C, and after Ctrl-Break.
 
-PowerShell starts the bridge there, and MSYS2's `kill -f -W` delivers the console event. From
-MSYS2's bash a native program runs under a stub process, and when none of its stdio is a terminal,
-as in CI or under ctest, a `kill -INT` sent to it comes back as "killed by SIGINT" (exit status 130)
-whatever the program returned (msys2-runtime 3.6.11: `exceptions.cc`, `pinfo.cc`, `spawn.cc`). That
-is read from msys2-runtime's source, and the job measures it: it runs `tests/bridge/options_arm.sh`
-under that bash and requires the rows the bridge ends by itself — an unknown `-R` and every
-malformed or refused `-C` — while the rows that stop it with `SIGINT` are shown and not asserted.
+PowerShell starts the bridge there, and MSYS2's `kill -f -W` delivers the console event. A
+`kill -INT` from MSYS2's bash does not reach a native program: in run 39869456383 the bridge was
+still running 30 s after it, on every row of `tests/bridge/options_arm.sh` that stops it that way,
+and was killed. So the job runs that arm under MSYS2's bash and requires only the rows the bridge
+ends by itself — an unknown `-R` and every malformed or refused `-C` — while the rows that stop it
+with `SIGINT` are shown and not asserted.
 The ctest bridge arms stay unregistered on Windows for the same reason, and because the fault arm's
 preload shim has no Windows equivalent.
 
