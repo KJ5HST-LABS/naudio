@@ -216,7 +216,8 @@ static long transmit_tone(na_stream_client* c, int ms, int peak) {
 
 /* --profile values. `tcp` makes no profile call at all, which leaves the client on the C ABI's
  * default transport, plain TCP: the configuration of a consumer that never selects a profile, as
- * WSJT-X's does. The others select the named UDP profile. */
+ * the network-audio input WSJT-X has in development does. The others select the named UDP
+ * profile. */
 #define PROBE_PROFILE_TCP     (-1)
 #define PROBE_PROFILE_UNKNOWN (-2)
 

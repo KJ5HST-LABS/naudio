@@ -38,7 +38,8 @@ streaming-capable libhamlib.
 In upstream Hamlib master the Dummy is still the only backend with
 .IR stream_caps .
 Hamlib PR #2178 (open) adds Icom network backends (models 3095\(en3100)
-that implement them; naudio has not run the bridge against a radio, so
+that implement them, and draft PR #2213 extends the FlexRadio backend with
+audio and I/Q streaming; naudio has not run the bridge against a radio, so
 real-rig behaviour is unverified.
 The Dummy backend (model 1) exercises the full path hardware-free.
 .SH OPTIONS
@@ -83,14 +84,23 @@ and
 .I model
 .B \-L
 lists a model's tokens.
-A token the model does not have, an argument with no
-.BR = ,
-or a value the backend refuses stops the bridge with a message naming the
-token; the value is never printed.
+A token the model does not have, a malformed argument, or a value the
+backend refuses stops the bridge with a message naming the token (a
+malformed argument only up to the end of its leading name).
+The bridge never prints the value; libhamlib's own diagnostics may, on the
+same standard error (see the guide named below).
+A value libhamlib refuses for
+.B \-r
+or
+.B \-S
+only draws a warning, while a refused
+.B \-C
+stops the bridge.
 Command-line arguments are visible to other users of the machine (for
 example through
 .BR ps (1)),
-so a password given here is too.
+so a password given here is too, as is one in a service definition that
+carries the arguments, such as a systemd unit or a launchd plist.
 .TP
 .BI \-p " naudio_port"
 port the bridge's naudio server listens on (default 4533).
@@ -114,8 +124,9 @@ are UDP without FEC.
 serves plain TCP, and
 .I dual
 serves TCP and UDP on the same port.
-A client that selects no profile connects over TCP \(em WSJT-X's naudio
-client is one \(em and the UDP profiles refuse it, so serve it with
+A client that selects no profile connects over TCP \(em the network-audio
+input WSJT-X has in development is one \(em and the UDP profiles refuse it,
+so serve it with
 .I tcp
 or
 .IR dual .
@@ -142,10 +153,9 @@ token the model does not have or a value it refuses.
 .B 2
 usage error, including an unknown
 .B \-R
-profile and a
+profile and a malformed
 .B \-C
-argument with no
-.BR = .
+argument.
 .SH EXAMPLES
 Hardware-free end to end, serving a test tone from the Dummy rig:
 .PP
@@ -163,7 +173,8 @@ na_hamlib_bridge \-m 2 \-r radio\-host:5555 \-x \-R ft8
 .RE
 .fi
 .PP
-Serve a TCP-only client such as WSJT-X, on the same machine or LAN:
+Serve a TCP-only client, such as the network-audio input WSJT-X has in
+development, on the same machine or LAN:
 .PP
 .nf
 .RS

@@ -520,8 +520,8 @@ your TX path. `-h` lists the rest (`-m 2` for netrigctl, `-p` port, `-c` channel
 
 **A client that never selects a reliability profile connects over TCP** — the C ABI's default
 transport — and the three UDP profiles refuse it at connect (`SO_ERROR=61`, connection refused, on
-macOS). WSJT-X's naudio client is one of these, so a bridge feeding WSJT-X runs `-R tcp`, or
-`-R dual` if UDP clients share it:
+macOS). A TCP-only client, such as the network-audio input WSJT-X has in development, therefore
+needs `-R tcp`, or `-R dual` if UDP clients share the bridge:
 
 ```bash
 ./build/tools/na_hamlib_bridge -m 1 -R tcp            # a TCP-only client on this host or LAN
@@ -533,10 +533,12 @@ run on it; for a lossy hop keep `wan` and a client that selects `NA_RELIABILITY_
 
 ### Hamlib configuration tokens (`-C`)
 
-`-C token=value` sets any Hamlib configuration token on the rig before it opens — what `rigctl -C`
-does, one token per `-C` (so a value may contain commas). Repeat it as needed. They are applied in
-the order given, **after** `-r` and `-S`, so `-C stream_mode=tone` does what `-S tone` does and
-overrides it. `rigctl -m <model> -L` lists a model's tokens.
+`-C token=value` sets any Hamlib configuration token on the rig before it opens. It is like
+`rigctl -C`, but one token per `-C` (so a value may contain commas), applied **after** `-r` and
+`-S`, and any failure stops the bridge. Repeat it as needed; they are applied in the order given, so
+`-C stream_mode=tone` does what `-S tone` does and overrides it. One difference remains: a value
+libhamlib refuses for `-r` or `-S` only prints a warning and the bridge carries on, while a refused
+`-C` stops it. `rigctl -m <model> -L` lists a model's tokens.
 
 Any failure stops the bridge before it serves anything, with a message that names the token and
 never the value. A malformed argument is named only up to the end of its leading token name, since
@@ -553,9 +555,24 @@ the likeliest malformed ones are typos of a password option — `-C net_password
 Every libhamlib error the bridge prints — this refusal, a failed `rig_open`, a failed stream open —
 is libhamlib's one-line message (`rigerror2`), never `rigerror`, which returns the library's saved
 debug history at every level. `-C` values reach that history: libhamlib records `-C client=X` there
-as `Client claims to be X`, and a `rig_open` that then failed used to print it. Messages libhamlib
-prints itself at warning or error level are not the bridge's to filter; for an unknown `client`
-value it prints the value.
+as `Client claims to be X`, and a `rig_open` that then failed used to print it.
+
+**The bridge never prints a `-C` value; libhamlib's own diagnostics may**, on the same stderr, and
+the bridge cannot filter them without silencing libhamlib's warnings and errors altogether. Two
+mechanisms, both checked against a libhamlib built from `0748e823e`:
+
+- **A backend's own refusal text.** Some name the value they refuse: `-m 3095 -C
+  net_control_port=98765` prints `check_range: net_control_port must be 0..65535, got 98765`, and
+  an unknown `-C client=…` prints `frontend_set_conf: unknown client=…`.
+- **Its own history dumps.** Some of libhamlib's error and warning lines embed `rigerror()`'s whole
+  history — the morse, multicast and poll-routine start failures in `rig_open`, a failed stream
+  close, and `errmsg()`, which the Yaesu `newcat` backend uses. Any value libhamlib recorded there,
+  `client` among them, can come out through those.
+
+The Icom login tokens reach neither in the libhamlib checked: `rig_set_conf` records `name='value'`
+only when verbose debugging is switched on, which the bridge never does, and the Icom network
+backend's `net_username` and `net_password` handling logs no value — its length refusal names the
+token only.
 
 ### An Icom network radio
 
@@ -569,11 +586,15 @@ and the login is the **network user configured in the radio's menu**, set with t
     -C net_username=USER -C net_password=PASS
 ```
 
-Add `-R tcp` when the client is WSJT-X or another TCP-only client. The bridge then needs no station
-computer of its own: it can run on the operator's machine, beside the client.
+Add `-R tcp` for a TCP-only client. When the operator's machine is on the radio's LAN, the bridge
+needs no station computer of its own: it can run there, beside the client. Across the Internet, run
+it at the radio site as usual, so that the lossy hop is naudio's (`-R wan`) and not the radio's own
+UDP protocol.
 
 > **The password is on the command line, and command-line arguments are visible to other users of
-> the machine** (`ps`, `/proc/<pid>/cmdline` on Linux). Run the bridge where that is acceptable.
+> the machine** (`ps`, `/proc/<pid>/cmdline` on Linux) for as long as the bridge runs. So is a
+> service definition that carries them — a systemd unit's `ExecStart=` or a launchd plist's
+> `ProgramArguments`, which are commonly world-readable. Run the bridge where that is acceptable.
 
 What has been checked, and what has not. Against a libhamlib built from `0748e823e` (Hamlib master
 with PR #2178 and later fixes on top), model 3095 accepts `net_username` and `net_password` through
@@ -646,16 +667,18 @@ asks for 48 kHz exactly as it always did.
 > backend advertises 48 kHz natively, so no hardware-free path exercises a negotiated rate; issue
 > [#12](https://github.com/KJ5HST-LABS/naudio/issues/12) is still the open on-air check.
 >
-> **Upstream Hamlib still has no radio backend for it.** Measured against upstream master
-> `0839c03`: **1 of 313 Hamlib models advertises `stream_caps`, and it is the Dummy**; on master
-> `06335264d` (2026-10-19) the Dummy's is still the only `.stream_caps` in `rigs/`, and `netrigctl`
-> only relays a remote backend. Hamlib PR [#2178](https://github.com/Hamlib/Hamlib/pull/2178)
-> (open) adds the first radio backends that implement it, the Icom network models — the same scan
-> against a libhamlib built from `0748e823e` (master with PR #2178 and later fixes) reports
-> **7 of 321**: the Dummy and models 3095–3100. The bridge takes them as it takes any model (see
-> [An Icom network radio](#an-icom-network-radio)), but **naudio has not run them against a
-> radio**. See [`on-air-verification.md`](on-air-verification.md) for the scan, the one-command
-> re-check, and the device-layer path that a radio *can* verify in the meantime.
+> **Upstream Hamlib still has no radio backend for it.** The model scan in
+> [`on-air-verification.md`](on-air-verification.md) reports **1 of 313 Hamlib models advertising
+> `stream_caps`, the Dummy**, against upstream master `0839c03`, and **1 of 315** against master
+> `06335264d` (2026-10-19); `netrigctl` only relays a remote backend. Two open Hamlib PRs add radio
+> backends that implement it. [#2178](https://github.com/Hamlib/Hamlib/pull/2178) adds the Icom
+> network models: the same scan against a libhamlib built from `0748e823e` (master with PR #2178
+> and later fixes) reports **7 of 321**, the Dummy and models 3095–3100.
+> [#2213](https://github.com/Hamlib/Hamlib/pull/2213), a draft, extends the FlexRadio backend with
+> audio and I/Q streaming; that libhamlib does not carry it, so it has not been scanned. The bridge
+> takes such models as it takes any other (see [An Icom network radio](#an-icom-network-radio)), but
+> **naudio has not run it against a radio**. See the same document for the one-command re-check and
+> the device-layer path that a radio *can* verify in the meantime.
 
 ### Over a remote `rigctld` (`-m 2`)
 

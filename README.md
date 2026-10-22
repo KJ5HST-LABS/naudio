@@ -363,12 +363,12 @@ consumer. The byte-identity tell for a correctly received stream is
   probe primitive **are** runtime-exercised on real Core Audio via `na_audio_daemon --list-devices`.
 - **The Hamlib streaming bridge has not been pointed at a radio, and upstream Hamlib has no radio
   backend for it yet.** Measured against Hamlib master `0839c03`: **1 of 313 models advertises
-  `stream_caps`, and it is the Dummy**, and master `06335264d` (2026-10-19) is the same. Hamlib PR
-  #2178 (open) adds the first radio backends that implement the audio-streaming subsystem
-  `na_hamlib_bridge` is built on, for Icom radios on the network (models 3095–3100), but naudio has
-  not run the bridge against one — so the bridge's real-backend behaviour (format negotiation
-  against real caps, `-k` keying around TX bursts, a short write from a radio that will not take a
-  full buffer) is **unverified**, not merely untested.
+  `stream_caps`, and it is the Dummy**, and master `06335264d` (2026-10-19) is the same (1 of 315).
+  Two open Hamlib PRs add radio backends that implement the audio-streaming subsystem
+  `na_hamlib_bridge` is built on — #2178 for Icom radios on the network (models 3095–3100) and the
+  draft #2213 for FlexRadio. naudio has not run the bridge against either, so its real-backend
+  behaviour (format negotiation against real caps, `-k` keying around TX bursts, a short write from
+  a radio that will not take a full buffer) is **unverified**, not merely untested.
   The device layer *can* be verified with real equipment today via its USB-audio interface; both the
   measurement and that procedure are in
   **[docs/on-air-verification.md](docs/on-air-verification.md)**.

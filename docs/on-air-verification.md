@@ -13,8 +13,10 @@ It exists for [issue #12](https://github.com/KJ5HST-LABS/naudio/issues/12).
 
 `na_hamlib_bridge` sources its audio from Hamlib's audio-streaming subsystem (`rig_stream_open`,
 `rig_stream_read`, `rig_stream_write`). **No radio backend in upstream Hamlib implements that
-subsystem.** Hamlib PR [#2178](https://github.com/Hamlib/Hamlib/pull/2178) (open) adds the first
-ones, for Icom radios on the network, and naudio has not run the bridge against one.
+subsystem.** Two open Hamlib PRs add radio backends that do —
+[#2178](https://github.com/Hamlib/Hamlib/pull/2178) for Icom radios on the network and the draft
+[#2213](https://github.com/Hamlib/Hamlib/pull/2213) for FlexRadio — and naudio has not run the
+bridge against either.
 
 Measured against `Hamlib 5.0.0~git SHA=0839c03` (upstream master, 2026-08-15), by enumerating every
 model the library knows and asking which advertise streaming capabilities:
@@ -35,9 +37,9 @@ accessor rather than reading the `rig_caps` pointer:
 | 1035 | Yaesu FT-991 | **0** |
 | 2037 | Kenwood TS-590SG | **0** |
 
-Upstream master is the same at `06335264d` (2026-10-19): the Dummy's is still the only
-`.stream_caps` in `rigs/`. The enumeration below, run against a libhamlib built from `0748e823e`
-(master with PR #2178 and later fixes on top), reports the Icom network backends:
+Upstream master is the same at `06335264d` (2026-10-19): the enumeration below reports
+`1 of 315 models advertise stream_caps`, the Dummy. Run against a libhamlib built from `0748e823e`
+(master with PR #2178 and later fixes on top), it reports the Icom network backends:
 
 ```
 7 of 321 models advertise stream_caps
@@ -51,13 +53,14 @@ Upstream master is the same at `06335264d` (2026-10-19): the Dummy's is still th
 ```
 
 A backend with no `stream_caps` cannot open a stream, so the bridge exits at startup rather than
-running degraded. **Chaining through `rigctld` does not help:** model 2 has no streaming
-capabilities of its own, it forwards the remote backend's — so the chain streams only if the
-remote backend is one of the above.
+running degraded. **Chaining through `rigctld` adds no streaming of its own:** model 2 has no
+streaming capabilities, it forwards the remote backend's — so the chain streams only if the remote
+backend is one of the above.
 
 This is an upstream gap, not a naudio defect. The condition that unblocks it is exactly one thing:
-**a radio backend that authors a `stream_caps` table** — which PR #2178 adds, and which a released
-Hamlib does not have yet. To re-check, enumerate the installed library again:
+**a radio backend that authors a `stream_caps` table** — which PR #2178 adds for Icom and draft
+PR #2213 for FlexRadio, and which a released Hamlib does not have yet. To re-check, enumerate the
+installed library again:
 
 ```c
 /* cc scan.c -I$PREFIX/include -L$PREFIX/lib -lhamlib -Wl,-rpath,$PREFIX/lib -o scan */
@@ -77,11 +80,12 @@ int main(void) {
 }
 ```
 
-Where it prints anything other than `Dummy`, path B below can be run with that radio — today only
-against a libhamlib carrying PR #2178, and only with an Icom radio on the network. Until someone
-does, the bridge's real-backend behaviour — format negotiation against real caps, `-k` PTT keying
-around TX bursts, a real short-write from a radio that will not take a full buffer — stays
-unverified, and this project should say so rather than imply otherwise.
+Where it prints anything other than `Dummy`, path B below can be run with that radio — in the
+libhamlib scanned above (`0748e823e`), only with an Icom radio on the network; PR #2213's FlexRadio
+backend is not in it and has not been scanned. Until someone does, the bridge's real-backend
+behaviour — format negotiation against real caps, `-k` PTT keying around TX bursts, a real
+short-write from a radio that will not take a full buffer — stays unverified, and this project
+should say so rather than imply otherwise.
 
 ---
 
@@ -318,8 +322,8 @@ unless something shows it can fire.
 ## Path B — the bridge, when a backend exists
 
 Executable only with a radio whose backend the enumeration at the top of this document reports —
-today the Icom network models of Hamlib PR #2178, which naudio has not run. Recorded now so the
-procedure is not reconstructed from scratch on the day.
+in the libhamlib scanned there, the Icom network models of Hamlib PR #2178, which naudio has not
+run. Recorded now so the procedure is not reconstructed from scratch on the day.
 
 Three topologies, and they are not equivalent:
 
@@ -340,8 +344,8 @@ goes through `-C token=value`, once per token.
     -C net_username=<user> -C net_password=<password>
 ```
 
-The login is the network user configured in the radio's menu, and command-line arguments are
-visible to other users of the machine; see
+The login is the network user configured in the radio's menu, and command-line arguments — and a
+service definition that carries them — are visible to other users of the machine; see
 [`hamlib-streaming-bridge.md`](hamlib-streaming-bridge.md) § "An Icom network radio".
 
 **Via `rigctld`** — all radio configuration lives in `rigctld`, which has flags for it:
