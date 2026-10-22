@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.0.0rc12] — 2026-10-22
+
 ### Added
 - **`na_hamlib_bridge` builds on Windows, with MinGW-w64 in MSYS2's UCRT64 environment.** Its `NOT WIN32` gate came from moving the directory-wide gate inward (923b5f6), not from anything the bridge needs: MinGW-w64 supplies `getopt`, pthreads, `nanosleep` and `clock_gettime`, and the streaming libhamlib builds with it. Measured by cross-compiling with MinGW-w64 GCC 16.2 against static libhamlibs built from upstream master (`d269f30b7`, what CI builds) and from dchristle/Hamlib `291f73549` (which carries the open Hamlib PR #2178's Icom network backends): against each, the bridge links with no warnings, and imports `libnaudio.dll` and `libwinpthread-1.dll`, and through `libnaudio.dll` `libstdc++-6.dll` and `libgcc_s_seh-1.dll`; everything else it loads is part of Windows. `docs/hamlib-streaming-bridge.md` has the MSYS2 build and that list, and `INSTALL.md` no longer says the bridge is not built on Windows. Its man page is not installed on Windows, as for `na_wav_tap`.
 - **On Windows, Ctrl-C and Ctrl-Break stop the bridge cleanly.** The C runtime resets a signal handler to the default before calling it, so the bridge re-installs its own; a second Ctrl-C during the shutdown is then absorbed, as on POSIX, instead of ending the process with the rig open and, under `-k`, PTT keyed. Ctrl-Break (`SIGBREAK`) stops it as Ctrl-C does; it is the console event a supervisor can send to a bridge started in a process group of its own, where Windows disables Ctrl-C, and Windows has no `SIGTERM`. Nothing changes on POSIX.
