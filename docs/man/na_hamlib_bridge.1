@@ -85,8 +85,11 @@ and
 .B \-L
 lists a model's tokens.
 A token the model does not have, a malformed argument, or a value the
-backend refuses stops the bridge with a message naming the token (a
-malformed argument only up to the end of its leading name).
+backend refuses stops the bridge with a message naming the token.
+An argument with no
+.B =
+is not shown at all, since it may be a value; one whose token name holds
+other characters is shown only up to them.
 The bridge never prints the value; libhamlib's own diagnostics may, on the
 same standard error (see the guide named below).
 A value libhamlib refuses for

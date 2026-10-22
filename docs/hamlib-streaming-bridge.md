@@ -318,8 +318,8 @@ Registered wherever `naudio_bridge_arm` is, and run by the same CI job. It drive
 | `conf/after-S` | `-S silence -C stream_mode=tone` | deliver content: `-C` is applied after `-S` |
 | `conf/after-r` | `-r A -C rig_pathname=B` | name `B` on the startup line: `-C` is applied after `-r` |
 | `conf/unknown` | `-C no_such_token=…` | exit 1, naming the token |
-| `conf/no-equals` | `-C stream_mode` | exit 2, naming the token |
-| `conf/colon`, `conf/space` | `-C stream_mode:…`, `-C 'stream_mode …'` | exit 2, naming at most `stream_mode` |
+| `conf/no-equals`, `conf/bare-value`, `conf/joined` | `-C stream_mode`, `-C …`, `-C net_password…` | exit 2, printing no part of the argument |
+| `conf/colon`, `conf/space` | `-C stream_mode:…`, `-C 'stream_mode …'` | exit 2, printing no part of the argument |
 | `conf/bad-name` | `-C stream_mode:…=tone` | exit 2, naming at most `stream_mode` |
 | `conf/empty-token` | `-C =…` | exit 2, printing no part of the argument |
 | `conf/limit` | 65 × `-C stream_mode=tone` | exit 2: the bridge keeps 64 |
@@ -541,13 +541,14 @@ libhamlib refuses for `-r` or `-S` only prints a warning and the bridge carries 
 `-C` stops it. `rigctl -m <model> -L` lists a model's tokens.
 
 Any failure stops the bridge before it serves anything, with a message that names the token and
-never the value. A malformed argument is named only up to the end of its leading token name, since
-the likeliest malformed ones are typos of a password option — `-C net_password:PASS` or
-`-C 'net_password PASS'` — whose rest is the password:
+never the value. A malformed argument is shown even less. With no `=` none of it is printed: it may
+be the value alone (a forgotten token), a token and value run together (a forgotten `=`), or a typo
+such as `-C net_password:PASS` or `-C 'net_password PASS'`. With an `=` but a token name holding
+other characters, only the name's leading run of letters, digits and `_` is printed:
 
 | Cause | Exit | Message |
 |---|---|---|
-| no `=` | 2 | `-C stream_mode: expected token=value` |
+| no `=` | 2 | `-C: expected token=value; this argument has no '=' (it is not shown: it may be a value)` |
 | a token name with any character but letters, digits and `_`, or none | 2 | `-C net_password...: expected token=value, a token of letters, digits and '_' (the rest of the argument is not shown)` |
 | a token the model does not have | 1 | `-C no_such_token: model 1 has no such token (rigctl -m 1 -L lists its tokens)` |
 | a value the backend refuses | 1 | `-C net_password: refused: Invalid parameter` |

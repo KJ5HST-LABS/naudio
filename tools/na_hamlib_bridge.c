@@ -490,20 +490,22 @@ static const char k_token_chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
 
 /* -C's argument is token=value, the token made of k_token_chars. Checked at parse time so a
- * malformed one stops the bridge before any Hamlib call. The message names at most the argument's
- * leading run of token characters and never what follows it: the likeliest malformed arguments are
- * typos of a password option — `net_password:PASS`, `'net_password PASS'` — and the rest is the
- * password. */
+ * malformed one stops the bridge before any Hamlib call, and the message never shows a value:
+ *  - with no '=', none of the argument is printed. It may be the value alone (a forgotten token),
+ *    a token and value run together (a forgotten '='), or a typo such as `net_password:PASS`;
+ *  - with an '=' but a token holding other characters, only the leading run of token characters,
+ *    since `net_password:x=y` holds a password before its '='. */
 static int conf_arg_ok(const char *arg) {
     size_t len = strspn(arg, k_token_chars);
     if (len > 0 && arg[len] == '=') return 1;
-    if (arg[0] == '=')
+    if (strchr(arg, '=') == NULL)
+        fprintf(stderr, "na_hamlib_bridge: -C: expected token=value; this argument has no '=' "
+                        "(it is not shown: it may be a value)\n");
+    else if (arg[0] == '=')
         fprintf(stderr, "na_hamlib_bridge: -C: no token name before '='\n");
     else if (len == 0)
         fprintf(stderr, "na_hamlib_bridge: -C: expected token=value, a token of letters, digits "
                         "and '_' (the argument is not shown)\n");
-    else if (arg[len] == '\0')
-        fprintf(stderr, "na_hamlib_bridge: -C %s: expected token=value\n", arg);
     else
         fprintf(stderr, "na_hamlib_bridge: -C %.*s...: expected token=value, a token of letters, "
                         "digits and '_' (the rest of the argument is not shown)\n", (int)len, arg);

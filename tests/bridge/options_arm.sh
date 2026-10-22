@@ -30,10 +30,13 @@
 #   conf/after-r      -r A -C rig_pathname=B applies B, which the startup line reads back from
 #                     libhamlib: -C is applied after -r too
 #   conf/unknown      a token the model lacks stops the bridge (exit 1), naming the token
-#   conf/no-equals    -C stream_mode, with no '=', stops it (exit 2), naming the token
-#   conf/colon        -C stream_mode:<value> and -C 'stream_mode <value>' (the likeliest typos of
-#   conf/space        a password option) stop it (exit 2), naming at most the leading name
-#   conf/bad-name     a token name with a character no token has, before an '=', likewise
+#   conf/no-equals    an argument with no '=' stops it (exit 2) and is not printed at any part, since
+#   conf/bare-value   it may be a value: -C stream_mode, a forgotten token (-C <value>), a forgotten
+#   conf/joined       '=' (-C net_password<value>), and the likeliest typos of a password option,
+#   conf/colon        -C stream_mode:<value> and -C 'stream_mode <value>'
+#   conf/space
+#   conf/bad-name     a token name with a character no token has, before an '=', stops it (exit 2),
+#                     naming at most its leading run of token characters
 #   conf/empty-token  -C =<value> stops it (exit 2) and prints no argument at all
 #   conf/limit        a 65th -C stops it (exit 2): the bridge keeps 64
 #   conf/refused      a value the backend refuses stops it (exit 1), naming the token
@@ -55,6 +58,9 @@ SECS="${NA_BRIDGE_OPTIONS_SECONDS:-4}"
 # refusing costs seconds, not minutes.
 REFUSE_DEADLINE=10
 SECRET="s3cret-VALUE-never-printed"
+# A value made only of token characters, as a password can be: an argument with no '=' that is all
+# token characters looks exactly like a token name.
+BARE_SECRET="s3cretVALUEneverprinted"
 # conf/open-fails needs a -C value that libhamlib records in its saved debug history, and `client`
 # is the token every streaming libhamlib logs that way ("Client claims to be <value>", at verbose
 # level, so recorded but not printed). It must name a client libhamlib knows — it matches them
@@ -255,13 +261,13 @@ run_served conf/after-S wan content wan -S silence -C stream_mode=tone || fail $
 run_started conf/after-r ' s80-path-from-C -> naudio :' 's80-path-from-r' \
     -S tone -r s80-path-from-r -C rig_pathname=s80-path-from-C || fail $?
 run_refused conf/unknown   1 '-C no_such_token: ' "$SECRET" -C "no_such_token=$SECRET" || fail $?
-run_refused conf/no-equals 2 '^na_hamlib_bridge: -C stream_mode: expected token=value' "" \
-    -C stream_mode || fail $?
-run_refused conf/colon       2 '^na_hamlib_bridge: -C stream_mode' "$SECRET" -C "stream_mode:$SECRET" \
-    || fail $?
-run_refused conf/space       2 '^na_hamlib_bridge: -C stream_mode' "$SECRET" -C "stream_mode $SECRET" \
-    || fail $?
-run_refused conf/bad-name    2 '^na_hamlib_bridge: -C stream_mode' "$SECRET" \
+NO_EQUALS='^na_hamlib_bridge: -C: expected token=value'
+run_refused conf/no-equals  2 "$NO_EQUALS" stream_mode    -C stream_mode                 || fail $?
+run_refused conf/bare-value 2 "$NO_EQUALS" "$BARE_SECRET" -C "$BARE_SECRET"              || fail $?
+run_refused conf/joined     2 "$NO_EQUALS" "$BARE_SECRET" -C "net_password$BARE_SECRET"  || fail $?
+run_refused conf/colon      2 "$NO_EQUALS" "$SECRET"      -C "stream_mode:$SECRET"       || fail $?
+run_refused conf/space      2 "$NO_EQUALS" "$SECRET"      -C "stream_mode $SECRET"       || fail $?
+run_refused conf/bad-name 2 '^na_hamlib_bridge: -C stream_mode\.\.\.: ' "$SECRET" \
     -C "stream_mode:$SECRET=tone" || fail $?
 run_refused conf/empty-token 2 "^na_hamlib_bridge: -C: no token name before '='" "$SECRET" \
     -C "=$SECRET" || fail $?
