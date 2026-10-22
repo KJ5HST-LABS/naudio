@@ -318,17 +318,21 @@ Registered wherever `naudio_bridge_arm` is, and run by the same CI job. It drive
 | `conf/unknown` | `-C no_such_token=…` | exit 1, naming the token |
 | `conf/no-equals` | `-C stream_mode` | exit 2, naming the token |
 | `conf/refused` | `-C stream_mode=…` (a mode the dummy refuses) | exit 1, naming the token |
+| `conf/open-fails` | `-m 2 -r` a closed port, `-C client=…` | exit 1 on the failed `rig_open` |
 
 The control row is what makes the first two mean anything: a probe whose `--profile tcp` quietly
-connected over UDP would pass them, and fails it. The last three also require that the **value**
-never appears in the bridge's output, since for a network radio it is a password.
+connected over UDP would pass them, and fails it. The last four also require that the **value**
+never appears in the bridge's output, since for a network radio it is a password. `conf/open-fails`
+uses `client` because libhamlib records that token's value in its saved debug history, so the row
+fails if any error path prints that history.
 
 ```bash
 ctest --test-dir build -R naudio_bridge_options_arm --output-on-failure   # ~30 s
 ```
 
 Every row was driven red before it was trusted: against the bridge as it was before these options
-existed, every row but the control fails, and seven targeted mutants of the new code (`-C` applied
+existed, every row but the control fails; `conf/open-fails` failed against the first `-C` build,
+whose failed `rig_open` printed the history; and seven targeted mutants of the new code (`-C` applied
 before `-S`, the whole `-C` argument printed, an unknown token or a refused value skipped, `dual`
 served as plain TCP, `tcp` served as UDP, an unknown `-R` falling back to `wan`) are each failed by
 the row meant for them.
@@ -526,8 +530,12 @@ never the value:
 | a token the model does not have | 1 | `-C no_such_token: model 1 has no such token (rigctl -m 1 -L lists its tokens)` |
 | a value the backend refuses | 1 | `-C net_password: refused: Invalid parameter` |
 
-The refusal is libhamlib's one-line message (`rigerror2`), not `rigerror`, which returns the library's
-saved debug history at every level and could carry a value a backend had logged.
+Every libhamlib error the bridge prints — this refusal, a failed `rig_open`, a failed stream open —
+is libhamlib's one-line message (`rigerror2`), never `rigerror`, which returns the library's saved
+debug history at every level. `-C` values reach that history: libhamlib records `-C client=X` there
+as `Client claims to be X`, and a `rig_open` that then failed used to print it. Messages libhamlib
+prints itself at warning or error level are not the bridge's to filter; for an unknown `client`
+value it prints the value.
 
 ### An Icom network radio
 

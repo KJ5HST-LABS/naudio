@@ -26,7 +26,8 @@
 #   conf/unknown      a token the model lacks stops the bridge (exit 1), naming the token
 #   conf/no-equals    -C with no '=' stops it (exit 2), naming the token
 #   conf/refused      a value the backend refuses stops it (exit 1), naming the token
-# The last three also require that the VALUE never reaches the output: for a network radio it is
+#   conf/open-fails   a rig_open that fails after -C stops it (exit 1) without printing a -C value
+# The last four also require that the VALUE never reaches the output: for a network radio it is
 # a password.
 #
 # macOS SIP TRAP (CLAUDE.md Learning 6): every child is launched DIRECTLY from this script, never
@@ -43,6 +44,12 @@ SECS="${NA_BRIDGE_OPTIONS_SECONDS:-4}"
 # refusing costs seconds, not minutes.
 REFUSE_DEADLINE=10
 SECRET="s3cret-VALUE-never-printed"
+# conf/open-fails needs a -C value that libhamlib records in its saved debug history, and `client`
+# is the token every streaming libhamlib logs that way ("Client claims to be <value>", at verbose
+# level, so recorded but not printed). It must name a client libhamlib knows — it matches them
+# without regard to case — or libhamlib prints the value itself at ERR level, which is not the
+# bridge's doing. This spelling appears nowhere else in the bridge's output.
+CLIENT_VALUE="wSjTx"
 
 for exe in "$BRIDGE" "$PROBE"; do
     if [ ! -x "$exe" ]; then
@@ -158,10 +165,11 @@ run_wan_refuses_tcp () {
     return "$arc"
 }
 
-# One refusal row: the bridge must exit on its own with exactly $want_exit, never come up, and its
-# output must match $must (an ERE) and must not contain $SECRET.
+# One refusal row: run_refused <label> <exit> <must> <never> <bridge args...>. The bridge must exit
+# on its own with exactly <exit>, never come up, and its output must match <must> (an ERE) and must
+# not contain <never>, the -C value the row passed.
 run_refused () {
-    local label="$1" want_exit="$2" must="$3"; shift 3
+    local label="$1" want_exit="$2" must="$3" never="$4"; shift 4
     local log="$workdir/bridge.${label//\//_}.log"
     "$BRIDGE" -m 1 -p "$PORT" "$@" >"$log" 2>&1 &
     local pid=$!
@@ -183,7 +191,7 @@ run_refused () {
         echo "FAIL options_arm/$label: nothing in its output matches /$must/" >&2
         arc=1
     fi
-    if grep -Fq -- "$SECRET" "$log"; then
+    if grep -Fq -- "$never" "$log"; then
         echo "FAIL options_arm/$label: the -C value reached the output — it may be a password" >&2
         arc=1
     fi
@@ -201,18 +209,22 @@ echo "options_arm: $BRIDGE on :$PORT, ${SECS}s per probe"
 run_served tcp  tcp  content "tcp"     -S tone -R tcp  || fail $?
 run_served dual dual content "tcp ft8" -S tone -R dual || fail $?
 run_wan_refuses_tcp || fail $?
-run_refused bogus 2 '^usage: ' -S tone -R bogus || fail $?
+run_refused bogus 2 '^usage: ' "$SECRET" -S tone -R bogus || fail $?
 
 run_served conf/silence wan silence wan -C stream_mode=silence           || fail $?
 run_served conf/after-S wan content wan -S silence -C stream_mode=tone || fail $?
-run_refused conf/unknown   1 '-C no_such_token: ' -C "no_such_token=$SECRET" || fail $?
-run_refused conf/no-equals 2 '-C stream_mode: '   -C stream_mode             || fail $?
-run_refused conf/refused   1 '-C stream_mode: '   -C "stream_mode=$SECRET"   || fail $?
+run_refused conf/unknown   1 '-C no_such_token: ' "$SECRET" -C "no_such_token=$SECRET" || fail $?
+run_refused conf/no-equals 2 '-C stream_mode: '   "$SECRET" -C stream_mode             || fail $?
+run_refused conf/refused   1 '-C stream_mode: '   "$SECRET" -C "stream_mode=$SECRET"   || fail $?
+# -m 2 (the later -m wins over the helper's -m 1) against this arm's own port, where nothing
+# listens for TCP: netrigctl's rig_open is refused at connect in every streaming libhamlib.
+run_refused conf/open-fails 1 'rig_open: ' "$CLIENT_VALUE" \
+    -m 2 -r "127.0.0.1:$PORT" -C "client=$CLIENT_VALUE" || fail $?
 
 if [ "$rc" -eq 0 ]; then
     echo "options_arm: OK — -R tcp and -R dual serve TCP clients, -R wan refuses them, an unknown" \
          "-R is refused, and -C reaches the backend after -S and stops the bridge on any failure" \
-         "without printing its value"
+         "without printing its value, a failed rig_open included"
 fi
 na_harness_done
 exit "$rc"

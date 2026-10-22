@@ -443,6 +443,20 @@ static void *tx_thread(void *arg) {
 
 /* ------------------------------------------------------------------ helpers */
 
+/* libhamlib's one-line message for a failed call, without the newline rigerror2() appends. Every
+ * libhamlib error the main thread prints goes through this, never through rigerror(), which
+ * returns the library's saved debug history, every level included — and -C values reach that
+ * history. Measured: libhamlib records `-C client=X` there as "Client claims to be X", and a
+ * rig_open that then failed printed it. A static buffer, as rigerror2()'s own is, so the main
+ * thread only; the workers trim in worker_failed(). */
+static const char *rig_msg(int rc) {
+    static char line[256];
+    snprintf(line, sizeof line, "%s", rigerror2(rc));
+    size_t n = strlen(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+    return line;
+}
+
 /* The -R names. The first three serve UDP only, and a client that selects no reliability profile
  * is on the C ABI's default transport, plain TCP — a UDP-only server refuses it at connect. `tcp`
  * serves that client; `dual` serves it and a UDP client on the same port. */
@@ -488,9 +502,7 @@ static int conf_arg_ok(const char *arg) {
 
 /* Apply each -C in command-line order, after -r and -S, so a -C naming the same token wins.
  * Returns 0, or -1 having named the token that failed. The value is never printed: for a network
- * radio it is a login (net_username, net_password). Nor is rigerror(): it returns libhamlib's
- * saved debug history, every level included, and a backend may have logged the value there;
- * rigerror2() is the one-line message alone. */
+ * radio it is a login (net_username, net_password). */
 static int apply_conf(RIG *rig, int model, const char *const *conf, int n) {
     for (int i = 0; i < n; i++) {
         const char *eq = strchr(conf[i], '=');
@@ -510,12 +522,8 @@ static int apply_conf(RIG *rig, int model, const char *const *conf, int n) {
             rc = -RIG_EINVAL;
         } else {
             rc = rig_set_conf(rig, token, eq + 1);
-            if (rc != RIG_OK) {
-                const char *why = rigerror2(rc);
-                size_t wn = strlen(why);
-                while (wn > 0 && (why[wn - 1] == '\n' || why[wn - 1] == '\r')) wn--;
-                fprintf(stderr, "na_hamlib_bridge: -C %s: refused: %.*s\n", name, (int)wn, why);
-            }
+            if (rc != RIG_OK)
+                fprintf(stderr, "na_hamlib_bridge: -C %s: refused: %s\n", name, rig_msg(rc));
         }
         free(name);
         if (rc != RIG_OK) return -1;
@@ -585,7 +593,7 @@ static void report_conversions(rig_stream_t *stream, rig_stream_type_t type, int
     int conv = rig_stream_get_conversions(stream);
     if (conv < 0) {
         fprintf(stderr, "na_hamlib_bridge: stream type=%d: cannot read conversion state: %s\n",
-                (int)type, rigerror(conv));
+                (int)type, rig_msg(conv));
         return;
     }
     if (conv == RIG_STREAM_CONV_NONE) {
@@ -716,7 +724,7 @@ static int open_stream(RIG *rig, rig_stream_type_t type, int channels, int rate,
         return r;
     }
     fprintf(stderr, "na_hamlib_bridge: rig_stream_open(type=%d, S16@%d/%dch): %s\n",
-            (int)type, rate, channels, rigerror(r));
+            (int)type, rate, channels, rig_msg(r));
 #ifdef NAUDIO_HAMLIB_HAS_REQUIRE_NATIVE_MASK
     if (r == -RIG_ENAVAIL) {
         /* The distinct code rig_stream_open documents for exactly this refusal. */
@@ -907,7 +915,7 @@ int main(int argc, char **argv) {
         int rc = rig_set_conf(b.rig, rig_token_lookup(b.rig, "rig_pathname"), rig_file);
         if (rc != RIG_OK)
             fprintf(stderr, "na_hamlib_bridge: warning: set rig_pathname(%s): %s\n",
-                    rig_file, rigerror(rc));
+                    rig_file, rig_msg(rc));
     }
     if (stream_mode) {
         /* Backend-specific conf, read when the stream opens — so it must be set before
@@ -916,7 +924,7 @@ int main(int argc, char **argv) {
         int rc = rig_set_conf(b.rig, rig_token_lookup(b.rig, "stream_mode"), stream_mode);
         if (rc != RIG_OK)
             fprintf(stderr, "na_hamlib_bridge: warning: set stream_mode(%s): %s\n",
-                    stream_mode, rigerror(rc));
+                    stream_mode, rig_msg(rc));
     }
     if (apply_conf(b.rig, model, conf, n_conf) != 0) {
         rig_cleanup(b.rig);
@@ -926,7 +934,7 @@ int main(int argc, char **argv) {
     }
     int r = rig_open(b.rig);
     if (r != RIG_OK) {
-        fprintf(stderr, "na_hamlib_bridge: rig_open: %s\n", rigerror(r));
+        fprintf(stderr, "na_hamlib_bridge: rig_open: %s\n", rig_msg(r));
         rig_cleanup(b.rig);
         ring_free(&b.txring);
         rx_meter_free(&b.rxm);
