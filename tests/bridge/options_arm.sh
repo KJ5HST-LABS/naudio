@@ -24,11 +24,15 @@
 #   conf/after-S      -S silence -C stream_mode=tone delivers content: -C acts as -S does, and is
 #                     applied after it
 #   conf/unknown      a token the model lacks stops the bridge (exit 1), naming the token
-#   conf/no-equals    -C with no '=' stops it (exit 2), naming the token
+#   conf/no-equals    -C stream_mode, with no '=', stops it (exit 2), naming the token
+#   conf/colon        -C stream_mode:<value> and -C 'stream_mode <value>' (the likeliest typos of
+#   conf/space        a password option) stop it (exit 2), naming at most the leading name
+#   conf/bad-name     a token name with a character no token has, before an '=', likewise
+#   conf/empty-token  -C =<value> stops it (exit 2) and prints no argument at all
 #   conf/refused      a value the backend refuses stops it (exit 1), naming the token
 #   conf/open-fails   a rig_open that fails after -C stops it (exit 1) without printing a -C value
-# The last four also require that the VALUE never reaches the output: for a network radio it is
-# a password.
+# Every row that puts a value on the command line also requires that the VALUE never reaches the
+# output: for a network radio it is a password.
 #
 # macOS SIP TRAP (CLAUDE.md Learning 6): every child is launched DIRECTLY from this script, never
 # through `timeout` or another shell — see deadline.sh.
@@ -167,7 +171,7 @@ run_wan_refuses_tcp () {
 
 # One refusal row: run_refused <label> <exit> <must> <never> <bridge args...>. The bridge must exit
 # on its own with exactly <exit>, never come up, and its output must match <must> (an ERE) and must
-# not contain <never>, the -C value the row passed.
+# not contain <never>, the -C value the row passed — "" for a row that passes none.
 run_refused () {
     local label="$1" want_exit="$2" must="$3" never="$4"; shift 4
     local log="$workdir/bridge.${label//\//_}.log"
@@ -191,7 +195,7 @@ run_refused () {
         echo "FAIL options_arm/$label: nothing in its output matches /$must/" >&2
         arc=1
     fi
-    if grep -Fq -- "$never" "$log"; then
+    if [ -n "$never" ] && grep -Fq -- "$never" "$log"; then
         echo "FAIL options_arm/$label: the -C value reached the output — it may be a password" >&2
         arc=1
     fi
@@ -209,12 +213,21 @@ echo "options_arm: $BRIDGE on :$PORT, ${SECS}s per probe"
 run_served tcp  tcp  content "tcp"     -S tone -R tcp  || fail $?
 run_served dual dual content "tcp ft8" -S tone -R dual || fail $?
 run_wan_refuses_tcp || fail $?
-run_refused bogus 2 '^usage: ' "$SECRET" -S tone -R bogus || fail $?
+run_refused bogus 2 '^usage: ' "" -S tone -R bogus || fail $?
 
 run_served conf/silence wan silence wan -C stream_mode=silence           || fail $?
 run_served conf/after-S wan content wan -S silence -C stream_mode=tone || fail $?
 run_refused conf/unknown   1 '-C no_such_token: ' "$SECRET" -C "no_such_token=$SECRET" || fail $?
-run_refused conf/no-equals 2 '-C stream_mode: '   "$SECRET" -C stream_mode             || fail $?
+run_refused conf/no-equals 2 '^na_hamlib_bridge: -C stream_mode: expected token=value' "" \
+    -C stream_mode || fail $?
+run_refused conf/colon       2 '^na_hamlib_bridge: -C stream_mode' "$SECRET" -C "stream_mode:$SECRET" \
+    || fail $?
+run_refused conf/space       2 '^na_hamlib_bridge: -C stream_mode' "$SECRET" -C "stream_mode $SECRET" \
+    || fail $?
+run_refused conf/bad-name    2 '^na_hamlib_bridge: -C stream_mode' "$SECRET" \
+    -C "stream_mode:$SECRET=tone" || fail $?
+run_refused conf/empty-token 2 "^na_hamlib_bridge: -C: no token name before '='" "$SECRET" \
+    -C "=$SECRET" || fail $?
 run_refused conf/refused   1 '-C stream_mode: '   "$SECRET" -C "stream_mode=$SECRET"   || fail $?
 # -m 2 (the later -m wins over the helper's -m 1) against this arm's own port, where nothing
 # listens for TCP: netrigctl's rig_open is refused at connect in every streaming libhamlib.

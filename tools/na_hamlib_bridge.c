@@ -484,20 +484,30 @@ static const char *parse_profile(const char *s, na_reliability_profile *out) {
     return NULL;
 }
 
-/* -C's argument is token=value with a non-empty token. Checked at parse time so a malformed one
- * stops the bridge before any Hamlib call. With no '=' the whole argument is the token, so naming
- * it shows no value. */
+/* The characters of a Hamlib configuration token name; every name libhamlib defines is made of
+ * these. */
+static const char k_token_chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
+
+/* -C's argument is token=value, the token made of k_token_chars. Checked at parse time so a
+ * malformed one stops the bridge before any Hamlib call. The message names at most the argument's
+ * leading run of token characters and never what follows it: the likeliest malformed arguments are
+ * typos of a password option — `net_password:PASS`, `'net_password PASS'` — and the rest is the
+ * password. */
 static int conf_arg_ok(const char *arg) {
-    const char *eq = strchr(arg, '=');
-    if (eq == NULL) {
-        fprintf(stderr, "na_hamlib_bridge: -C %s: expected token=value\n", arg);
-        return 0;
-    }
-    if (eq == arg) {
+    size_t len = strspn(arg, k_token_chars);
+    if (len > 0 && arg[len] == '=') return 1;
+    if (arg[0] == '=')
         fprintf(stderr, "na_hamlib_bridge: -C: no token name before '='\n");
-        return 0;
-    }
-    return 1;
+    else if (len == 0)
+        fprintf(stderr, "na_hamlib_bridge: -C: expected token=value, a token of letters, digits "
+                        "and '_' (the argument is not shown)\n");
+    else if (arg[len] == '\0')
+        fprintf(stderr, "na_hamlib_bridge: -C %s: expected token=value\n", arg);
+    else
+        fprintf(stderr, "na_hamlib_bridge: -C %.*s...: expected token=value, a token of letters, "
+                        "digits and '_' (the rest of the argument is not shown)\n", (int)len, arg);
+    return 0;
 }
 
 /* Apply each -C in command-line order, after -r and -S, so a -C naming the same token wins.
