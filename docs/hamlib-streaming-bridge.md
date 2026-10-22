@@ -274,12 +274,9 @@ the process from Task Manager skips the shutdown, as a hangup or `SIGKILL` does 
 
 ### What CI checks on Windows
 
-The `windows-hamlib-bridge` job (windows-latest, MSYS2 UCRT64) builds Hamlib from
-`dchristle/Hamlib` at `291f73549`, the revision WSJT-X's direct-streaming PR #723 pins: upstream
-`master` plus Hamlib PR #2178's Icom network backends and later fixes. That is a pin, unlike the
-Linux job's upstream `master` (see [Provenance](#provenance)), and it puts the Icom network backends
-into the Windows build. It runs the bridge from a directory holding only it and the DLLs above, with
-nothing else on `PATH`:
+The `windows-hamlib-bridge` job (windows-latest, MSYS2 UCRT64) builds the same Hamlib as the Linux
+job: the build script's defaults, upstream `master` at its head (see [Provenance](#provenance)). It
+runs the bridge from a directory holding only it and the DLLs above, with nothing else on `PATH`:
 
 - `-h`;
 - the Dummy's tone delivered to a TCP client over `-R tcp`, with a silent Dummy as the control
@@ -296,8 +293,9 @@ malformed or refused `-C` — while the rows that stop it with `SIGINT` are show
 The ctest bridge arms stay unregistered on Windows for the same reason, and because the fault arm's
 preload shim has no Windows equivalent.
 
-Not checked on Windows: a radio, and the Icom network backends at run time. They compile and link
-into the bridge; nothing has run them there.
+Not checked on Windows: a radio. Upstream `master` has no Icom network backends (Hamlib PR #2178 is
+open); a cross-build against a libhamlib that carries them (`dchristle/Hamlib` `291f73549`)
+compiled and linked them into the bridge, and nothing has run them there.
 
 ---
 

@@ -651,11 +651,9 @@ jobs:
     # UCRT64 is the MSYS2 environment WSJT-X's Windows build uses, and the UCRT is the C runtime
     # naudio's MSVC packages use.
     #
-    # WHICH HAMLIB. The Linux job tracks upstream master (issue #81). This one builds the revision
-    # WSJT-X's direct-streaming PR #723 pins, dchristle/Hamlib 291f73549: upstream master plus Hamlib
-    # PR #2178's Icom network backends (models 3095-3100) and later fixes, so those backends are in
-    # the Windows build too. A full SHA, so it cannot move. Static (--static), so the bridge embeds
-    # libhamlib and needs no libhamlib DLL beside it.
+    # WHICH HAMLIB. The same as the Linux job: tools/build-streaming-hamlib.sh's defaults, upstream
+    # master at its head (issue #81), so both platforms build one Hamlib source. Static (--static),
+    # so the bridge embeds libhamlib and needs no libhamlib DLL beside it.
     #
     # WHY POWERSHELL STARTS THE BRIDGE. A native program started from MSYS2's bash runs under a stub
     # process, and when none of its stdio is a terminal, as here, a `kill -INT` sent to it comes back
@@ -668,9 +666,6 @@ jobs:
     defaults:
       run:
         shell: msys2 {0}
-    env:
-      HAMLIB_REPO: https://github.com/dchristle/Hamlib.git
-      HAMLIB_REF: 291f73549d0dd6111c4f864c7e797f20a51069a9
     steps:
       - name: Keep LF line endings (the bash scripts run under MSYS2)
         shell: pwsh
@@ -690,7 +685,7 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkg-config
 
-      - name: "Build a static streaming libhamlib (dchristle/Hamlib 291f73549) from source"
+      - name: "Build a static streaming libhamlib (Hamlib master, as the Linux job) from source"
         env:
           CC: gcc
         run: |
@@ -698,8 +693,7 @@ jobs:
           # and gcc that read it take /d/a/... for a path on the current drive.
           prefix="$(cygpath -m "$RUNNER_TEMP")/hamlib-streaming"
           echo "HAMLIB_PREFIX=$prefix" >> "$GITHUB_ENV"
-          bash tools/build-streaming-hamlib.sh --static --repo "$HAMLIB_REPO" --ref "$HAMLIB_REF" \
-            --prefix "$prefix"
+          bash tools/build-streaming-hamlib.sh --static --prefix "$prefix"
 
       - name: Configure with the bridge enabled
         run: |
