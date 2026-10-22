@@ -329,22 +329,33 @@ Registered wherever `naudio_bridge_arm` is, and run by the same CI job. It drive
 
 The control row is what makes the first two mean anything: a probe whose `--profile tcp` quietly
 connected over UDP would pass them, and fails it. A refusal row counts only with the probe's own
-`connect … failed` line, since a probe that wedged or could not run exits 2 as well. Every row that puts a value on the command line
-(each `…` above) also requires that the **value** never appears in the bridge's output, since for a
-network radio it is a password. `conf/open-fails`
-uses `client` because libhamlib records that token's value in its saved debug history, so the row
-fails if any error path prints that history.
+`connect … failed` line, since a probe that wedged or could not run exits 2 as well. Every row that
+puts a value on the command line (each `…` above) also requires that the **value** never appears in
+the bridge's output, since for a network radio it is a password. `conf/open-fails` uses `client`
+because libhamlib records that token's value in its saved debug history, so the row fails if any
+error path prints that history.
 
 ```bash
 ctest --test-dir build -R naudio_bridge_options_arm --output-on-failure   # ~40 s
 ```
 
-Every row was driven red before it was trusted: against the bridge as it was before these options
-existed, every row but the control fails; `conf/open-fails` failed against the first `-C` build,
-whose failed `rig_open` printed the history; and seven targeted mutants of the new code (`-C` applied
-before `-S`, the whole `-C` argument printed, an unknown token or a refused value skipped, `dual`
-served as plain TCP, `tcp` served as UDP, an unknown `-R` falling back to `wan`) are each failed by
-the row meant for them.
+Every row was driven red before it was trusted, against the build before its fix or against a
+mutant of the code it guards:
+
+- Against the bridge as it was before these options existed, every original row but the control
+  fails.
+- Rows added later failed against the build just before their fix: `conf/open-fails` (its failed
+  `rig_open` printed the history); `conf/colon`, `conf/space` and `conf/bad-name` (they printed the
+  value); `conf/after-r` (the startup line named the `-r` address); and `conf/no-equals`,
+  `conf/bare-value` and `conf/joined` (they printed the argument).
+- The rest were driven red by mutants: `tcp-udp` (`tcp` served as `dual`), `conf/limit` (the 64
+  limit off by one), `conf/empty-token` (the empty-token check removed, or its message printing the
+  argument) and `conf/path-only` (the `-C rig_pathname` half of the startup line dropped).
+- The implementer's eight mutants (`-C` applied before `-S`, the whole `-C` argument printed, an
+  unknown token or a refused value skipped, a failed `rig_open` printed with `rigerror()`, `dual`
+  served as plain TCP, `tcp` served as UDP, an unknown `-R` falling back to `wan`) and both rounds of
+  review mutants are each failed by the row meant for them. The one that a failed stream open
+  printed with `rigerror()` is failed by the fault arm's `open-fail`, below.
 
 ---
 
@@ -417,19 +428,21 @@ which calls it actually makes, measured rather than assumed:
 | `tx-fail` | read | plus its forced-write line, which is strictly stronger for the write side |
 | `open-fail` | open | the stream never opens, so neither read nor write is called |
 
-Proved by removing both `DYLD_INTERPOSE` entries, so the shim loads and binds nothing: **all four
-arms report a harness fault (exit 2)**, none blames the bridge. Against the harness as it stood
-before this check, the same shim reported `rx-fail` and `tx-short` as **live bridge bugs** — issues
-#5 and #6 regressing — while `control` **passed clean**. Removing only the write marker leaves
-`rx-fail` and `tx-fail` green and fails `control` and `tx-short` alone, which is what shows the two
-requirements are independent rather than one check counted twice.
+Proved by removing every `DYLD_INTERPOSE` entry, so the shim loads and binds nothing: **all five
+arms report a harness fault (exit 2)**, none blames the bridge (re-measured on macOS with the three
+interposers `open-fail` brought; first measured with the two the first four arms used). Against the
+harness as it stood before this check, the same shim reported `rx-fail` and `tx-short` as **live
+bridge bugs** — issues #5 and #6 regressing — while `control` **passed clean**. Removing only the
+write marker leaves `rx-fail` and `tx-fail` green and fails `control` and `tx-short` alone, which is
+what shows the two requirements are independent rather than one check counted twice.
 
-Proved again on ELF, against the mutation that caused the original defect. In an `ubuntu:24.04`
-amd64 container, reverting `naudio_failshim`'s `C_VISIBILITY_PRESET` to `hidden` leaves `nm -D`
-reporting **no** exported interposers and `nm` two local `t` symbols — and all four arms report a
-**harness fault**, with the `armed` marker present in every one of them. The unmutated build in the
-same container passes all four, which is itself the evidence that the marker prints under
-`LD_PRELOAD`: every arm asserts it, so none of them could have passed otherwise.
+Proved again on ELF, against the mutation that caused the original defect, measured with the first
+four arms, before `open-fail` existed. In an `ubuntu:24.04` amd64 container, reverting
+`naudio_failshim`'s `C_VISIBILITY_PRESET` to `hidden` leaves `nm -D` reporting **no** exported
+interposers and `nm` two local `t` symbols — and all four arms report a **harness fault**, with the
+`armed` marker present in every one of them. The unmutated build in the same container passes all
+four, which is itself the evidence that the marker prints under `LD_PRELOAD`: every arm asserts it,
+so none of them could have passed otherwise.
 
 > **macOS SIP.** `DYLD_INSERT_LIBRARIES` is stripped the moment a SIP-protected binary is exec'd,
 > which includes `/usr/bin/timeout`, `/bin/zsh` and `/usr/bin/perl`. Both driver scripts launch the
@@ -559,9 +572,10 @@ is libhamlib's one-line message (`rigerror2`), never `rigerror`, which returns t
 debug history at every level. `-C` values reach that history: libhamlib records `-C client=X` there
 as `Client claims to be X`, and a `rig_open` that then failed used to print it.
 
-**The bridge never prints a `-C` value; libhamlib's own diagnostics may**, on the same stderr, and
-the bridge cannot filter them without silencing libhamlib's warnings and errors altogether. Two
-mechanisms, both checked against a libhamlib built from `0748e823e`:
+**The bridge never prints a `-C` value in a message; libhamlib's own diagnostics may**, on the same
+stderr, and the bridge cannot filter them without silencing libhamlib's warnings and errors
+altogether. (The startup line does name the rig address, whether it came from `-r` or from
+`-C rig_pathname`.) Two mechanisms, both checked against a libhamlib built from `0748e823e`:
 
 - **A backend's own refusal text.** Some name the value they refuse: `-m 3095 -C
   net_control_port=98765` prints `check_range: net_control_port must be 0..65535, got 98765`, and

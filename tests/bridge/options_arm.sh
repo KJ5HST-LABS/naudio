@@ -17,9 +17,9 @@
 #                     `--profile tcp` quietly ran UDP would pass them both, and fails this one
 #   tcp-udp           -R tcp REFUSES a UDP client: tcp is TCP only, not dual. Costs the probe's 10 s
 #                     handshake timeout, since nothing answers a UDP connect to a TCP-only port
+#   bogus             -R bogus exits 2 with the usage text instead of coming up as wan
 # A refusal counts only with the probe's own "connect … failed" line: a probe that wedged or could
 # not run also exits 2, and must not pass a refusal row.
-#   bogus             -R bogus exits 2 with the usage text instead of coming up as wan
 #
 # -C. A Hamlib configuration token set before rig_open — an Icom network radio's login is two of
 # them (net_username, net_password). The dummy backend's stream_mode is the token every streaming

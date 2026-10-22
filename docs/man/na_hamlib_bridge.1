@@ -90,8 +90,12 @@ An argument with no
 .B =
 is not shown at all, since it may be a value; one whose token name holds
 other characters is shown only up to them.
-The bridge never prints the value; libhamlib's own diagnostics may, on the
-same standard error (see the guide named below).
+The bridge never prints the value in a message; libhamlib's own
+diagnostics may, on the same standard error (see the guide named below).
+The startup line names the rig address, whether from
+.B \-r
+or from
+.BR "\-C rig_pathname" .
 A value libhamlib refuses for
 .B \-r
 or

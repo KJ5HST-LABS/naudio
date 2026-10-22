@@ -1,12 +1,12 @@
 /*
  * SPDX-License-Identifier: LGPL-2.1-or-later
  *
- * naudio tests — failshim: force rig_stream_read / rig_stream_write to fail, from outside.
+ * naudio tests — failshim: force rig_stream_read / _write / _open to fail, from outside.
  *
  * Copyright (C) 2025-2026 Terrell Deppe
  *
  * A preloaded interposition library that sits between na_hamlib_bridge and libhamlib and makes the
- * two stream calls misbehave on demand. It exists because the faults issues #5 and #6 describe
+ * three stream calls misbehave on demand. It exists because the faults issues #5 and #6 describe
  * CANNOT be provoked from outside the bridge's process: the Hamlib dummy has no error-injection
  * knob, and it routes reads through its own caps->stream_read hook, so libhamlib's own error and
  * `closing` paths are unreachable however the backend is configured. Without this file, #5 and #6
